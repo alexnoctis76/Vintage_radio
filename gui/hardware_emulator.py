@@ -158,8 +158,13 @@ class PygameHardwareEmulator(HardwareInterface):
             folder, track, start_ms = self._pending_playback
             self._pending_playback = None
             self._delay_playback = False
+            self.log(f"Executing pending playback: folder={folder}, track={track}, start_ms={start_ms}")
             # Call play_track directly (bypassing delay check since we disabled it)
             self.play_track(folder, track, start_ms)
+        else:
+            # No pending playback - this can happen if playback was already started
+            # or if delay_playback was cleared before AM overlay finished
+            self.log("execute_pending_playback called but no pending playback (playback may have already started)")
     
     def play_track(self, folder: int, track: int, start_ms: int = 0):
         """Play a track by folder/track number or by resolving from database."""

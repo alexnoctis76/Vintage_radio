@@ -473,6 +473,14 @@ class RadioCore:
         self.mode = MODE_SHUFFLE
         self.hw.log(f"Mode: Shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
         self._save_state("shuffle current")
+        
+        # Stop current playback and enable delay for AM overlay sequencing (same as switch_mode)
+        self.hw.stop()
+        self.is_playing = False
+        if hasattr(self.hw, 'set_delay_playback'):
+            self.hw.set_delay_playback(True)
+        
+        # Start playback (will be delayed if delay_playback is True)
         self._start_playback_for_current()
     
     def _init_library_shuffle(self):
@@ -497,6 +505,14 @@ class RadioCore:
         self._shuffle_source_type = None  # Library shuffle has no specific source
         self.hw.log(f"Mode: Shuffle (Library, {len(self.shuffle_tracks)} tracks)")
         self._save_state("shuffle library")
+        
+        # Stop current playback and enable delay for AM overlay sequencing (same as switch_mode)
+        self.hw.stop()
+        self.is_playing = False
+        if hasattr(self.hw, 'set_delay_playback'):
+            self.hw.set_delay_playback(True)
+        
+        # Start playback (will be delayed if delay_playback is True)
         self._start_playback_for_current()
     
     # ===========================
@@ -660,6 +676,10 @@ class RadioCore:
         
         self.mode = new_mode
         self.hw.log(f"Switched to mode: {new_mode}")
+        
+        # Stop current playback before switching modes
+        self.hw.stop()
+        self.is_playing = False
         
         # Enable playback delay so GUI can sequence AM overlay before track
         if hasattr(self.hw, 'set_delay_playback'):
@@ -914,6 +934,10 @@ class RadioCore:
         
         self.hw.log("Power on")
         self.power_on = True
+        
+        # Stop any current playback (in case power was toggled quickly)
+        self.hw.stop()
+        self.is_playing = False
         
         # Enable playback delay so GUI can sequence AM overlay before track
         if hasattr(self.hw, 'set_delay_playback'):

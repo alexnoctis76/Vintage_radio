@@ -68,6 +68,10 @@ class RadioFaceView(QtWidgets.QGraphicsView):
     dial_changed = QtCore.pyqtSignal(int)
     button_pressed = QtCore.pyqtSignal()
     button_released = QtCore.pyqtSignal()
+    
+    # Store callback for synchronous button handling (avoids QueuedConnection timing issues)
+    _button_press_callback = None
+    _button_release_callback = None
 
     def __init__(self, png_path: Path, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -187,7 +191,10 @@ class RadioFaceView(QtWidgets.QGraphicsView):
         pos = self.mapToScene(event.position().toPoint())
         if self._inside_button(pos):
             self._button_down = True
-            self.button_pressed.emit()
+            # Call callback directly for synchronous processing (critical for tap counting)
+            # Don't emit signal to avoid duplicate events
+            if self._button_press_callback:
+                self._button_press_callback("PNG")
             event.accept()
             return
         if self._inside_dial(pos):
@@ -220,7 +227,10 @@ class RadioFaceView(QtWidgets.QGraphicsView):
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if self._button_down:
             self._button_down = False
-            self.button_released.emit()
+            # Call callback directly for synchronous processing (critical for tap counting)
+            # Don't emit signal to avoid duplicate events
+            if self._button_release_callback:
+                self._button_release_callback("PNG")
             event.accept()
             return
         if self._dial_drag:
@@ -396,15 +406,11 @@ class TestModeWidget(QtWidgets.QWidget):
         png_path = Path(__file__).resolve().parent / "resources" / "vintage_radio.png"
         self.radio_face = RadioFaceView(png_path)
         self.radio_face.dial_changed.connect(self.knob_slider.setValue)
-        # Use QueuedConnection to avoid timing issues with QGraphicsView event processing
-        self.radio_face.button_pressed.connect(
-            lambda: self.on_button_pressed("PNG"), 
-            QtCore.Qt.ConnectionType.QueuedConnection
-        )
-        self.radio_face.button_released.connect(
-            lambda: self.on_button_released("PNG"),
-            QtCore.Qt.ConnectionType.QueuedConnection
-        )
+        # Use direct callbacks for synchronous processing (critical for tap counting)
+        # QueuedConnection causes timing issues that break tap+hold combinations
+        # We use direct callbacks only (no signals) to avoid duplicate events
+        self.radio_face._button_press_callback = self.on_button_pressed
+        self.radio_face._button_release_callback = self.on_button_released
 
         self.play_btn = QtWidgets.QPushButton("Play Current")
         self.play_btn.clicked.connect(self.play_current)
@@ -1037,11 +1043,12 @@ class TestModeWidget(QtWidgets.QWidget):
     
     def _power_on_handler(self) -> None:
         """Handle power on after boot delay - uses RadioCore."""
+        # Stop any current playback (in case power was toggled quickly)
+        self.hw_emulator.stop()
+        self.is_playing = False
+        
         # Enable playback delay so we can sequence AM overlay before track
         self.hw_emulator.set_delay_playback(True)
-        
-        # Play AM overlay first
-        self.hw_emulator.play_am_overlay()
         
         if not hasattr(self, '_core_initialized'):
             self._core_initialized = True
@@ -1051,13 +1058,42 @@ class TestModeWidget(QtWidgets.QWidget):
         
         self._sync_from_core()
         
-        # Schedule track playback after AM overlay finishes
-        if self.am_sound:
-            am_duration_ms = int(self.am_sound.get_length() * 1000)
-            QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
+        # Play AM overlay first, then schedule track playback after it finishes
+        # Use the same approach as _play_am_overlay_then_track() for consistency
+        if not self.audio_ready:
+            # No audio, execute pending playback immediately
+            self.hw_emulator.set_delay_playback(False)
+            self.hw_emulator.execute_pending_playback()
         else:
-            # No AM sound, play immediately
-            self._start_track_after_am()
+            try:
+                import pygame
+                if self.am_sound is None:
+                    # No AM sound available, play track immediately
+                    self.hw_emulator.set_delay_playback(False)
+                    self.hw_emulator.execute_pending_playback()
+                else:
+                    # Stop any existing AM overlay
+                    self._stop_am_overlay()
+                    
+                    # Play AM overlay
+                    self.am_channel = pygame.mixer.find_channel()
+                    if self.am_channel:
+                        self.am_channel.set_volume(1.0)
+                        self.am_channel.play(self.am_sound)
+                        self._log("AM overlay playing (power on)")
+                        
+                        # Calculate AM sound duration and schedule track playback
+                        am_duration_ms = int(self.am_sound.get_length() * 1000)
+                        QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
+                    else:
+                        # No channel available, play track immediately
+                        self.hw_emulator.set_delay_playback(False)
+                        self.hw_emulator.execute_pending_playback()
+            except Exception as e:
+                self._log(f"AM overlay error: {e}")
+                # Fallback: play track immediately if AM overlay fails
+                self.hw_emulator.set_delay_playback(False)
+                self.hw_emulator.execute_pending_playback()
         
         self._update_status("Power on, playback started.")
 
@@ -1437,11 +1473,62 @@ class TestModeWidget(QtWidgets.QWidget):
             self.hw_emulator.set_delay_playback(False)
             self.hw_emulator.execute_pending_playback()
     
+    def _play_am_overlay_for_mode_switch(self) -> None:
+        """Play AM overlay for mode switches triggered by button combinations.
+        
+        Uses the EXACT same logic as _switch_mode() to ensure identical behavior.
+        """
+        # Use the same approach as _switch_mode() for consistency
+        if not self.audio_ready:
+            # No audio, execute pending playback immediately
+            self._log("Mode switch: audio not ready, playing immediately")
+            self.hw_emulator.set_delay_playback(False)
+            self.hw_emulator.execute_pending_playback()
+        else:
+            try:
+                import pygame
+                if self.am_sound is None:
+                    # No AM sound available, play track immediately
+                    self._log("Mode switch: no AM sound, playing immediately")
+                    self.hw_emulator.set_delay_playback(False)
+                    self.hw_emulator.execute_pending_playback()
+                else:
+                    # Stop any existing AM overlay
+                    self._stop_am_overlay()
+                    
+                    # Play AM overlay
+                    self.am_channel = pygame.mixer.find_channel()
+                    if self.am_channel:
+                        self.am_channel.set_volume(1.0)
+                        self.am_channel.play(self.am_sound)
+                        self._log("AM overlay playing (mode switch from button combination)")
+                        
+                        # Calculate AM sound duration and schedule track playback
+                        am_duration_ms = int(self.am_sound.get_length() * 1000)
+                        self._log(f"Mode switch: scheduling track playback in {am_duration_ms}ms")
+                        QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
+                    else:
+                        # No channel available, play track immediately
+                        self._log("Mode switch: no pygame channel available, playing immediately")
+                        self.hw_emulator.set_delay_playback(False)
+                        self.hw_emulator.execute_pending_playback()
+            except Exception as e:
+                self._log(f"AM overlay error: {e}")
+                import traceback
+                self._log(traceback.format_exc())
+                # Fallback: play track immediately if AM overlay fails
+                self.hw_emulator.set_delay_playback(False)
+                self.hw_emulator.execute_pending_playback()
+    
     def _start_track_after_am(self) -> None:
         """Start track playback after AM overlay finishes."""
+        self._log("AM overlay finished, starting track.")
+        # Stop AM overlay to ensure it's not still playing
+        self._stop_am_overlay()
         # Execute pending playback (works for radio tuning, mode switching, and power on)
         self.hw_emulator.set_delay_playback(False)
         self.hw_emulator.execute_pending_playback()
+        self._apply_radio_distortion(tuning=False)  # Ensure distortion is removed
 
     def _apply_radio_distortion(self, *, tuning: bool) -> None:
         """Apply radio distortion effect (lower volume when tuning)."""
@@ -1497,11 +1584,12 @@ class TestModeWidget(QtWidgets.QWidget):
 
     def _switch_mode(self, mode: str) -> None:
         """Switch mode using RadioCore."""
+        # Stop current playback before switching modes
+        self.hw_emulator.stop()
+        self.is_playing = False
+        
         # Enable playback delay so we can sequence AM overlay before track
         self.hw_emulator.set_delay_playback(True)
-        
-        # Play AM overlay first
-        self.hw_emulator.play_am_overlay()
         
         # Special handling for shuffle button
         if mode == "shuffle":
@@ -1525,13 +1613,48 @@ class TestModeWidget(QtWidgets.QWidget):
         self._sync_from_core()
         self.mode_label.setText(f"Mode: {self.mode.title()}")
         
-        # Schedule track playback after AM overlay finishes
-        if self.am_sound:
-            am_duration_ms = int(self.am_sound.get_length() * 1000)
-            QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
+        # Play AM overlay first, then schedule track playback after it finishes
+        # Use the same approach as _play_am_overlay_then_track() for consistency
+        if not self.audio_ready:
+            # No audio, execute pending playback immediately
+            self._log("Mode switch: audio not ready, playing immediately")
+            self.hw_emulator.set_delay_playback(False)
+            self.hw_emulator.execute_pending_playback()
         else:
-            # No AM sound, play immediately
-            self._start_track_after_am()
+            try:
+                import pygame
+                if self.am_sound is None:
+                    # No AM sound available, play track immediately
+                    self._log("Mode switch: no AM sound, playing immediately")
+                    self.hw_emulator.set_delay_playback(False)
+                    self.hw_emulator.execute_pending_playback()
+                else:
+                    # Stop any existing AM overlay
+                    self._stop_am_overlay()
+                    
+                    # Play AM overlay
+                    self.am_channel = pygame.mixer.find_channel()
+                    if self.am_channel:
+                        self.am_channel.set_volume(1.0)
+                        self.am_channel.play(self.am_sound)
+                        self._log("AM overlay playing (mode switch)")
+                        
+                        # Calculate AM sound duration and schedule track playback
+                        am_duration_ms = int(self.am_sound.get_length() * 1000)
+                        self._log(f"Mode switch: scheduling track playback in {am_duration_ms}ms")
+                        QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
+                    else:
+                        # No channel available, play track immediately
+                        self._log("Mode switch: no pygame channel available, playing immediately")
+                        self.hw_emulator.set_delay_playback(False)
+                        self.hw_emulator.execute_pending_playback()
+            except Exception as e:
+                self._log(f"AM overlay error: {e}")
+                import traceback
+                self._log(traceback.format_exc())
+                # Fallback: play track immediately if AM overlay fails
+                self.hw_emulator.set_delay_playback(False)
+                self.hw_emulator.execute_pending_playback()
         
         self._update_status("Mode switched.")
 
@@ -1555,10 +1678,39 @@ class TestModeWidget(QtWidgets.QWidget):
         elapsed = self._press_timer.elapsed() if self._press_timer.isValid() else 0
         self._log(f"[{source}] Button RELEASED, elapsed={elapsed}ms")
         
+        # Store old mode and shuffle state to detect changes
+        old_mode = self.mode
+        old_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
+        
         # Delegate to RadioCore (same logic as firmware)
+        # RadioCore's switch_mode() or shuffle init methods will stop playback and set delay_playback
         self.core.on_button_release()
         
         # Sync state from core and update display
         self._sync_from_core()
+        
+        # Check if we need to play AM overlay:
+        # 1. Mode changed (normal mode switch)
+        # 2. Mode is shuffle AND shuffle_source_type changed (reshuffling)
+        # 3. Mode is shuffle AND delay_playback is True (shuffle was reinitialized)
+        new_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
+        mode_changed = old_mode != self.mode
+        shuffle_reshuffled = (
+            self.mode == "shuffle" and 
+            (old_shuffle_source != new_shuffle_source or 
+             (old_mode == "shuffle" and self.hw_emulator._delay_playback))
+        )
+        
+        if mode_changed or shuffle_reshuffled:
+            if mode_changed:
+                self._log(f"Mode changed from {old_mode} to {self.mode} via button combination, triggering AM overlay")
+            else:
+                self._log(f"Shuffle reinitialized (source: {old_shuffle_source} -> {new_shuffle_source}) via button combination, triggering AM overlay")
+            # RadioCore's switch_mode() or shuffle init methods should have already:
+            # - Stopped playback
+            # - Set delay_playback = True
+            # So we just need to play the AM overlay
+            self._play_am_overlay_for_mode_switch()
+        
         self._update_status("Button action processed.")
 
