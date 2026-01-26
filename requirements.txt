@@ -1,0 +1,7 @@
+PyQt6>=6.6.0
+mutagen>=1.47.0
+pygame>=2.5.2
+psutil>=5.9.0
+pydub>=0.25.1
+python-vlc>=3.0.20123
+
