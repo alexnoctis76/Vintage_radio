@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QIcon, QIcon
 
 from .audio_metadata import compute_file_hash, extract_metadata
 from .database import DatabaseManager
@@ -250,6 +250,11 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Vintage Radio Music Manager")
         self.resize(1000, 700)
+        
+        # Set window icon
+        icon_path = Path(__file__).resolve().parent / "resources" / "vintage_radio.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         self.db = DatabaseManager()
         self._undo_stack: List[dict] = []
@@ -1563,6 +1568,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def run_app() -> None:
     app = QtWidgets.QApplication(sys.argv)
+    
+    # Set application icon (for taskbar/Windows thumbnail)
+    icon_path = Path(__file__).resolve().parent / "resources" / "vintage_radio.png"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
