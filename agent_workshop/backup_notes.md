@@ -83,3 +83,4 @@ RadioCore uses different data structures:
 5. **refresh_from_db overwrites state** - Resets indexes after sync
 6. **Two auto-advance systems** - _poll_playback AND _core_tick both try to advance
 
+

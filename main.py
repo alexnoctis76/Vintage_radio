@@ -57,6 +57,9 @@ class VintageRadioFirmware:
         
         # BUSY pin state for track-finished detection
         self.prev_busy = 1
+        
+        # Track mode changes for AM overlay sequencing
+        self._pending_am_overlay = False
     
     def wait_for_power(self):
         """Wait for power sense (GP14) to go HIGH."""
@@ -110,15 +113,49 @@ class VintageRadioFirmware:
         
         # Button release edge (0 -> 1)
         elif self.last_button == 0 and curr == 1:
+            # Store old mode and shuffle state to detect changes
+            old_mode = self.core.mode
+            old_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
+            
+            # Delegate to RadioCore (same logic as GUI)
             self.core.on_button_release()
+            
+            # Check if we need to play AM overlay:
+            # 1. Mode changed (normal mode switch)
+            # 2. Mode is shuffle AND shuffle_source_type changed (reshuffling)
+            new_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
+            mode_changed = old_mode != self.core.mode
+            shuffle_reshuffled = (
+                self.core.mode == MODE_SHUFFLE and 
+                old_shuffle_source != new_shuffle_source
+            )
             
             # Check if this was a long press with mode switching
             press_dur = ticks_diff(now, self.press_start)
             
-            # For album changes, we need to play AM overlay
+            # For album changes (long press alone), we need to play AM overlay
             if press_dur >= LONG_PRESS_MS and self.core.tap_count == 0:
                 # Long press alone = next album, which needs AM overlay
                 self._handle_album_change_with_am()
+            elif mode_changed or shuffle_reshuffled:
+                # Mode changed or shuffle reinitialized - play AM overlay
+                if mode_changed:
+                    print(f"Mode changed from {old_mode} to {self.core.mode}, playing AM overlay")
+                else:
+                    print(f"Shuffle reinitialized (source: {old_shuffle_source} -> {new_shuffle_source}), playing AM overlay")
+                
+                # Mark that we need to play AM overlay
+                # RadioCore will call play_track(), but we'll intercept it with start_with_am()
+                self._pending_am_overlay = True
+                
+                # Get the track that RadioCore wants to play
+                # RadioCore's switch_mode() or shuffle init already set current_album_index and current_track
+                folder = self.core.current_album_index + 1
+                track = self.core.current_track
+                
+                # Play AM overlay with current track (this will start the track after AM finishes)
+                self.hw.start_with_am(folder, track)
+                self._pending_am_overlay = False
             
             time.sleep_ms(40)  # Debounce
         

@@ -124,6 +124,9 @@ class DFPlayerHardware(HardwareInterface):
         self._playlists = []
         self._all_tracks = []
         self._known_tracks = {}
+        
+        # Flag to prevent duplicate playback when AM overlay is playing
+        self._am_overlay_active = False
     
     def _load_wav(self):
         """Load the AM radio WAV file."""
@@ -216,6 +219,11 @@ class DFPlayerHardware(HardwareInterface):
     
     def play_track(self, folder, track, start_ms=0):
         """Play a track with optional seeking to start_ms position."""
+        # If AM overlay is active, skip this call (start_with_am already started the track)
+        if self._am_overlay_active:
+            print("AM overlay active, skipping play_track (already started via start_with_am)")
+            return True
+        
         self._df_stop()
         time.sleep_ms(POST_CMD_GUARD_MS)
         self._df_play_folder_track(folder, track)
@@ -261,6 +269,9 @@ class DFPlayerHardware(HardwareInterface):
         if self.wav_data is None:
             self.log("No WAV data - skipping AM overlay")
             return False
+        
+        # Set flag to prevent duplicate playback from RadioCore's play_track()
+        self._am_overlay_active = True
         
         if folder and track:
             self._df_stop()
@@ -358,6 +369,26 @@ class DFPlayerHardware(HardwareInterface):
             self.np[0] = (0, 0, 0)
             self.np.write()
             print("RP: AM WAV done")
+        
+        # After AM overlay finishes, fade in the track volume if a track was started
+        if folder and track and confirmed:
+            # Track is already playing (started during AM overlay)
+            # Now fade in the volume from 0 to target volume
+            print("RP: Fading in track volume after AM overlay")
+            track_fade_steps = 20
+            track_fade_delay = int((FADE_IN_S * 1000) / track_fade_steps)
+            if track_fade_delay < 40:
+                track_fade_delay = 40
+            
+            for step in range(track_fade_steps + 1):
+                fade_vol = int((step / track_fade_steps) * self._df_volume)
+                self._df_set_vol(fade_vol)
+                time.sleep_ms(track_fade_delay)
+            
+            print("RP: Track fade-in complete")
+        
+        # Clear flag after AM overlay finishes
+        self._am_overlay_active = False
         
         return confirmed
     

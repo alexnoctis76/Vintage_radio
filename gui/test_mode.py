@@ -1062,14 +1062,14 @@ class TestModeWidget(QtWidgets.QWidget):
         # Use the same approach as _play_am_overlay_then_track() for consistency
         if not self.audio_ready:
             # No audio, execute pending playback immediately
-            self.hw_emulator.set_delay_playback(False)
+            # execute_pending_playback() will set delay_playback=False internally
             self.hw_emulator.execute_pending_playback()
         else:
             try:
                 import pygame
                 if self.am_sound is None:
                     # No AM sound available, play track immediately
-                    self.hw_emulator.set_delay_playback(False)
+                    # execute_pending_playback() will set delay_playback=False internally
                     self.hw_emulator.execute_pending_playback()
                 else:
                     # Stop any existing AM overlay
@@ -1087,12 +1087,12 @@ class TestModeWidget(QtWidgets.QWidget):
                         QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
                     else:
                         # No channel available, play track immediately
-                        self.hw_emulator.set_delay_playback(False)
+                        # execute_pending_playback() will set delay_playback=False internally
                         self.hw_emulator.execute_pending_playback()
             except Exception as e:
                 self._log(f"AM overlay error: {e}")
                 # Fallback: play track immediately if AM overlay fails
-                self.hw_emulator.set_delay_playback(False)
+                # execute_pending_playback() will set delay_playback=False internally
                 self.hw_emulator.execute_pending_playback()
         
         self._update_status("Power on, playback started.")
@@ -1243,7 +1243,10 @@ class TestModeWidget(QtWidgets.QWidget):
             volume = (self._fade_step / self._fade_steps) * self.target_volume
             if self.mode == "radio" and self.is_tuning:
                 volume = min(0.2, volume)
-            pygame.mixer.music.set_volume(volume)
+            # Use hardware emulator's set_volume to support both VLC and pygame
+            # Convert from 0.0-1.0 range to 0-100 range
+            volume_percent = int(volume * 100)
+            self.hw_emulator.set_volume(volume_percent)
         if self.am_channel is not None and self._am_fade_steps > 0:
             self._am_fade_step += 1
             remaining = max(self._am_fade_steps - self._am_fade_step, 0)
@@ -1278,18 +1281,17 @@ class TestModeWidget(QtWidgets.QWidget):
             return
         self._last_tune_value = value
         
-        # Stop current playback when tuning starts
-        self.hw_emulator.stop()
-        self.is_playing = False
-        
         # Check if station changed (before calling tune_radio)
         old_station_idx = getattr(self, '_last_tuned_station', None)
         
         # Enable playback delay so RadioCore's play_track calls are intercepted
         self.hw_emulator.set_delay_playback(True)
         
+        # Clear any existing pending playback to check if RadioCore requests new playback
+        old_pending = self.hw_emulator._pending_playback
+        
         # Use RadioCore's tune_radio (handles mode switch and station selection)
-        # This will call play_track, but it will be delayed and stored in _pending_playback
+        # This will call play_track only if should_restart=True, which will be delayed and stored in _pending_playback
         self.core.tune_radio(value)
         self._sync_from_core()
         
@@ -1300,17 +1302,27 @@ class TestModeWidget(QtWidgets.QWidget):
         )
         self._last_tuned_station = self.core.radio_station_index
         
+        # Check if RadioCore requested playback (i.e., should_restart was True)
+        playback_requested = (self.hw_emulator._pending_playback is not None)
+        
+        # Only stop playback if RadioCore actually requested a restart
+        # This prevents stopping playback when just fine-tuning within the same track
+        if playback_requested:
+            self.hw_emulator.stop()
+            self.is_playing = False
+        
         self.is_tuning = True
         self._tuning_timer.start(600)  # Reset timer - if knob stops, this fires
         self.mode_label.setText(f"Mode: {self.mode.title()}")
         
         # Play AM overlay first if station changed, then execute pending playback
-        if station_changed:
-            self._play_am_overlay_then_track()
-        else:
-            # Same station, just update position - play immediately (no AM overlay)
-            self.hw_emulator.set_delay_playback(False)
-            self.hw_emulator.execute_pending_playback()
+        if playback_requested:
+            if station_changed:
+                self._play_am_overlay_then_track()
+            else:
+                # Same station, just update position - play immediately (no AM overlay, no fade-in in radio mode)
+                # execute_pending_playback() will set delay_playback=False internally
+                self.hw_emulator.execute_pending_playback(fade_in=False)
 
     def _init_log_file(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
@@ -1415,9 +1427,9 @@ class TestModeWidget(QtWidgets.QWidget):
         # Stop AM overlay immediately
         self._stop_am_overlay()
         
-        # Disable playback delay and execute pending playback immediately
-        self.hw_emulator.set_delay_playback(False)
-        self.hw_emulator.execute_pending_playback()
+        # Execute pending playback immediately (no fade-in in radio mode)
+        # execute_pending_playback() will set delay_playback=False internally
+        self.hw_emulator.execute_pending_playback(fade_in=False)
         
         self._apply_radio_distortion(tuning=False)
         self._update_status("Locked radio station.")
@@ -1436,19 +1448,22 @@ class TestModeWidget(QtWidgets.QWidget):
             pass
     
     def _play_am_overlay_then_track(self) -> None:
-        """Play AM overlay first, then start track playback when it finishes."""
+        """Play AM overlay first, then start track playback when it finishes.
+        
+        Used for radio mode - no fade-in, plays immediately at full volume.
+        """
         if not self.audio_ready:
-            # No audio, execute pending playback immediately
-            self.hw_emulator.set_delay_playback(False)
-            self.hw_emulator.execute_pending_playback()
+            # No audio, execute pending playback immediately (no fade-in in radio mode)
+            # execute_pending_playback() will set delay_playback=False internally
+            self.hw_emulator.execute_pending_playback(fade_in=False)
             return
         
         try:
             import pygame
             if self.am_sound is None:
-                # No AM sound available, play track immediately
-                self.hw_emulator.set_delay_playback(False)
-                self.hw_emulator.execute_pending_playback()
+                # No AM sound available, play track immediately (no fade-in in radio mode)
+                # execute_pending_playback() will set delay_playback=False internally
+                self.hw_emulator.execute_pending_playback(fade_in=False)
                 return
             
             # Stop any existing AM overlay
@@ -1469,9 +1484,9 @@ class TestModeWidget(QtWidgets.QWidget):
                 QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
         except Exception as e:
             self._log(f"AM overlay error: {e}")
-            # Fallback: play track immediately if AM overlay fails
-            self.hw_emulator.set_delay_playback(False)
-            self.hw_emulator.execute_pending_playback()
+            # Fallback: play track immediately if AM overlay fails (no fade-in in radio mode)
+            # execute_pending_playback() will set delay_playback=False internally
+            self.hw_emulator.execute_pending_playback(fade_in=False)
     
     def _play_am_overlay_for_mode_switch(self) -> None:
         """Play AM overlay for mode switches triggered by button combinations.
@@ -1482,7 +1497,7 @@ class TestModeWidget(QtWidgets.QWidget):
         if not self.audio_ready:
             # No audio, execute pending playback immediately
             self._log("Mode switch: audio not ready, playing immediately")
-            self.hw_emulator.set_delay_playback(False)
+            # execute_pending_playback() will set delay_playback=False internally
             self.hw_emulator.execute_pending_playback()
         else:
             try:
@@ -1490,7 +1505,7 @@ class TestModeWidget(QtWidgets.QWidget):
                 if self.am_sound is None:
                     # No AM sound available, play track immediately
                     self._log("Mode switch: no AM sound, playing immediately")
-                    self.hw_emulator.set_delay_playback(False)
+                    # execute_pending_playback() will set delay_playback=False internally
                     self.hw_emulator.execute_pending_playback()
                 else:
                     # Stop any existing AM overlay
@@ -1510,24 +1525,45 @@ class TestModeWidget(QtWidgets.QWidget):
                     else:
                         # No channel available, play track immediately
                         self._log("Mode switch: no pygame channel available, playing immediately")
-                        self.hw_emulator.set_delay_playback(False)
+                        # execute_pending_playback() will set delay_playback=False internally
                         self.hw_emulator.execute_pending_playback()
             except Exception as e:
                 self._log(f"AM overlay error: {e}")
                 import traceback
                 self._log(traceback.format_exc())
                 # Fallback: play track immediately if AM overlay fails
-                self.hw_emulator.set_delay_playback(False)
+                # execute_pending_playback() will set delay_playback=False internally
                 self.hw_emulator.execute_pending_playback()
     
     def _start_track_after_am(self) -> None:
-        """Start track playback after AM overlay finishes."""
-        self._log("AM overlay finished, starting track.")
+        """Start track playback after AM overlay finishes.
+        
+        In radio mode, plays immediately at full volume (no fade-in).
+        In other modes, fades in from volume 0.
+        """
         # Stop AM overlay to ensure it's not still playing
         self._stop_am_overlay()
-        # Execute pending playback (works for radio tuning, mode switching, and power on)
-        self.hw_emulator.set_delay_playback(False)
-        self.hw_emulator.execute_pending_playback()
+        
+        # In radio mode, skip fade-in and play immediately at full volume
+        # In other modes, use fade-in for smooth transition
+        use_fade_in = (self.mode != "radio")
+        
+        if use_fade_in:
+            self._log("AM overlay finished, starting track with fade-in.")
+        else:
+            self._log("AM overlay finished, starting track immediately (radio mode, no fade-in).")
+        
+        # Execute pending playback with fade_in parameter
+        # Note: execute_pending_playback() will set delay_playback=False internally
+        self.hw_emulator.execute_pending_playback(fade_in=use_fade_in)
+        
+        # Only start fade-in timer if fade-in is enabled
+        if use_fade_in:
+            self._fade_steps = max(int(FADE_IN_S * 10), 1)  # 2.4 seconds = 24 steps at 100ms intervals
+            self._fade_step = 0
+            if not self._fade_timer.isActive():
+                self._fade_timer.start()
+        
         self._apply_radio_distortion(tuning=False)  # Ensure distortion is removed
 
     def _apply_radio_distortion(self, *, tuning: bool) -> None:
@@ -1584,12 +1620,8 @@ class TestModeWidget(QtWidgets.QWidget):
 
     def _switch_mode(self, mode: str) -> None:
         """Switch mode using RadioCore."""
-        # Stop current playback before switching modes
-        self.hw_emulator.stop()
-        self.is_playing = False
-        
-        # Enable playback delay so we can sequence AM overlay before track
-        self.hw_emulator.set_delay_playback(True)
+        # Store old mode to check if it actually changed
+        old_mode = self.mode
         
         # Special handling for shuffle button
         if mode == "shuffle":
@@ -1601,9 +1633,13 @@ class TestModeWidget(QtWidgets.QWidget):
                 else:
                     # Reshuffle library
                     self.core._init_library_shuffle()
+                # Reshuffling doesn't change mode, so no AM overlay needed
+                self._sync_from_core()
+                return
             elif self.mode in ("album", "playlist"):
-                # Shuffle the current album/playlist
+                # Shuffle the current album/playlist - this is a mode switch
                 self.core._init_current_shuffle()
+                # Mode will change to shuffle, so continue with AM overlay
             else:
                 # Other mode - switch to library shuffle
                 self.core.switch_mode(mode)
@@ -1611,6 +1647,21 @@ class TestModeWidget(QtWidgets.QWidget):
             self.core.switch_mode(mode)
         
         self._sync_from_core()
+        
+        # Only play AM overlay if mode actually changed
+        if self.mode == old_mode:
+            # Mode didn't change (e.g., switch_mode returned early)
+            # Don't stop playback or play AM overlay
+            self.mode_label.setText(f"Mode: {self.mode.title()}")
+            return
+        
+        # Mode changed - stop playback and play AM overlay
+        self.hw_emulator.stop()
+        self.is_playing = False
+        
+        # Enable playback delay so we can sequence AM overlay before track
+        self.hw_emulator.set_delay_playback(True)
+        
         self.mode_label.setText(f"Mode: {self.mode.title()}")
         
         # Play AM overlay first, then schedule track playback after it finishes
@@ -1618,7 +1669,7 @@ class TestModeWidget(QtWidgets.QWidget):
         if not self.audio_ready:
             # No audio, execute pending playback immediately
             self._log("Mode switch: audio not ready, playing immediately")
-            self.hw_emulator.set_delay_playback(False)
+            # execute_pending_playback() will set delay_playback=False internally
             self.hw_emulator.execute_pending_playback()
         else:
             try:
@@ -1626,7 +1677,7 @@ class TestModeWidget(QtWidgets.QWidget):
                 if self.am_sound is None:
                     # No AM sound available, play track immediately
                     self._log("Mode switch: no AM sound, playing immediately")
-                    self.hw_emulator.set_delay_playback(False)
+                    # execute_pending_playback() will set delay_playback=False internally
                     self.hw_emulator.execute_pending_playback()
                 else:
                     # Stop any existing AM overlay
@@ -1646,14 +1697,14 @@ class TestModeWidget(QtWidgets.QWidget):
                     else:
                         # No channel available, play track immediately
                         self._log("Mode switch: no pygame channel available, playing immediately")
-                        self.hw_emulator.set_delay_playback(False)
+                        # execute_pending_playback() will set delay_playback=False internally
                         self.hw_emulator.execute_pending_playback()
             except Exception as e:
                 self._log(f"AM overlay error: {e}")
                 import traceback
                 self._log(traceback.format_exc())
                 # Fallback: play track immediately if AM overlay fails
-                self.hw_emulator.set_delay_playback(False)
+                # execute_pending_playback() will set delay_playback=False internally
                 self.hw_emulator.execute_pending_playback()
         
         self._update_status("Mode switched.")
@@ -1701,7 +1752,9 @@ class TestModeWidget(QtWidgets.QWidget):
              (old_mode == "shuffle" and self.hw_emulator._delay_playback))
         )
         
-        if mode_changed or shuffle_reshuffled:
+        # Only play AM overlay if mode actually changed or shuffle was reinitialized
+        # AND delay_playback is True (indicating RadioCore actually stopped playback)
+        if (mode_changed or shuffle_reshuffled) and self.hw_emulator._delay_playback:
             if mode_changed:
                 self._log(f"Mode changed from {old_mode} to {self.mode} via button combination, triggering AM overlay")
             else:
@@ -1711,6 +1764,10 @@ class TestModeWidget(QtWidgets.QWidget):
             # - Set delay_playback = True
             # So we just need to play the AM overlay
             self._play_am_overlay_for_mode_switch()
+        elif mode_changed or shuffle_reshuffled:
+            # Mode changed but delay_playback is False - RadioCore didn't stop playback
+            # This shouldn't happen, but log it for debugging
+            self._log(f"Mode changed but delay_playback is False - RadioCore may not have stopped playback")
         
         self._update_status("Button action processed.")
 

@@ -66,3 +66,9 @@ radio_manager.db
 radio_manager.db-shm
 radio_manager.db-wal
 
+
+# Gradle
+.gradle/
+.gradle/caches/
+*.class
+metadata.bin

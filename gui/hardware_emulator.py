@@ -152,22 +152,36 @@ class PygameHardwareEmulator(HardwareInterface):
             self._pending_playback = None
             self.play_track(folder, track, start_ms)
     
-    def execute_pending_playback(self):
-        """Execute any pending playback (after AM overlay finishes)."""
+    def execute_pending_playback(self, fade_in: bool = True):
+        """Execute any pending playback (after AM overlay finishes).
+        
+        Args:
+            fade_in: If True, start at volume 0 and fade in. If False, start at full volume immediately.
+        """
         if self._pending_playback:
             folder, track, start_ms = self._pending_playback
             self._pending_playback = None
             self._delay_playback = False
-            self.log(f"Executing pending playback: folder={folder}, track={track}, start_ms={start_ms}")
-            # Call play_track directly (bypassing delay check since we disabled it)
-            self.play_track(folder, track, start_ms)
+            if fade_in:
+                self.log(f"Executing pending playback with fade-in: folder={folder}, track={track}, start_ms={start_ms}")
+            else:
+                self.log(f"Executing pending playback (no fade-in): folder={folder}, track={track}, start_ms={start_ms}")
+            # Call play_track with fade_in parameter
+            self.play_track(folder, track, start_ms, fade_in=fade_in)
         else:
             # No pending playback - this can happen if playback was already started
             # or if delay_playback was cleared before AM overlay finished
             self.log("execute_pending_playback called but no pending playback (playback may have already started)")
     
-    def play_track(self, folder: int, track: int, start_ms: int = 0):
-        """Play a track by folder/track number or by resolving from database."""
+    def play_track(self, folder: int, track: int, start_ms: int = 0, fade_in: bool = False):
+        """Play a track by folder/track number or by resolving from database.
+        
+        Args:
+            folder: Folder number (album index + 1)
+            track: Track number
+            start_ms: Start position in milliseconds
+            fade_in: If True, start at volume 0 for fade-in effect
+        """
         if not self._audio_ready:
             self.log("Audio not ready")
             return
@@ -198,6 +212,9 @@ class PygameHardwareEmulator(HardwareInterface):
             self.log(f"File not found for track: {song.get('title', 'Unknown')}")
             return
         
+        # Determine initial volume (0 if fade_in, otherwise current volume)
+        initial_volume = 0 if fade_in else self._volume
+        
         try:
             file_ext = Path(path).suffix.lower()
             
@@ -206,7 +223,7 @@ class PygameHardwareEmulator(HardwareInterface):
                 try:
                     media = self._vlc_instance.media_new(str(path))
                     self._vlc_player.set_media(media)
-                    self._vlc_player.set_volume(self._volume)
+                    self._vlc_player.set_volume(initial_volume)
                     
                     # VLC supports native seeking for ALL formats!
                     if start_ms and start_ms > 0:
@@ -258,7 +275,7 @@ class PygameHardwareEmulator(HardwareInterface):
                     
                     # Play the temporary file
                     pygame.mixer.music.load(str(tmp_path))
-                    pygame.mixer.music.set_volume(self._volume / 100.0)
+                    pygame.mixer.music.set_volume(initial_volume / 100.0)
                     pygame.mixer.music.play()
                     
                     # Store temp file path for cleanup
@@ -277,7 +294,7 @@ class PygameHardwareEmulator(HardwareInterface):
             
             # Default: use mixer.music (streaming)
             pygame.mixer.music.load(path)
-            pygame.mixer.music.set_volume(self._volume / 100.0)
+            pygame.mixer.music.set_volume(initial_volume / 100.0)
             pygame.mixer.music.play()
             
             # Try pygame's set_pos if seeking (only works for OGG)
