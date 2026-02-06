@@ -212,3 +212,4 @@ The firmware (`firmware/dfplayer_hardware.py`) implements the same `HardwareInte
 - DFPlayer Mini for hardware audio playback
 
 
+

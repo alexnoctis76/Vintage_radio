@@ -14,6 +14,7 @@ from .audio_metadata import compute_file_hash, extract_metadata
 from .database import DatabaseManager
 from .sd_manager import SDManager
 from .test_mode import TestModeWidget
+from .firmware_manager import FirmwareManagerWidget
 from . import sd_manager as sd_manager_module
 
 
@@ -369,6 +370,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_playlists_tab(), "Playlists")
         tabs.addTab(self._build_sd_tab(), "SD Card")
         tabs.addTab(self.test_mode_widget, "Test Mode")
+        self.firmware_manager_widget = FirmwareManagerWidget()
+        tabs.addTab(self.firmware_manager_widget, "Firmware")
         self.setCentralWidget(tabs)
 
     def _build_library_tab(self) -> QtWidgets.QWidget:
@@ -498,6 +501,30 @@ class MainWindow(QtWidgets.QMainWindow):
         root_layout.addWidget(detect_btn)
         root_layout.addWidget(browse_btn)
 
+        # Hardware mode selection
+        mode_layout = QtWidgets.QHBoxLayout()
+        mode_layout.addWidget(QtWidgets.QLabel("Hardware Mode:"))
+        self.hardware_mode_group = QtWidgets.QButtonGroup()
+        self.dfplayer_mode_radio = QtWidgets.QRadioButton("DFPlayer + Microcontroller")
+        self.microcontroller_mode_radio = QtWidgets.QRadioButton("Microcontroller Only")
+        self.hardware_mode_group.addButton(self.dfplayer_mode_radio, 0)
+        self.hardware_mode_group.addButton(self.microcontroller_mode_radio, 1)
+        
+        # Load saved preference
+        saved_mode = self.db.get_setting("hardware_mode", "microcontroller_only")
+        if saved_mode == "dfplayer":
+            self.dfplayer_mode_radio.setChecked(True)
+        else:
+            self.microcontroller_mode_radio.setChecked(True)
+        
+        # Save preference when changed
+        self.dfplayer_mode_radio.toggled.connect(self._save_hardware_mode)
+        self.microcontroller_mode_radio.toggled.connect(self._save_hardware_mode)
+        
+        mode_layout.addWidget(self.dfplayer_mode_radio)
+        mode_layout.addWidget(self.microcontroller_mode_radio)
+        mode_layout.addStretch()
+
         actions_layout = QtWidgets.QHBoxLayout()
         sync_btn = QtWidgets.QPushButton("Sync Library to SD")
         sync_btn.clicked.connect(self.sync_to_sd)
@@ -523,11 +550,19 @@ class MainWindow(QtWidgets.QMainWindow):
         export_layout.addWidget(export_playlist_btn)
 
         layout.addLayout(root_layout)
+        layout.addLayout(mode_layout)
         layout.addLayout(actions_layout)
         layout.addLayout(export_layout)
         layout.addWidget(QtWidgets.QLabel("SD Validation / Import Status:"))
         layout.addWidget(self.sd_status, 1)
         return widget
+
+    def _save_hardware_mode(self) -> None:
+        """Save hardware mode preference to database."""
+        if self.dfplayer_mode_radio.isChecked():
+            self.db.set_setting("hardware_mode", "dfplayer")
+        else:
+            self.db.set_setting("hardware_mode", "microcontroller_only")
 
     def _create_song_table(self, reorderable: bool = False) -> QtWidgets.QTableWidget:
         table: QtWidgets.QTableWidget

@@ -125,6 +125,11 @@ class DFPlayerHardware(HardwareInterface):
         self._all_tracks = []
         self._known_tracks = {}
         
+        # DFPlayer translation mappings (loaded from metadata)
+        self._album_mappings = {}  # album_id -> dfplayer_folder
+        self._playlist_mappings = {}  # playlist_id -> dfplayer_folder
+        self._song_mappings = {}  # song_id -> {folder, track}
+        
         # Flag to prevent duplicate playback when AM overlay is playing
         self._am_overlay_active = False
     
@@ -217,21 +222,83 @@ class DFPlayerHardware(HardwareInterface):
     #   HardwareInterface IMPLEMENTATION
     # ===========================
     
-    def play_track(self, folder, track, start_ms=0):
-        """Play a track with optional seeking to start_ms position."""
+    def play_track(self, folder=None, track=None, start_ms=0, album_id=None, track_index=None, song_id=None):
+        """
+        Play a track with optional seeking to start_ms position.
+        
+        Can be called with:
+        - folder/track: Direct DFPlayer folder/track numbers (legacy mode)
+        - album_id/track_index: Logical album/track (uses translation layer)
+        - song_id: Direct song ID (uses song mapping)
+        
+        Translation layer: If album_id/track_index or song_id provided, translates
+        to DFPlayer folder/track using database mappings.
+        """
         # If AM overlay is active, skip this call (start_with_am already started the track)
         if self._am_overlay_active:
             print("AM overlay active, skipping play_track (already started via start_with_am)")
             return True
         
+        # Translation layer: Convert logical album/track to DFPlayer folder/track
+        dfplayer_folder = folder
+        dfplayer_track = track
+        
+        if song_id is not None:
+            # Direct song ID lookup
+            song_mapping = self._song_mappings.get(song_id)
+            if song_mapping:
+                dfplayer_folder = song_mapping["folder"]
+                dfplayer_track = song_mapping["track"]
+                print(f"Translated song_id {song_id} -> folder {dfplayer_folder}, track {dfplayer_track}")
+            else:
+                print(f"No DFPlayer mapping for song_id {song_id}")
+                return False
+        elif album_id is not None and track_index is not None:
+            # Logical album/track translation
+            # Get DFPlayer folder for this album
+            dfplayer_folder = self._album_mappings.get(album_id)
+            if dfplayer_folder is None:
+                print(f"No DFPlayer mapping for album_id {album_id}")
+                return False
+            
+            # Find the track in the album
+            album = None
+            for a in self._albums:
+                if a.get('id') == album_id:
+                    album = a
+                    break
+            
+            if not album or track_index >= len(album.get('tracks', [])):
+                print(f"Invalid track_index {track_index} for album {album_id}")
+                return False
+            
+            track_dict = album['tracks'][track_index]
+            song_id_from_track = track_dict.get('id')
+            
+            # Look up DFPlayer track number for this song
+            song_mapping = self._song_mappings.get(song_id_from_track)
+            if song_mapping:
+                # Use mapped folder/track (song might be in different folder)
+                dfplayer_folder = song_mapping["folder"]
+                dfplayer_track = song_mapping["track"]
+                print(f"Translated album {album_id}, track {track_index} -> folder {dfplayer_folder}, track {dfplayer_track}")
+            else:
+                # Fallback: assume sequential within album folder (not ideal but works)
+                dfplayer_track = track_index + 1
+                print(f"Translated album {album_id}, track {track_index} -> folder {dfplayer_folder}, track {dfplayer_track} (fallback)")
+        elif folder is None or track is None:
+            print("play_track: Must provide either (folder, track) or (album_id, track_index) or song_id")
+            return False
+        
+        # Now play using DFPlayer folder/track
         self._df_stop()
         time.sleep_ms(POST_CMD_GUARD_MS)
-        self._df_play_folder_track(folder, track)
+        self._df_play_folder_track(dfplayer_folder, dfplayer_track)
         
         # Wait for playback to start
         if self._wait_for_busy_low():
             print("BUSY went LOW -> playback started")
-            self._note_track_learned(folder, track)
+            self._note_track_learned(dfplayer_folder, dfplayer_track)
             self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 2000)
             
             # If start_ms > 0, seek to that position
@@ -462,9 +529,38 @@ class DFPlayerHardware(HardwareInterface):
             with open(METADATA_FILE, "r") as f:
                 data = json.load(f)
             
+            # Load DFPlayer mappings if available
+            dfplayer_mappings = data.get("dfplayer_mappings", {})
+            if dfplayer_mappings:
+                # Load album mappings
+                album_maps = dfplayer_mappings.get("albums", {})
+                self._album_mappings = {
+                    int(album_id): mapping["folder"]
+                    for album_id, mapping in album_maps.items()
+                }
+                
+                # Load playlist mappings
+                playlist_maps = dfplayer_mappings.get("playlists", {})
+                self._playlist_mappings = {
+                    int(playlist_id): mapping["folder"]
+                    for playlist_id, mapping in playlist_maps.items()
+                }
+                
+                # Load song mappings
+                song_maps = dfplayer_mappings.get("songs", {})
+                self._song_mappings = {
+                    int(song_id): {"folder": mapping["folder"], "track": mapping["track"]}
+                    for song_id, mapping in song_maps.items()
+                }
+                
+                print(f"Loaded DFPlayer mappings: {len(self._album_mappings)} albums, {len(self._playlist_mappings)} playlists, {len(self._song_mappings)} songs")
+            
             folders = data.get("folders", {})
             self._albums = []
             self._playlists = []
+            
+            # Also load songs dict for title/artist lookup
+            songs_dict = data.get("songs", {})
             
             for folder_id_str, folder in folders.items():
                 try:
@@ -476,20 +572,29 @@ class DFPlayerHardware(HardwareInterface):
                 name = folder.get("name", f"Folder {folder_id}")
                 tracks_data = folder.get("tracks", [])
                 
+                # Get logical ID (album_id or playlist_id)
+                logical_id = folder.get("id", folder_id)
+                
                 tracks = []
                 for idx, t in enumerate(tracks_data):
+                    song_id = t.get('song_id', idx + 1)
+                    song_info = songs_dict.get(str(song_id), {})
+                    
                     track = {
-                        'id': t.get('song_id', idx + 1),
-                        'title': t.get('title', f'Track {idx + 1}'),
-                        'artist': t.get('artist', 'Unknown'),
+                        'id': song_id,
+                        'title': song_info.get('title', t.get('title', f'Track {idx + 1}')),
+                        'artist': song_info.get('artist', t.get('artist', 'Unknown')),
                         'duration': t.get('duration', 180),
-                        'folder': folder_id,
-                        'track_number': t.get('track', idx + 1),
+                        'folder': folder_id,  # Logical folder ID (for metadata)
+                        'track_number': t.get('track', idx + 1),  # Logical track number
+                        'album_id': logical_id if folder_type == "album" else None,
+                        'playlist_id': logical_id if folder_type == "playlist" else None,
+                        'track_index': idx,  # 0-based index for translation
                     }
                     tracks.append(track)
                 
                 entry = {
-                    'id': folder_id,
+                    'id': logical_id,  # Logical ID (album_id or playlist_id)
                     'name': name,
                     'tracks': tracks,
                 }
@@ -499,9 +604,18 @@ class DFPlayerHardware(HardwareInterface):
                 else:
                     self._albums.append(entry)
                 
-                # Record known track count
+                # Record known track count (using DFPlayer folder if available)
                 if tracks:
-                    self._known_tracks[folder_id] = len(tracks)
+                    # For DFPlayer mode, use DFPlayer folder number for known_tracks
+                    if folder_type == "album" and logical_id in self._album_mappings:
+                        dfplayer_folder = self._album_mappings[logical_id]
+                        self._known_tracks[dfplayer_folder] = len(tracks)
+                    elif folder_type == "playlist" and logical_id in self._playlist_mappings:
+                        dfplayer_folder = self._playlist_mappings[logical_id]
+                        self._known_tracks[dfplayer_folder] = len(tracks)
+                    else:
+                        # Fallback to logical folder_id
+                        self._known_tracks[folder_id] = len(tracks)
             
             print("Loaded metadata:", len(self._albums), "albums,", len(self._playlists), "playlists")
             
@@ -521,14 +635,20 @@ class DFPlayerHardware(HardwareInterface):
     
     def get_albums(self):
         """Return list of albums."""
+        if not self._albums:
+            self._load_metadata()
         return self._albums
     
     def get_playlists(self):
         """Return list of playlists."""
+        if not self._playlists:
+            self._load_metadata()
         return self._playlists
     
     def get_all_tracks(self):
         """Return all tracks from all albums."""
+        if not self._albums:
+            self._load_metadata()
         all_tracks = []
         for album in self._albums:
             all_tracks.extend(album.get('tracks', []))
@@ -552,10 +672,50 @@ class DFPlayerHardware(HardwareInterface):
         print("Waiting for DFPlayer boot:", DF_BOOT_MS, "ms")
         time.sleep_ms(DF_BOOT_MS)
     
-    def start_with_am(self, folder, track):
-        """Start playback with AM overlay and volume fade-in."""
+    def start_with_am(self, folder=None, track=None, album_id=None, track_index=None, song_id=None):
+        """
+        Start playback with AM overlay and volume fade-in.
+        
+        Supports translation layer: can be called with album_id/track_index or song_id
+        instead of direct folder/track numbers.
+        """
+        # Translation layer: Convert logical album/track to DFPlayer folder/track
+        dfplayer_folder = folder
+        dfplayer_track = track
+        
+        if song_id is not None:
+            song_mapping = self._song_mappings.get(song_id)
+            if song_mapping:
+                dfplayer_folder = song_mapping["folder"]
+                dfplayer_track = song_mapping["track"]
+        elif album_id is not None and track_index is not None:
+            dfplayer_folder = self._album_mappings.get(album_id)
+            if dfplayer_folder is None:
+                return False
+            
+            album = None
+            for a in self._albums:
+                if a.get('id') == album_id:
+                    album = a
+                    break
+            
+            if not album or track_index >= len(album.get('tracks', [])):
+                return False
+            
+            track_dict = album['tracks'][track_index]
+            song_id_from_track = track_dict.get('id')
+            song_mapping = self._song_mappings.get(song_id_from_track)
+            if song_mapping:
+                dfplayer_folder = song_mapping["folder"]
+                dfplayer_track = song_mapping["track"]
+            else:
+                dfplayer_track = track_index + 1
+        
+        if dfplayer_folder is None or dfplayer_track is None:
+            return False
+        
         self._df_set_vol(0)
-        return self._play_am_and_fade(folder, track)
+        return self._play_am_and_fade(dfplayer_folder, dfplayer_track)
     
     def check_busy_edge(self):
         """Check for BUSY rising edge (track finished)."""

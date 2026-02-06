@@ -232,7 +232,7 @@ class SDManager:
                     print(f"Alternative FLAC conversion also failed for {source_path.name}: {e2}")
             return False
 
-    def sync_library(self, sd_root: Path) -> Tuple[int, int]:
+    def sync_library(self, sd_root: Path, use_dfplayer_structure: bool = False) -> Tuple[int, int]:
         """
         Sync library to SD card, converting all files to MP3 for DFPlayer Mini compatibility.
         
@@ -260,7 +260,19 @@ class SDManager:
         
         The original firmware likely only had MP3 files because users manually converted them
         before putting them on the SD card. We automate this step.
+        
+        Args:
+            sd_root: Root path of SD card
+            use_dfplayer_structure: If True, creates DFPlayer-compatible structure (folders 01-99, files 001-999.mp3)
+                                    and populates database mappings. If False, uses named-folder structure.
         """
+        if use_dfplayer_structure:
+            return self._sync_library_dfplayer(sd_root)
+        else:
+            return self._sync_library_named(sd_root)
+
+    def _sync_library_named(self, sd_root: Path) -> Tuple[int, int]:
+        """Sync library using named folders (current/default structure)."""
         vintage_root = self.vintage_root(sd_root)
         vintage_root.mkdir(parents=True, exist_ok=True)
         library_root = self.library_root(sd_root)
@@ -331,7 +343,149 @@ class SDManager:
                 print(f"Error syncing {file_path.name}: {e}")
                 skipped += 1
         
-        self._write_metadata(vintage_root)
+        self._write_metadata(vintage_root, use_dfplayer_structure=False)
+        return copied, skipped
+
+    def _sync_library_dfplayer(self, sd_root: Path) -> Tuple[int, int]:
+        """
+        Sync library to SD card with DFPlayer-compatible structure.
+        Creates folders 01-99, files 001-999.mp3, and populates database mappings.
+        """
+        vintage_root = self.vintage_root(sd_root)
+        vintage_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_am_wav(vintage_root)
+
+        # Clear existing mappings before re-sync
+        self.db.clear_dfplayer_mappings()
+
+        copied = 0
+        skipped = 0
+        vlc_available = self._check_vlc()
+        ffmpeg_available = self._check_ffmpeg()
+        
+        dfplayer_folder = 1  # Start at folder 01 (DFPlayer uses 1-99)
+        
+        # Sync albums to DFPlayer folders
+        albums = self.db.list_albums()
+        for album in albums:
+            if dfplayer_folder > 99:
+                print(f"Warning: DFPlayer folder limit (99) reached. Skipping remaining albums.")
+                break
+            
+            folder_path = vintage_root / f"{dfplayer_folder:02d}"
+            folder_path.mkdir(exist_ok=True)
+            
+            tracks = self.db.list_album_songs(album["id"])
+            dfplayer_track = 1  # Start at track 001 (DFPlayer uses 1-999)
+            
+            for song_data in tracks:
+                if dfplayer_track > 999:
+                    print(f"Warning: DFPlayer track limit (999) reached for folder {dfplayer_folder:02d}")
+                    break
+                
+                song = self.db.get_song_by_id(song_data["id"])
+                if not song:
+                    skipped += 1
+                    continue
+                
+                file_path = Path(song["file_path"])
+                if not file_path.exists():
+                    skipped += 1
+                    continue
+                
+                # Target filename: 001.mp3, 002.mp3, etc.
+                target_filename = f"{dfplayer_track:03d}.mp3"
+                target_path = folder_path / target_filename
+                
+                try:
+                    source_ext = file_path.suffix.lower()
+                    # Convert to MP3 if needed
+                    if source_ext == ".mp3":
+                        shutil.copy2(file_path, target_path)
+                    else:
+                        if self._convert_to_mp3(file_path, target_path):
+                            print(f"Converted {file_path.name} to {target_filename}")
+                        else:
+                            if not vlc_available and not (ffmpeg_available and PYDUB_AVAILABLE):
+                                print(f"Cannot convert {file_path.name} (VLC and ffmpeg/pydub not available), skipping")
+                            else:
+                                print(f"Failed to convert {file_path.name}, skipping")
+                            skipped += 1
+                            continue
+                    
+                    # Update song's SD path
+                    self.db.update_song_sd_path(song["id"], str(target_path))
+                    
+                    # Store DFPlayer mapping
+                    self.db.set_dfplayer_song_mapping(song["id"], dfplayer_folder, dfplayer_track)
+                    
+                    copied += 1
+                    dfplayer_track += 1
+                except OSError as e:
+                    print(f"Error syncing {file_path.name}: {e}")
+                    skipped += 1
+            
+            # Store album mapping
+            self.db.set_dfplayer_album_mapping(album["id"], dfplayer_folder)
+            dfplayer_folder += 1
+        
+        # Sync playlists to DFPlayer folders (continue numbering)
+        playlists = self.db.list_playlists()
+        for playlist in playlists:
+            if dfplayer_folder > 99:
+                print(f"Warning: DFPlayer folder limit (99) reached. Skipping remaining playlists.")
+                break
+            
+            folder_path = vintage_root / f"{dfplayer_folder:02d}"
+            folder_path.mkdir(exist_ok=True)
+            
+            tracks = self.db.list_playlist_songs(playlist["id"])
+            dfplayer_track = 1
+            
+            for song_data in tracks:
+                if dfplayer_track > 999:
+                    print(f"Warning: DFPlayer track limit (999) reached for folder {dfplayer_folder:02d}")
+                    break
+                
+                song = self.db.get_song_by_id(song_data["id"])
+                if not song:
+                    skipped += 1
+                    continue
+                
+                file_path = Path(song["file_path"])
+                if not file_path.exists():
+                    skipped += 1
+                    continue
+                
+                target_filename = f"{dfplayer_track:03d}.mp3"
+                target_path = folder_path / target_filename
+                
+                try:
+                    source_ext = file_path.suffix.lower()
+                    if source_ext == ".mp3":
+                        shutil.copy2(file_path, target_path)
+                    else:
+                        if self._convert_to_mp3(file_path, target_path):
+                            print(f"Converted {file_path.name} to {target_filename}")
+                        else:
+                            skipped += 1
+                            continue
+                    
+                    self.db.update_song_sd_path(song["id"], str(target_path))
+                    self.db.set_dfplayer_song_mapping(song["id"], dfplayer_folder, dfplayer_track)
+                    
+                    copied += 1
+                    dfplayer_track += 1
+                except OSError as e:
+                    print(f"Error syncing {file_path.name}: {e}")
+                    skipped += 1
+            
+            # Store playlist mapping
+            self.db.set_dfplayer_playlist_mapping(playlist["id"], dfplayer_folder)
+            dfplayer_folder += 1
+        
+        # Write metadata with DFPlayer mappings
+        self._write_metadata(vintage_root, use_dfplayer_structure=True)
         return copied, skipped
 
     def validate_sd(self) -> Dict[str, List[Dict[str, str]]]:
@@ -489,11 +643,43 @@ class SDManager:
                     imported_playlists += 1
         return {"albums": imported_albums, "playlists": imported_playlists}
 
-    def _write_metadata(self, vintage_root: Path) -> None:
+    def _write_metadata(self, vintage_root: Path, use_dfplayer_structure: bool = False) -> None:
         metadata = {
             "folders": {},
             "songs": {},
         }
+        
+        # Add hardware mode and DFPlayer mappings if using DFPlayer structure
+        if use_dfplayer_structure:
+            metadata["hardware_mode"] = "dfplayer"
+            metadata["dfplayer_mappings"] = {
+                "albums": {},
+                "playlists": {},
+                "songs": {}
+            }
+            
+            # Load DFPlayer mappings from database
+            album_mappings = self.db.get_all_dfplayer_album_mappings()
+            for mapping in album_mappings:
+                metadata["dfplayer_mappings"]["albums"][str(mapping["album_id"])] = {
+                    "folder": mapping["dfplayer_folder"]
+                }
+            
+            playlist_mappings = self.db.get_all_dfplayer_playlist_mappings()
+            for mapping in playlist_mappings:
+                metadata["dfplayer_mappings"]["playlists"][str(mapping["playlist_id"])] = {
+                    "folder": mapping["dfplayer_folder"]
+                }
+            
+            song_mappings = self.db.get_all_dfplayer_song_mappings()
+            for song_id, mapping in song_mappings.items():
+                metadata["dfplayer_mappings"]["songs"][str(song_id)] = {
+                    "folder": mapping["folder"],
+                    "track": mapping["track"]
+                }
+        else:
+            metadata["hardware_mode"] = "microcontroller_only"
+        
         folder_index = 1
         for album in self.db.list_albums():
             tracks = self.db.list_album_songs(album["id"])

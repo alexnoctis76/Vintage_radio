@@ -340,6 +340,10 @@ class TestModeWidget(QtWidgets.QWidget):
         self._tuning_timer = QtCore.QTimer(self)
         self._tuning_timer.setSingleShot(True)
         self._tuning_timer.timeout.connect(self._lock_radio_station)
+        # Timer for continuous gap effect updates while tuning
+        self._gap_effect_timer = QtCore.QTimer(self)
+        self._gap_effect_timer.setInterval(50)  # Update every 50ms for smooth effect
+        self._gap_effect_timer.timeout.connect(self._update_gap_effect)
         self.is_tuning = False
         self._pending_track_playback = None  # (track, start_ms) tuple for delayed playback after AM overlay
         # Radio stations: [Library, Album1, Album2, ..., Playlist1, Playlist2, ...]
@@ -505,6 +509,14 @@ class TestModeWidget(QtWidgets.QWidget):
         if self.hw_emulator.check_track_finished():
             self.core.on_track_finished()
             self._sync_from_core()
+            
+            # In radio mode, ensure playback actually starts (delay_playback might be enabled)
+            if self.mode == "radio" and self.hw_emulator._delay_playback:
+                # Disable delay and execute any pending playback
+                self.hw_emulator.set_delay_playback(False)
+                if self.hw_emulator._pending_playback:
+                    self.hw_emulator.execute_pending_playback(fade_in=False)
+            
             self._update_status("Track finished, auto-advanced.")
     
     def _sync_from_core(self) -> None:
@@ -1271,6 +1283,54 @@ class TestModeWidget(QtWidgets.QWidget):
             return None
         return pos
 
+    def _calculate_station_distance(self, dial_value: float) -> tuple:
+        """
+        Calculate distance from dial value to nearest station and gap.
+        
+        Returns:
+            (distance_to_station, distance_to_gap, in_gap, gap_middle)
+            - distance_to_station: 0.0 (on station) to 0.5 (in middle of gap)
+            - distance_to_gap: 0.0 (in middle of gap) to 0.5 (on station)
+            - in_gap: True if dial is in a gap between stations
+            - gap_middle: True if dial is exactly in the middle of a gap
+        """
+        if not self.core.radio_stations:
+            return (0.0, 1.0, False, False)
+        
+        num_stations = len(self.core.radio_stations)
+        if num_stations <= 1:
+            return (0.0, 1.0, False, False)
+        
+        # Calculate station positions (center of each station's range)
+        station_range = 100.0 / num_stations
+        station_positions = [(i + 0.5) * station_range for i in range(num_stations)]
+        
+        # Find nearest station
+        nearest_station_dist = min(abs(dial_value - pos) for pos in station_positions)
+        # Normalize to 0.0 (on station) to 0.5 (in middle of gap)
+        distance_to_station = nearest_station_dist / station_range
+        
+        # Calculate gap positions (midpoints between stations)
+        gap_positions = []
+        for i in range(num_stations - 1):
+            gap_pos = (station_positions[i] + station_positions[i + 1]) / 2.0
+            gap_positions.append(gap_pos)
+        
+        # Find nearest gap
+        if gap_positions:
+            nearest_gap_dist = min(abs(dial_value - gap_pos) for gap_pos in gap_positions)
+            # Normalize to 0.0 (in middle of gap) to 0.5 (on station)
+            distance_to_gap = nearest_gap_dist / station_range
+        else:
+            distance_to_gap = 1.0
+        
+        # Determine if we're in a gap (more than halfway from station to gap)
+        in_gap = distance_to_station > 0.25
+        # Check if we're exactly in the middle of a gap (within 2% of gap center)
+        gap_middle = distance_to_gap < 0.02
+        
+        return (distance_to_station, distance_to_gap, in_gap, gap_middle)
+    
     def _tune_radio(self, value: int) -> None:
         """Tune radio dial using RadioCore."""
         if not self.rail2_on:
@@ -1280,6 +1340,9 @@ class TestModeWidget(QtWidgets.QWidget):
         if hasattr(self, '_last_tune_value') and self._last_tune_value == value:
             return
         self._last_tune_value = value
+        
+        # Calculate distance from stations for gap effect
+        distance_to_station, distance_to_gap, in_gap, gap_middle = self._calculate_station_distance(float(value))
         
         # Check if station changed (before calling tune_radio)
         old_station_idx = getattr(self, '_last_tuned_station', None)
@@ -1305,18 +1368,37 @@ class TestModeWidget(QtWidgets.QWidget):
         # Check if RadioCore requested playback (i.e., should_restart was True)
         playback_requested = (self.hw_emulator._pending_playback is not None)
         
-        # Only stop playback if RadioCore actually requested a restart
-        # This prevents stopping playback when just fine-tuning within the same track
-        if playback_requested:
-            self.hw_emulator.stop()
-            self.is_playing = False
+        # Apply gap effect (distortion and AM overlay volume) - always apply while tuning
+        self._apply_gap_effect(distance_to_station, distance_to_gap, in_gap)
+        
+        # If we're in the middle of a gap, play only AM overlay (no track)
+        if gap_middle:
+            # Stop any track playback
+            if self.is_playing:
+                self.hw_emulator.stop()
+                self.is_playing = False
+            # Clear pending playback so track doesn't start
+            self.hw_emulator._pending_playback = None
+            # Ensure AM overlay is playing at full volume
+            if not self.am_channel or not self.am_channel.get_busy():
+                self._play_am_overlay_in_gap(distance_to_station)
+        else:
+            # Only stop playback if RadioCore actually requested a restart
+            # This prevents stopping playback when just fine-tuning within the same track
+            if playback_requested:
+                self.hw_emulator.stop()
+                self.is_playing = False
         
         self.is_tuning = True
         self._tuning_timer.start(600)  # Reset timer - if knob stops, this fires
+        # Start gap effect timer for continuous updates while tuning
+        if hasattr(self, '_gap_effect_timer') and not self._gap_effect_timer.isActive():
+            self._gap_effect_timer.start()
         self.mode_label.setText(f"Mode: {self.mode.title()}")
         
         # Play AM overlay first if station changed, then execute pending playback
-        if playback_requested:
+        # (unless we're in gap middle, which is handled above)
+        if playback_requested and not gap_middle:
             if station_changed:
                 self._play_am_overlay_then_track()
             else:
@@ -1418,13 +1500,46 @@ class TestModeWidget(QtWidgets.QWidget):
         self._start_playback_for_song(track, offset_ms=track_offset_ms, with_am_overlay=True)
 
 
+    def _update_gap_effect(self) -> None:
+        """Continuously update gap effect while tuning."""
+        if not self.is_tuning or self.mode != "radio":
+            if hasattr(self, '_gap_effect_timer'):
+                self._gap_effect_timer.stop()
+            return
+        
+        if hasattr(self, '_last_tune_value'):
+            distance_to_station, distance_to_gap, in_gap, gap_middle = self._calculate_station_distance(float(self._last_tune_value))
+            self._apply_gap_effect(distance_to_station, distance_to_gap, in_gap)
+            
+            # If we moved into gap middle, stop track and play only AM overlay
+            if gap_middle and self.is_playing:
+                self.hw_emulator.stop()
+                self.is_playing = False
+                self._play_am_overlay_in_gap(distance_to_station)
+            # If we moved out of gap middle, stop looping AM overlay
+            elif not gap_middle and self.am_channel and self.am_channel.get_busy():
+                # Check if AM overlay is looping (in gap mode)
+                # If so, stop it and let normal playback resume
+                pass  # Let normal playback handle it
+    
     def _lock_radio_station(self) -> None:
         """Called when knob stops moving - stop AM overlay and play track immediately."""
         if self.mode != "radio":
             return
         self.is_tuning = False
+        if hasattr(self, '_gap_effect_timer'):
+            self._gap_effect_timer.stop()  # Stop gap effect updates
         
-        # Stop AM overlay immediately
+        # Check if we're in a gap - if so, keep AM overlay playing
+        if hasattr(self, '_last_tune_value'):
+            distance_to_station, distance_to_gap, in_gap, gap_middle = self._calculate_station_distance(float(self._last_tune_value))
+            if gap_middle:
+                # Still in gap middle - keep AM overlay, don't play track
+                self._apply_gap_effect(distance_to_station, distance_to_gap, in_gap)
+                self._update_status("Tuning in gap.")
+                return
+        
+        # Not in gap - stop AM overlay and play track
         self._stop_am_overlay()
         
         # Execute pending playback immediately (no fade-in in radio mode)
@@ -1581,6 +1696,105 @@ class TestModeWidget(QtWidgets.QWidget):
         else:
             # Normal volume when locked
             pygame.mixer.music.set_volume(base_volume)
+    
+    def _apply_gap_effect(self, distance_to_station: float, distance_to_gap: float, in_gap: bool) -> None:
+        """
+        Apply gap effect: louder AM overlay and distorted track when tuning between stations.
+        Fades both ways: from station to gap and from gap to station.
+        
+        Args:
+            distance_to_station: 0.0 (on station) to 0.5 (in middle of gap)
+            distance_to_gap: 0.0 (in middle of gap) to 0.5 (on station)
+            in_gap: True if dial is in a gap between stations
+        """
+        if not self.audio_ready:
+            return
+        try:
+            import pygame
+        except Exception:
+            return
+        
+        base_volume = self.knob_slider.value() / 100.0
+        
+        # Calculate smooth fade based on distance from station
+        # distance_to_station: 0.0 (on station) to 0.5 (in middle of gap)
+        # We want smooth fading both ways, so use distance_to_station for both track and AM
+        
+        # Track volume: 1.0 (on station) to 0.0 (in middle of gap)
+        # Smooth fade: use distance_to_station directly, but only start fading after 0.1 (10% from station)
+        if distance_to_station < 0.1:
+            # Very close to station: full volume
+            track_volume_factor = 1.0
+            am_volume_factor = 0.0  # No AM overlay on station
+        elif distance_to_station > 0.4:
+            # In gap middle: no track, full AM
+            track_volume_factor = 0.0
+            am_volume_factor = 1.0
+        else:
+            # Between station and gap: smooth fade
+            # Map 0.1-0.4 to 1.0-0.0 for track, 0.0-1.0 for AM
+            fade_progress = (distance_to_station - 0.1) / 0.3  # 0.0 to 1.0
+            track_volume_factor = 1.0 - fade_progress
+            am_volume_factor = fade_progress
+        
+        # Calculate actual volumes
+        track_volume = base_volume * track_volume_factor
+        # When in gap, reduce track volume further (more distortion)
+        if in_gap and distance_to_station > 0.25:
+            track_volume = track_volume * 0.2  # Additional 20% reduction in gap
+        
+        # Apply track volume (works for both pygame and VLC via hardware emulator)
+        if self.is_playing:
+            track_volume_percent = int(track_volume * 100)
+            self.hw_emulator.set_volume(track_volume_percent)
+        
+        # Handle AM overlay
+        if am_volume_factor > 0.0:
+            # Need AM overlay - ensure it's playing
+            if not self.am_channel or not self.am_channel.get_busy():
+                try:
+                    if self.am_sound:
+                        self.am_channel = pygame.mixer.find_channel()
+                        if self.am_channel:
+                            self.am_channel.set_volume(am_volume_factor)
+                            self.am_channel.play(self.am_sound, loops=-1)  # Loop while in gap
+                except Exception:
+                    pass
+            else:
+                # Update AM overlay volume
+                self.am_channel.set_volume(am_volume_factor)
+        else:
+            # On station: stop or reduce AM overlay
+            if self.am_channel and self.am_channel.get_busy():
+                # Fade out AM overlay when moving back to station
+                if distance_to_station < 0.05:
+                    # Very close to station: stop AM overlay
+                    self.am_channel.stop()
+                    self.am_channel = None
+                else:
+                    # Fading back: reduce volume gradually
+                    self.am_channel.set_volume(am_volume_factor * 0.1)
+    
+    def _play_am_overlay_in_gap(self, distance_to_station: float) -> None:
+        """Play AM overlay when in the middle of a gap (no track)."""
+        if not self.audio_ready:
+            return
+        try:
+            import pygame
+            if self.am_sound is None:
+                return
+            
+            # Stop any existing AM overlay
+            self._stop_am_overlay()
+            
+            # Play AM overlay at full volume (we're in the gap)
+            self.am_channel = pygame.mixer.find_channel()
+            if self.am_channel:
+                self.am_channel.set_volume(1.0)
+                self.am_channel.play(self.am_sound, loops=-1)  # Loop continuously while in gap
+                self._log("AM overlay playing in gap (no track)")
+        except Exception as e:
+            self._log(f"AM overlay error in gap: {e}")
 
     def _find_track_at_position(self, tracks: List[Dict], position_ms: int) -> tuple:
         """Find which track contains the given position and the offset within it."""

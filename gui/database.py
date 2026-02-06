@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,10 @@ class DatabaseManager:
         if current < 2:
             self._migrate_to_v2()
             self._set_schema_version(2)
+            current = 2
+        if current < 3:
+            self._migrate_to_v3()
+            self._set_schema_version(3)
 
     def _ensure_settings_table(self) -> None:
         self.conn.execute(
@@ -176,6 +180,40 @@ class DatabaseManager:
         if not any(column["name"] == "sd_path" for column in columns):
             self.conn.execute("ALTER TABLE songs ADD COLUMN sd_path TEXT;")
             self.conn.commit()
+
+    def _migrate_to_v3(self) -> None:
+        """Add DFPlayer mapping tables for translation layer."""
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS dfplayer_album_mapping (
+                album_id INTEGER PRIMARY KEY,
+                dfplayer_folder INTEGER NOT NULL UNIQUE,
+                FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS dfplayer_playlist_mapping (
+                playlist_id INTEGER PRIMARY KEY,
+                dfplayer_folder INTEGER NOT NULL UNIQUE,
+                FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS dfplayer_song_mapping (
+                song_id INTEGER PRIMARY KEY,
+                dfplayer_folder INTEGER NOT NULL,
+                dfplayer_track INTEGER NOT NULL,
+                UNIQUE (dfplayer_folder, dfplayer_track),
+                FOREIGN KEY (song_id) REFERENCES songs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dfplayer_album_folder
+                ON dfplayer_album_mapping (dfplayer_folder);
+            CREATE INDEX IF NOT EXISTS idx_dfplayer_playlist_folder
+                ON dfplayer_playlist_mapping (dfplayer_folder);
+            CREATE INDEX IF NOT EXISTS idx_dfplayer_song_folder_track
+                ON dfplayer_song_mapping (dfplayer_folder, dfplayer_track);
+            """
+        )
+        self.conn.commit()
 
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         row = self.conn.execute(
@@ -581,6 +619,101 @@ class DatabaseManager:
         return self.conn.execute(
             "SELECT * FROM sd_mapping WHERE song_id = ?;", (song_id,)
         ).fetchone()
+
+    # ===========================
+    #   DFPlayer Mapping Methods
+    # ===========================
+
+    def set_dfplayer_album_mapping(self, album_id: int, dfplayer_folder: int) -> None:
+        """Map a logical album to a DFPlayer folder number (1-99)."""
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO dfplayer_album_mapping (album_id, dfplayer_folder)
+            VALUES (?, ?);
+            """,
+            (album_id, dfplayer_folder),
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def get_dfplayer_album_mapping(self, album_id: int) -> Optional[sqlite3.Row]:
+        """Get DFPlayer folder number for a logical album."""
+        return self.conn.execute(
+            "SELECT * FROM dfplayer_album_mapping WHERE album_id = ?;", (album_id,)
+        ).fetchone()
+
+    def get_all_dfplayer_album_mappings(self) -> List[sqlite3.Row]:
+        """Get all album to DFPlayer folder mappings."""
+        return self.conn.execute(
+            "SELECT * FROM dfplayer_album_mapping ORDER BY dfplayer_folder;"
+        ).fetchall()
+
+    def set_dfplayer_playlist_mapping(self, playlist_id: int, dfplayer_folder: int) -> None:
+        """Map a logical playlist to a DFPlayer folder number (1-99)."""
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO dfplayer_playlist_mapping (playlist_id, dfplayer_folder)
+            VALUES (?, ?);
+            """,
+            (playlist_id, dfplayer_folder),
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def get_dfplayer_playlist_mapping(self, playlist_id: int) -> Optional[sqlite3.Row]:
+        """Get DFPlayer folder number for a logical playlist."""
+        return self.conn.execute(
+            "SELECT * FROM dfplayer_playlist_mapping WHERE playlist_id = ?;", (playlist_id,)
+        ).fetchone()
+
+    def get_all_dfplayer_playlist_mappings(self) -> List[sqlite3.Row]:
+        """Get all playlist to DFPlayer folder mappings."""
+        return self.conn.execute(
+            "SELECT * FROM dfplayer_playlist_mapping ORDER BY dfplayer_folder;"
+        ).fetchall()
+
+    def set_dfplayer_song_mapping(self, song_id: int, dfplayer_folder: int, dfplayer_track: int) -> None:
+        """Map a logical song to a DFPlayer folder/track number."""
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO dfplayer_song_mapping (song_id, dfplayer_folder, dfplayer_track)
+            VALUES (?, ?, ?);
+            """,
+            (song_id, dfplayer_folder, dfplayer_track),
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def get_dfplayer_song_mapping(self, song_id: int) -> Optional[sqlite3.Row]:
+        """Get DFPlayer folder/track numbers for a logical song."""
+        return self.conn.execute(
+            "SELECT * FROM dfplayer_song_mapping WHERE song_id = ?;", (song_id,)
+        ).fetchone()
+
+    def get_all_dfplayer_song_mappings(self) -> Dict[int, Dict[str, int]]:
+        """Get all song to DFPlayer folder/track mappings as a dictionary."""
+        rows = self.conn.execute(
+            "SELECT song_id, dfplayer_folder, dfplayer_track FROM dfplayer_song_mapping;"
+        ).fetchall()
+        return {
+            row["song_id"]: {
+                "folder": row["dfplayer_folder"],
+                "track": row["dfplayer_track"]
+            }
+            for row in rows
+        }
+
+    def clear_dfplayer_mappings(self) -> None:
+        """Clear all DFPlayer mappings (useful for re-sync)."""
+        self.conn.executescript(
+            """
+            DELETE FROM dfplayer_album_mapping;
+            DELETE FROM dfplayer_playlist_mapping;
+            DELETE FROM dfplayer_song_mapping;
+            """
+        )
+        self.conn.commit()
+        self._maybe_backup()
 
     def backup_now(self) -> Optional[Path]:
         self.backups_dir.mkdir(parents=True, exist_ok=True)

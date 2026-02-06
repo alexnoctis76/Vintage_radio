@@ -1011,15 +1011,29 @@ class RadioCore:
         if not track:
             return
         
-        # For DFPlayer, we need folder/track numbers
-        folder = track.get('folder', 1)
-        track_num = track.get('track_number', 1)
-        
         # Set track hint for GUI emulator (ignored by DFPlayer firmware)
         if hasattr(self.hw, 'set_current_track_hint'):
             self.hw.set_current_track_hint(track)
         
-        self.hw.play_track(folder, track_num, start_ms=start_ms)
+        # Check if track has translation info (album_id/track_index) for DFPlayer mode
+        # If so, use translation layer; otherwise use direct folder/track_number
+        album_id = track.get('album_id')
+        playlist_id = track.get('playlist_id')
+        track_index = track.get('track_index')
+        song_id = track.get('id')
+        
+        if album_id is not None and track_index is not None:
+            # Use translation layer for DFPlayer
+            self.hw.play_track(album_id=album_id, track_index=track_index, start_ms=start_ms)
+        elif song_id is not None:
+            # Try song_id translation
+            self.hw.play_track(song_id=song_id, start_ms=start_ms)
+        else:
+            # Fallback: direct folder/track (legacy or microcontroller-only mode)
+            folder = track.get('folder', 1)
+            track_num = track.get('track_number', 1)
+            self.hw.play_track(folder, track_num, start_ms=start_ms)
+        
         self.is_playing = True
     
     def set_volume(self, level):
