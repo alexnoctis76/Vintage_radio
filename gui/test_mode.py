@@ -1003,7 +1003,7 @@ class TestModeWidget(QtWidgets.QWidget):
 
     def _poll_playback(self) -> None:
         """Poll playback state - just updates internal state.
-        
+
         Auto-advance is handled by _core_tick() via RadioCore.
         """
         if not self.audio_ready:
@@ -1011,6 +1011,10 @@ class TestModeWidget(QtWidgets.QWidget):
         try:
             import pygame
         except Exception:
+            return
+        # When using VLC, pygame.mixer is never initialized - sync from emulator instead
+        if pygame.mixer.get_init() is None:
+            self.is_playing = self.hw_emulator.is_playing()
             return
         # Just sync is_playing state - auto-advance is handled by _core_tick
         if self.is_playing and not pygame.mixer.music.get_busy():
@@ -1023,9 +1027,12 @@ class TestModeWidget(QtWidgets.QWidget):
             import pygame
         except Exception:
             return
-        pygame.mixer.music.stop()
-        if self.am_channel is not None:
-            self.am_channel.stop()
+        if pygame.mixer.get_init() is not None:
+            pygame.mixer.music.stop()
+            if self.am_channel is not None:
+                self.am_channel.stop()
+        else:
+            self.hw_emulator.stop()
         self._fade_timer.stop()
         self.is_playing = False
 
@@ -1202,6 +1209,25 @@ class TestModeWidget(QtWidgets.QWidget):
             return
         self.target_volume = max(0.0, min(1.0, self.knob_slider.value() / 100.0))
         self._stop_playback()
+        # When using VLC, pygame.mixer is never initialized - drive playback via emulator
+        if pygame.mixer.get_init() is None:
+            song = self._current_song()
+            if song is not None:
+                self.hw_emulator.set_current_track_hint(song)
+                folder = song.get("folder", self.core.current_album_index + 1)
+                track = song.get("track_number", self.core.current_track)
+            else:
+                folder = self.core.current_album_index + 1
+                track = self.core.current_track
+            self.hw_emulator.play_track(folder, track, start_ms or 0)
+            self.is_playing = True
+            self._fade_steps = max(int(FADE_IN_S * 10), 1)
+            self._fade_step = 0
+            if not self._fade_timer.isActive():
+                self._fade_timer.start()
+            if not self._playback_timer.isActive():
+                self._playback_timer.start()
+            return
         try:
             pygame.mixer.music.load(path)
             pygame.mixer.music.set_volume(0.0)

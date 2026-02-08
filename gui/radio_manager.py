@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices, QIcon, QIcon
+from PyQt6.QtGui import QDesktopServices, QIcon
 
 from .audio_metadata import compute_file_hash, extract_metadata
 from .database import DatabaseManager
@@ -245,6 +247,125 @@ class CollectionDropTable(ReorderTable):
         super().dropEvent(event)
 
 
+class InstallMicroPythonDialog(QtWidgets.QDialog):
+    """One-time setup: copy MicroPython .uf2 to Pico in BOOTSEL mode."""
+
+    MICROPYTHON_PICO_URL = "https://micropython.org/download/RPI_PICO/"
+    MICROPYTHON_PICO_W_URL = "https://micropython.org/download/RPI_PICO_W/"
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Install MicroPython on Pico")
+        self.setModal(True)
+        self._build_ui()
+        self._refresh_drives()
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        instructions = (
+            "1. Hold the BOOTSEL button on the Pico.\n"
+            "2. Plug the Pico into USB. It will appear as a drive (e.g. RPI-RP2).\n"
+            "3. Download the MicroPython .uf2 for your board (link below), then select it and the Pico drive here.\n"
+            "4. Click Copy to Pico. The Pico will reboot with MicroPython (one-time setup)."
+        )
+        layout.addWidget(QtWidgets.QLabel(instructions))
+        link_layout = QtWidgets.QHBoxLayout()
+        link_btn = QtWidgets.QPushButton("Open MicroPython download (Pico)")
+        link_btn.setToolTip("Standard Pico (no wireless)")
+        link_btn.clicked.connect(lambda: QDesktopServices.openUrl(QtCore.QUrl(self.MICROPYTHON_PICO_URL)))
+        link_w_btn = QtWidgets.QPushButton("Open download (Pico W)")
+        link_w_btn.setToolTip("Pico W (Wi-Fi)")
+        link_w_btn.clicked.connect(lambda: QDesktopServices.openUrl(QtCore.QUrl(self.MICROPYTHON_PICO_W_URL)))
+        link_layout.addWidget(link_btn)
+        link_layout.addWidget(link_w_btn)
+        link_layout.addStretch()
+        layout.addLayout(link_layout)
+        form = QtWidgets.QFormLayout()
+        self.uf2_edit = QtWidgets.QLineEdit()
+        self.uf2_edit.setPlaceholderText("Path to .uf2 file")
+        browse_btn = QtWidgets.QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_uf2)
+        uf2_row = QtWidgets.QHBoxLayout()
+        uf2_row.addWidget(self.uf2_edit)
+        uf2_row.addWidget(browse_btn)
+        form.addRow("UF2 file:", uf2_row)
+        self.drive_combo = QtWidgets.QComboBox()
+        self.drive_combo.setToolTip("Select the Pico drive (shown when BOOTSEL is held and Pico is connected)")
+        refresh_drives_btn = QtWidgets.QPushButton("Refresh")
+        refresh_drives_btn.clicked.connect(self._refresh_drives)
+        drive_row = QtWidgets.QHBoxLayout()
+        drive_row.addWidget(self.drive_combo)
+        drive_row.addWidget(refresh_drives_btn)
+        form.addRow("Pico drive:", drive_row)
+        layout.addLayout(form)
+        copy_btn = QtWidgets.QPushButton("Copy to Pico")
+        copy_btn.clicked.connect(self._copy_to_pico)
+        layout.addWidget(copy_btn)
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setStyleSheet("color: green;")
+        layout.addWidget(self.status_label)
+
+    def _browse_uf2(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select MicroPython firmware (.uf2)",
+            "",
+            "UF2 firmware (*.uf2);;All files (*)",
+        )
+        if path:
+            self.uf2_edit.setText(path)
+
+    def _refresh_drives(self) -> None:
+        self.drive_combo.clear()
+        for path, label in SDManager.detect_sd_roots():
+            display = f"{label} ({path})" if label else str(path)
+            self.drive_combo.addItem(display, path)
+        if self.drive_combo.count() == 0:
+            self.drive_combo.addItem("(No removable drives found)", None)
+
+    def _copy_to_pico(self) -> None:
+        uf2_path = Path(self.uf2_edit.text().strip())
+        if not uf2_path.is_file() or uf2_path.suffix.lower() != ".uf2":
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Install MicroPython on Pico",
+                "Please select a valid .uf2 file (e.g. from the MicroPython download page).",
+            )
+            return
+        drive_data = self.drive_combo.currentData()
+        if drive_data is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Install MicroPython on Pico",
+                "No Pico drive selected. Hold BOOTSEL, plug in the Pico, then click Refresh.",
+            )
+            return
+        dest_dir = Path(drive_data)
+        if not dest_dir.is_dir():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Install MicroPython on Pico",
+                f"Drive not found: {dest_dir}. Unplug and replug the Pico (with BOOTSEL held), then Refresh.",
+            )
+            return
+        dest_file = dest_dir / uf2_path.name
+        try:
+            shutil.copy2(uf2_path, dest_file)
+        except OSError as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Install MicroPython on Pico",
+                f"Could not copy to Pico: {e}",
+            )
+            return
+        self.status_label.setText("Firmware copied. Pico will reboot with MicroPython.")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Install MicroPython on Pico",
+            "MicroPython firmware copied. The Pico will reboot shortly. You can then use \"Install to Pico\" to deploy the app.",
+        )
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -367,7 +488,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_library_tab(), "Library")
         tabs.addTab(self._build_albums_tab(), "Albums")
         tabs.addTab(self._build_playlists_tab(), "Playlists")
-        tabs.addTab(self._build_sd_tab(), "SD Card")
+        tabs.addTab(self._build_sd_tab(), "Devices")
         tabs.addTab(self.test_mode_widget, "Test Mode")
         self.setCentralWidget(tabs)
 
@@ -488,46 +609,129 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
+        # ---- Storage & target ----
+        storage_group = QtWidgets.QGroupBox("Storage & target")
+        storage_layout = QtWidgets.QVBoxLayout(storage_group)
         root_layout = QtWidgets.QHBoxLayout()
-        root_layout.addWidget(QtWidgets.QLabel("SD Root:"))
+        root_layout.addWidget(QtWidgets.QLabel("SD / media root:"))
         root_layout.addWidget(self.sd_root_label)
         detect_btn = QtWidgets.QPushButton("Detect")
+        detect_btn.setToolTip("Auto-detect removable drives (e.g. SD card or USB) as the storage root.")
         detect_btn.clicked.connect(self.select_sd_root)
         browse_btn = QtWidgets.QPushButton("Browse")
+        browse_btn.setToolTip("Choose a folder on your computer to use as the storage root (e.g. SD card mount or a folder for testing).")
         browse_btn.clicked.connect(self.browse_sd_root)
         root_layout.addWidget(detect_btn)
         root_layout.addWidget(browse_btn)
+        storage_layout.addLayout(root_layout)
+        target_layout = QtWidgets.QHBoxLayout()
+        target_layout.addWidget(QtWidgets.QLabel("Audio target:"))
+        self.audio_target_combo = QtWidgets.QComboBox()
+        self.audio_target_combo.addItem("DFPlayer + RP2040", "dfplayer_rp2040")
+        self.audio_target_combo.addItem("Raspberry Pi 2W/3", "raspberry_pi")
+        self.audio_target_combo.setToolTip("Choose which device the library will be synced for. DFPlayer uses numbered folders (01/, 002.mp3); Pi uses a flat library folder.")
+        idx = self.audio_target_combo.findData(self.audio_target)
+        if idx >= 0:
+            self.audio_target_combo.setCurrentIndex(idx)
+        self.audio_target_combo.currentIndexChanged.connect(self._on_audio_target_changed)
+        target_layout.addWidget(self.audio_target_combo)
+        target_layout.addWidget(QtWidgets.QLabel("Used for sync layout and export options."))
+        target_layout.addStretch()
+        storage_layout.addLayout(target_layout)
+        self.pi_convert_checkbox = QtWidgets.QCheckBox("Convert non-MP3 to MP3 when syncing for Pi")
+        self.pi_convert_checkbox.setToolTip("When Raspberry Pi is the audio target: if checked, non-MP3 files are converted to MP3 during sync; if unchecked, files are copied as-is (e.g. FLAC, WAV).")
+        self.pi_convert_checkbox.setChecked(self.pi_convert_audio)
+        self.pi_convert_checkbox.stateChanged.connect(self._on_pi_convert_changed)
+        self._update_pi_convert_visibility()
+        storage_layout.addWidget(self.pi_convert_checkbox)
+        layout.addWidget(storage_group)
 
-        actions_layout = QtWidgets.QHBoxLayout()
+        # ---- SD card operations ----
+        sd_ops_group = QtWidgets.QGroupBox("SD card / media operations")
+        sd_ops_layout = QtWidgets.QVBoxLayout(sd_ops_group)
+        actions_row = QtWidgets.QHBoxLayout()
         sync_btn = QtWidgets.QPushButton("Sync Library to SD")
+        sync_btn.setToolTip("Copy (and convert if needed) your full library to the storage root. Layout depends on Audio target: DFPlayer uses 01/, 02/, 001.mp3; Pi uses VintageRadio/library/.")
         sync_btn.clicked.connect(self.sync_to_sd)
         validate_btn = QtWidgets.QPushButton("Validate SD")
+        validate_btn.setToolTip("Check that every track in the library has a file on storage and report missing or mismatched files.")
         validate_btn.clicked.connect(self.validate_sd)
         import_btn = QtWidgets.QPushButton("Import from SD")
+        import_btn.setToolTip("Import albums and playlists that were previously exported to this storage (e.g. from another machine) into your library.")
         import_btn.clicked.connect(self.import_from_sd)
-        actions_layout.addWidget(sync_btn)
-        actions_layout.addWidget(validate_btn)
-        actions_layout.addWidget(import_btn)
-
-        export_layout = QtWidgets.QHBoxLayout()
+        export_sd_contents_btn = QtWidgets.QPushButton("Export SD contents to folder...")
+        export_sd_contents_btn.setToolTip("Run the same sync as \"Sync Library to SD\" but into a folder you choose (e.g. to copy to a USB stick or SD card manually later).")
+        export_sd_contents_btn.clicked.connect(self.export_sd_contents_to_folder)
+        actions_row.addWidget(sync_btn)
+        actions_row.addWidget(validate_btn)
+        actions_row.addWidget(import_btn)
+        actions_row.addWidget(export_sd_contents_btn)
+        sd_ops_layout.addLayout(actions_row)
+        export_collections_row = QtWidgets.QHBoxLayout()
         export_album_btn = QtWidgets.QPushButton("Export Album")
+        export_album_btn.setToolTip("Copy only the selected album to the storage root. Format depends on Audio target (DFPlayer: 01/001.mp3 style; Pi: folder with tracks).")
         export_album_btn.clicked.connect(self.export_album_to_sd)
         export_playlist_btn = QtWidgets.QPushButton("Export Playlist")
+        export_playlist_btn.setToolTip("Copy only the selected playlist to the storage root. Format depends on Audio target.")
         export_playlist_btn.clicked.connect(self.export_playlist_to_sd)
-        export_layout.addWidget(QtWidgets.QLabel("Album:"))
-        export_layout.addWidget(self.sd_album_combo)
-        export_layout.addWidget(export_album_btn)
-        export_layout.addSpacing(20)
-        export_layout.addWidget(QtWidgets.QLabel("Playlist:"))
-        export_layout.addWidget(self.sd_playlist_combo)
-        export_layout.addWidget(export_playlist_btn)
+        export_collections_row.addWidget(QtWidgets.QLabel("Album:"))
+        export_collections_row.addWidget(self.sd_album_combo)
+        export_collections_row.addWidget(export_album_btn)
+        export_collections_row.addSpacing(20)
+        export_collections_row.addWidget(QtWidgets.QLabel("Playlist:"))
+        export_collections_row.addWidget(self.sd_playlist_combo)
+        export_collections_row.addWidget(export_playlist_btn)
+        sd_ops_layout.addLayout(export_collections_row)
+        layout.addWidget(sd_ops_group)
 
-        layout.addLayout(root_layout)
-        layout.addLayout(actions_layout)
-        layout.addLayout(export_layout)
-        layout.addWidget(QtWidgets.QLabel("SD Validation / Import Status:"))
+        # ---- RP2040 (Pico) ----
+        rp2040_group = QtWidgets.QGroupBox("RP2040 (Pico)")
+        rp2040_layout = QtWidgets.QHBoxLayout(rp2040_group)
+        export_rp2040_btn = QtWidgets.QPushButton("Export for RP2040")
+        export_rp2040_btn.setToolTip("Save main.py, radio_core.py, and components/ to a folder on your PC. Copy that folder to the Pico (e.g. with Thonny) after installing MicroPython.")
+        export_rp2040_btn.clicked.connect(self.export_rp2040_firmware)
+        install_pico_btn = QtWidgets.QPushButton("Install to Pico")
+        install_pico_btn.setToolTip("Copy the application files directly to a connected Pico via USB. Requires mpremote (pip install mpremote) and MicroPython already installed on the Pico.")
+        install_pico_btn.clicked.connect(self.install_to_pico)
+        install_mp_btn = QtWidgets.QPushButton("Install MicroPython on Pico...")
+        install_mp_btn.setToolTip("One-time setup: put the Pico in BOOTSEL mode, then copy the MicroPython .uf2 to it. After this you can use Install to Pico.")
+        install_mp_btn.clicked.connect(self._show_install_micropython_dialog)
+        rp2040_layout.addWidget(export_rp2040_btn)
+        rp2040_layout.addWidget(install_pico_btn)
+        rp2040_layout.addWidget(install_mp_btn)
+        rp2040_layout.addStretch()
+        layout.addWidget(rp2040_group)
+
+        # ---- Raspberry Pi ----
+        pi_group = QtWidgets.QGroupBox("Raspberry Pi")
+        pi_layout = QtWidgets.QHBoxLayout(pi_group)
+        export_pi_btn = QtWidgets.QPushButton("Export for Raspberry Pi")
+        export_pi_btn.setToolTip("Save main_pi.py, radio_core.py, components/pi_hardware.py, and requirements_pi.txt to a folder. Copy that folder to the Pi (e.g. via USB or SCP) and run pip3 install -r requirements_pi.txt.")
+        export_pi_btn.clicked.connect(self.export_pi_firmware)
+        deploy_pi_btn = QtWidgets.QPushButton("Deploy to Pi")
+        deploy_pi_btn.setToolTip("Copy the application files to a Raspberry Pi over the network via SCP, then run pip3 install on the Pi. Enter the Pi's IP address when prompted. Requires SSH access.")
+        deploy_pi_btn.clicked.connect(self.deploy_to_pi)
+        pi_layout.addWidget(export_pi_btn)
+        pi_layout.addWidget(deploy_pi_btn)
+        pi_layout.addStretch()
+        layout.addWidget(pi_group)
+
+        layout.addWidget(QtWidgets.QLabel("Validation / import status:"))
         layout.addWidget(self.sd_status, 1)
         return widget
+
+    def _on_audio_target_changed(self) -> None:
+        self.audio_target = self.audio_target_combo.currentData() or "dfplayer_rp2040"
+        self.db.set_setting("audio_target", self.audio_target)
+        self._update_pi_convert_visibility()
+
+    def _on_pi_convert_changed(self) -> None:
+        self.pi_convert_audio = self.pi_convert_checkbox.isChecked()
+        self.db.set_setting("pi_convert_audio", "1" if self.pi_convert_audio else "0")
+
+    def _update_pi_convert_visibility(self) -> None:
+        if hasattr(self, "pi_convert_checkbox"):
+            self.pi_convert_checkbox.setVisible(self.audio_target == "raspberry_pi")
 
     def _create_song_table(self, reorderable: bool = False) -> QtWidgets.QTableWidget:
         table: QtWidgets.QTableWidget
@@ -550,6 +754,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_root = self.db.get_setting("sd_root", "") or ""
         self.sd_auto_detect = self.db.get_setting("sd_auto_detect", "1") == "1"
         self.sd_label = self.db.get_setting("sd_label", "") or ""
+        self.audio_target = self.db.get_setting("audio_target", "dfplayer_rp2040") or "dfplayer_rp2040"
+        if self.audio_target not in ("dfplayer_rp2040", "raspberry_pi"):
+            self.audio_target = "dfplayer_rp2040"
+        self.pi_convert_audio = self.db.get_setting("pi_convert_audio", "1") == "1"
         try:
             retention = max(1, int(retention_raw))
         except ValueError:
@@ -1149,7 +1357,11 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()  # Update UI
         
         try:
-            copied, skipped = self.sd_manager.sync_library(sd_root)
+            copied, skipped = self.sd_manager.sync_library(
+                sd_root,
+                audio_target=self.audio_target,
+                pi_convert_audio=self.pi_convert_audio,
+            )
             progress.close()
             self.statusBar().showMessage(
                 f"SD sync complete. Copied: {copied}, skipped: {skipped}", 5000
@@ -1179,7 +1391,12 @@ class MainWindow(QtWidgets.QMainWindow):
         album_id = self.sd_album_combo.currentData()
         if album_id is None:
             return
-        target = self.sd_manager.export_album(int(album_id), sd_root)
+        target = self.sd_manager.export_album(
+            int(album_id),
+            sd_root,
+            audio_target=self.audio_target,
+            pi_convert_audio=self.pi_convert_audio,
+        )
         if target:
             self.statusBar().showMessage(
                 f"Exported album to {target.name}", 5000
@@ -1192,7 +1409,12 @@ class MainWindow(QtWidgets.QMainWindow):
         playlist_id = self.sd_playlist_combo.currentData()
         if playlist_id is None:
             return
-        target = self.sd_manager.export_playlist(int(playlist_id), sd_root)
+        target = self.sd_manager.export_playlist(
+            int(playlist_id),
+            sd_root,
+            audio_target=self.audio_target,
+            pi_convert_audio=self.pi_convert_audio,
+        )
         if target:
             self.statusBar().showMessage(
                 f"Exported playlist to {target.name}", 5000
@@ -1209,6 +1431,265 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_status.setPlainText(
             f"Imported albums: {results['albums']}\nImported playlists: {results['playlists']}"
         )
+
+    def _project_root(self) -> Path:
+        """Project root (parent of gui package)."""
+        return Path(__file__).resolve().parents[1]
+
+    def export_rp2040_firmware(self) -> None:
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose folder to export RP2040 components",
+            str(Path.home()),
+        )
+        if not folder:
+            return
+        root = self._project_root()
+        dest = Path(folder)
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in ("main.py", "radio_core.py"):
+            src = root / name
+            if src.exists():
+                shutil.copy2(src, dest / name)
+        fw_src = root / "components" / "dfplayer_hardware.py"
+        if fw_src.exists():
+            (dest / "components").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(fw_src, dest / "components" / "dfplayer_hardware.py")
+        am_wav = Path(__file__).resolve().parent / "resources" / "AMradioSound.wav"
+        vintage_dest = dest / "VintageRadio"
+        vintage_dest.mkdir(parents=True, exist_ok=True)
+        if am_wav.exists():
+            shutil.copy2(am_wav, vintage_dest / "AMradioSound.wav")
+        readme_txt = dest / "README_RP2040.txt"
+        readme_txt.write_text(
+            "RP2040 + DFPlayer. Copy main.py, radio_core.py, and components/\n"
+            "to the Pico. Put AMradioSound.wav in VintageRadio/ on the SD card.\n"
+            "SD layout: folders 01/, 02/, ... at SD root with 001.mp3, 002.mp3 inside;\n"
+            "VintageRadio/ for AMradioSound.wav, album_state.txt, radio_metadata.json.\n"
+            "See README_RP2040.md in this folder for full setup.\n",
+            encoding="utf-8",
+        )
+        docs_readme = root / "docs" / "README_RP2040.md"
+        if docs_readme.exists():
+            shutil.copy2(docs_readme, dest / "README_RP2040.md")
+        self.statusBar().showMessage(f"Exported RP2040 components to {folder}", 5000)
+
+    def _show_install_micropython_dialog(self) -> None:
+        dlg = InstallMicroPythonDialog(self)
+        dlg.exec()
+
+    def install_to_pico(self) -> None:
+        """Copy application files to Pico via mpremote (requires: pip install mpremote, MicroPython on Pico)."""
+        mpremote = shutil.which("mpremote")
+        if not mpremote:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Install to Pico",
+                "mpremote is not installed. Install it with:\n\n  pip install mpremote\n\n"
+                "Then connect the Pico via USB (with MicroPython already installed) and try again.\n"
+                "See README_RP2040.md for how to install MicroPython on the Pico (one-time).",
+            )
+            return
+        root = self._project_root()
+        if not (root / "main.py").exists() or not (root / "radio_core.py").exists():
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", "Project files not found.")
+            return
+        comp_src = root / "components" / "dfplayer_hardware.py"
+        if not comp_src.exists():
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", "components/dfplayer_hardware.py not found.")
+            return
+        progress = QtWidgets.QProgressDialog("Installing to Pico...", None, 0, 0, self)
+        progress.setWindowTitle("Install to Pico")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            try:
+                subprocess.run(
+                    [mpremote, "exec", "import os; os.mkdir('components')"],
+                    cwd=str(root), capture_output=True, text=True, timeout=15
+                )
+            except Exception:
+                pass
+            for local, remote in [
+                ("main.py", "main.py"),
+                ("radio_core.py", "radio_core.py"),
+                ("components/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
+            ]:
+                src = root / local
+                if not src.exists():
+                    continue
+                cmd = [mpremote, "cp", str(src), f":{remote}"]
+                r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+                if r.returncode != 0:
+                    progress.close()
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Install to Pico",
+                        f"Failed to copy {local}.\n\nEnsure the Pico is connected via USB and running MicroPython.\n\n{r.stderr or r.stdout or ''}",
+                    )
+                    return
+            progress.close()
+            self.statusBar().showMessage("Installed to Pico successfully.", 5000)
+        except subprocess.TimeoutExpired:
+            progress.close()
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", "Timed out. Check Pico connection and try again.")
+        except Exception as e:
+            progress.close()
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", f"Error: {e}")
+
+    def deploy_to_pi(self) -> None:
+        """Copy application files to Raspberry Pi via SCP (requires SSH access)."""
+        ip, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Deploy to Pi",
+            "Enter Raspberry Pi IP address:",
+            QtWidgets.QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if not ok or not ip.strip():
+            return
+        ip = ip.strip()
+        user = "pi"
+        root = self._project_root()
+        deploy_dir = root / "agent_workshop" / "deploy_pi" / "vintage_radio"
+        deploy_dir.mkdir(parents=True, exist_ok=True)
+        (deploy_dir / "components").mkdir(parents=True, exist_ok=True)
+        for name in ("main_pi.py", "radio_core.py"):
+            src = root / name
+            if src.exists():
+                shutil.copy2(src, deploy_dir / name)
+        pi_hw = root / "components" / "pi_hardware.py"
+        if pi_hw.exists():
+            shutil.copy2(pi_hw, deploy_dir / "components" / "pi_hardware.py")
+        (deploy_dir / "requirements_pi.txt").write_text("python-vlc\nRPi.GPIO\n", encoding="utf-8")
+        docs_pi = root / "docs" / "README_Pi.md"
+        if docs_pi.exists():
+            shutil.copy2(docs_pi, deploy_dir / "README_Pi.md")
+        parent = deploy_dir.parent
+        progress = QtWidgets.QProgressDialog("Deploying to Pi...", None, 0, 0, self)
+        progress.setWindowTitle("Deploy to Pi")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            r = subprocess.run(
+                ["scp", "-r", "-o", "StrictHostKeyChecking=no", "vintage_radio", f"{user}@{ip}:/home/{user}/"],
+                cwd=str(parent),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if r.returncode != 0:
+                progress.close()
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Deploy to Pi",
+                    f"SCP failed. Ensure the Pi is on the network and SSH is enabled.\n\n{r.stderr or r.stdout or ''}",
+                )
+                return
+            r2 = subprocess.run(
+                ["ssh", "-o", "StrictHostKeyChecking=no", f"{user}@{ip}", f"cd /home/{user}/vintage_radio && pip3 install -r requirements_pi.txt"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            progress.close()
+            if r2.returncode != 0:
+                self.statusBar().showMessage(
+                    "Files copied; pip install failed. Run on Pi: cd vintage_radio && pip3 install -r requirements_pi.txt",
+                    8000,
+                )
+            else:
+                self.statusBar().showMessage("Deployed to Pi successfully.", 5000)
+        except subprocess.TimeoutExpired:
+            progress.close()
+            QtWidgets.QMessageBox.warning(self, "Deploy to Pi", "Timed out. Check Pi IP and SSH.")
+        except FileNotFoundError:
+            progress.close()
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Deploy to Pi",
+                "scp/ssh not found. On Windows enable OpenSSH client (Settings > Apps > Optional features).",
+            )
+        except Exception as e:
+            progress.close()
+            QtWidgets.QMessageBox.warning(self, "Deploy to Pi", f"Error: {e}")
+
+    def export_pi_firmware(self) -> None:
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose folder to export Raspberry Pi components",
+            str(Path.home()),
+        )
+        if not folder:
+            return
+        root = self._project_root()
+        dest = Path(folder)
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in ("main_pi.py", "radio_core.py"):
+            src = root / name
+            if src.exists():
+                shutil.copy2(src, dest / name)
+        pi_hw = root / "components" / "pi_hardware.py"
+        if pi_hw.exists():
+            (dest / "components").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pi_hw, dest / "components" / "pi_hardware.py")
+        req = dest / "requirements_pi.txt"
+        req.write_text(
+            "python-vlc\nRPi.GPIO\n",
+            encoding="utf-8",
+        )
+        readme_txt = dest / "README_Pi.txt"
+        readme_txt.write_text(
+            "Raspberry Pi 2W/3. Run: python3 main_pi.py\n"
+            "Set media path (VintageRadio folder or library) in pi_hardware.py or config.\n"
+            "SD/Export for Pi uses VintageRadio/library/ with original-style filenames.\n"
+            "See README_Pi.md in this folder for full setup.\n",
+            encoding="utf-8",
+        )
+        docs_readme_pi = root / "docs" / "README_Pi.md"
+        if docs_readme_pi.exists():
+            shutil.copy2(docs_readme_pi, dest / "README_Pi.md")
+        self.statusBar().showMessage(f"Exported Raspberry Pi components to {folder}", 5000)
+
+    def export_sd_contents_to_folder(self) -> None:
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose folder to export SD contents",
+            str(Path.home()),
+        )
+        if not folder:
+            return
+        sd_root = Path(folder)
+        progress = QtWidgets.QProgressDialog(
+            "Exporting SD contents...", "Cancel", 0, 0, self
+        )
+        progress.setWindowTitle("Export SD Contents")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            copied, skipped = self.sd_manager.sync_library(
+                sd_root,
+                audio_target=self.audio_target,
+                pi_convert_audio=self.pi_convert_audio,
+            )
+            progress.close()
+            self.statusBar().showMessage(
+                f"Exported SD contents to {folder}. Copied: {copied}, skipped: {skipped}",
+                5000,
+            )
+        except Exception as e:
+            progress.close()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Error",
+                f"An error occurred:\n{str(e)}",
+            )
 
     def _resolve_sd_root(self) -> Optional[Path]:
         if self.sd_root:

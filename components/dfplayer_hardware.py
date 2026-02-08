@@ -565,4 +565,3 @@ class DFPlayerHardware(HardwareInterface):
         if time.ticks_diff(now, self.ignore_busy_until) < 0:
             return False
         return not self.is_playing()
-

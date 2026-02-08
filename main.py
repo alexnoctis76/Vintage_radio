@@ -17,7 +17,7 @@ from radio_core import (
 )
 
 # Import hardware implementation
-from firmware.dfplayer_hardware import DFPlayerHardware
+from components.dfplayer_hardware import DFPlayerHardware
 
 # ===========================
 #      CONFIGURATION

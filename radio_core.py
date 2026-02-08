@@ -622,11 +622,9 @@ class RadioCore:
         # Calculate current virtual position
         if self.radio_mode_start_ms is None:
             self.radio_mode_start_ms = ticks_ms()
-            return
-        
         elapsed_ms = ticks_diff(ticks_ms(), self.radio_mode_start_ms)
         virtual_pos_ms = (station.start_offset_ms + elapsed_ms) % station.total_duration_ms
-        
+
         # Find which track should be playing at this virtual time
         current_track, current_offset = self._find_track_at_position(station.tracks, virtual_pos_ms)
         if not current_track:

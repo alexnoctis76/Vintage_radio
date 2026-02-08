@@ -232,105 +232,142 @@ class SDManager:
                     print(f"Alternative FLAC conversion also failed for {source_path.name}: {e2}")
             return False
 
-    def sync_library(self, sd_root: Path) -> Tuple[int, int]:
+    def sync_library(
+        self,
+        sd_root: Path,
+        audio_target: Optional[str] = None,
+        pi_convert_audio: Optional[bool] = None,
+    ) -> Tuple[int, int]:
         """
-        Sync library to SD card, converting all files to MP3 for DFPlayer Mini compatibility.
-        
-        WHY CONVERT TO MP3?
-        ===================
-        The original firmware (main.py) uses:
-        - DFPlayer Mini: For music track playback (primarily MP3)
-        - RP2040 PWM: For AM overlay sound (WAV file - AMradioSound.wav)
-        
-        DFPlayer Mini hardware format support:
-        - MP3: Fully supported, reliable, seeking works with setTime()
-        - WAV: May work but format-dependent and unreliable for seeking
-        - MIDI/FLAC/OGG/etc.: Not supported by DFPlayer Mini
-        
-        NOTE: While RP2040 CAN play WAV files directly via PWM (as shown with AMradioSound.wav),
-        the music tracks are played through DFPlayer Mini, which primarily supports MP3.
-        
-        Since your GUI accepts ALL formats (MP3, WAV, FLAC, MIDI, OGG, etc.) for metadata extraction,
-        but DFPlayer Mini can only reliably play MP3, we convert everything to MP3 during SD sync.
-        
-        This ensures:
-        1. Hardware compatibility - all files will play on DFPlayer Mini
-        2. Seeking works - setTime() command works reliably on MP3
-        3. User convenience - users can import any format, conversion is automatic
-        
-        The original firmware likely only had MP3 files because users manually converted them
-        before putting them on the SD card. We automate this step.
+        Sync library to SD card. Layout and naming depend on audio_target:
+        - dfplayer_rp2040: folders 01/, 02/, ... at SD root with 001.mp3, 002.mp3 inside;
+          VintageRadio/ only for AM WAV, state, metadata. All tracks converted to MP3.
+        - raspberry_pi: flat VintageRadio/library/ with original-style filenames;
+          if pi_convert_audio convert non-MP3 to MP3, else copy as-is.
         """
+        target = audio_target or "dfplayer_rp2040"
+        pi_convert = pi_convert_audio if pi_convert_audio is not None else True
+        if target == "dfplayer_rp2040":
+            return self._sync_library_dfplayer(sd_root)
+        return self._sync_library_pi(sd_root, convert_to_mp3=pi_convert)
+
+    def _sync_library_dfplayer(self, sd_root: Path) -> Tuple[int, int]:
+        """DFPlayer layout: sd_root/01/, 02/, ... with 001.mp3, 002.mp3; VintageRadio/ for WAV and metadata."""
         vintage_root = self.vintage_root(sd_root)
         vintage_root.mkdir(parents=True, exist_ok=True)
-        library_root = self.library_root(sd_root)
-        library_root.mkdir(parents=True, exist_ok=True)
         self._ensure_am_wav(vintage_root)
-
-        songs = self.db.list_songs()
-        copied = 0
-        skipped = 0
         vlc_available = self._check_vlc()
         ffmpeg_available = self._check_ffmpeg()
-        
-        # Debug output
         if vlc_available:
             print(f"VLC available for conversion: {self._get_vlc_path()}")
         if ffmpeg_available and PYDUB_AVAILABLE:
             print("ffmpeg/pydub available for conversion")
         if not vlc_available and not (ffmpeg_available and PYDUB_AVAILABLE):
             print("Warning: No conversion tools available (VLC or ffmpeg/pydub)")
-        
-        for song in songs:
+        copied = 0
+        skipped = 0
+        folder_index = 1
+        for album in self.db.list_albums():
+            tracks = self.db.list_album_songs(album["id"])
+            c, s = self._write_folder_tracks_dfplayer(
+                sd_root, folder_index, tracks, vlc_available, ffmpeg_available
+            )
+            copied += c
+            skipped += s
+            folder_index += 1
+        for playlist in self.db.list_playlists():
+            tracks = self.db.list_playlist_songs(playlist["id"])
+            c, s = self._write_folder_tracks_dfplayer(
+                sd_root, folder_index, tracks, vlc_available, ffmpeg_available
+            )
+            copied += c
+            skipped += s
+            folder_index += 1
+        self._write_metadata(vintage_root)
+        return copied, skipped
+
+    def _write_folder_tracks_dfplayer(
+        self,
+        sd_root: Path,
+        folder_index: int,
+        tracks: List[Dict],
+        vlc_available: bool,
+        ffmpeg_available: bool,
+    ) -> Tuple[int, int]:
+        folder_path = sd_root / f"{folder_index:02d}"
+        folder_path.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        skipped = 0
+        for track_num, song in enumerate(tracks, start=1):
             file_path = Path(song["file_path"])
             if not file_path.exists():
                 skipped += 1
                 continue
-            
-            # Determine target filename (always MP3 for DFPlayer compatibility)
+            target_path = folder_path / f"{track_num:03d}.mp3"
             source_ext = file_path.suffix.lower()
-            target_filename = file_path.stem + ".mp3"
-            
-            existing_sd = song["sd_path"]
-            if existing_sd:
-                existing_path = Path(existing_sd)
-                if existing_path.exists():
-                    try:
-                        # Check if file exists and is MP3 (converted)
-                        if existing_path.suffix.lower() == ".mp3":
-                            # Check if source hasn't changed (simple size check)
-                            if existing_path.stat().st_size > 0:
-                                skipped += 1
-                                continue
-                    except OSError:
-                        pass
-            
-            target_path = self._unique_path(library_root, target_filename)
-            
             try:
-                # Convert to MP3 if needed (for DFPlayer Mini compatibility)
                 if source_ext == ".mp3":
-                    # Already MP3, just copy
                     shutil.copy2(file_path, target_path)
                 else:
-                    # Convert to MP3 - try conversion (VLC or pydub/ffmpeg)
-                    if self._convert_to_mp3(file_path, target_path):
-                        print(f"Converted {file_path.name} to MP3")
-                    else:
-                        # Conversion failed - check what's available for better error message
+                    if not self._convert_to_mp3(file_path, target_path):
                         if not vlc_available and not (ffmpeg_available and PYDUB_AVAILABLE):
-                            print(f"Cannot convert {file_path.name} (VLC and ffmpeg/pydub not available), skipping")
+                            print(f"Cannot convert {file_path.name}, skipping")
                         else:
                             print(f"Failed to convert {file_path.name}, skipping")
                         skipped += 1
                         continue
-                
                 self.db.update_song_sd_path(song["id"], str(target_path))
                 copied += 1
             except OSError as e:
                 print(f"Error syncing {file_path.name}: {e}")
                 skipped += 1
-        
+        return copied, skipped
+
+    def _sync_library_pi(self, sd_root: Path, convert_to_mp3: bool) -> Tuple[int, int]:
+        """Pi layout: VintageRadio/library/ with original-style filenames; convert or copy per convert_to_mp3."""
+        vintage_root = self.vintage_root(sd_root)
+        vintage_root.mkdir(parents=True, exist_ok=True)
+        library_root = self.library_root(sd_root)
+        library_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_am_wav(vintage_root)
+        vlc_available = self._check_vlc()
+        ffmpeg_available = self._check_ffmpeg()
+        if convert_to_mp3 and not vlc_available and not (ffmpeg_available and PYDUB_AVAILABLE):
+            print("Warning: No conversion tools available (VLC or ffmpeg/pydub)")
+        copied = 0
+        skipped = 0
+        for song in self.db.list_songs():
+            file_path = Path(song["file_path"])
+            if not file_path.exists():
+                skipped += 1
+                continue
+            source_ext = file_path.suffix.lower()
+            if convert_to_mp3:
+                target_filename = file_path.stem + ".mp3"
+            else:
+                target_filename = file_path.name
+            existing_sd = song["sd_path"]
+            if existing_sd:
+                existing_path = Path(existing_sd)
+                if existing_path.exists() and existing_path.stat().st_size > 0:
+                    skipped += 1
+                    continue
+            target_path = self._unique_path(library_root, target_filename)
+            try:
+                if convert_to_mp3:
+                    if source_ext == ".mp3":
+                        shutil.copy2(file_path, target_path)
+                    else:
+                        if not self._convert_to_mp3(file_path, target_path):
+                            skipped += 1
+                            continue
+                else:
+                    shutil.copy2(file_path, target_path)
+                self.db.update_song_sd_path(song["id"], str(target_path))
+                copied += 1
+            except OSError as e:
+                print(f"Error syncing {file_path.name}: {e}")
+                skipped += 1
         self._write_metadata(vintage_root)
         return copied, skipped
 
@@ -403,69 +440,119 @@ class SDManager:
                     )
         return results
 
-    def export_album(self, album_id: int, sd_root: Path) -> Optional[Path]:
+    def export_album(
+        self,
+        album_id: int,
+        sd_root: Path,
+        audio_target: Optional[str] = None,
+        pi_convert_audio: Optional[bool] = None,
+    ) -> Optional[Path]:
         album = self.db.get_album_by_id(album_id)
         if album is None:
             return None
+        album = dict(album)
+        target = audio_target or "dfplayer_rp2040"
+        pi_convert = pi_convert_audio if pi_convert_audio is not None else True
+        tracks = self.db.list_album_songs(album_id)
+        if target == "dfplayer_rp2040":
+            folder = sd_root / "01"
+            folder.mkdir(parents=True, exist_ok=True)
+            return self._export_collection_dfplayer(
+                folder, tracks, "album", album_id, album["name"], album.get("description") or ""
+            )
         vintage_root = self.vintage_root(sd_root)
         vintage_root.mkdir(parents=True, exist_ok=True)
         folder = vintage_root / f"{album['name']}_album"
         folder.mkdir(parents=True, exist_ok=True)
-        tracks = self.db.list_album_songs(album_id)
-        metadata = {
-            "type": "album",
-            "id": album_id,
-            "name": album["name"],
-            "description": album["description"] or "",
-            "tracks": [],
-        }
+        return self._export_collection_pi(
+            folder, tracks, "album", album_id, album["name"], album.get("description") or "",
+            convert_to_mp3=pi_convert,
+        )
+
+    def export_playlist(
+        self,
+        playlist_id: int,
+        sd_root: Path,
+        audio_target: Optional[str] = None,
+        pi_convert_audio: Optional[bool] = None,
+    ) -> Optional[Path]:
+        playlist = self.db.get_playlist_by_id(playlist_id)
+        if playlist is None:
+            return None
+        playlist = dict(playlist)
+        target = audio_target or "dfplayer_rp2040"
+        pi_convert = pi_convert_audio if pi_convert_audio is not None else True
+        tracks = self.db.list_playlist_songs(playlist_id)
+        if target == "dfplayer_rp2040":
+            folder = sd_root / "02"
+            folder.mkdir(parents=True, exist_ok=True)
+            return self._export_collection_dfplayer(
+                folder, tracks, "playlist", playlist_id, playlist["name"],
+                playlist.get("description") or "",
+            )
+        vintage_root = self.vintage_root(sd_root)
+        vintage_root.mkdir(parents=True, exist_ok=True)
+        folder = vintage_root / f"{playlist['name']}_playlist"
+        folder.mkdir(parents=True, exist_ok=True)
+        return self._export_collection_pi(
+            folder, tracks, "playlist", playlist_id, playlist["name"],
+            playlist.get("description") or "",
+            convert_to_mp3=pi_convert,
+        )
+
+    def _export_collection_dfplayer(
+        self,
+        folder: Path,
+        tracks: List[Dict],
+        col_type: str,
+        col_id: int,
+        name: str,
+        description: str,
+    ) -> Path:
+        metadata = {"type": col_type, "id": col_id, "name": name, "description": description, "tracks": []}
         for index, song in enumerate(tracks, start=1):
             source = Path(song["file_path"])
             if not source.exists():
                 continue
-            target = folder / source.name
-            shutil.copy2(source, target)
+            target_path = folder / f"{index:03d}.mp3"
+            if source.suffix.lower() == ".mp3":
+                shutil.copy2(source, target_path)
+            else:
+                self._convert_to_mp3(source, target_path)
             metadata["tracks"].append(
-                {
-                    "order": index,
-                    "filename": source.name,
-                    "title": song["title"],
-                    "artist": song["artist"],
-                }
+                {"order": index, "filename": target_path.name, "title": song["title"], "artist": song["artist"]}
             )
         with (folder / "metadata.json").open("w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
         return folder
 
-    def export_playlist(self, playlist_id: int, sd_root: Path) -> Optional[Path]:
-        playlist = self.db.get_playlist_by_id(playlist_id)
-        if playlist is None:
-            return None
-        vintage_root = self.vintage_root(sd_root)
-        vintage_root.mkdir(parents=True, exist_ok=True)
-        folder = vintage_root / f"{playlist['name']}_playlist"
-        folder.mkdir(parents=True, exist_ok=True)
-        tracks = self.db.list_playlist_songs(playlist_id)
-        metadata = {
-            "type": "playlist",
-            "id": playlist_id,
-            "name": playlist["name"],
-            "description": playlist["description"] or "",
-            "tracks": [],
-        }
+    def _export_collection_pi(
+        self,
+        folder: Path,
+        tracks: List[Dict],
+        col_type: str,
+        col_id: int,
+        name: str,
+        description: str,
+        *,
+        convert_to_mp3: bool,
+    ) -> Path:
+        metadata = {"type": col_type, "id": col_id, "name": name, "description": description, "tracks": []}
         for index, song in enumerate(tracks, start=1):
             source = Path(song["file_path"])
             if not source.exists():
                 continue
-            target = folder / source.name
-            shutil.copy2(source, target)
+            if convert_to_mp3:
+                target = folder / (source.stem + ".mp3")
+                if source.suffix.lower() == ".mp3":
+                    shutil.copy2(source, target)
+                else:
+                    self._convert_to_mp3(source, target)
+            else:
+                target = folder / source.name
+                shutil.copy2(source, target)
             metadata["tracks"].append(
-                {
-                    "order": index,
-                    "filename": source.name,
-                    "title": song["title"],
-                    "artist": song["artist"],
-                }
+                {"order": index, "filename": target.name, "title": song["title"], "artist": song["artist"]}
             )
         with (folder / "metadata.json").open("w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
