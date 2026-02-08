@@ -79,6 +79,7 @@ class PiHardware(HardwareInterface):
         self._songs_sd_path: Dict[str, str] = {}
         self._folder_track_to_song: Dict[tuple, int] = {}
         self._am_overlay_active = False
+        self._delay_playback = False
         self.ignore_busy_until = 0.0  # time.monotonic() until we ignore track-finished
         if VLC_AVAILABLE:
             self._instance = vlc.Instance("--no-xlib")
@@ -148,8 +149,14 @@ class PiHardware(HardwareInterface):
         path = self._path_for(folder, track)
         return path is not None and os.path.isfile(path)
 
+    def set_delay_playback(self, delay: bool) -> None:
+        """When True, play_track() no-ops so firmware can run start_with_am() first."""
+        self._delay_playback = bool(delay)
+
     def play_track(self, folder: int, track: int, start_ms: int = 0) -> bool:
         if self._am_overlay_active:
+            return True
+        if self._delay_playback:
             return True
         path = self._path_for(folder, track)
         if not path or not os.path.isfile(path):
@@ -297,4 +304,6 @@ class PiHardware(HardwareInterface):
 
     def start_with_am(self, folder: int, track: int) -> bool:
         self.play_am_overlay()
-        return self.play_track(folder, track, 0)
+        result = self.play_track(folder, track, 0)
+        self._delay_playback = False
+        return result

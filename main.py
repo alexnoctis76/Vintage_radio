@@ -87,9 +87,13 @@ class VintageRadioFirmware:
         self.core.init(skip_initial_playback=True)
         
         # Start with AM overlay (single start, same as baseline start_sequence_synced)
-        album_idx = self.core.current_album_index
-        track = self.core.current_track
-        folder = album_idx + 1  # DFPlayer folders 1-based
+        tr = self.core._get_current_track()
+        if tr:
+            folder = tr.get("folder", 1)
+            track = tr.get("track_number", 1)
+        else:
+            folder = self.core.current_album_index + 1
+            track = self.core.current_track
         confirmed = self.hw.start_with_am(folder, track)
         
         if confirmed:
@@ -138,24 +142,23 @@ class VintageRadioFirmware:
                 # Long press alone = next album, which needs AM overlay
                 self._handle_album_change_with_am()
             elif mode_changed or shuffle_reshuffled:
-                # Mode changed or shuffle reinitialized - play AM overlay
+                # Mode changed or shuffle reinitialized - play AM overlay first, then track
                 if mode_changed:
                     print(f"Mode changed from {old_mode} to {self.core.mode}, playing AM overlay")
                 else:
                     print(f"Shuffle reinitialized (source: {old_shuffle_source} -> {new_shuffle_source}), playing AM overlay")
                 
-                # Mark that we need to play AM overlay
-                # RadioCore will call play_track(), but we'll intercept it with start_with_am()
-                self._pending_am_overlay = True
+                # Get the track RadioCore wants to play (use actual track for shuffle/radio)
+                tr = self.core._get_current_track()
+                if tr:
+                    folder = tr.get('folder', 1)
+                    track = tr.get('track_number', 1)
+                else:
+                    folder = self.core.current_album_index + 1
+                    track = self.core.current_track
                 
-                # Get the track that RadioCore wants to play
-                # RadioCore's switch_mode() or shuffle init already set current_album_index and current_track
-                folder = self.core.current_album_index + 1
-                track = self.core.current_track
-                
-                # Play AM overlay with current track (this will start the track after AM finishes)
+                # Play AM overlay then start track (delay_playback prevents core from starting early)
                 self.hw.start_with_am(folder, track)
-                self._pending_am_overlay = False
             
             time.sleep_ms(40)  # Debounce
         

@@ -1071,40 +1071,19 @@ class TestModeWidget(QtWidgets.QWidget):
         self._sync_from_core()
         
         # Play AM overlay first, then schedule track playback after it finishes
-        # Use the same approach as _play_am_overlay_then_track() for consistency
         if not self.audio_ready:
-            # No audio, execute pending playback immediately
-            # execute_pending_playback() will set delay_playback=False internally
+            self.hw_emulator.execute_pending_playback()
+        elif not self.hw_emulator.am_overlay_available():
             self.hw_emulator.execute_pending_playback()
         else:
             try:
-                import pygame
-                if self.am_sound is None:
-                    # No AM sound available, play track immediately
-                    # execute_pending_playback() will set delay_playback=False internally
-                    self.hw_emulator.execute_pending_playback()
-                else:
-                    # Stop any existing AM overlay
-                    self._stop_am_overlay()
-                    
-                    # Play AM overlay
-                    self.am_channel = pygame.mixer.find_channel()
-                    if self.am_channel:
-                        self.am_channel.set_volume(1.0)
-                        self.am_channel.play(self.am_sound)
-                        self._log("AM overlay playing (power on)")
-                        
-                        # Calculate AM sound duration and schedule track playback
-                        am_duration_ms = int(self.am_sound.get_length() * 1000)
-                        QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
-                    else:
-                        # No channel available, play track immediately
-                        # execute_pending_playback() will set delay_playback=False internally
-                        self.hw_emulator.execute_pending_playback()
+                self._stop_am_overlay()
+                self.hw_emulator.play_am_overlay()
+                am_duration_ms = self.hw_emulator.get_am_overlay_duration_ms()
+                self._log("AM overlay playing (power on)")
+                QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
             except Exception as e:
                 self._log(f"AM overlay error: {e}")
-                # Fallback: play track immediately if AM overlay fails
-                # execute_pending_playback() will set delay_playback=False internally
                 self.hw_emulator.execute_pending_playback()
         
         self._update_status("Power on, playback started.")
@@ -1243,13 +1222,13 @@ class TestModeWidget(QtWidgets.QWidget):
             self._log(f"Playback error: {exc}")
             return
         # Only play AM radio overlay when tuning or first entering radio mode
-        if with_am_overlay and self.am_sound is not None:
-            self.am_channel = pygame.mixer.find_channel()
-            if self.am_channel is not None:
-                self.am_channel.set_volume(1.0)
-                self.am_channel.play(self.am_sound)
-                self._am_fade_steps = max(int(self.am_sound.get_length() * 10), 1)
+        if with_am_overlay and self.hw_emulator.am_overlay_available():
+            try:
+                self.hw_emulator.play_am_overlay()
+                self._am_fade_steps = max(self.hw_emulator.get_am_overlay_duration_ms() // 100, 1)
                 self._am_fade_step = 0
+            except Exception:
+                pass
         self.is_playing = True
         self._fade_steps = max(int(FADE_IN_S * 10), 1)
         self._fade_step = 0
@@ -1477,91 +1456,42 @@ class TestModeWidget(QtWidgets.QWidget):
             pass
     
     def _play_am_overlay_then_track(self) -> None:
-        """Play AM overlay first, then start track playback when it finishes.
-        
-        Used for radio mode - no fade-in, plays immediately at full volume.
-        """
+        """Play AM overlay first, then start track playback when it finishes (radio mode)."""
         if not self.audio_ready:
-            # No audio, execute pending playback immediately (no fade-in in radio mode)
-            # execute_pending_playback() will set delay_playback=False internally
             self.hw_emulator.execute_pending_playback(fade_in=False)
             return
-        
+        if not self.hw_emulator.am_overlay_available():
+            self.hw_emulator.execute_pending_playback(fade_in=False)
+            return
         try:
-            import pygame
-            if self.am_sound is None:
-                # No AM sound available, play track immediately (no fade-in in radio mode)
-                # execute_pending_playback() will set delay_playback=False internally
-                self.hw_emulator.execute_pending_playback(fade_in=False)
-                return
-            
-            # Stop any existing AM overlay
             self._stop_am_overlay()
-            
-            # Play AM overlay
-            self.am_channel = pygame.mixer.find_channel()
-            if self.am_channel:
-                self.am_channel.set_volume(1.0)
-                self.am_channel.play(self.am_sound)
-                self._log("AM overlay playing")
-                
-                # Calculate AM sound duration and schedule track playback
-                am_duration_ms = int(self.am_sound.get_length() * 1000)
-                
-                # Start track playback after AM overlay finishes
-                # Only if still tuning (otherwise _lock_radio_station will handle it)
-                QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
+            self.hw_emulator.play_am_overlay()
+            am_duration_ms = self.hw_emulator.get_am_overlay_duration_ms()
+            self._log("AM overlay playing")
+            QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
         except Exception as e:
             self._log(f"AM overlay error: {e}")
-            # Fallback: play track immediately if AM overlay fails (no fade-in in radio mode)
-            # execute_pending_playback() will set delay_playback=False internally
             self.hw_emulator.execute_pending_playback(fade_in=False)
     
     def _play_am_overlay_for_mode_switch(self) -> None:
-        """Play AM overlay for mode switches triggered by button combinations.
-        
-        Uses the EXACT same logic as _switch_mode() to ensure identical behavior.
-        """
-        # Use the same approach as _switch_mode() for consistency
+        """Play AM overlay for mode switches triggered by button combinations (tap+hold, etc.)."""
         if not self.audio_ready:
-            # No audio, execute pending playback immediately
-            self._log("Mode switch: audio not ready, playing immediately")
-            # execute_pending_playback() will set delay_playback=False internally
+            self._log("Mode switch (button): audio not ready, playing immediately")
+            self.hw_emulator.execute_pending_playback()
+        elif not self.hw_emulator.am_overlay_available():
+            self._log("Mode switch (button): no AM overlay, playing immediately")
             self.hw_emulator.execute_pending_playback()
         else:
             try:
-                import pygame
-                if self.am_sound is None:
-                    # No AM sound available, play track immediately
-                    self._log("Mode switch: no AM sound, playing immediately")
-                    # execute_pending_playback() will set delay_playback=False internally
-                    self.hw_emulator.execute_pending_playback()
-                else:
-                    # Stop any existing AM overlay
-                    self._stop_am_overlay()
-                    
-                    # Play AM overlay
-                    self.am_channel = pygame.mixer.find_channel()
-                    if self.am_channel:
-                        self.am_channel.set_volume(1.0)
-                        self.am_channel.play(self.am_sound)
-                        self._log("AM overlay playing (mode switch from button combination)")
-                        
-                        # Calculate AM sound duration and schedule track playback
-                        am_duration_ms = int(self.am_sound.get_length() * 1000)
-                        self._log(f"Mode switch: scheduling track playback in {am_duration_ms}ms")
-                        QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
-                    else:
-                        # No channel available, play track immediately
-                        self._log("Mode switch: no pygame channel available, playing immediately")
-                        # execute_pending_playback() will set delay_playback=False internally
-                        self.hw_emulator.execute_pending_playback()
+                self._stop_am_overlay()
+                self.hw_emulator.play_am_overlay()
+                am_duration_ms = self.hw_emulator.get_am_overlay_duration_ms()
+                self._log(f"Mode switch (button): AM overlay playing, scheduling track in {am_duration_ms}ms")
+                QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
             except Exception as e:
                 self._log(f"AM overlay error: {e}")
                 import traceback
                 self._log(traceback.format_exc())
-                # Fallback: play track immediately if AM overlay fails
-                # execute_pending_playback() will set delay_playback=False internally
                 self.hw_emulator.execute_pending_playback()
     
     def _start_track_after_am(self) -> None:
@@ -1696,46 +1626,23 @@ class TestModeWidget(QtWidgets.QWidget):
         self.mode_label.setText(f"Mode: {self.mode.title()}")
         
         # Play AM overlay first, then schedule track playback after it finishes
-        # Use the same approach as _play_am_overlay_then_track() for consistency
         if not self.audio_ready:
-            # No audio, execute pending playback immediately
             self._log("Mode switch: audio not ready, playing immediately")
-            # execute_pending_playback() will set delay_playback=False internally
+            self.hw_emulator.execute_pending_playback()
+        elif not self.hw_emulator.am_overlay_available():
+            self._log("Mode switch: no AM overlay available, playing immediately")
             self.hw_emulator.execute_pending_playback()
         else:
             try:
-                import pygame
-                if self.am_sound is None:
-                    # No AM sound available, play track immediately
-                    self._log("Mode switch: no AM sound, playing immediately")
-                    # execute_pending_playback() will set delay_playback=False internally
-                    self.hw_emulator.execute_pending_playback()
-                else:
-                    # Stop any existing AM overlay
-                    self._stop_am_overlay()
-                    
-                    # Play AM overlay
-                    self.am_channel = pygame.mixer.find_channel()
-                    if self.am_channel:
-                        self.am_channel.set_volume(1.0)
-                        self.am_channel.play(self.am_sound)
-                        self._log("AM overlay playing (mode switch)")
-                        
-                        # Calculate AM sound duration and schedule track playback
-                        am_duration_ms = int(self.am_sound.get_length() * 1000)
-                        self._log(f"Mode switch: scheduling track playback in {am_duration_ms}ms")
-                        QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
-                    else:
-                        # No channel available, play track immediately
-                        self._log("Mode switch: no pygame channel available, playing immediately")
-                        # execute_pending_playback() will set delay_playback=False internally
-                        self.hw_emulator.execute_pending_playback()
+                self._stop_am_overlay()
+                self.hw_emulator.play_am_overlay()
+                am_duration_ms = self.hw_emulator.get_am_overlay_duration_ms()
+                self._log(f"Mode switch: AM overlay playing, scheduling track in {am_duration_ms}ms")
+                QtCore.QTimer.singleShot(am_duration_ms, self._start_track_after_am)
             except Exception as e:
                 self._log(f"AM overlay error: {e}")
                 import traceback
                 self._log(traceback.format_exc())
-                # Fallback: play track immediately if AM overlay fails
-                # execute_pending_playback() will set delay_playback=False internally
                 self.hw_emulator.execute_pending_playback()
         
         self._update_status("Mode switched.")

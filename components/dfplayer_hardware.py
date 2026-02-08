@@ -127,6 +127,13 @@ class DFPlayerHardware(HardwareInterface):
         
         # Flag to prevent duplicate playback when AM overlay is playing
         self._am_overlay_active = False
+        
+        # When True, play_track() no-ops so firmware can play AM overlay first (mode switch / power-on)
+        self._delay_playback = False
+    
+    def set_delay_playback(self, delay):
+        """When True, play_track() will no-op so the firmware can run start_with_am() first."""
+        self._delay_playback = bool(delay)
     
     def _load_wav(self):
         """Load the AM radio WAV file."""
@@ -225,6 +232,10 @@ class DFPlayerHardware(HardwareInterface):
         if self._am_overlay_active:
             print("AM overlay active, skipping play_track (already started via start_with_am)")
             return True
+        # Delay playback until firmware runs start_with_am() (mode switch / power-on)
+        if self._delay_playback:
+            print("Delay playback set, skipping play_track (firmware will start_with_am)")
+            return True
         
         self._df_stop()
         time.sleep_ms(POST_CMD_GUARD_MS)
@@ -270,6 +281,11 @@ class DFPlayerHardware(HardwareInterface):
         """
         if self.wav_data is None:
             self.log("No WAV data - skipping AM overlay")
+            if folder is not None and track is not None:
+                self._df_stop()
+                time.sleep_ms(POST_CMD_GUARD_MS)
+                self._df_play_folder_track(folder, track)
+            self._delay_playback = False
             return False
         
         # Set flag to prevent duplicate playback from RadioCore's play_track()
@@ -391,6 +407,7 @@ class DFPlayerHardware(HardwareInterface):
         
         # Clear flag after AM overlay finishes
         self._am_overlay_active = False
+        self._delay_playback = False
         
         return confirmed
     

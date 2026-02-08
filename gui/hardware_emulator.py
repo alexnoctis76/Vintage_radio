@@ -73,6 +73,9 @@ class PygameHardwareEmulator(HardwareInterface):
         self._delay_playback = False
         self._pending_playback = None  # (folder, track, start_ms) tuple
 
+        # AM overlay duration in ms (for scheduling track after overlay)
+        self._am_overlay_duration_ms = 2000
+
         # Debounce spurious "track finished": ignore for a short window after stop/play
         # (VLC/media transitions can briefly report not-playing and trigger false auto-advance)
         self._ignore_track_finished_until = 0.0
@@ -115,6 +118,9 @@ class PygameHardwareEmulator(HardwareInterface):
                     try:
                         am_media = self._vlc_instance.media_new(str(self.am_wav_path))
                         self._vlc_am_player.set_media(am_media)
+                        d_ms = am_media.get_duration()
+                        if d_ms > 0:
+                            self._am_overlay_duration_ms = d_ms
                         self.log(f"AM sound loaded: {self.am_wav_path}")
                     except Exception as e:
                         self.log(f"Failed to load AM sound: {e}")
@@ -136,6 +142,7 @@ class PygameHardwareEmulator(HardwareInterface):
             if self.am_wav_path and self.am_wav_path.exists():
                 try:
                     self._am_sound = pygame.mixer.Sound(str(self.am_wav_path))
+                    self._am_overlay_duration_ms = int(self._am_sound.get_length() * 1000)
                     self.log(f"AM sound loaded: {self.am_wav_path}")
                 except Exception as e:
                     self.log(f"Failed to load AM sound: {e}")
@@ -488,13 +495,24 @@ class PygameHardwareEmulator(HardwareInterface):
             elapsed_ms = int((time.time() * 1000) - self._playback_start_time)
             return self._playback_start_offset_ms + elapsed_ms
     
+    def am_overlay_available(self) -> bool:
+        """Return True if AM overlay can be played (VLC or pygame)."""
+        if self._vlc_am_player and self._vlc_am_player.get_media():
+            return True
+        return self._am_sound is not None
+
+    def get_am_overlay_duration_ms(self) -> int:
+        """Return AM overlay duration in ms (for scheduling track after overlay)."""
+        return self._am_overlay_duration_ms
+
     def play_am_overlay(self):
         """Play the AM radio sound overlay."""
         if not self._audio_ready:
             return
         try:
-            if self._vlc_am_player:
-                # VLC AM overlay
+            if self._vlc_am_player and self._vlc_am_player.get_media():
+                # VLC AM overlay - restart from start each time
+                self._vlc_am_player.set_time(0)
                 self._vlc_am_player.play()
                 self.log("AM overlay playing (VLC)")
             elif self._am_sound:

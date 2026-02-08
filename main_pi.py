@@ -51,9 +51,13 @@ class VintageRadioFirmwarePi:
     def boot_sequence(self):
         self.hw.reset_dfplayer()
         self.core.init(skip_initial_playback=True)
-        album_idx = self.core.current_album_index
-        track = self.core.current_track
-        folder = album_idx + 1
+        tr = self.core._get_current_track()
+        if tr:
+            folder = tr.get("folder", 1)
+            track = tr.get("track_number", 1)
+        else:
+            folder = self.core.current_album_index + 1
+            track = self.core.current_track
         confirmed = self.hw.start_with_am(folder, track)
         if confirmed:
             print("Boot playback confirmed")
@@ -83,8 +87,13 @@ class VintageRadioFirmwarePi:
             if press_dur >= LONG_PRESS_MS and self.core.tap_count == 0:
                 self._handle_album_change_with_am()
             elif mode_changed or shuffle_reshuffled:
-                folder = self.core.current_album_index + 1
-                track = self.core.current_track
+                tr = self.core._get_current_track()
+                if tr:
+                    folder = tr.get("folder", 1)
+                    track = tr.get("track_number", 1)
+                else:
+                    folder = self.core.current_album_index + 1
+                    track = self.core.current_track
                 self.hw.start_with_am(folder, track)
             time.sleep(0.04)
         self.last_button = curr
