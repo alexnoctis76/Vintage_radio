@@ -1,6 +1,6 @@
 # Vintage Radio Music Manager
 
-A desktop GUI application for managing music libraries, albums, and playlists for a vintage radio device. The system provides a modern interface for organizing music files, syncing to SD cards, and testing firmware behavior.
+A desktop GUI application for managing music libraries, albums, and playlists for a vintage radio device. The system provides a modern interface for organizing music files, syncing to SD cards, and testing firmware behavior. You can **drag and drop files or folders** into the Library, Albums, or Playlists views to import music quickly.
 
 ## Features
 
@@ -90,30 +90,29 @@ python gui/radio_manager.py
 
 ### Basic Workflow
 
-1. **Import Music Files**
-   - Drag and drop audio files into the Library tab
-   - Files are automatically scanned for metadata
-   - All formats are supported (conversion happens during SD sync)
+1. **Import Music Files (Library)**
+   - **Drag and drop** audio files or entire folders into the Library tab, or use Import Files / Import Folder. The library shows all tracks in a searchable table with title, artist, duration, and format; you can edit or remove entries from here and use **Sync to SD** when ready.
+   - ![Library: search, import, and sync to SD](docs/images/library.png)
 
-2. **Create Albums/Playlists**
-   - Switch to Albums or Playlists tab
-   - Create a new album/playlist
-   - Drag songs from the library or import directly
-   - Reorder tracks by dragging
+2. **Create Albums**
+   - In the Albums tab, create a new album, then **drag and drop** files or folders onto the drop area (or add selected songs from the library). Select an album to see its track list, reorder by dragging, and use the buttons to rename, edit the description, or remove tracks.
+   - ![Albums: drag and drop to add tracks](docs/images/albums.png)
+   - ![Album detail: track list and ordering](docs/images/albums-detail.png)
 
-3. **Sync to SD Card**
-   - Go to Library tab
-   - Click "Sync to SD" button
-   - Select your SD card drive
-   - Files are converted to MP3 and organized automatically
+3. **Create Playlists**
+   - In the Playlists tab, create a playlist and add tracks from the library (or drag and drop). The right panel shows the playlist’s track list; use Add Selected Songs / Remove Selected to adjust the order and contents.
+   - ![Playlists: build and edit playlists](docs/images/playlists.png)
 
-4. **Test Mode**
-   - Switch to Test Mode tab
-   - Interact with the virtual radio face
-   - Test all modes and button combinations
-   - View detailed logs of device behavior
+4. **Sync to SD and Devices**
+   - The Devices tab is where you set the **SD / media root** (or drag a folder onto it), run **Sync Library to SD**, validate the card, and export album or playlist contents. You can also export for RP2040 (Pico), install to Pico, or deploy to Raspberry Pi.
+   - ![Devices: SD root, sync, validate, export, Pico, and Pi](docs/images/devices.png)
 
-### Button Controls (Test Mode)
+5. **Test Mode**
+   - The Test Mode tab emulates the radio: power on/off, volume knob, and mode buttons (Album, Playlist, Shuffle, Radio). Use the virtual dial and tap/hold controls to change tracks and stations; the event log at the bottom shows playback and state. Sync your library to SD first so Test Mode can use the same files as the hardware.
+   - ![Test Mode: Shuffle with radio face and event log](docs/images/test-mode-shuffle.png)
+   - ![Test Mode: Radio mode and station info](docs/images/test-mode-radio.png)
+
+### Button Controls (Works on Physical Device and Test Mode - try clicking the button on the test mode radio and using the dial!)
 
 - **Single Tap**: Next track
 - **Tap + Hold**: Toggle Album/Playlist mode
@@ -149,20 +148,37 @@ Then rebuild. The spec will use `vintage_radio.ico` if present.
 
 ```
 Vintage_radio/
-├── gui/                    # GUI application code
-│   ├── radio_manager.py    # Main window
-│   ├── test_mode.py        # Test mode emulator
-│   ├── database.py         # Database operations
-│   ├── sd_manager.py       # SD card sync
-│   ├── hardware_emulator.py # Hardware emulation
-│   └── resources/          # Images and sounds
-├── components/             # Hardware interfaces
-│   ├── dfplayer_hardware.py # DFPlayer (Pico)
-│   └── pi_hardware.py      # Raspberry Pi (VLC)
-├── radio_core.py           # Shared core logic (GUI + firmware)
-├── main.py                 # Original firmware (reference)
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
+├── .github/
+│   └── workflows/
+│       └── build-release.yml   # CI: build Windows/macOS executables
+├── components/                 # Hardware interfaces
+│   ├── __init__.py
+│   ├── dfplayer_hardware.py   # DFPlayer (Pico/RP2040)
+│   └── pi_hardware.py         # Raspberry Pi (VLC)
+├── docs/
+│   ├── README_Pi.md           # Raspberry Pi setup
+│   └── README_RP2040.md       # RP2040 firmware notes
+├── gui/                        # GUI application code
+│   ├── __init__.py
+│   ├── radio_manager.py       # Main window
+│   ├── test_mode.py           # Test mode emulator
+│   ├── database.py            # Database operations
+│   ├── sd_manager.py          # SD card sync
+│   ├── hardware_emulator.py   # Hardware emulation
+│   ├── audio_metadata.py      # Metadata extraction
+│   ├── resource_paths.py      # Paths for dev vs frozen exe
+│   ├── resources/             # Icons, images, sounds
+│   │   ├── vintage_radio.ico, .png, .svg
+│   │   ├── volDial.png, powerInd.png, AMradioSound.wav, etc.
+│   └── ...
+├── radio_core.py              # Shared core logic (GUI + firmware)
+├── main.py                    # Firmware entry (reference)
+├── main_pi.py                 # Raspberry Pi entry
+├── run_vintage_radio.py       # Launcher for GUI (used by PyInstaller)
+├── vintage_radio.spec         # PyInstaller spec for standalone build
+├── requirements.txt
+├── README.md
+└── RELEASE_NOTES.md           # Template for release notes
 ```
 
 ## Architecture
@@ -198,7 +214,7 @@ The test mode provides a complete emulation of the device:
 - Detailed logging
 
 ### Firmware Integration
-The firmware (`firmware/dfplayer_hardware.py`) implements the same `HardwareInterface` as the GUI, ensuring compatibility.
+The firmware uses `components/dfplayer_hardware.py` (and `components/pi_hardware.py` for Pi), implementing the same `HardwareInterface` as the GUI, ensuring compatibility.
 
 ## Known Limitations
 
