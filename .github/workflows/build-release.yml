@@ -1,11 +1,14 @@
 # Build standalone Vintage Radio executable (Windows + macOS)
-# Runs on: push to release, release publish, or manual "Run workflow"
+# Creates a GitHub Release with binaries when you push a version tag (e.g. v0.1.0-beta).
+# To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
+# Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
 
 name: Build release
 
 on:
   push:
     branches: [release]
+    tags: ["v*"]
   release:
     types: [published]
   workflow_dispatch:
@@ -52,10 +55,10 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/Vintage Radio/
 
-  # Attach built artifacts to the GitHub Release when one is published
+  # Create/update a GitHub Release and attach built binaries (on tag push or release published)
   upload-release:
     needs: build
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
@@ -75,9 +78,12 @@ jobs:
           zip -r ../../Vintage-Radio-macOS.zip .
           cd ../..
 
-      - name: Upload to Release
+      - name: Create Release and upload binaries
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          name: Release ${{ github.event.release.tag_name || github.ref_name }}
+          generate_release_notes: true
           files: |
             Vintage-Radio-Windows.zip
             Vintage-Radio-macOS.zip
