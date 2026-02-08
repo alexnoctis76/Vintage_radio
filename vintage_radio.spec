@@ -1,6 +1,9 @@
 # PyInstaller spec for Vintage Radio Music Manager
-# Build: pyinstaller vintage_radio.spec
+# Build: pyinstaller vintage_radio.spec   (or pyinstaller --noconfirm vintage_radio.spec to skip prompt)
 # Output: dist/Vintage Radio/ (one-folder; run the exe or .app inside)
+# Note: Close any running Vintage Radio app before rebuilding, or you may get "Access is denied" when PyInstaller cleans the output dir.
+# The SyntaxWarnings during build come from the pydub dependency; they are harmless and the build still succeeds.
+# If the exe icon looks wrong in Explorer (e.g. small icons), try renaming the exe so Windows refreshes its icon cache.
 
 import sys
 from pathlib import Path
@@ -19,14 +22,13 @@ datas = [
     (str(project_dir / 'components'), 'components'),
 ]
 
-# Application icon (radio icon). Use .ico on Windows for exe icon; .png may work on some versions.
-# If Windows build fails on icon, create .ico: python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
-icon_path = project_dir / 'gui' / 'resources' / 'vintage_radio.png'
-if (project_dir / 'gui' / 'resources' / 'vintage_radio.ico').exists():
-    icon_path = project_dir / 'gui' / 'resources' / 'vintage_radio.ico'
+# Application icon (radio icon). Windows exe requires .ico; pass only .ico to avoid build failure without Pillow.
+# To create .ico: pip install Pillow && python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
+icon_ico = project_dir / 'gui' / 'resources' / 'vintage_radio.ico'
+icon_path = str(icon_ico) if icon_ico.exists() else None
 
 a = Analysis(
-    ['gui/radio_manager.py'],
+    ['run_vintage_radio.py'],
     pathex=[str(project_dir)],
     binaries=[],
     datas=datas,
@@ -70,7 +72,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(icon_path) if icon_path.exists() else None,
+    icon=icon_path,
 )
 
 coll = COLLECT(
