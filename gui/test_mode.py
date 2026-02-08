@@ -501,11 +501,16 @@ class TestModeWidget(QtWidgets.QWidget):
             self._sync_from_core()
             self._update_status("Action from core tick.")
         
-        # Check if track finished
+        # Check if track finished (skip in radio mode while waiting for AM overlay)
+        # Otherwise we stop for AM overlay, track-finished fires, core advances and
+        # overwrites _pending_playback with next track at 0ms, so tuned position is lost
         if self.hw_emulator.check_track_finished():
-            self.core.on_track_finished()
-            self._sync_from_core()
-            self._update_status("Track finished, auto-advanced.")
+            if self.mode == "radio" and self.hw_emulator._pending_playback is not None:
+                pass  # Waiting for AM overlay; do not advance or we lose tuned track/offset
+            else:
+                self.core.on_track_finished()
+                self._sync_from_core()
+                self._update_status("Track finished, auto-advanced.")
     
     def _sync_from_core(self) -> None:
         """Sync widget state from RadioCore."""
@@ -1102,15 +1107,13 @@ class TestModeWidget(QtWidgets.QWidget):
         self.radio_face.set_dial_value(value)
         if not self.audio_ready:
             return
-        try:
-            import pygame
-        except Exception:
-            return
         self.target_volume = max(0.0, min(1.0, value / 100.0))
         if self.mode == "radio" and self.is_tuning:
-            pygame.mixer.music.set_volume(min(0.2, self.target_volume))
+            vol = min(0.2, self.target_volume)
         else:
-            pygame.mixer.music.set_volume(self.target_volume)
+            vol = self.target_volume
+        volume_percent = int(vol * 100)
+        self.hw_emulator.set_volume(volume_percent)
 
     def _register_tap(self) -> None:
         if not self.rail2_on:
@@ -1573,6 +1576,8 @@ class TestModeWidget(QtWidgets.QWidget):
         try:
             import pygame
         except Exception:
+            return
+        if not pygame.mixer.get_init():
             return
         base_volume = self.knob_slider.value() / 100.0
         if tuning:

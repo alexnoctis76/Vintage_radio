@@ -72,6 +72,10 @@ class PygameHardwareEmulator(HardwareInterface):
         # Flag to delay playback (used for AM overlay sequencing)
         self._delay_playback = False
         self._pending_playback = None  # (folder, track, start_ms) tuple
+
+        # Debounce spurious "track finished": ignore for a short window after stop/play
+        # (VLC/media transitions can briefly report not-playing and trigger false auto-advance)
+        self._ignore_track_finished_until = 0.0
         
         # Check if ffmpeg is available (needed for seeking all formats with pygame fallback)
         self._ffmpeg_available = self._check_ffmpeg()
@@ -222,23 +226,26 @@ class PygameHardwareEmulator(HardwareInterface):
             if self._vlc_player:
                 try:
                     media = self._vlc_instance.media_new(str(path))
-                    self._vlc_player.set_media(media)
-                    self._vlc_player.set_volume(initial_volume)
-                    
-                    # VLC supports native seeking for ALL formats!
+                    # set_time() before play() is unreliable; use start-time option so VLC starts at position
                     if start_ms and start_ms > 0:
-                        # VLC uses milliseconds for set_time
-                        self._vlc_player.set_time(start_ms)
-                    
+                        media.add_option(f'start-time={start_ms / 1000.0}')
+                    self._vlc_player.set_media(media)
+                    self._vlc_player.audio_set_volume(initial_volume)
                     self._vlc_player.play()
                     self._playback_start_time = time.time() * 1000
                     self._playback_start_offset_ms = start_ms if start_ms else 0
                     self._is_playing = True
-                    
+                    self._ignore_track_finished_until = time.time() + 1.5
+
                     self.log(f"Playing: {song.get('title', 'Unknown')} (start={start_ms}ms, VLC - native seeking for ALL formats)")
                     return
                 except Exception as e:
                     self.log(f"VLC playback failed: {e}, falling back to pygame")
+            
+            # Fall back to pygame only if mixer is initialized (otherwise skip to avoid mixer error)
+            if not pygame.mixer.get_init():
+                self.log("Pygame mixer not initialized; playback unavailable")
+                return
             
             # Fall back to pygame (requires temp files for seeking non-OGG formats)
             # 
@@ -285,6 +292,7 @@ class PygameHardwareEmulator(HardwareInterface):
                     
                     self.log(f"Playing: {song.get('title', 'Unknown')} (start={start_ms}ms, using pydub+ffmpeg - works for ALL formats)")
                     self._is_playing = True
+                    self._ignore_track_finished_until = time.time() + 1.5
                     self._current_sound = None
                     self._current_channel = None
                     return
@@ -314,6 +322,7 @@ class PygameHardwareEmulator(HardwareInterface):
             self._playback_start_time = time.time() * 1000
             self._playback_start_offset_ms = start_ms if start_ms else 0
             self._is_playing = True
+            self._ignore_track_finished_until = time.time() + 1.5
             self._current_sound = None
             self._current_channel = None
             self._current_temp_file = None
@@ -386,15 +395,22 @@ class PygameHardwareEmulator(HardwareInterface):
         if not self._audio_ready:
             return
         try:
-            # Stop Sound object if playing
+            # Stop VLC if playing
+            if self._vlc_player:
+                try:
+                    self._vlc_player.stop()
+                except Exception:
+                    pass
+            # Stop Sound object if playing (pygame)
             if self._current_channel:
                 self._current_channel.stop()
                 self._current_channel = None
                 self._current_sound = None
-            
-            # Stop mixer.music if playing
-            pygame.mixer.music.stop()
-            
+            # Stop mixer.music only if pygame mixer was initialized
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+                if self._am_channel:
+                    self._am_channel.stop()
             # Clean up temporary file if one was created for seeking
             if self._current_temp_file and self._current_temp_file.exists():
                 try:
@@ -402,10 +418,8 @@ class PygameHardwareEmulator(HardwareInterface):
                 except Exception:
                     pass
                 self._current_temp_file = None
-            
-            if self._am_channel:
-                self._am_channel.stop()
             self._is_playing = False
+            self._ignore_track_finished_until = time.time() + 0.8
             self.log("Playback stopped")
         except Exception as e:
             self.log(f"Stop error: {e}")
@@ -556,6 +570,8 @@ class PygameHardwareEmulator(HardwareInterface):
     def check_track_finished(self) -> bool:
         """Check if current track has finished playing."""
         if not self._audio_ready:
+            return False
+        if time.time() < self._ignore_track_finished_until:
             return False
         was_playing = self._is_playing
         is_now_playing = self.is_playing()

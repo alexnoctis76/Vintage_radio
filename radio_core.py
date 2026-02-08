@@ -167,6 +167,8 @@ class RadioCore:
         self.radio_stations = []
         self.radio_station_index = 0
         self.radio_mode_start_ms = None
+        # Cooldown so tick does not override a recent tune or force-advance (avoids ping-pong/wrong start)
+        self._radio_advance_cooldown_until_ms = 0
         
         # Track the source type when entering shuffle mode (for "shuffle current" functionality)
         self._shuffle_source_type = None  # 'album' or 'playlist'
@@ -186,11 +188,14 @@ class RadioCore:
         # Known tracks per album (for firmware compatibility)
         self.known_tracks = {}
     
-    def init(self):
-        """Initialize the radio - load state and start playback."""
+    def init(self, skip_initial_playback=False):
+        """Initialize the radio - load state and optionally start playback.
+        skip_initial_playback: If True, do not start playback (caller will e.g. start_with_am).
+        Used by firmware to match baseline: one start inside AM overlay, no double-start.
+        """
         self._load_data()
         self._load_state()
-        if self.power_on:
+        if self.power_on and not skip_initial_playback:
             self._start_playback_for_current()
     
     def _load_data(self):
@@ -309,6 +314,10 @@ class RadioCore:
         if not self.radio_stations or self.radio_station_index >= len(self.radio_stations):
             return False
         
+        # Do not override a recent tune or force-advance (avoids ping-pong and wrong start position)
+        if ticks_ms() < self._radio_advance_cooldown_until_ms:
+            return False
+        
         station = self.radio_stations[self.radio_station_index]
         if not station.tracks:
             return False
@@ -332,7 +341,14 @@ class RadioCore:
         # Only advance if we've moved to a completely different track
         # Don't restart if we're on the same track (even if offset changed slightly)
         if current_track_idx != self.current_track:
-            # Virtual time says we should be on a different track - advance
+            n = len(station.tracks)
+            next_after_virtual = (current_track_idx % n) + 1
+            # Do not override when we're one track *ahead* of virtual time: that happens
+            # when the previous track finished and we force-advanced to the next track.
+            # Overriding would ping-pong us back to the previous track (handles wrap: e.g. virtual=20, we're on 1).
+            if self.current_track == next_after_virtual:
+                return False
+            # Virtual time says we should be on a different track and we're behind - advance
             self.current_track = current_track_idx
             self._start_playback_for_track(current_track, start_ms=current_offset)
             self.hw.log(f"Radio advanced to track {current_track_idx} at {current_offset // 1000}s (virtual time)")
@@ -654,6 +670,7 @@ class RadioCore:
                     next_offset = 0
             
             self.current_track = next_track_idx
+            self._radio_advance_cooldown_until_ms = ticks_ms() + 1500
             self._start_playback_for_track(next_track, start_ms=next_offset)
             self.hw.log(f"Radio advanced to track {next_track_idx} at {next_offset // 1000}s (track finished, forced advance)")
     
@@ -852,32 +869,23 @@ class RadioCore:
         if track:
             track_idx = station.tracks.index(track) + 1 if track in station.tracks else 1
             
-            # Get current playback position to check if we need to restart
+            # Only restart when station or track (by virtual time) actually changed.
+            # Do NOT use get_playback_position_ms() to decide restart: during tuning we often
+            # just stopped playback (or AM overlay is playing), so position is 0 and we would
+            # restart on every dial tick and overwrite pending playback repeatedly.
+            should_restart = station_changed or (track_idx != self.current_track)
+            
             current_pos_ms = self.hw.get_playback_position_ms()
-            
-            # Calculate the expected position based on virtual time
-            # If we're on the same station and track, check if actual position matches expected
-            # (within a tolerance to account for playback drift)
-            position_tolerance_ms = 2000  # 2 seconds tolerance
-            position_matches = (
-                not station_changed and 
-                track_idx == self.current_track and
-                abs(current_pos_ms - offset_ms) < position_tolerance_ms
-            )
-            
-            # Only restart playback if:
-            # 1. Station changed (tuning to a different station)
-            # 2. Track changed (virtual time advanced to a different track)
-            # 3. Position doesn't match (playback is significantly off from virtual time)
-            should_restart = station_changed or (track_idx != self.current_track) or not position_matches
-            
             self.hw.log(f"[RADIO DEBUG] Found track: idx={track_idx}, offset={offset_ms}ms, should_restart={should_restart}")
-            self.hw.log(f"[RADIO DEBUG] Current playback: pos={current_pos_ms}ms, track={self.current_track}, station_changed={station_changed}, position_matches={position_matches}")
+            self.hw.log(f"[RADIO DEBUG] Current playback: pos={current_pos_ms}ms, track={self.current_track}, station_changed={station_changed}")
             
             self.current_track = track_idx
             
             if should_restart:
                 self.hw.log(f"Radio: {station.name} - Track {track_idx} at {offset_ms // 1000}s")
+                
+                # Cooldown so the next tick does not override this tune (correct track/offset)
+                self._radio_advance_cooldown_until_ms = ticks_ms() + 2500
                 
                 # Play AM overlay when tuning to a new station
                 if station_changed:
@@ -886,7 +894,7 @@ class RadioCore:
                 # Start playback at the correct position in the station's timeline
                 self._start_playback_for_track(track, start_ms=offset_ms)
             else:
-                self.hw.log(f"[RADIO DEBUG] Not restarting playback (position matches virtual time)")
+                self.hw.log(f"[RADIO DEBUG] Not restarting playback (same station and track)")
     
     def _find_track_at_position(self, tracks, position_ms):
         """Find which track contains the given position."""

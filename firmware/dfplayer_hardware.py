@@ -178,9 +178,11 @@ class DFPlayerHardware(HardwareInterface):
         self._df_send(0x0F, folder, track)
     
     def _df_set_time(self, seconds):
-        """Set playback time position (seek) in seconds (0-65535)."""
-        # Command 0x03: Set playback time
-        # p1 = high byte of seconds, p2 = low byte of seconds
+        """Set playback time position (seek) in seconds (0-65535).
+        Note: Some DFPlayer docs use 0x03 for 'play track in root'; if the module
+        does not support in-track seek, this may have no effect and track plays from start.
+        """
+        # Command 0x03: attempt seek; p1 = high byte of seconds, p2 = low byte
         seconds = max(0, min(65535, int(seconds)))
         p1 = (seconds >> 8) & 0xFF
         p2 = seconds & 0xFF

@@ -77,19 +77,19 @@ class VintageRadioFirmware:
         self.last_sense = 1
     
     def boot_sequence(self):
-        """Perform boot sequence: reset DFPlayer, load state, start playback."""
+        """Perform boot sequence: reset DFPlayer, load state, start playback with AM overlay.
+        Matches baseline 5.9.1: one start inside AM overlay (no double-start).
+        """
         # Reset DFPlayer and wait for boot
         self.hw.reset_dfplayer()
         
-        # Initialize core (loads state and starts playback)
-        self.core.init()
+        # Load state only; do not start playback yet (we start with AM overlay below)
+        self.core.init(skip_initial_playback=True)
         
-        # Use AM overlay for initial boot
+        # Start with AM overlay (single start, same as baseline start_sequence_synced)
         album_idx = self.core.current_album_index
         track = self.core.current_track
-        
-        # For DFPlayer, folder = album_index + 1 (1-based)
-        folder = album_idx + 1
+        folder = album_idx + 1  # DFPlayer folders 1-based
         confirmed = self.hw.start_with_am(folder, track)
         
         if confirmed:
