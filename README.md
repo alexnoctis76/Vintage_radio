@@ -43,13 +43,16 @@ pip install -r requirements.txt
 - `pydub>=0.25.1` - Audio processing
 - `python-vlc>=3.0.20123` - Advanced audio playback (optional, for better seeking support)
 
-### Optional Dependencies
-- **VLC Media Player**: For better audio format support and seeking capabilities
-  - Windows: Download from [VideoLAN](https://www.videolan.org/vlc/)
-  - The application will work without VLC, but with limited seeking support for some formats
-- **FFmpeg**: For audio conversion (required if VLC is not available)
-  - Download from [FFmpeg](https://ffmpeg.org/download.html)
-  - Add to system PATH
+### Required for file conversion (sync to SD)
+To convert non-MP3 files (FLAC, WAV, OGG, etc.) to MP3 when syncing to SD card or exporting, **one of the following is required**:
+
+- **VLC Media Player** (recommended) – [Download from VideoLAN](https://www.videolan.org/vlc/). Install on your system; the app will use it for conversion and for better seeking in Test Mode.
+- **FFmpeg** – [Download from FFmpeg](https://ffmpeg.org/download.html) and add it to your system PATH. The app uses pydub with FFmpeg as a fallback when VLC is not installed.
+
+Without either VLC or FFmpeg, only MP3 files can be synced (other formats will be skipped).
+
+### Optional
+- **VLC** also improves playback and seeking in Test Mode. **FFmpeg** is only used when VLC is not available for conversion.
 
 ## Installation
 
@@ -120,6 +123,27 @@ python gui/radio_manager.py
 - **Volume Knob**: Adjust volume
 - **Power Button**: Turn device on/off
 
+## Building standalone executables (Windows / Mac)
+
+To build a standalone folder (no install; user runs the exe or .app directly):
+
+1. Install dependencies and PyInstaller:
+   ```bash
+   pip install -r requirements.txt
+   pip install pyinstaller
+   ```
+
+2. From the project root, run:
+   ```bash
+   pyinstaller vintage_radio.spec
+   ```
+
+3. Output is in `dist/Vintage Radio/`. Run the executable inside that folder. All Python dependencies and the radio icon are included. VLC is not bundled; users can install VLC system-wide for better conversion and seeking if desired.
+
+**Windows:** For a proper .exe icon, create an ICO from the PNG (requires Pillow):  
+`python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"`  
+Then rebuild. The spec will use `vintage_radio.ico` if present.
+
 ## Project Structure
 
 ```
@@ -131,8 +155,9 @@ Vintage_radio/
 │   ├── sd_manager.py       # SD card sync
 │   ├── hardware_emulator.py # Hardware emulation
 │   └── resources/          # Images and sounds
-├── firmware/               # Firmware code
-│   └── dfplayer_hardware.py # DFPlayer hardware interface
+├── components/             # Hardware interfaces
+│   ├── dfplayer_hardware.py # DFPlayer (Pico)
+│   └── pi_hardware.py      # Raspberry Pi (VLC)
 ├── radio_core.py           # Shared core logic (GUI + firmware)
 ├── main.py                 # Original firmware (reference)
 ├── requirements.txt        # Python dependencies

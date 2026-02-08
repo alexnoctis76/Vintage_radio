@@ -14,6 +14,7 @@ from PyQt6.QtGui import QDesktopServices, QIcon
 
 from .audio_metadata import compute_file_hash, extract_metadata
 from .database import DatabaseManager
+from .resource_paths import app_data_dir, project_root, resource_path
 from .sd_manager import SDManager
 from .test_mode import TestModeWidget
 from . import sd_manager as sd_manager_module
@@ -372,8 +373,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Vintage Radio Music Manager")
         self.resize(1000, 700)
         
-        # Set window icon
-        icon_path = Path(__file__).resolve().parent / "resources" / "vintage_radio.png"
+        # Set window icon (radio icon)
+        icon_path = resource_path("vintage_radio.png")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
@@ -1433,8 +1434,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _project_root(self) -> Path:
-        """Project root (parent of gui package)."""
-        return Path(__file__).resolve().parents[1]
+        """Project root (parent of gui package, or bundle root when frozen)."""
+        return project_root()
 
     def export_rp2040_firmware(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(
@@ -1455,7 +1456,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if fw_src.exists():
             (dest / "components").mkdir(parents=True, exist_ok=True)
             shutil.copy2(fw_src, dest / "components" / "dfplayer_hardware.py")
-        am_wav = Path(__file__).resolve().parent / "resources" / "AMradioSound.wav"
+        am_wav = resource_path("AMradioSound.wav")
         vintage_dest = dest / "VintageRadio"
         vintage_dest.mkdir(parents=True, exist_ok=True)
         if am_wav.exists():
@@ -1553,7 +1554,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ip = ip.strip()
         user = "pi"
         root = self._project_root()
-        deploy_dir = root / "agent_workshop" / "deploy_pi" / "vintage_radio"
+        deploy_dir = app_data_dir() / "agent_workshop" / "deploy_pi" / "vintage_radio"
         deploy_dir.mkdir(parents=True, exist_ok=True)
         (deploy_dir / "components").mkdir(parents=True, exist_ok=True)
         for name in ("main_pi.py", "radio_core.py"):
@@ -2050,8 +2051,8 @@ class MainWindow(QtWidgets.QMainWindow):
 def run_app() -> None:
     app = QtWidgets.QApplication(sys.argv)
     
-    # Set application icon (for taskbar/Windows thumbnail)
-    icon_path = Path(__file__).resolve().parent / "resources" / "vintage_radio.png"
+    # Set application icon (radio icon; taskbar/dock)
+    icon_path = resource_path("vintage_radio.png")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
     

@@ -20,6 +20,7 @@ except ImportError:
 
 from .audio_metadata import compute_file_hash, extract_metadata, file_matches_metadata
 from .database import DatabaseManager
+from .resource_paths import resource_path
 
 
 class SDManager:
@@ -626,7 +627,7 @@ class SDManager:
             pass
 
     def _ensure_am_wav(self, vintage_root: Path) -> None:
-        source = Path(__file__).resolve().parent / "resources" / "AMradioSound.wav"
+        source = resource_path("AMradioSound.wav")
         target = vintage_root / "AMradioSound.wav"
         if target.exists() or not source.exists():
             return

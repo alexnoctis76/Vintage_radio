@@ -23,6 +23,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .database import DatabaseManager
 from .hardware_emulator import PygameHardwareEmulator
+from .resource_paths import app_data_dir, resource_path
 from .sd_manager import SDManager
 
 import sys
@@ -129,7 +130,7 @@ class RadioFaceView(QtWidgets.QGraphicsView):
         self.power_radius = self.base_power_radius
 
         # Load dial overlay PNG
-        dial_path = Path(__file__).resolve().parent / "resources" / "volDial.png"
+        dial_path = resource_path("volDial.png")
         self.dial_pixmap_base = QtGui.QPixmap(str(dial_path))
         self.dial_item = QtWidgets.QGraphicsPixmapItem(self.dial_pixmap_base)
         self.dial_item.setTransformationMode(QtCore.Qt.TransformationMode.SmoothTransformation)
@@ -137,7 +138,7 @@ class RadioFaceView(QtWidgets.QGraphicsView):
         self.scene.addItem(self.dial_item)
 
         # Load power indicator PNG
-        power_path = Path(__file__).resolve().parent / "resources" / "powerInd.png"
+        power_path = resource_path("powerInd.png")
         self.power_pixmap_on = QtGui.QPixmap(str(power_path))
         self.power_pixmap_off = self._create_off_power_pixmap(self.power_pixmap_on)
         self.power_indicator = QtWidgets.QGraphicsPixmapItem(self.power_pixmap_on)
@@ -303,7 +304,7 @@ class TestModeWidget(QtWidgets.QWidget):
         self.is_playing = False
         
         # Initialize hardware emulator (pygame-based)
-        am_wav = Path(__file__).resolve().parent / "resources" / "AMradioSound.wav"
+        am_wav = resource_path("AMradioSound.wav")
         self.hw_emulator = PygameHardwareEmulator(
             db=db,
             log_callback=self._log,
@@ -403,7 +404,7 @@ class TestModeWidget(QtWidgets.QWidget):
         self.radio_dial.setValue(50)
         self.radio_dial.valueChanged.connect(self._tune_radio)
         self.radio_dial_label = QtWidgets.QLabel("Radio Dial")
-        png_path = Path(__file__).resolve().parent / "resources" / "vintage_radio.png"
+        png_path = resource_path("vintage_radio.png")
         self.radio_face = RadioFaceView(png_path)
         self.radio_face.dial_changed.connect(self.knob_slider.setValue)
         # Use direct callbacks for synchronous processing (critical for tap counting)
@@ -992,7 +993,7 @@ class TestModeWidget(QtWidgets.QWidget):
             pygame.mixer.init()
             pygame.mixer.set_num_channels(2)
             self.audio_ready = True
-            am_path = Path(__file__).resolve().parent / "resources" / WAV_FILE
+            am_path = resource_path(WAV_FILE)
             if am_path.exists():
                 self.am_sound = pygame.mixer.Sound(str(am_path))
             else:
@@ -1333,8 +1334,7 @@ class TestModeWidget(QtWidgets.QWidget):
                 self.hw_emulator.execute_pending_playback(fade_in=False)
 
     def _init_log_file(self) -> None:
-        project_root = Path(__file__).resolve().parents[1]
-        log_dir = project_root / "agent_workshop"
+        log_dir = app_data_dir() / "agent_workshop"
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
             self.log_path = log_dir / "test_mode.log"

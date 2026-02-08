@@ -57,6 +57,12 @@ desktop.ini
 *.temp
 agent_workshop/temp/
 
+# Agent/dev workshop (entire directory)
+agent_workshop/
+
+# Cursor plan files
+*.plan.md
+
 # Test files (keep structure, ignore content)
 agent_workshop/test_*.py
 !agent_workshop/backup_*.py

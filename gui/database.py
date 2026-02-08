@@ -7,6 +7,8 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from .resource_paths import app_data_dir
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -37,9 +39,9 @@ class DatabaseManager:
         auto_backup: bool = False,
         backup_retention: int = 10,
     ) -> None:
-        project_root = Path(__file__).resolve().parents[1]
-        self.db_path = db_path or project_root / "radio_manager.db"
-        self.backups_dir = backups_dir or project_root / "backups"
+        root = app_data_dir()
+        self.db_path = db_path or root / "radio_manager.db"
+        self.backups_dir = backups_dir or root / "backups"
         self.auto_backup = auto_backup
         self.backup_retention = backup_retention
 
