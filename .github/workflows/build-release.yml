@@ -2,6 +2,9 @@
 # Creates a GitHub Release with binaries when you push a version tag (e.g. v0.1.0-beta).
 # To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
 # Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
+#
+# Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
+# add a Personal Access Token (classic) with scope "repo" as a repo secret named RELEASE_TOKEN.
 
 name: Build release
 
@@ -60,6 +63,8 @@ jobs:
     needs: build
     if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -88,4 +93,4 @@ jobs:
             Vintage-Radio-Windows.zip
             Vintage-Radio-macOS.zip
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}

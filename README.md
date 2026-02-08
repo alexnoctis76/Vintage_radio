@@ -1,6 +1,10 @@
 # Vintage Radio Music Manager
 
-A desktop GUI application for managing music libraries, albums, and playlists for a vintage radio device. The system provides a modern interface for organizing music files, syncing to SD cards, and testing firmware behavior. You can **drag and drop files or folders** into the Library, Albums, or Playlists views to import music quickly.
+This app makes it easier to load and manage music for the [Vintage AM Radio](https://www.zionbrock.com/radio) by Zion Brock—a 3D-printed, offline radio that plays from an SD card and uses a DFPlayer Mini for playback. Instead of manually formatting the card and organizing files by folder and name, you can use this desktop app to manage your library, build albums and playlists, sync to SD with automatic conversion to MP3, and test behavior before using the hardware.
+
+The GUI provides a modern interface for organizing music files, syncing to SD cards, and testing firmware behavior. You can **drag and drop files or folders** into the Library, Albums, or Playlists views to import music quickly.
+
+In the future I will be adding metadata support to automatically create albums from file metadata, and finalize support for the raspberry pi 2 W and raspberry pi 3 (currently implemented, but not fully tested with hardware)
 
 ## Features
 
