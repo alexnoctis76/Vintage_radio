@@ -59,7 +59,7 @@ Without either VLC or FFmpeg, only MP3 files can be synced (other formats will b
 - **VLC** also improves playback and seeking in Test Mode. **FFmpeg** is only used when VLC is not available for conversion.
 
 ## Installation
-
+(This is if you are compiling the app yourself. If you download one of the ZIPs from the release, the only additional thing you need is VLC media player)
 1. Clone the repository:
 ```bash
 git clone <repository-url>
@@ -79,6 +79,8 @@ source .venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 ```
 
+4. Install VLC media player
+   if you havent already, please install VLC media player, this is required for the app to work.
 ## Usage
 
 ### Running the Application
