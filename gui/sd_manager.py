@@ -238,6 +238,7 @@ class SDManager:
         sd_root: Path,
         audio_target: Optional[str] = None,
         pi_convert_audio: Optional[bool] = None,
+        force_clean: bool = False,
     ) -> Tuple[int, int]:
         """
         Sync library to SD card. Layout and naming depend on audio_target:
@@ -245,18 +246,29 @@ class SDManager:
           VintageRadio/ only for AM WAV, state, metadata. All tracks converted to MP3.
         - raspberry_pi: flat VintageRadio/library/ with original-style filenames;
           if pi_convert_audio convert non-MP3 to MP3, else copy as-is.
+        
+        Args:
+            force_clean: If True, re-sync all files even if they already exist and match.
         """
         target = audio_target or "dfplayer_rp2040"
         pi_convert = pi_convert_audio if pi_convert_audio is not None else True
         if target == "dfplayer_rp2040":
-            return self._sync_library_dfplayer(sd_root)
-        return self._sync_library_pi(sd_root, convert_to_mp3=pi_convert)
+            return self._sync_library_dfplayer(sd_root, force_clean=force_clean)
+        return self._sync_library_pi(sd_root, convert_to_mp3=pi_convert, force_clean=force_clean)
 
-    def _sync_library_dfplayer(self, sd_root: Path) -> Tuple[int, int]:
-        """DFPlayer layout: sd_root/01/, 02/, ... with 001.mp3, 002.mp3; VintageRadio/ for WAV and metadata."""
+    def _sync_library_dfplayer(self, sd_root: Path, force_clean: bool = False) -> Tuple[int, int]:
+        """DFPlayer layout: sd_root/01/, 02/, ... with 001.mp3, 002.mp3; VintageRadio/ for metadata only.
+        
+        The AM WAV file is also copied to folder 99/001.wav on the SD card so the
+        DFPlayer can play the AM static sound through the speaker. (Previously it
+        was only on the Pico flash and played via PWM on a GPIO pin that typically
+        isn't wired to the speaker.)
+        
+        Args:
+            force_clean: If True, re-sync all files even if they already exist and match.
+        """
         vintage_root = self.vintage_root(sd_root)
         vintage_root.mkdir(parents=True, exist_ok=True)
-        self._ensure_am_wav(vintage_root)
         vlc_available = self._check_vlc()
         ffmpeg_available = self._check_ffmpeg()
         if vlc_available:
@@ -271,7 +283,7 @@ class SDManager:
         for album in self.db.list_albums():
             tracks = self.db.list_album_songs(album["id"])
             c, s = self._write_folder_tracks_dfplayer(
-                sd_root, folder_index, tracks, vlc_available, ffmpeg_available
+                sd_root, folder_index, tracks, vlc_available, ffmpeg_available, force_clean=force_clean
             )
             copied += c
             skipped += s
@@ -279,13 +291,84 @@ class SDManager:
         for playlist in self.db.list_playlists():
             tracks = self.db.list_playlist_songs(playlist["id"])
             c, s = self._write_folder_tracks_dfplayer(
-                sd_root, folder_index, tracks, vlc_available, ffmpeg_available
+                sd_root, folder_index, tracks, vlc_available, ffmpeg_available, force_clean=force_clean
             )
             copied += c
             skipped += s
             folder_index += 1
+        # Copy AM WAV to folder 99 on the SD card for DFPlayer playback
+        self._copy_am_wav_to_dfplayer_sd(sd_root)
         self._write_metadata(vintage_root)
         return copied, skipped
+
+    def _copy_am_wav_to_dfplayer_sd(self, sd_root: Path) -> bool:
+        """Copy AMradioSound.wav to folder 99/001.wav on the DFPlayer SD card.
+        
+        The DFPlayer can play WAV files natively (16-bit PCM). By placing the AM
+        static sound on the SD card, the DFPlayer itself plays the sound through
+        its speaker output instead of the Pico trying to play it via PWM on GPIO.
+        
+        Returns True if the file was successfully copied.
+        """
+        source = resource_path("AMradioSound.wav")
+        folder_path = sd_root / "99"
+        folder_path.mkdir(parents=True, exist_ok=True)
+        target_path = folder_path / "001.wav"
+        
+        if not source.exists():
+            print(f"Warning: AM WAV source not found: {source}")
+            return False
+        
+        # Check if already exists and matches
+        if target_path.exists():
+            try:
+                source_size = source.stat().st_size
+                target_size = target_path.stat().st_size
+                if source_size == target_size:
+                    print(f"AM WAV already on SD card: {target_path} (size matches)")
+                    return True
+            except OSError:
+                pass
+        
+        try:
+            # Validate and optionally convert for DFPlayer compatibility
+            import wave
+            needs_conversion = False
+            try:
+                with wave.open(str(source), 'rb') as wav_in:
+                    channels = wav_in.getnchannels()
+                    sample_width = wav_in.getsampwidth()
+                    framerate = wav_in.getframerate()
+                    comptype = wav_in.getcomptype()
+                    print(f"AM WAV format: {sample_width*8}-bit, {channels} ch, {framerate} Hz, {comptype}")
+                    # DFPlayer prefers: 16-bit, mono, PCM
+                    if sample_width != 2 or channels != 1 or comptype != 'NONE':
+                        needs_conversion = True
+                        print("Converting to 16-bit PCM mono for DFPlayer compatibility...")
+            except Exception as e:
+                print(f"Could not read WAV format: {e}, copying as-is")
+            
+            if needs_conversion and PYDUB_AVAILABLE:
+                try:
+                    from pydub import AudioSegment
+                    audio = AudioSegment.from_wav(str(source))
+                    if audio.channels != 1:
+                        audio = audio.set_channels(1)
+                    audio = audio.set_sample_width(2)  # 16-bit
+                    audio.export(str(target_path), format="wav",
+                                 parameters=["-acodec", "pcm_s16le"])
+                    print(f"AM WAV converted and copied to SD: {target_path}")
+                    return True
+                except Exception as e:
+                    print(f"Conversion failed: {e}, copying original")
+            
+            shutil.copy2(source, target_path)
+            print(f"AM WAV copied to SD: {target_path}")
+            return True
+            
+        except OSError as e:
+            print(f"Error copying AM WAV to SD: {e}")
+            return False
 
     def _write_folder_tracks_dfplayer(
         self,
@@ -294,6 +377,7 @@ class SDManager:
         tracks: List[Dict],
         vlc_available: bool,
         ffmpeg_available: bool,
+        force_clean: bool = False,
     ) -> Tuple[int, int]:
         folder_path = sd_root / f"{folder_index:02d}"
         folder_path.mkdir(parents=True, exist_ok=True)
@@ -305,6 +389,44 @@ class SDManager:
                 skipped += 1
                 continue
             target_path = folder_path / f"{track_num:03d}.mp3"
+            
+            # Check if file already exists and matches (skip if not force_clean)
+            if not force_clean and target_path.exists():
+                # Check if existing file matches source (by hash if available, otherwise by size)
+                try:
+                    target_size = target_path.stat().st_size
+                    source_size = file_path.stat().st_size
+                    
+                    # For MP3 files, compare directly
+                    source_ext = file_path.suffix.lower()
+                    if source_ext == ".mp3":
+                        # If source is MP3, compare file hashes
+                        if song.get("file_hash"):
+                            source_hash = song["file_hash"]
+                            target_hash = compute_file_hash(target_path)
+                            if source_hash == target_hash:
+                                # File already exists and matches - skip
+                                self.db.update_song_sd_path(song["id"], str(target_path))
+                                skipped += 1
+                                continue
+                        elif target_size == source_size:
+                            # No hash available, but sizes match - likely the same file
+                            self.db.update_song_sd_path(song["id"], str(target_path))
+                            skipped += 1
+                            continue
+                    else:
+                        # Source is not MP3 - check if converted file exists and is reasonable size
+                        # (converted MP3s are usually smaller than source, so we can't compare sizes directly)
+                        # Just check if target exists and has reasonable size (> 1KB)
+                        if target_size > 1024:
+                            # File exists and has content - assume it's valid (user can force clean if needed)
+                            self.db.update_song_sd_path(song["id"], str(target_path))
+                            skipped += 1
+                            continue
+                except (OSError, Exception) as e:
+                    # Error checking existing file - proceed with copy
+                    pass
+            
             source_ext = file_path.suffix.lower()
             try:
                 if source_ext == ".mp3":
@@ -324,12 +446,13 @@ class SDManager:
                 skipped += 1
         return copied, skipped
 
-    def _sync_library_pi(self, sd_root: Path, convert_to_mp3: bool) -> Tuple[int, int]:
+    def _sync_library_pi(self, sd_root: Path, convert_to_mp3: bool, force_clean: bool = False) -> Tuple[int, int]:
         """Pi layout: VintageRadio/library/ with original-style filenames; convert or copy per convert_to_mp3."""
         vintage_root = self.vintage_root(sd_root)
         vintage_root.mkdir(parents=True, exist_ok=True)
         library_root = self.library_root(sd_root)
         library_root.mkdir(parents=True, exist_ok=True)
+        # For Pi, copy AM WAV to SD card (Pi can access SD card directly)
         self._ensure_am_wav(vintage_root)
         vlc_available = self._check_vlc()
         ffmpeg_available = self._check_ffmpeg()
@@ -347,12 +470,28 @@ class SDManager:
                 target_filename = file_path.stem + ".mp3"
             else:
                 target_filename = file_path.name
+            # Check if file already exists and matches (skip if not force_clean)
             existing_sd = song["sd_path"]
-            if existing_sd:
+            if not force_clean and existing_sd:
                 existing_path = Path(existing_sd)
-                if existing_path.exists() and existing_path.stat().st_size > 0:
-                    skipped += 1
-                    continue
+                if existing_path.exists():
+                    try:
+                        existing_size = existing_path.stat().st_size
+                        if existing_size > 0:
+                            # Check if file matches by hash if available
+                            if song.get("file_hash"):
+                                existing_hash = compute_file_hash(existing_path)
+                                if existing_hash == song["file_hash"]:
+                                    # File already exists and matches - skip
+                                    skipped += 1
+                                    continue
+                            else:
+                                # No hash, but file exists and has size - skip
+                                skipped += 1
+                                continue
+                    except (OSError, Exception):
+                        # Error checking existing file - proceed with copy
+                        pass
             target_path = self._unique_path(library_root, target_filename)
             try:
                 if convert_to_mp3:
@@ -581,6 +720,10 @@ class SDManager:
         metadata = {
             "folders": {},
             "songs": {},
+            "am_sound": {
+                "folder": 99,
+                "track": 1,
+            },
         }
         folder_index = 1
         for album in self.db.list_albums():
@@ -627,14 +770,76 @@ class SDManager:
             pass
 
     def _ensure_am_wav(self, vintage_root: Path) -> None:
+        """Ensure AM WAV file is copied to SD card in DFPlayer-compatible format.
+        
+        DFPlayer Mini supports WAV files in PCM format. The file is validated and
+        converted to 16-bit PCM mono if needed for maximum compatibility.
+        """
         source = resource_path("AMradioSound.wav")
         target = vintage_root / "AMradioSound.wav"
-        if target.exists() or not source.exists():
+        
+        if not source.exists():
+            print(f"Warning: AM WAV source not found: {source}")
             return
+        
+        # Ensure VintageRadio directory exists
+        vintage_root.mkdir(parents=True, exist_ok=True)
+        
         try:
-            shutil.copy2(source, target)
-        except OSError:
-            pass
+            # Check if we need to convert the WAV file for DFPlayer compatibility
+            # DFPlayer works best with 16-bit PCM WAV files
+            import wave
+            needs_conversion = False
+            
+            try:
+                with wave.open(str(source), 'rb') as wav_in:
+                    channels = wav_in.getnchannels()
+                    sample_width = wav_in.getsampwidth()
+                    framerate = wav_in.getframerate()
+                    comptype = wav_in.getcomptype()
+                    
+                    # Check if format needs conversion
+                    # DFPlayer prefers: 16-bit (2 bytes), mono, uncompressed PCM
+                    if sample_width != 2 or channels != 1 or comptype != 'NONE':
+                        needs_conversion = True
+                        print(f"AM WAV format: {sample_width*8}-bit, {channels} channel(s), {framerate} Hz, {comptype}")
+                        print("Converting to 16-bit PCM mono for DFPlayer compatibility...")
+            except Exception as e:
+                print(f"Could not read WAV file format: {e}, copying as-is")
+                needs_conversion = False
+            
+            if needs_conversion and PYDUB_AVAILABLE:
+                # Convert to 16-bit PCM mono using pydub
+                try:
+                    from pydub import AudioSegment
+                    audio = AudioSegment.from_wav(str(source))
+                    # Ensure mono and 16-bit
+                    if audio.channels != 1:
+                        audio = audio.set_channels(1)
+                    # Export as 16-bit PCM WAV
+                    audio.export(str(target), format="wav", parameters=["-acodec", "pcm_s16le"])
+                    print(f"AM WAV converted and copied to: {target}")
+                except Exception as e:
+                    print(f"Conversion failed: {e}, copying original file")
+                    shutil.copy2(source, target)
+                    print(f"AM WAV copied to: {target} (original format)")
+            else:
+                # Copy as-is (format is already compatible or conversion not available)
+                shutil.copy2(source, target)
+                if not needs_conversion:
+                    print(f"AM WAV copied to: {target} (format already compatible)")
+                else:
+                    print(f"AM WAV copied to: {target} (conversion not available, may need manual conversion)")
+        except OSError as e:
+            print(f"Error copying AM WAV to {target}: {e}")
+        except Exception as e:
+            print(f"Unexpected error processing AM WAV: {e}")
+            # Fallback: try to copy as-is
+            try:
+                shutil.copy2(source, target)
+                print(f"AM WAV copied to: {target} (fallback)")
+            except Exception as e2:
+                print(f"Failed to copy AM WAV: {e2}")
 
     def _import_collection(self, folder: Path, *, is_album: bool) -> bool:
         metadata_path = folder / "metadata.json"

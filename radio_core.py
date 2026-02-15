@@ -33,8 +33,8 @@ except ImportError:
 
 FADE_IN_S = 2.4
 DF_BOOT_MS = 2000
-LONG_PRESS_MS = 1000
-TAP_WINDOW_MS = 800
+LONG_PRESS_MS = 500   # Hold >= 500ms = long press
+TAP_WINDOW_MS = 500   # 500ms of no input after last release = resolve accumulated input
 BUSY_CONFIRM_MS = 1800
 POST_CMD_GUARD_MS = 120
 MAX_ALBUM_NUM = 99
@@ -178,6 +178,7 @@ class RadioCore:
         self.press_start_ms = 0
         self.last_release_ms = 0
         self.button_down = False
+        self._pending_long_press = False
         
         # Resume state (for power off/on)
         self.resume_state = None
@@ -252,13 +253,10 @@ class RadioCore:
         """Called when button is pressed down."""
         if not self.power_on:
             return
-        # If we're in a tap window and get a new press, preserve tap_count for potential long press
-        # This allows "tap + hold" to work even if tap window hasn't expired yet
-        if self.tap_count > 0 and ticks_diff(ticks_ms(), self.last_release_ms) < TAP_WINDOW_MS:
-            # Cancel any pending tap resolution - we might be doing a long press
-            pass  # tap_count is preserved, will be used in _handle_long_press if this becomes a long press
+        # New press always resets the idle timer - we're receiving input
         self.button_down = True
         self.press_start_ms = ticks_ms()
+        self.hw.log(f"on_button_press: down (existing tap_count={self.tap_count})")
     
     def on_button_release(self):
         """Called when button is released."""
@@ -270,13 +268,15 @@ class RadioCore:
         press_duration = ticks_diff(now, self.press_start_ms)
         
         if press_duration >= LONG_PRESS_MS:
-            self._handle_long_press()
-            self.tap_count = 0
-            self.last_release_ms = 0
+            # This was a hold (long press). Record it and start the 500ms idle timer.
+            self.hw.log(f"on_button_release: HOLD detected ({press_duration}ms), tap_count={self.tap_count}")
+            self._pending_long_press = True
+            self.last_release_ms = now
         else:
+            # This was a tap. Increment count and start/restart the 500ms idle timer.
             self.tap_count += 1
             self.last_release_ms = now
-            self.hw.log(f"Tap detected, count={self.tap_count}")
+            self.hw.log(f"on_button_release: TAP #{self.tap_count} ({press_duration}ms)")
     
     def tick(self):
         """
@@ -288,9 +288,11 @@ class RadioCore:
         
         now = ticks_ms()
         
-        # Process tap window timeout
-        if self.tap_count > 0 and ticks_diff(now, self.last_release_ms) >= TAP_WINDOW_MS:
-            self._resolve_taps()
+        # Wait for 500ms of no input (idle timeout) after the last release
+        # Only resolve if button is NOT currently held down
+        if self.last_release_ms > 0 and not self.button_down and \
+           ticks_diff(now, self.last_release_ms) >= TAP_WINDOW_MS:
+            self._resolve_input()
             return True
         
         # Radio mode: check if track should advance based on virtual time
@@ -356,21 +358,37 @@ class RadioCore:
         
         return False
     
-    def _resolve_taps(self):
-        """Process accumulated taps after tap window expires."""
-        # Only resolve if button is not currently pressed (not a long press)
-        if self.button_down:
-            # Button is pressed, might be a long press - don't resolve taps yet
-            return
+    def _resolve_input(self):
+        """
+        Called after 500ms of idle (no button activity).
+        Resolves ALL accumulated input: taps and/or a hold.
         
-        if self.tap_count >= 3:
-            self._triple_tap()
-        elif self.tap_count == 2:
-            self._double_tap()
-        elif self.tap_count == 1:
-            self._single_tap()
+        Gestures:
+          Taps only:  1=next, 2=prev, 3+=restart
+          Hold only:  next album/playlist
+          N taps + hold: 1+hold=toggle mode, 2+hold=shuffle current, 3+hold=shuffle library
+        """
+        had_hold = getattr(self, '_pending_long_press', False)
+        tap_count = self.tap_count
+        
+        self.hw.log(f"_resolve_input: taps={tap_count}, hold={had_hold}")
+        
+        # Reset state
         self.tap_count = 0
         self.last_release_ms = 0
+        self._pending_long_press = False
+        
+        if had_hold:
+            # Had a hold - use _handle_long_press with accumulated tap count
+            self._handle_long_press_with_taps(tap_count)
+        elif tap_count >= 3:
+            self._triple_tap()
+        elif tap_count == 2:
+            self._double_tap()
+        elif tap_count == 1:
+            self._single_tap()
+        else:
+            self.hw.log(f"_resolve_input: no actionable input")
     
     def _single_tap(self):
         """Single tap - next track."""
@@ -389,30 +407,26 @@ class RadioCore:
         self._save_state("triple tap restart")
         self._start_playback_for_current()
     
-    def _handle_long_press(self):
+    def _handle_long_press_with_taps(self, tap_count):
         """
-        Long press - mode switching based on tap count before hold:
-        -_   (1 tap + hold) = Toggle Album/Playlist
-        --_  (2 taps + hold) = Shuffle current album/playlist
-        ---_ (3+ taps + hold) = Shuffle entire library
-        _    (just hold) = Next album
-        """
-        # Save tap_count before it gets reset
-        saved_tap_count = self.tap_count
-        self.hw.log(f"Long press with tap_count={saved_tap_count}")
+        Hold gesture resolved after 500ms idle.
         
-        if saved_tap_count >= 3:
-            # Three taps + hold = shuffle entire library
+        Behaviour depends on how many taps preceded the hold:
+          0 taps + hold = Next album/playlist
+          1 tap  + hold = Toggle Album/Playlist mode
+          2 taps + hold = Shuffle current album/playlist
+          3+ taps + hold = Shuffle entire library
+        """
+        self.hw.log(f"_handle_long_press_with_taps: tap_count={tap_count}")
+        
+        if tap_count >= 3:
             self._init_library_shuffle()
             self.hw.log("Mode: Shuffle (Library)")
-        elif saved_tap_count == 2:
-            # Two taps + hold = shuffle current album/playlist
+        elif tap_count == 2:
             self._init_current_shuffle()
-        elif saved_tap_count == 1:
-            # One tap + hold = toggle between album/playlist
+        elif tap_count == 1:
             self._cycle_mode_basic()
         else:
-            # Just long press = next album
             self._next_album()
     
     def _cycle_mode_basic(self):
@@ -486,15 +500,20 @@ class RadioCore:
         
         self.shuffle_index = 0
         self.current_track = 1
-        self.mode = MODE_SHUFFLE
+        
+        # Save shuffle configuration before calling switch_mode (which will overwrite it)
+        saved_shuffle_tracks = list(self.shuffle_tracks) if self.shuffle_tracks else list(tracks)
+        saved_shuffle_source = self._shuffle_source_type if self._shuffle_source_type else ('playlist' if self.mode == MODE_PLAYLIST else 'album')
+        
+        # Use switch_mode to properly initialize shuffle mode
+        self.switch_mode(MODE_SHUFFLE)
+        
+        # Restore our specific shuffle configuration (switch_mode calls _init_shuffle which overwrites)
+        self.shuffle_tracks = saved_shuffle_tracks
+        self._shuffle_source_type = saved_shuffle_source
+        
         self.hw.log(f"Mode: Shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
         self._save_state("shuffle current")
-        
-        # Stop current playback and enable delay for AM overlay sequencing (same as switch_mode)
-        self.hw.stop()
-        self.is_playing = False
-        if hasattr(self.hw, 'set_delay_playback'):
-            self.hw.set_delay_playback(True)
         
         # Start playback (will be delayed if delay_playback is True)
         self._start_playback_for_current()
@@ -517,18 +536,21 @@ class RadioCore:
         
         self.shuffle_index = 0
         self.current_track = 1
-        self.mode = MODE_SHUFFLE
+        
+        # Save shuffle configuration before calling switch_mode (which will overwrite it)
+        saved_shuffle_tracks = list(self.shuffle_tracks)
+        
+        # Use switch_mode to properly initialize shuffle mode
+        self.switch_mode(MODE_SHUFFLE)
+        
+        # Restore our library shuffle configuration (switch_mode calls _init_shuffle which overwrites)
+        self.shuffle_tracks = saved_shuffle_tracks
         self._shuffle_source_type = None  # Library shuffle has no specific source
+        
         self.hw.log(f"Mode: Shuffle (Library, {len(self.shuffle_tracks)} tracks)")
         self._save_state("shuffle library")
         
-        # Stop current playback and enable delay for AM overlay sequencing (same as switch_mode)
-        self.hw.stop()
-        self.is_playing = False
-        if hasattr(self.hw, 'set_delay_playback'):
-            self.hw.set_delay_playback(True)
-        
-        # Start playback (will be delayed if delay_playback is True)
+        # Start playback (switch_mode already stopped playback and set delay_playback)
         self._start_playback_for_current()
     
     # ===========================
@@ -537,62 +559,126 @@ class RadioCore:
     
     def _next_track(self):
         """Move to next track."""
+        old_track = self.current_track
+        old_album = self.current_album_index
+        
         if self.mode == MODE_SHUFFLE:
             if not self.shuffle_tracks:
+                self.hw.log("_next_track: No shuffle tracks available")
                 return
             self.shuffle_index = (self.shuffle_index + 1) % len(self.shuffle_tracks)
             self.current_track = self.shuffle_index + 1
         elif self.mode == MODE_RADIO:
             # In radio mode, don't manually advance (virtual time handles it)
+            self.hw.log("_next_track: Radio mode - manual advance disabled")
             return
         else:
             total = self._get_track_count()
             if total == 0:
+                self.hw.log("_next_track: No tracks available")
                 return
             if self.current_track >= total:
                 self.current_track = 1
             else:
                 self.current_track += 1
         
+        # Get track info for logging
+        new_tr = self._get_current_track()
+        new_title = new_tr.get('title', 'Unknown') if new_tr else 'Unknown'
+        new_artist = new_tr.get('artist', 'Unknown') if new_tr else 'Unknown'
+        self.hw.log(f"_next_track: album {old_album+1} track {old_track} -> album {self.current_album_index+1} track {self.current_track}")
+        self.hw.log(f"_next_track: Will play '{new_title}' by {new_artist}")
         self._save_state("next track")
         self._start_playback_for_current()
     
     def _prev_track(self):
         """Move to previous track."""
+        old_track = self.current_track
+        old_album = self.current_album_index
+        
         if self.mode == MODE_SHUFFLE:
             if not self.shuffle_tracks:
+                self.hw.log("_prev_track: No shuffle tracks available")
                 return
             self.shuffle_index = (self.shuffle_index - 1) % len(self.shuffle_tracks)
             self.current_track = self.shuffle_index + 1
         elif self.mode == MODE_RADIO:
             # In radio mode, don't manually advance (virtual time handles it)
+            self.hw.log("_prev_track: Radio mode - manual advance disabled")
             return
         else:
             total = self._get_track_count()
             if total == 0:
+                self.hw.log("_prev_track: No tracks available")
                 return
             if self.current_track <= 1:
                 self.current_track = total
             else:
                 self.current_track -= 1
         
+        self.hw.log(f"_prev_track: album {old_album+1} track {old_track} -> album {self.current_album_index+1} track {self.current_track}")
         self._save_state("prev track")
         self._start_playback_for_current()
     
     def _next_album(self):
-        """Move to next album (long press)."""
-        self.hw.log("Long press: next album")
+        """Move to next album/playlist (long press).
         
-        if self.mode == MODE_PLAYLIST:
+        In shuffle mode: advance to next album/playlist in the source list
+        and reshuffle the new album/playlist's tracks.
+        In album/playlist mode: advance to next album/playlist.
+        """
+        self.hw.log("Long press: next album/playlist")
+        
+        if self.mode == MODE_SHUFFLE and self._shuffle_source_type in ('album', 'playlist'):
+            # In shuffle (album/playlist) mode: advance to next album/playlist and reshuffle
+            if self._shuffle_source_type == 'playlist':
+                if self.playlists:
+                    self.current_album_index = (self.current_album_index + 1) % len(self.playlists)
+                    new_source = self.playlists[self.current_album_index]
+                    tracks = new_source.get('tracks', [])
+                    source_name = new_source.get('name', 'Unknown')
+                    self.hw.log(f"Shuffle: advancing to next playlist '{source_name}' (idx={self.current_album_index})")
+                else:
+                    return
+            else:  # album
+                if self.albums:
+                    self.current_album_index = (self.current_album_index + 1) % len(self.albums)
+                    new_source = self.albums[self.current_album_index]
+                    tracks = new_source.get('tracks', [])
+                    source_name = new_source.get('name', 'Unknown')
+                    self.hw.log(f"Shuffle: advancing to next album '{source_name}' (idx={self.current_album_index})")
+                else:
+                    return
+            
+            # Reshuffle the new album/playlist tracks
+            self.shuffle_tracks = list(tracks)
+            for i in range(len(self.shuffle_tracks) - 1, 0, -1):
+                j = randint(0, i)
+                self.shuffle_tracks[i], self.shuffle_tracks[j] = self.shuffle_tracks[j], self.shuffle_tracks[i]
+            self.shuffle_index = 0
+            self.current_track = 1
+            self.hw.log(f"Mode: Shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
+            self._save_state("shuffle next album")
+            
+            # Set delay_playback so firmware can play AM overlay
+            if hasattr(self.hw, 'set_delay_playback'):
+                self.hw.set_delay_playback(True)
+            self._start_playback_for_current()
+        elif self.mode == MODE_PLAYLIST:
             self.current_album_index = (self.current_album_index + 1) % max(len(self.playlists), 1)
+            self.current_track = 1
+            self._save_state("next playlist")
+            if hasattr(self.hw, 'set_delay_playback'):
+                self.hw.set_delay_playback(True)
+            self._start_playback_for_current()
         else:
+            # Album mode (or shuffle library — just advance album)
             self.current_album_index = (self.current_album_index + 1) % max(len(self.albums), 1)
-        
-        self.current_track = 1
-        self._save_state("next album")
-        # AM overlay is now handled in switch_mode() when mode changes
-        # Don't play it here for simple album switching
-        self._start_playback_for_current()
+            self.current_track = 1
+            self._save_state("next album")
+            if hasattr(self.hw, 'set_delay_playback'):
+                self.hw.set_delay_playback(True)
+            self._start_playback_for_current()
     
     def on_track_finished(self):
         """Called when current track finishes playing."""
@@ -679,18 +765,24 @@ class RadioCore:
     def switch_mode(self, new_mode):
         """Switch to a new mode."""
         if new_mode == self.mode:
-            self.hw.log(f"[MODE DEBUG] Already in mode {new_mode}, no switch needed")
             return
         
         old_mode = self.mode
-        self.hw.log(f"[MODE DEBUG] Switching from {old_mode} to {new_mode}")
+        self.hw.log(f"[MODE] {old_mode} -> {new_mode}")
+        
+        # Validate mode switch
+        if new_mode == MODE_PLAYLIST and not self.playlists:
+            self.hw.log("[MODE] No playlists, cannot switch")
+            return
+        if new_mode == MODE_ALBUM and not self.albums:
+            self.hw.log("[MODE] No albums, cannot switch")
+            return
         
         # Clear shuffle source type when leaving shuffle mode
         if self.mode == MODE_SHUFFLE and new_mode != MODE_SHUFFLE:
             self._shuffle_source_type = None
         
         self.mode = new_mode
-        self.hw.log(f"Switched to mode: {new_mode}")
         
         # Stop current playback before switching modes
         self.hw.stop()
@@ -703,20 +795,33 @@ class RadioCore:
         # Note: AM overlay is played by GUI layer to ensure proper sequencing
         
         if new_mode == MODE_SHUFFLE:
-            self._init_shuffle()
+            # Only initialize if shuffle_tracks is empty (don't overwrite existing shuffle)
+            if not self.shuffle_tracks:
+                self._init_shuffle()
         elif new_mode == MODE_RADIO:
-            # IMPORTANT: Don't reinitialize radio if already initialized (preserve virtual time)
-            # Only initialize if radio_stations is empty or radio_mode_start_ms is None
             if not self.radio_stations or self.radio_mode_start_ms is None:
-                self.hw.log(f"[MODE DEBUG] Initializing radio mode (stations={len(self.radio_stations) if self.radio_stations else 0}, start_ms={self.radio_mode_start_ms})")
                 self._init_radio()
-            else:
-                self.hw.log(f"[MODE DEBUG] Radio mode already initialized, preserving virtual time (start_ms={self.radio_mode_start_ms})")
             # Radio mode playback is started in _init_radio() or handled by tune_radio()
             self._save_state("mode switch")
             return
         else:
+            # For album/playlist mode, reset to track 1
             self.current_track = 1
+            
+            # Reset album_index to 0 when switching between album and playlist modes
+            if (old_mode == MODE_ALBUM and new_mode == MODE_PLAYLIST) or \
+               (old_mode == MODE_PLAYLIST and new_mode == MODE_ALBUM):
+                self.current_album_index = 0
+            
+            # Ensure album_index is valid for the new mode
+            if new_mode == MODE_PLAYLIST:
+                if self.playlists and self.current_album_index >= len(self.playlists):
+                    self.current_album_index = 0
+            elif new_mode == MODE_ALBUM:
+                if self.albums and self.current_album_index >= len(self.albums):
+                    self.current_album_index = 0
+            
+            self.hw.log(f"[MODE] {old_mode} -> {new_mode}, album_idx={self.current_album_index}")
         
         self._save_state("mode switch")
         self._start_playback_for_current()
@@ -988,7 +1093,11 @@ class RadioCore:
     
     def _get_track_count(self):
         """Get total track count for current mode."""
-        return max(len(self._get_current_tracks()), 1)
+        tracks = self._get_current_tracks()
+        count = len(tracks)
+        # Don't log here - can cause recursion when called from get_status() during logging
+        # Return 0 if no tracks so _next_track can detect the issue
+        return count
     
     def _get_current_track(self):
         """Get the current track dict."""
@@ -1008,25 +1117,86 @@ class RadioCore:
     
     def _start_playback_for_current(self, start_ms=0):
         """Start playback for current track."""
+        # Validate current state before getting track
+        if self.mode == MODE_PLAYLIST:
+            if not self.playlists:
+                self.hw.log("_start_playback_for_current: No playlists available")
+                return
+            if self.current_album_index >= len(self.playlists):
+                self.hw.log(f"_start_playback_for_current: Invalid playlist index {self.current_album_index} (have {len(self.playlists)} playlists), resetting to 0")
+                self.current_album_index = 0
+        elif self.mode == MODE_ALBUM:
+            if not self.albums:
+                self.hw.log("_start_playback_for_current: No albums available")
+                return
+            if self.current_album_index >= len(self.albums):
+                self.hw.log(f"_start_playback_for_current: Invalid album index {self.current_album_index} (have {len(self.albums)} albums), resetting to 0")
+                self.current_album_index = 0
+        
+        # Determine source name for logging (album/playlist/shuffle source)
+        source_name = ""
+        shuffle_type = ""
+        if self.mode == MODE_SHUFFLE:
+            if self._shuffle_source_type == 'playlist':
+                shuffle_type = "playlist"
+                if self.playlists and self.current_album_index < len(self.playlists):
+                    source_name = self.playlists[self.current_album_index].get('name', 'Playlist')
+                else:
+                    source_name = "Unknown Playlist"
+            elif self._shuffle_source_type == 'album':
+                shuffle_type = "album"
+                if self.albums and self.current_album_index < len(self.albums):
+                    source_name = self.albums[self.current_album_index].get('name', 'Album')
+                else:
+                    source_name = "Unknown Album"
+            else:
+                shuffle_type = "library"
+                source_name = "Library"
+        elif self.mode == MODE_PLAYLIST:
+            if self.playlists and self.current_album_index < len(self.playlists):
+                source_name = self.playlists[self.current_album_index].get('name', 'Unknown Playlist')
+        elif self.mode == MODE_ALBUM:
+            if self.albums and self.current_album_index < len(self.albums):
+                source_name = self.albums[self.current_album_index].get('name', 'Unknown Album')
+        
         track = self._get_current_track()
         if track:
+            folder = track.get('folder')
+            track_num = track.get('track_number')
+            title = track.get('title', 'Unknown')
+            artist = track.get('artist', 'Unknown')
+            # Single combined log line so GUI parser can extract everything at once
+            self.hw.log(f"_start_playback_for_current: mode={self.mode}, source={source_name}, shuffle_type={shuffle_type}, album_idx={self.current_album_index}, track_idx={self.current_track}, folder={folder}, track={track_num}")
+            self.hw.log(f"_start_playback_for_current: Playing '{title}' by {artist}")
             self._start_playback_for_track(track, start_ms=start_ms)
+        else:
+            self.hw.log(f"_start_playback_for_current: No track available (mode={self.mode}, album_idx={self.current_album_index}, track={self.current_track})")
     
     def _start_playback_for_track(self, track, start_ms=0):
         """Start playback for a specific track."""
         if not track:
+            self.hw.log("_start_playback_for_track: No track provided")
             return
         
         # For DFPlayer, we need folder/track numbers
         folder = track.get('folder', 1)
         track_num = track.get('track_number', 1)
+        title = track.get('title', 'Unknown')
+        artist = track.get('artist', 'Unknown')
+        
+        self.hw.log(f"Starting playback: '{title}' by {artist} (folder={folder}, track={track_num}, start_ms={start_ms})")
         
         # Set track hint for GUI emulator (ignored by DFPlayer firmware)
         if hasattr(self.hw, 'set_current_track_hint'):
             self.hw.set_current_track_hint(track)
         
-        self.hw.play_track(folder, track_num, start_ms=start_ms)
-        self.is_playing = True
+        result = self.hw.play_track(folder, track_num, start_ms=start_ms)
+        if result:
+            self.is_playing = True
+            self.hw.log(f"Playback started successfully: '{title}' by {artist}")
+        else:
+            self.hw.log(f"Playback failed to start: '{title}' by {artist}")
+            self.is_playing = False
     
     def set_volume(self, level):
         """Set volume (0-100)."""

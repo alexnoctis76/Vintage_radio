@@ -1,0 +1,2457 @@
+"""Device Debug Widget - REPL and debugging interface for physical Pico device."""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+import threading
+import traceback
+from pathlib import Path
+from typing import Optional
+
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+
+class DeviceDebugWidget(QtWidgets.QWidget):
+    """Widget for debugging the physical Pico device via mpremote."""
+    
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._mpremote_cmd = None
+        self._connected = False
+        self._output_thread = None
+        self._stop_output = False
+        self._streaming_thread = None
+        self._stop_streaming = False
+        self._active_operations = set()  # Track active operations to prevent conflicts
+        self._debug_logging = True  # Enable detailed debug logging
+        self._port_lock = threading.Lock()  # Serialize port access
+        self._serial_connection = None  # THE persistent serial connection (shared by all operations)
+        self._use_mpremote = False  # Set to False to disable mpremote entirely (serial-only mode)
+        self._streaming_pause_event = threading.Event()  # Set = streaming paused
+        self._streaming_resume_event = threading.Event()  # Set = streaming can resume
+        self._current_device_mode = ""  # Track current mode from stream output
+        self._current_device_source = ""  # Track current source (album/playlist name)
+        self._current_shuffle_type = ""  # Track shuffle type: 'library', 'album', 'playlist', 'source'
+        self._current_track_title = ""
+        self._current_track_artist = ""
+        self._current_album_idx = 0  # Track album/playlist index for fallback display
+        self._am_wav_loaded = None  # None = unknown, True/False = detected from stream
+        self._setup_ui()
+        self._scan_ports()  # Port scanning uses serial.tools.list_ports (no mpremote needed)
+        self._debug_log("DeviceDebugWidget initialized", "info")
+    
+    def _setup_ui(self) -> None:
+        """Set up the user interface."""
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        # Title
+        title = QtWidgets.QLabel("Device Debug Console")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(title)
+        
+        # Connection section
+        conn_group = QtWidgets.QGroupBox("Connection")
+        conn_layout = QtWidgets.QVBoxLayout(conn_group)
+        
+        # Info label about connection method
+        info_label = QtWidgets.QLabel(
+            "ℹ️ Connection uses direct serial port (non-intrusive, like Thonny). "
+            "Firmware continues running. Use 'Restart Firmware' if device stops responding."
+        )
+        info_label.setStyleSheet("color: #9cdcfe; font-size: 10px; padding: 4px;")
+        info_label.setWordWrap(True)
+        conn_layout.addWidget(info_label)
+        
+        port_layout = QtWidgets.QHBoxLayout()
+        port_layout.addWidget(QtWidgets.QLabel("COM Port:"))
+        self.port_combo = QtWidgets.QComboBox()
+        self.port_combo.setEditable(True)
+        self.port_combo.setMinimumWidth(150)
+        port_layout.addWidget(self.port_combo)
+        
+        self.scan_btn = QtWidgets.QPushButton("Scan Ports")
+        self.scan_btn.clicked.connect(self._scan_ports)
+        port_layout.addWidget(self.scan_btn)
+        
+        self.connect_btn = QtWidgets.QPushButton("Connect")
+        self.connect_btn.clicked.connect(self._toggle_connection)
+        port_layout.addWidget(self.connect_btn)
+        
+        self.reset_connection_btn = QtWidgets.QPushButton("Reset Connection")
+        self.reset_connection_btn.setToolTip("Forcefully reset connection (useful if device is stuck or frozen)")
+        self.reset_connection_btn.clicked.connect(self._reset_connection)
+        self.reset_connection_btn.setEnabled(False)
+        port_layout.addWidget(self.reset_connection_btn)
+        
+        port_layout.addStretch()
+        conn_layout.addLayout(port_layout)
+        
+        self.connection_status = QtWidgets.QLabel("Not connected")
+        self.connection_status.setStyleSheet("color: gray;")
+        conn_layout.addWidget(self.connection_status)
+        
+        layout.addWidget(conn_group)
+        
+        # Quick actions
+        actions_group = QtWidgets.QGroupBox("Quick Actions")
+        actions_layout = QtWidgets.QHBoxLayout(actions_group)
+        
+        self.restart_firmware_btn = QtWidgets.QPushButton("Restart Firmware")
+        self.restart_firmware_btn.setToolTip("Restart main.py on the device (use this if device stops working after connecting)")
+        self.restart_firmware_btn.clicked.connect(self._restart_firmware)
+        self.restart_firmware_btn.setEnabled(False)
+        
+        self.soft_reset_btn = QtWidgets.QPushButton("Soft Reset")
+        self.soft_reset_btn.setToolTip("Perform a full device soft reset (machine.soft_reset())")
+        self.soft_reset_btn.clicked.connect(self._soft_reset)
+        self.soft_reset_btn.setEnabled(False)
+        
+        self.get_status_btn = QtWidgets.QPushButton("Get Status")
+        self.get_status_btn.setToolTip("Get device status, memory info, and recent debug log")
+        self.get_status_btn.clicked.connect(self._get_status)
+        self.get_status_btn.setEnabled(False)
+        
+        self.view_debug_log_btn = QtWidgets.QPushButton("View Debug Log")
+        self.view_debug_log_btn.setToolTip("View the debug.log file from the Pico (shows what's happening)")
+        self.view_debug_log_btn.clicked.connect(self._view_debug_log)
+        self.view_debug_log_btn.setEnabled(False)
+        
+        self.check_firmware_btn = QtWidgets.QPushButton("Check Firmware Status")
+        self.check_firmware_btn.setToolTip("Check if firmware is running and see recent activity")
+        self.check_firmware_btn.clicked.connect(self._check_firmware_status)
+        self.check_firmware_btn.setEnabled(False)
+        
+        self.list_files_btn = QtWidgets.QPushButton("List Files")
+        self.list_files_btn.setToolTip("List files on the device")
+        self.list_files_btn.clicked.connect(self._list_files)
+        self.list_files_btn.setEnabled(False)
+        
+        self.clear_console_btn = QtWidgets.QPushButton("Clear Console")
+        self.clear_console_btn.clicked.connect(self._clear_console)
+        
+        self.stream_output_btn = QtWidgets.QPushButton("Start Streaming")
+        self.stream_output_btn.setToolTip(
+            "Stream real-time output from the Pico (non-intrusive, like Thonny). "
+            "This just reads from the serial port and doesn't interrupt the firmware."
+        )
+        self.stream_output_btn.clicked.connect(self._toggle_streaming)
+        self.stream_output_btn.setEnabled(False)
+        
+        # Debug logging toggle
+        self.debug_logging_checkbox = QtWidgets.QCheckBox("Debug Logging")
+        self.debug_logging_checkbox.setChecked(True)
+        self.debug_logging_checkbox.setToolTip("Enable detailed debug logs in console and Python console")
+        self.debug_logging_checkbox.stateChanged.connect(self._toggle_debug_logging)
+        
+        actions_layout.addWidget(self.restart_firmware_btn)
+        actions_layout.addWidget(self.soft_reset_btn)
+        actions_layout.addWidget(self.get_status_btn)
+        actions_layout.addWidget(self.list_files_btn)
+        actions_layout.addWidget(self.view_debug_log_btn)
+        actions_layout.addWidget(self.check_firmware_btn)
+        actions_layout.addWidget(self.clear_console_btn)
+        actions_layout.addWidget(self.stream_output_btn)
+        actions_layout.addWidget(self.debug_logging_checkbox)
+        actions_layout.addStretch()
+        
+        # Power sense toggle
+        power_layout = QtWidgets.QHBoxLayout()
+        self.power_sense_checkbox = QtWidgets.QCheckBox("Skip Power Sense Check (No Potentiometer)")
+        self.power_sense_checkbox.setToolTip(
+            "When checked, the device will start without waiting for GP14 (power sense) to go HIGH. "
+            "Use this when testing without a potentiometer. Default: OFF (requires power sense)."
+        )
+        self.power_sense_checkbox.stateChanged.connect(self._toggle_power_sense)
+        power_layout.addWidget(self.power_sense_checkbox)
+        power_layout.addStretch()
+        actions_layout.addLayout(power_layout)
+        
+        layout.addWidget(actions_group)
+        
+        # Now Playing display
+        now_playing_group = QtWidgets.QGroupBox("Now Playing")
+        now_playing_layout = QtWidgets.QVBoxLayout(now_playing_group)
+        
+        self.now_playing_label = QtWidgets.QLabel("Not connected")
+        self.now_playing_label.setStyleSheet(
+            "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
+            "border: 1px solid #555; border-radius: 4px; color: #d4d4d4;"
+        )
+        self.now_playing_label.setWordWrap(True)
+        self.now_playing_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
+        now_playing_layout.addWidget(self.now_playing_label)
+        
+        refresh_layout = QtWidgets.QHBoxLayout()
+        self.refresh_now_playing_btn = QtWidgets.QPushButton("Query Device (⚠️ interrupts firmware)")
+        self.refresh_now_playing_btn.setToolTip(
+            "Query the device for detailed status. WARNING: This sends Ctrl+C to interrupt the firmware.\n"
+            "Now-playing info is automatically parsed from the stream output without interruption.\n"
+            "Use 'Restart Firmware' after querying to resume normal operation."
+        )
+        self.refresh_now_playing_btn.clicked.connect(self._refresh_now_playing)
+        self.refresh_now_playing_btn.setEnabled(False)
+        refresh_layout.addWidget(self.refresh_now_playing_btn)
+        refresh_layout.addStretch()
+        now_playing_layout.addLayout(refresh_layout)
+        
+        # Auto-refresh timer for now playing
+        self.now_playing_timer = QtCore.QTimer(self)
+        self.now_playing_timer.timeout.connect(self._refresh_now_playing)
+        self.now_playing_timer.setInterval(3000)  # Update every 3 seconds
+        
+        # Console output
+        console_group = QtWidgets.QGroupBox("Console Output")
+        console_layout = QtWidgets.QVBoxLayout(console_group)
+        
+        self.console_output = QtWidgets.QTextEdit()
+        self.console_output.setReadOnly(True)
+        self.console_output.setFont(QtGui.QFont("Consolas", 9))
+        self.console_output.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
+        console_layout.addWidget(self.console_output)
+        
+        # Command input
+        cmd_group = QtWidgets.QGroupBox("Send Command")
+        cmd_layout = QtWidgets.QVBoxLayout(cmd_group)
+        
+        cmd_input_layout = QtWidgets.QHBoxLayout()
+        self.cmd_input = QtWidgets.QLineEdit()
+        self.cmd_input.setPlaceholderText("Enter Python command (e.g., print('Hello')) or 'help' for examples")
+        self.cmd_input.returnPressed.connect(self._send_command)
+        cmd_input_layout.addWidget(self.cmd_input)
+        
+        self.send_btn = QtWidgets.QPushButton("Send")
+        self.send_btn.clicked.connect(self._send_command)
+        self.send_btn.setEnabled(False)
+        cmd_input_layout.addWidget(self.send_btn)
+        
+        cmd_layout.addLayout(cmd_input_layout)
+        
+        # Example commands
+        examples_label = QtWidgets.QLabel("Example commands:")
+        examples_label.setStyleSheet("color: gray; font-size: 10px;")
+        cmd_layout.addWidget(examples_label)
+        
+        examples_text = QtWidgets.QLabel(
+            "help | print('Hello') | import machine; machine.Pin(2).value() | "
+            "from components.dfplayer_hardware import DFPlayerHardware; hw = DFPlayerHardware() | "
+            "check_amplifier (diagnostic command)"
+        )
+        examples_text.setStyleSheet("color: gray; font-size: 9px;")
+        examples_text.setWordWrap(True)
+        cmd_layout.addWidget(examples_text)
+        
+        # Use a QSplitter so the user can drag to resize Now Playing vs Console
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(now_playing_group)
+        
+        # Combine console output and command input into one widget
+        console_container = QtWidgets.QWidget()
+        console_container_layout = QtWidgets.QVBoxLayout(console_container)
+        console_container_layout.setContentsMargins(0, 0, 0, 0)
+        console_container_layout.addWidget(console_group, 1)
+        console_container_layout.addWidget(cmd_group)
+        splitter.addWidget(console_container)
+        
+        # Give most space to the console by default
+        splitter.setStretchFactor(0, 0)  # Now Playing: don't stretch
+        splitter.setStretchFactor(1, 1)  # Console: stretch to fill
+        splitter.setSizes([120, 400])    # Initial sizes in pixels
+        
+        # Style the splitter handle so it's visible and easy to grab
+        splitter.setHandleWidth(6)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background-color: #444; border: 1px solid #555; }"
+        )
+        
+        layout.addWidget(splitter, 1)
+    
+    def _pause_streaming(self):
+        """Pause the streaming thread so we can use the serial port for a command."""
+        if not self._streaming_thread or not self._streaming_thread.is_alive():
+            return  # Not streaming, nothing to pause
+        self._streaming_resume_event.clear()
+        self._streaming_pause_event.set()  # Signal streaming to pause
+        # Wait up to 2s for streaming to actually pause (it will set resume_event when paused)
+        self._streaming_resume_event.wait(timeout=2.0)
+    
+    def _resume_streaming(self):
+        """Resume the streaming thread after a command completes."""
+        self._streaming_pause_event.clear()  # Clear pause signal so streaming continues
+        self._streaming_resume_event.clear()
+    
+    def _send_serial_command(self, port: str, command: str, timeout: float = 5.0) -> tuple[int, str, str]:
+        """
+        Send a command via the persistent serial connection.
+        Thread-safe: uses port_lock to prevent concurrent commands.
+        Pauses streaming if active, sends Ctrl+C to enter REPL, executes command, resumes streaming.
+        
+        Returns: (returncode, stdout, stderr)
+        """
+        if not SERIAL_AVAILABLE:
+            return (1, "", "pyserial not available")
+        
+        ser = self._serial_connection
+        if not ser or not ser.is_open:
+            return (1, "", "Not connected. Use Connect button first.")
+        
+        # Lock to prevent concurrent commands
+        with self._port_lock:
+            return self._send_serial_command_locked(ser, command, timeout)
+    
+    def _send_serial_command_locked(self, ser, command: str, timeout: float) -> tuple[int, str, str]:
+        """Internal: execute command with port_lock already held."""
+        # Pause streaming so we have exclusive access to the serial port
+        was_streaming = self._streaming_thread and self._streaming_thread.is_alive()
+        if was_streaming:
+            self._pause_streaming()
+        
+        import time
+        try:
+            # Clear any existing data
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            # Send Ctrl+C to interrupt firmware and get to REPL
+            for _ in range(2):
+                ser.write(b'\x03')
+                time.sleep(0.15)
+            
+            # Wait for REPL prompt
+            time.sleep(0.5)
+            ser.reset_input_buffer()  # Discard interrupt output
+            
+            # Send command
+            if '\n' in command:
+                lines = command.strip().split('\n')
+                for i, line in enumerate(lines):
+                    if line.strip():
+                        ser.write((line + '\r\n').encode('utf-8'))
+                        time.sleep(0.15)
+                        if i < len(lines) - 1:
+                            time.sleep(0.2)
+                            if ser.in_waiting > 0:
+                                ser.read(ser.in_waiting)  # consume continuation prompt
+            else:
+                ser.write((command + '\r\n').encode('utf-8'))
+            
+            # Read response
+            output = b""
+            start_time = time.time()
+            prompt_found = False
+            last_data_time = start_time
+            
+            while time.time() - start_time < timeout:
+                if ser.in_waiting > 0:
+                    data = ser.read(ser.in_waiting)
+                    output += data
+                    last_data_time = time.time()
+                    tail = output[-60:] if len(output) >= 60 else output
+                    if b'>>> ' in tail:
+                        time.sleep(0.2)
+                        if ser.in_waiting > 0:
+                            output += ser.read(ser.in_waiting)
+                        prompt_found = True
+                        break
+                else:
+                    if len(output) > 0 and time.time() - last_data_time > 0.5:
+                        break
+                time.sleep(0.05)
+            
+            # Parse output
+            output_str = output.decode('utf-8', errors='replace')
+            lines = output_str.split('\n')
+            result_lines = []
+            command_lines = command.strip().split('\n') if command.strip() else []
+            
+            for line in lines:
+                ls = line.strip()
+                if ls.startswith('>>>') or ls.startswith('...') or not ls:
+                    continue
+                # Skip command echo lines
+                is_echo = False
+                for cmd_line in command_lines:
+                    cl = cmd_line.strip()
+                    if cl and cl in ls:
+                        is_echo = True
+                        break
+                if not is_echo:
+                    result_lines.append(ls)
+            
+            result = '\n'.join(result_lines).strip()
+            
+            if not result and not prompt_found:
+                debug_output = output_str[:200] if output_str else "(no output)"
+                return (1, "", f"No response from device. Raw: {debug_output}")
+            
+            return (0, result, "")
+            
+        except serial.SerialException as e:
+            return (1, "", f"Serial error: {e}")
+        except Exception as e:
+            return (1, "", f"Error: {e}")
+        finally:
+            if was_streaming:
+                self._resume_streaming()
+    
+    def _scan_ports(self) -> None:
+        """Scan for available COM ports using serial.tools.list_ports (no mpremote needed)."""
+        self._debug_log("Starting port scan...", "info")
+        self.port_combo.clear()
+        
+        if not SERIAL_AVAILABLE:
+            self._log("Cannot scan ports: pyserial not available. Install with: pip install pyserial", "error")
+            return
+        
+        try:
+            # Use serial.tools.list_ports to find all COM ports (like Thonny does)
+            ports = serial.tools.list_ports.comports()
+            self._debug_log(f"Found {len(ports)} serial port(s)", "info")
+            
+            for port_info in ports:
+                port_name = port_info.device
+                description = f"{port_info.description or 'Unknown'} {port_info.hwid or ''}".strip()
+                self.port_combo.addItem(f"{port_name} - {description}", port_name)
+                self._debug_log(f"Added port: {port_name} - {description}", "info")
+            
+            if self.port_combo.count() == 0:
+                self.port_combo.addItem("(No COM ports found)", None)
+                self._log("No COM ports found. Connect your Pico via USB.", "warning")
+            else:
+                self._log(f"Found {self.port_combo.count()} device(s)", "info")
+        except Exception as e:
+            error_msg = f"Error scanning ports: {e}\n{traceback.format_exc()}"
+            self._debug_log(error_msg, "error")
+            self._log(f"Error scanning ports: {e}", "error")
+    
+    def _toggle_connection(self) -> None:
+        """Connect or disconnect from the device."""
+        if self._connected:
+            self._disconnect()
+        else:
+            self._connect()
+    
+    def _connect(self) -> None:
+        """Connect to the device."""
+        # Check if already connected
+        if self._connected:
+            self._log("Already connected. Disconnect first to reconnect.", "warning")
+            return
+        
+        if "connect" in self._active_operations:
+            self._debug_log("Connect operation already in progress, ignoring", "warning")
+            return
+        
+        port = self.port_combo.currentData()
+        if not port:
+            self._log("Please select a COM port first", "error")
+            return
+        
+        if not SERIAL_AVAILABLE:
+            self._log("pyserial not available. Install with: pip install pyserial", "error")
+            return
+        
+        # Ensure buttons are in correct state before starting
+        try:
+            self.connect_btn.setEnabled(True)  # Re-enable in case it was stuck
+        except:
+            pass
+        
+        self._active_operations.add("connect")
+        self._debug_log(f"Starting connection to {port}...", "info")
+        self._log(f"Connecting to {port}...", "info")
+        
+        try:
+            self.connect_btn.setEnabled(False)
+        except Exception as e:
+            self._debug_log(f"Error disabling connect button: {e}", "error")
+            self._active_operations.discard("connect")
+            return
+        
+        def connect_thread():
+            try:
+                import time
+                time.sleep(0.3)
+                
+                if "connect" not in self._active_operations:
+                    self._debug_log("Connection cancelled", "info")
+                    return
+                
+                # Open serial port and KEEP IT OPEN for the entire session
+                # This is how Thonny works - one persistent connection
+                try:
+                    ser = serial.Serial(
+                        port=port,
+                        baudrate=115200,
+                        timeout=0.5,
+                        write_timeout=2.0
+                    )
+                    # Store as persistent connection - used by ALL operations
+                    self._serial_connection = ser
+                    self._debug_log(f"Serial port {port} opened and stored as persistent connection", "info")
+                    port_val = str(port) if port else ""
+                    returncode_val = 0
+                    stdout_val = "Connected! (Persistent serial connection opened)"
+                    stderr_val = ""
+                except serial.SerialException as e:
+                    self._debug_log(f"Failed to open serial port: {e}", "error")
+                    self._serial_connection = None
+                    port_val = str(port) if port else ""
+                    returncode_val = 1
+                    stdout_val = ""
+                    stderr_val = f"Failed to open serial port: {e}"
+                
+                # Update UI on main thread - capture values and schedule callback
+                
+                # Use QMetaObject.invokeMethod to ensure this runs on main thread
+                # This is the proper way to call UI updates from background threads
+                try:
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_execute_ui_update",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(str, port_val),
+                        QtCore.Q_ARG(int, returncode_val),
+                        QtCore.Q_ARG(str, stdout_val),
+                        QtCore.Q_ARG(str, stderr_val)
+                    )
+                except Exception as invoke_error:
+                    error_msg = f"Error invoking UI update: {invoke_error}\n{traceback.format_exc()}"
+                    self._debug_log(error_msg, "error")
+                    # Fallback: try to log error (but don't access UI directly from thread)
+                    try:
+                        print(f"[DeviceDebug] Connection completed but UI update failed: {invoke_error}")
+                    except:
+                        pass
+                finally:
+                    # Always clear the operation, even if invokeMethod failed
+                    self._active_operations.discard("connect")
+                    self._debug_log("connect operation cleared from _active_operations", "info")
+                
+            except subprocess.TimeoutExpired:
+                self._debug_log("Connection timed out after 10 seconds - device may be unresponsive", "error")
+                # Clear operation immediately
+                self._active_operations.discard("connect")
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_connection_timeout",
+                    QtCore.Qt.ConnectionType.QueuedConnection
+                )
+            except KeyboardInterrupt:
+                # User cancelled (shouldn't happen in background thread, but handle it)
+                self._debug_log("Connection cancelled by user", "warning")
+                self._active_operations.discard("connect")
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_connection_error",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, "Connection cancelled")
+                )
+            except Exception as e:
+                error_msg = f"Connection error: {e}\n{traceback.format_exc()}"
+                self._debug_log(error_msg, "error")
+                # Clear operation immediately
+                self._active_operations.discard("connect")
+                error_msg_val = str(e)
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_connection_error",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, error_msg_val)
+                )
+        
+        threading.Thread(target=connect_thread, daemon=True).start()
+    
+    def _reset_connection(self) -> None:
+        """Forcefully reset the connection - close everything and release port."""
+        self._log("Resetting connection...", "info")
+        
+        # Stop streaming
+        self._stop_streaming_forcefully()
+        
+        # Close persistent serial connection
+        if self._serial_connection:
+            try:
+                if self._serial_connection.is_open:
+                    self._serial_connection.close()
+            except:
+                pass
+            self._serial_connection = None
+        
+        self._connected = False
+        self._active_operations.clear()
+        
+        import time
+        time.sleep(1.0)
+        
+        self._restore_disconnected_state()
+        self._log("Connection reset complete. You can now reconnect.", "info")
+    
+    def _disconnect(self) -> None:
+        """Disconnect from the device - close the persistent serial connection."""
+        self._debug_log("Disconnecting...", "info")
+        
+        # Stop streaming if active (but don't close port yet - we do that below)
+        self._stop_streaming = True
+        self._stop_output = True
+        self._streaming_pause_event.set()  # Unblock streaming if it's paused
+        
+        if self._streaming_thread and self._streaming_thread.is_alive():
+            self._streaming_thread.join(timeout=3.0)
+        
+        # Close the persistent serial connection
+        if self._serial_connection:
+            try:
+                if self._serial_connection.is_open:
+                    self._serial_connection.close()
+                    self._debug_log("Persistent serial connection closed", "info")
+            except Exception as e:
+                self._debug_log(f"Error closing serial connection: {e}", "warning")
+            finally:
+                self._serial_connection = None
+        
+        self._connected = False
+        self._active_operations.clear()
+        self._restore_disconnected_state()
+        self._log("Disconnected", "info")
+    
+    @QtCore.pyqtSlot(str, int, str, str)
+    def _execute_ui_update(self, port: str, returncode: int, stdout: str, stderr: str):
+        """Execute UI update on main thread - called via QMetaObject.invokeMethod."""
+        try:
+            self._debug_log(f"_execute_ui_update called on main thread: port={port}, returncode={returncode}", "info")
+            
+            # Validate that widget still exists and is valid
+            if not self or not hasattr(self, 'connect_btn'):
+                self._debug_log("Widget is invalid or destroyed, skipping UI update", "warning")
+                return
+            if returncode == 0:
+                self._debug_log("Connection successful, updating UI to connected state", "info")
+                self._connected = True
+                self.connect_btn.setText("Disconnect")
+                self.connect_btn.setEnabled(True)
+                self.connection_status.setText(f"Connected to {port}")
+                self.connection_status.setStyleSheet("color: green;")
+                
+                # Enable all action buttons
+                self.restart_firmware_btn.setEnabled(True)
+                self.soft_reset_btn.setEnabled(True)
+                self.get_status_btn.setEnabled(True)
+                self.list_files_btn.setEnabled(True)
+                self.view_debug_log_btn.setEnabled(True)
+                self.check_firmware_btn.setEnabled(True)
+                self.send_btn.setEnabled(True)
+                self.stream_output_btn.setEnabled(True)
+                self.refresh_now_playing_btn.setEnabled(True)
+                self.reset_connection_btn.setEnabled(True)
+                
+                # NOTE: Do NOT auto-start now_playing_timer here.
+                # _refresh_now_playing sends Ctrl+C which interrupts the running firmware.
+                # Instead, "now playing" info is parsed from the streaming output.
+                
+                # Set "now playing" to waiting state (parsed from stream, not from Ctrl+C)
+                self.now_playing_label.setText(
+                    "<span style='color: #9cdcfe;'>Listening for playback info from stream...</span>"
+                )
+                
+                # Auto-start streaming so user sees logs immediately
+                self._stop_streaming = False
+                self._stop_output = False
+                self.stream_output_btn.setText("Stop Streaming")
+                self._log("Auto-starting output stream...", "info")
+                self._start_streaming()
+                
+                # Disable port selection
+                self.port_combo.setEnabled(False)
+                self.scan_btn.setEnabled(False)
+                
+                # Verify buttons are actually enabled
+                soft_reset_enabled = self.soft_reset_btn.isEnabled()
+                get_status_enabled = self.get_status_btn.isEnabled()
+                list_files_enabled = self.list_files_btn.isEnabled()
+                send_enabled = self.send_btn.isEnabled()
+                self._debug_log(f"Button states verified - Soft Reset: {soft_reset_enabled}, Get Status: {get_status_enabled}, List Files: {list_files_enabled}, Send: {send_enabled}", "info")
+                
+                self._log(f"✓ Connected to {port}", "success")
+                if stdout and stdout.strip():
+                    self._log(stdout.strip(), "output")
+                
+                # NOTE: Do NOT check power sense here - it sends Ctrl+C and interrupts firmware.
+                # User can check/toggle power sense manually from the checkbox.
+                
+                # Final verification - ensure buttons are still enabled
+                final_soft_reset = self.soft_reset_btn.isEnabled()
+                final_get_status = self.get_status_btn.isEnabled()
+                final_list_files = self.list_files_btn.isEnabled()
+                final_send = self.send_btn.isEnabled()
+                self._debug_log(f"Final button states - Soft Reset: {final_soft_reset}, Get Status: {final_get_status}, List Files: {final_list_files}, Send: {final_send}", "info")
+                self._debug_log(f"Connection state: _connected={self._connected}", "info")
+                self._debug_log("UI updated to connected state successfully - all buttons should be enabled", "info")
+                
+                # Force a repaint to ensure UI updates
+                self.update()
+                self.repaint()  # Force immediate repaint
+            else:
+                self._debug_log(f"Connection failed with return code {returncode}", "error")
+                self._log(f"Connection failed: {stderr or stdout}", "error")
+                self._restore_disconnected_state()
+        except Exception as e:
+            error_msg = f"Error in _execute_ui_update: {e}\n{traceback.format_exc()}"
+            self._debug_log(error_msg, "error")
+            self._log(f"Error updating UI: {e}", "error")
+            # Try to preserve button states even on error
+            try:
+                # If we got partway through, try to keep buttons enabled
+                if self._connected:
+                    self._debug_log("Attempting to preserve connected state despite error", "warning")
+                    self.soft_reset_btn.setEnabled(True)
+                    self.get_status_btn.setEnabled(True)
+                    self.list_files_btn.setEnabled(True)
+                    self.view_debug_log_btn.setEnabled(True)
+                    self.check_firmware_btn.setEnabled(True)
+                    self.send_btn.setEnabled(True)
+                    self.stream_output_btn.setEnabled(True)
+                else:
+                    self._restore_disconnected_state()
+            except:
+                pass
+        finally:
+            self._active_operations.discard("connect")
+            self._debug_log("_execute_ui_update completed", "info")
+    
+    def _restore_disconnected_state(self) -> None:
+        """Restore UI to disconnected state - ensures all buttons are in correct state."""
+        try:
+            self._debug_log("Restoring disconnected state", "info")
+            # Stop streaming if active
+            self._stop_streaming_forcefully()
+            self.stream_output_btn.setText("Start Streaming")
+            self.stream_output_btn.setEnabled(False)
+            
+            self.connect_btn.setText("Connect")
+            self.connect_btn.setEnabled(True)
+            self.connection_status.setText("Not connected")
+            self.connection_status.setStyleSheet("color: gray;")
+            self.restart_firmware_btn.setEnabled(False)
+            self.soft_reset_btn.setEnabled(False)
+            self.get_status_btn.setEnabled(False)
+            self.list_files_btn.setEnabled(False)
+            self.view_debug_log_btn.setEnabled(False)
+            self.check_firmware_btn.setEnabled(False)
+            self.send_btn.setEnabled(False)
+            self.stream_output_btn.setEnabled(False)
+            self.stream_output_btn.setText("Start Streaming")
+            self.refresh_now_playing_btn.setEnabled(False)
+            self.reset_connection_btn.setEnabled(False)
+            
+            # Stop auto-refresh timer
+            self.now_playing_timer.stop()
+            self.now_playing_label.setText("Not connected")
+            
+            self.port_combo.setEnabled(True)
+            self.scan_btn.setEnabled(True)
+            self._debug_log("Disconnected state restored", "info")
+        except Exception as e:
+            self._debug_log(f"Error restoring disconnected state: {e}\n{traceback.format_exc()}", "error")
+    
+    def _send_command(self) -> None:
+        """Send a command to the device."""
+        if not self._connected:
+            self._log("Not connected. Please connect first.", "error")
+            return
+        
+        command = self.cmd_input.text().strip()
+        if not command:
+            return
+        
+        if command == "help":
+            self._show_help()
+            self.cmd_input.clear()
+            return
+        
+        if command.lower().strip() in ("check_amplifier", "_check_amplifier"):
+            # Handle both with and without underscore for user convenience
+            # This is a GUI command, not sent to the device
+            self._check_amplifier()
+            self.cmd_input.clear()
+            return
+        
+        # Handle test_play_track command (intercept and send as proper Python)
+        if command.strip().startswith("test_play_track"):
+            # Parse: test_play_track(1, 1) or test_play_track 1 1
+            try:
+                import re
+                match = re.match(r'test_play_track\s*\(?\s*(\d+)\s*,\s*(\d+)\s*\)?', command)
+                if match:
+                    folder = int(match.group(1))
+                    track = int(match.group(2))
+                    # Send as proper Python command
+                    py_cmd = f"from components.dfplayer_hardware import DFPlayerHardware; hw = DFPlayerHardware(); hw.test_play_track({folder}, {track})"
+                    command = py_cmd
+                else:
+                    self._log("Usage: test_play_track(1, 1) or test_play_track 1 1", "error")
+                    self.cmd_input.clear()
+                    return
+            except Exception as e:
+                self._log(f"Error parsing test_play_track: {e}", "error")
+                self.cmd_input.clear()
+                return
+        
+        op_id = f"cmd_{id(command)}"
+        if op_id in self._active_operations:
+            self._debug_log("Command already executing, ignoring", "warning")
+            return
+        
+        self._active_operations.add(op_id)
+        self._log(f">>> {command}", "command")
+        self.cmd_input.clear()
+        
+        port = self.port_combo.currentData()
+        self._debug_log(f"Sending command to {port}: {command[:100]}", "info")
+        
+        def run_command():
+            try:
+                if not SERIAL_AVAILABLE:
+                    self._active_operations.discard(op_id)
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_display_command_result",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(int, 1),
+                        QtCore.Q_ARG(str, ""),
+                        QtCore.Q_ARG(str, "pyserial not available."),
+                        QtCore.Q_ARG(int, 0)
+                    )
+                    return
+                
+                # Use _send_serial_command which handles pause/resume of streaming
+                returncode, stdout, stderr = self._send_serial_command(port, command, timeout=10)
+                
+                self._active_operations.discard(op_id)
+                
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_command_result",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(int, returncode),
+                    QtCore.Q_ARG(str, stdout.strip() if stdout else ""),
+                    QtCore.Q_ARG(str, stderr.strip() if stderr else ""),
+                    QtCore.Q_ARG(int, 0)
+                )
+                
+            except Exception as e:
+                error_msg = f"Error executing command: {e}\n{traceback.format_exc()}"
+                self._debug_log(error_msg, "error")
+                self._active_operations.discard(op_id)
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_command_error",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, str(e))
+                )
+        
+        threading.Thread(target=run_command, daemon=True).start()
+    
+    def _soft_reset(self) -> None:
+        """Perform a soft reset using mpremote's reset command."""
+        if not self._connected:
+            return
+        
+        if "soft_reset" in self._active_operations:
+            self._debug_log("Soft reset already in progress, ignoring", "warning")
+            return
+        
+        self._active_operations.add("soft_reset")
+        port = self.port_combo.currentData()
+        self._debug_log(f"Starting soft reset on {port}...", "info")
+        self._log("Performing soft reset...", "info")
+        
+        def reset():
+            try:
+                self._debug_log("Sending soft reset via serial...", "info")
+                returncode, stdout, stderr = self._send_serial_command(
+                    port, "import machine; machine.soft_reset()", timeout=3
+                )
+                
+                self._active_operations.discard("soft_reset")
+                
+                stdout_val = stdout.strip() if stdout else ""
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_soft_reset_result",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, stdout_val)
+                )
+            except subprocess.TimeoutExpired as e:
+                # Timeout is actually expected/normal for soft_reset - device resets immediately
+                self._debug_log(f"Soft reset command timed out (this is normal - device resets immediately): {e}", "info")
+                # Clear operation on timeout (which is expected for soft_reset)
+                self._active_operations.discard("soft_reset")
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_soft_reset_timeout_success",
+                    QtCore.Qt.ConnectionType.QueuedConnection
+                )
+            except Exception as e:
+                error_msg = f"Reset error: {e}\n{traceback.format_exc()}"
+                self._debug_log(error_msg, "error")
+                # Clear operation on error
+                self._active_operations.discard("soft_reset")
+                error_msg_val = str(e)
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_soft_reset_error",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, error_msg_val)
+                )
+        
+        threading.Thread(target=reset, daemon=True).start()
+    
+    def _restart_firmware(self) -> None:
+        """Restart main.py on the device - use this if device stops working after connecting."""
+        if not self._connected:
+            self._log("Not connected. Please connect first.", "error")
+            return
+        
+        if "restart_firmware" in self._active_operations:
+            self._debug_log("Restart firmware already in progress, ignoring", "warning")
+            return
+        
+        self._active_operations.add("restart_firmware")
+        port = self.port_combo.currentData()
+        self._log("Restarting firmware (main.py)...", "info")
+        self._debug_log(f"Restarting firmware on {port}...", "info")
+        
+        def restart():
+            try:
+                cmd = (
+                    "try:\n"
+                    "  try:\n"
+                    "    from components.dfplayer_hardware import DFPlayerHardware\n"
+                    "    hw = DFPlayerHardware()\n"
+                    "    hw._df_stop()\n"
+                    "    import time\n"
+                    "    time.sleep_ms(100)\n"
+                    "  except:\n"
+                    "    pass\n"
+                    "  exec(open('main.py').read())\n"
+                    "except Exception as e:\n"
+                    "  print(f'Error restarting: {e}')\n"
+                    "  import machine\n"
+                    "  machine.soft_reset()"
+                )
+                
+                returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=15)
+                self._active_operations.discard("restart_firmware")
+                
+                if returncode == 0:
+                    output = stdout.strip() if stdout else "Firmware restart initiated"
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_display_restart_firmware_result",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(str, output)
+                    )
+                else:
+                    error = stderr or stdout or "Unknown error"
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_display_restart_firmware_error",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(str, error[:200])
+                    )
+            except Exception as e:
+                self._active_operations.discard("restart_firmware")
+                self._debug_log(f"Error restarting firmware: {e}\n{traceback.format_exc()}", "error")
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_restart_firmware_error",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, str(e)[:200])
+                )
+        
+        threading.Thread(target=restart, daemon=True).start()
+    
+    def _get_status(self) -> None:
+        """Get device status."""
+        if not self._connected:
+            return
+        
+        if "get_status" in self._active_operations:
+            self._debug_log("Get status already in progress, ignoring", "warning")
+            return
+        
+        self._active_operations.add("get_status")
+        port = self.port_combo.currentData()
+        self._debug_log(f"Getting status from {port}...", "info")
+        self._log("Getting device status...", "info")
+        
+        commands = [
+            "import sys; print(f'MicroPython: {sys.version}')",
+            "import machine; print(f'Frequency: {machine.freq()} Hz')",
+            "import os; print(f'Free memory: {os.getfree(\"//\")} bytes')",
+            "try:\n  with open('debug.log', 'r') as f:\n    lines = f.readlines()\n    if lines:\n      # Only show last 10 lines to avoid memory issues\n      last_lines = lines[-10:] if len(lines) > 10 else lines\n      print(f'=== Recent Debug Log (last {len(last_lines)} of {len(lines)} lines) ===')\n      for line in last_lines:\n        print(line.rstrip())\n      print('=== End Debug Log ===')\n    else:\n      print('(debug.log is empty)')\nexcept Exception as e:\n  print(f'Could not read debug.log: {e}')",
+        ]
+        
+        def get_status():
+            try:
+                for i, cmd in enumerate(commands):
+                    try:
+                        self._debug_log(f"Executing status command {i+1}/{len(commands)}", "info")
+                        returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=5)
+                        self._debug_log(f"Status command {i+1} return code: {returncode}", "info")
+                        if returncode == 0 and stdout.strip():
+                            stdout_val = stdout.strip()
+                            # Use QMetaObject.invokeMethod to ensure UI update happens on main thread
+                            QtCore.QMetaObject.invokeMethod(
+                                self,
+                                "_display_status_output",
+                                QtCore.Qt.ConnectionType.QueuedConnection,
+                                QtCore.Q_ARG(str, stdout_val)
+                            )
+                    except subprocess.TimeoutExpired:
+                        self._debug_log(f"Status command {i+1} timed out", "warning")
+                    except Exception as e:
+                        error_msg = f"Error in status command {i+1}: {e}\n{traceback.format_exc()}"
+                        self._debug_log(error_msg, "error")
+                        error_msg_val = str(e)
+                        # Use QMetaObject.invokeMethod for thread-safe UI update
+                        QtCore.QMetaObject.invokeMethod(
+                            self,
+                            "_display_status_error",
+                            QtCore.Qt.ConnectionType.QueuedConnection,
+                            QtCore.Q_ARG(str, error_msg_val)
+                        )
+            finally:
+                self._active_operations.discard("get_status")
+        
+        threading.Thread(target=get_status, daemon=True).start()
+    
+    def _refresh_now_playing(self) -> None:
+        """Refresh the now playing display by querying the device for RadioCore status.
+        
+        WARNING: This sends Ctrl+C to interrupt firmware and enter REPL.
+        The firmware will STOP running until restarted.
+        Prefer using stream output parsing for non-intrusive now-playing updates.
+        """
+        if not self._connected:
+            return
+        
+        if "refresh_now_playing" in self._active_operations:
+            return  # Already refreshing
+        
+        port = self.port_combo.currentData()
+        if not port:
+            return
+        
+        self._active_operations.add("refresh_now_playing")
+        self._log("⚠️ Querying device (this interrupts firmware - use 'Restart Firmware' after)", "warning")
+        
+        # Command to get RadioCore status via REPL (firmware will be interrupted by Ctrl+C)
+        cmd = (
+            "try:\n"
+            "  import json\n"
+            "  sd = {'error': 'not found'}\n"
+            "  try:\n"
+            "    import __main__\n"
+            "    fw = getattr(__main__, 'firmware', None)\n"
+            "    if fw and hasattr(fw, 'core'):\n"
+            "      sd = fw.core.get_status()\n"
+            "  except:\n"
+            "    pass\n"
+            "  if 'error' in sd:\n"
+            "    try:\n"
+            "      import main\n"
+            "      fw = getattr(main, 'firmware', None)\n"
+            "      if fw and hasattr(fw, 'core'):\n"
+            "        sd = fw.core.get_status()\n"
+            "    except:\n"
+            "      pass\n"
+            "  print(json.dumps(sd))\n"
+            "except Exception as e:\n"
+            "  print(json.dumps({'error': str(e)}))"
+        )
+        
+        def refresh():
+            try:
+                returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=5)
+                
+                if returncode == 0 and stdout and stdout.strip():
+                    # Try to extract JSON from output (might have extra text)
+                    json_str = stdout.strip()
+                    # Look for JSON object in the output
+                    import json
+                    import re
+                    # Try to find JSON object in output
+                    json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', json_str, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group(0)
+                    
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_display_now_playing",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(str, json_str)
+                    )
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    import json
+                    error_json = json.dumps({"error": error_msg[:100]})
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_display_now_playing",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(str, error_json)
+                    )
+            except Exception as e:
+                import json
+                error_json = json.dumps({"error": f"Refresh error: {str(e)[:100]}"})
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_now_playing",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, error_json)
+                )
+            finally:
+                self._active_operations.discard("refresh_now_playing")
+        
+        threading.Thread(target=refresh, daemon=True).start()
+    
+    def _list_files(self) -> None:
+        """List files on the device."""
+        if not self._connected:
+            return
+        
+        if "list_files" in self._active_operations:
+            self._debug_log(f"List files already in progress, ignoring. Active operations: {self._active_operations}", "warning")
+            # Force clear if it's been stuck for too long (safety mechanism)
+            # This shouldn't normally happen, but helps recover from stuck operations
+            return
+        
+        self._active_operations.add("list_files")
+        port = self.port_combo.currentData()
+        self._debug_log(f"Listing files on {port}...", "info")
+        self._log("Listing files...", "info")
+        
+        def list_files():
+            try:
+                cmd = "import os; [print(f'{name} {os.stat(name)[6] if os.path.isfile(name) else \"[DIR]\"}') for name in sorted(os.listdir('.'))]"
+                self._debug_log(f"Executing: list files via serial", "info")
+                returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=15)
+                
+                self._active_operations.discard("list_files")
+                
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_list_files_result",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(int, returncode),
+                    QtCore.Q_ARG(str, stdout.strip() if stdout else ""),
+                    QtCore.Q_ARG(str, stderr.strip() if stderr else "")
+                )
+            except subprocess.TimeoutExpired as e:
+                self._debug_log(f"List files timed out after 15 seconds: {e}", "error")
+                # Clear operation immediately
+                self._active_operations.discard("list_files")
+                self._debug_log("list_files operation cleared after timeout", "info")
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_list_files_timeout",
+                    QtCore.Qt.ConnectionType.QueuedConnection
+                )
+            except Exception as e:
+                error_msg = f"Error listing files: {e}\n{traceback.format_exc()}"
+                self._debug_log(error_msg, "error")
+                # Clear operation immediately
+                self._active_operations.discard("list_files")
+                self._debug_log("list_files operation cleared after error", "info")
+                error_msg_val = str(e)
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_list_files_error",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, error_msg_val)
+                )
+        
+        threading.Thread(target=list_files, daemon=True).start()
+    
+    def _clear_console(self) -> None:
+        """Clear the console output."""
+        self.console_output.clear()
+    
+    def _view_debug_log(self) -> None:
+        """View the debug.log file from the Pico (reads in chunks to avoid memory issues)."""
+        if not self._connected:
+            self._log("Not connected. Please connect first.", "error")
+            return
+        
+        if "view_debug_log" in self._active_operations:
+            self._debug_log("View debug log already in progress, ignoring", "warning")
+            return
+        
+        # No need to stop streaming - _send_serial_command handles pause/resume
+        self._active_operations.add("view_debug_log")
+        # Get port name from combo box data (not text, which includes description)
+        port = self.port_combo.currentData()
+        if not port:
+            # Fallback: try to extract port from text if data is None
+            text = self.port_combo.currentText().strip()
+            if text and text.startswith("COM"):
+                port = text.split()[0] if ' ' in text else text
+            else:
+                self._log("No port selected", "error")
+                return
+        self._log("Reading debug.log from device (last 50 lines)...", "info")
+        
+        def read_log():
+            max_retries = 3
+            retry_delay = 2.0
+            
+            for attempt in range(max_retries):
+                try:
+                    cmd = (
+                        "try:\n"
+                        "  with open('debug.log', 'r') as f:\n"
+                        "    lines = f.readlines()\n"
+                        "    if lines:\n"
+                        "      last_lines = lines[-50:] if len(lines) > 50 else lines\n"
+                        "      print(f'=== Debug Log (showing last {len(last_lines)} of {len(lines)} lines) ===')\n"
+                        "      for line in last_lines:\n"
+                        "        print(line.rstrip())\n"
+                        "      print('=== End Debug Log ===')\n"
+                        "    else:\n"
+                    )
+                    returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=10)
+                
+                    if returncode == 0:
+                        output = stdout.strip() if stdout else ""
+                        self._active_operations.discard("view_debug_log")
+                        QtCore.QMetaObject.invokeMethod(
+                            self,
+                            "_display_debug_log_result",
+                            QtCore.Qt.ConnectionType.QueuedConnection,
+                            QtCore.Q_ARG(str, output)
+                        )
+                        break  # Success, exit retry loop
+                    else:
+                        error_msg = stderr or stdout or "Unknown error"
+                        # Check if it's a port conflict error
+                        if "failed to access" in error_msg.lower():
+                            if attempt < max_retries - 1:
+                                self._log(f"Port conflict, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})", "info")
+                                import time
+                                time.sleep(retry_delay)
+                                retry_delay *= 1.5  # Exponential backoff
+                                continue
+                            else:
+                                self._active_operations.discard("view_debug_log")
+                                QtCore.QMetaObject.invokeMethod(
+                                    self,
+                                    "_display_debug_log_error",
+                                    QtCore.Qt.ConnectionType.QueuedConnection,
+                                    QtCore.Q_ARG(str, error_msg)
+                                )
+                                break
+                        else:
+                            self._active_operations.discard("view_debug_log")
+                            QtCore.QMetaObject.invokeMethod(
+                                self,
+                                "_display_debug_log_error",
+                                QtCore.Qt.ConnectionType.QueuedConnection,
+                                QtCore.Q_ARG(str, error_msg)
+                            )
+                            break
+                except subprocess.TimeoutExpired:
+                    if attempt < max_retries - 1:
+                        self._log(f"Timeout, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})", "info")
+                        import time
+                        time.sleep(retry_delay)
+                        retry_delay *= 1.5
+                        continue
+                    else:
+                        self._active_operations.discard("view_debug_log")
+                        QtCore.QMetaObject.invokeMethod(
+                            self,
+                            "_display_debug_log_timeout",
+                            QtCore.Qt.ConnectionType.QueuedConnection
+                        )
+                        break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        self._log(f"Error, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries}): {e}", "warning")
+                        import time
+                        time.sleep(retry_delay)
+                        retry_delay *= 1.5
+                        continue
+                    else:
+                        self._active_operations.discard("view_debug_log")
+                        error_msg = str(e)
+                        QtCore.QMetaObject.invokeMethod(
+                            self,
+                            "_display_debug_log_error",
+                            QtCore.Qt.ConnectionType.QueuedConnection,
+                            QtCore.Q_ARG(str, error_msg)
+                        )
+                        break
+        
+        threading.Thread(target=read_log, daemon=True).start()
+    
+    @QtCore.pyqtSlot(str)
+    def _display_debug_log_result(self, content: str):
+        """Display debug log content on main thread."""
+        try:
+            self._log("=== Debug Log ===", "info")
+            if content:
+                # Split into lines and display
+                lines = content.split('\n')
+                for line in lines:
+                    if line.strip():
+                        self._log(line, "output")
+            else:
+                self._log("(debug.log is empty or doesn't exist)", "info")
+            self._log("=== End Debug Log ===", "info")
+            
+            # No streaming restart needed - _send_serial_command handles pause/resume
+        except Exception as e:
+            self._debug_log(f"Error displaying debug log: {e}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_debug_log_timeout(self):
+        """Display timeout message for debug log read."""
+        self._log("Reading debug.log timed out", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_debug_log_error(self, error: str):
+        """Display error message for debug log read."""
+        self._log(f"Error reading debug.log: {error}", "error")
+    
+    def _check_firmware_status(self) -> None:
+        """Check if firmware is running and show recent activity."""
+        if not self._connected:
+            self._log("Not connected. Please connect first.", "error")
+            return
+        
+        if "check_firmware" in self._active_operations:
+            self._debug_log("Firmware check already in progress, ignoring", "warning")
+            return
+        
+        self._active_operations.add("check_firmware")
+        # Get port name from combo box data (not text, which includes description)
+        port = self.port_combo.currentData()
+        if not port:
+            # Fallback: try to extract port from text if data is None
+            text = self.port_combo.currentText().strip()
+            if text and text.startswith("COM"):
+                port = text.split()[0] if ' ' in text else text
+            else:
+                self._log("No port selected", "error")
+                return
+        self._log("=== Checking Firmware Status ===", "info")
+        
+        def check_firmware():
+            max_retries = 3
+            retry_delay = 2.0
+            
+            try:
+                for attempt in range(max_retries):
+                    try:
+                        cmd = (
+                            "import os\n"
+                            "print('=== Firmware Status ===')\n"
+                            "files = os.listdir()\n"
+                            "print(f'main.py exists: {\"main.py\" in files}')\n"
+                            "print(f'radio_core.py exists: {\"radio_core.py\" in files}')\n"
+                            "# Check AM sound overlay status\n"
+                            "try:\n"
+                            "  if firmware.hw.wav_data is not None:\n"
+                            "    print(f'AM sound: PWM overlay ENABLED ({len(firmware.hw.wav_data)} samples)')\n"
+                            "  else:\n"
+                            "    print(f'AM sound: DFPlayer sequential (folder={firmware.hw._am_folder}, track={firmware.hw._am_track})')\n"
+                            "except: print('AM sound: firmware not accessible')\n"
+                            "# Check VintageRadio dir\n"
+                            "try:\n"
+                            "  vr = os.listdir('VintageRadio')\n"
+                            "  print(f'VintageRadio/ contents: {vr}')\n"
+                            "except: print('VintageRadio/ directory not found')\n"
+                            "# Check firmware instance\n"
+                            "try:\n"
+                            "  print(f'Mode: {firmware.core.mode}')\n"
+                            "  print(f'Album idx: {firmware.core.current_album_index}')\n"
+                            "  print(f'Track: {firmware.core.current_track}')\n"
+                            "except Exception as e: print(f'Firmware instance not accessible: {e}')\n"
+                            "# Check free space\n"
+                            "try:\n"
+                            "  stat = os.statvfs('/')\n"
+                            "  free = stat[0] * stat[3]\n"
+                            "  total = stat[0] * stat[2]\n"
+                            "  print(f'Flash: {free//1024}KB free / {total//1024}KB total')\n"
+                            "except: pass\n"
+                            "print('=== End Status ===')\n"
+                        )
+                        returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=15)
+                        
+                        if returncode == 0:
+                            output = stdout.strip() if stdout else ""
+                            if output:
+                                for line in output.split('\n'):
+                                    if line.strip():
+                                        self._log(line, "output")
+                            else:
+                                self._log("(No output)", "info")
+                            self._active_operations.discard("check_firmware")
+                            break  # Success
+                        else:
+                            error_msg = stderr or stdout or "Unknown error"
+                            if "failed to access" in error_msg.lower():
+                                if attempt < max_retries - 1:
+                                    self._log(f"Port conflict, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})", "info")
+                                    import time
+                                    time.sleep(retry_delay)
+                                    retry_delay *= 1.5
+                                    continue
+                                else:
+                                    self._log(f"Error: {error_msg}", "error")
+                                    self._active_operations.discard("check_firmware")
+                                    break
+                            else:
+                                self._log(f"Error: {error_msg}", "error")
+                                self._active_operations.discard("check_firmware")
+                                break
+                    except subprocess.TimeoutExpired:
+                        if attempt < max_retries - 1:
+                            self._log(f"Timeout, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})", "info")
+                            import time
+                            time.sleep(retry_delay)
+                            retry_delay *= 1.5
+                            continue
+                        else:
+                            self._active_operations.discard("check_firmware")
+                            self._log("Check timed out after multiple retries", "error")
+                            break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            self._log(f"Error, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries}): {e}", "warning")
+                            import time
+                            time.sleep(retry_delay)
+                            retry_delay *= 1.5
+                            continue
+                        else:
+                            self._active_operations.discard("check_firmware")
+                            self._log(f"Error checking firmware: {e}", "error")
+                            break
+            finally:
+                pass  # _send_serial_command handles streaming pause/resume
+        
+        threading.Thread(target=check_firmware, daemon=True).start()
+    
+    def _stop_streaming_forcefully(self) -> None:
+        """Stop the streaming thread. Does NOT close the persistent serial connection."""
+        self._stop_streaming = True
+        self._stop_output = True
+        self._streaming_pause_event.set()  # Unblock if paused
+        
+        # Wait for thread to finish
+        if self._streaming_thread and self._streaming_thread.is_alive():
+            self._streaming_thread.join(timeout=3.0)
+            if self._streaming_thread.is_alive():
+                self._debug_log("Warning: Streaming thread did not stop within timeout", "warning")
+        
+        self._stop_output = False  # Reset for next start
+    
+    def _toggle_streaming(self) -> None:
+        """Toggle real-time output streaming from the Pico."""
+        if not self._connected:
+            self._log("Not connected. Please connect first.", "error")
+            return
+        
+        if not SERIAL_AVAILABLE:
+            self._log("pyserial not available - cannot stream output. Install with: pip install pyserial", "error")
+            return
+        
+        if self._streaming_thread and self._streaming_thread.is_alive():
+            # Stop streaming
+            self._stop_streaming_forcefully()
+            self.stream_output_btn.setText("Start Streaming")
+            self._log("Stopped streaming output", "info")
+        else:
+            # Start streaming
+            self._stop_streaming = False
+            self._stop_output = False  # Ensure output is enabled
+            self.stream_output_btn.setText("Stop Streaming")
+            self._log("Starting output stream (capturing print statements from firmware)...", "info")
+            self._start_streaming()
+    
+    def _start_streaming(self) -> None:
+        """Start streaming output from the Pico using the persistent serial connection."""
+        if not self._connected:
+            return
+        
+        if not SERIAL_AVAILABLE:
+            self._log("pyserial not available", "error")
+            return
+        
+        ser = self._serial_connection
+        if not ser or not ser.is_open:
+            self._log("No serial connection. Connect first.", "error")
+            return
+        
+        # Reset stop flags
+        self._stop_streaming = False
+        self._stop_output = False
+        self._streaming_pause_event.clear()
+        self._streaming_resume_event.clear()
+        
+        def stream_thread():
+            """Background thread: reads output from Pico via the shared serial connection."""
+            import time
+            try:
+                self._debug_log("Streaming started on persistent connection", "info")
+                self._serial_error_count = 0
+                buffer = ""
+                
+                while not self._stop_output and not self._stop_streaming:
+                    if not self._connected:
+                        break
+                    
+                    # Check if we've been asked to pause (a command wants the port)
+                    if self._streaming_pause_event.is_set():
+                        self._debug_log("Streaming paused for command", "info")
+                        self._streaming_resume_event.set()  # Signal that we've paused
+                        # Wait until pause is cleared (command finished)
+                        while self._streaming_pause_event.is_set():
+                            if self._stop_streaming or self._stop_output:
+                                return
+                            time.sleep(0.05)
+                        self._debug_log("Streaming resumed", "info")
+                        # After resuming, clear any stale data from the command
+                        try:
+                            if ser.is_open and ser.in_waiting > 0:
+                                ser.read(ser.in_waiting)
+                        except:
+                            pass
+                        continue
+                    
+                    try:
+                        if not ser or not ser.is_open:
+                            self._debug_log("Serial port closed, stopping stream", "warning")
+                            break
+                        
+                        try:
+                            waiting = ser.in_waiting
+                        except (serial.SerialException, OSError) as e:
+                            self._serial_error_count += 1
+                            if self._serial_error_count > 10:
+                                self._debug_log("Too many serial errors, stopping stream", "error")
+                                break
+                            time.sleep(1.0)
+                            continue
+                        
+                        if waiting > 0:
+                            self._serial_error_count = 0
+                            try:
+                                data = ser.read(waiting).decode('utf-8', errors='replace')
+                                buffer += data
+                                while '\n' in buffer:
+                                    line, buffer = buffer.split('\n', 1)
+                                    if line.strip():
+                                        QtCore.QMetaObject.invokeMethod(
+                                            self,
+                                            "_display_stream_output",
+                                            QtCore.Qt.ConnectionType.QueuedConnection,
+                                            QtCore.Q_ARG(str, line)
+                                        )
+                                if len(buffer) > 200:
+                                    QtCore.QMetaObject.invokeMethod(
+                                        self,
+                                        "_display_stream_output",
+                                        QtCore.Qt.ConnectionType.QueuedConnection,
+                                        QtCore.Q_ARG(str, buffer)
+                                    )
+                                    buffer = ""
+                            except (serial.SerialException, OSError) as e:
+                                self._serial_error_count += 1
+                                if self._serial_error_count > 10:
+                                    break
+                                time.sleep(0.5)
+                                continue
+                        else:
+                            # No data - sleep briefly but check stop/pause flags frequently
+                            for _ in range(5):
+                                if self._stop_streaming or self._stop_output or self._streaming_pause_event.is_set():
+                                    break
+                                time.sleep(0.1)
+                    
+                    except Exception as e:
+                        self._serial_error_count += 1
+                        if self._serial_error_count > 20:
+                            break
+                        time.sleep(0.5)
+                        continue
+                
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_stream_stopped",
+                    QtCore.Qt.ConnectionType.QueuedConnection
+                )
+            except Exception as e:
+                self._debug_log(f"Stream thread error: {e}", "error")
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_stream_stopped",
+                    QtCore.Qt.ConnectionType.QueuedConnection
+                )
+            # NOTE: Do NOT close serial connection here - it's shared/persistent
+        
+        self._streaming_thread = threading.Thread(target=stream_thread, daemon=True)
+        self._streaming_thread.start()
+    
+    @QtCore.pyqtSlot(str)
+    def _display_stream_output(self, content: str):
+        """Display streamed output on main thread and parse for now-playing info."""
+        try:
+            if content and content.strip():
+                line = content.rstrip()
+                # Add timestamp prefix for streamed output
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self._log(f"[{timestamp}] {line}", "info")
+                
+                # Parse stream for "now playing" updates (non-intrusive)
+                self._parse_stream_for_now_playing(line)
+        except Exception as e:
+            self._debug_log(f"Error displaying stream output: {e}", "error")
+    
+    def _parse_stream_for_now_playing(self, line: str):
+        """Parse streaming output to extract now-playing info without interrupting firmware.
+        
+        Always displays the current mode alongside track information.
+        Detects: mode, source (album/playlist name), shuffle type, track title/artist.
+        Handles combined log format: _start_playback_for_current: mode=X, source=Y, shuffle_type=Z, album_idx=N, ...
+        Also handles older firmware that may have separate lines.
+        """
+        import re
+        try:
+            # Detect combined mode/source/shuffle_type from _start_playback_for_current log:
+            #   "_start_playback_for_current: mode=album, source=Toxicity, shuffle_type=, album_idx=1, ..."
+            if "_start_playback_for_current: mode=" in line:
+                mode_match = re.search(r"mode=(\w+)", line)
+                if mode_match:
+                    self._current_device_mode = mode_match.group(1)
+                
+                # Extract source name (everything between "source=" and the next ", shuffle_type=" or ", album_idx=")
+                source_match = re.search(r"source=([^,]*?)(?:,\s*shuffle_type=|,\s*album_idx=|$)", line)
+                if source_match:
+                    source_val = source_match.group(1).strip()
+                    if source_val:
+                        self._current_device_source = source_val
+                
+                # Extract shuffle_type
+                shuffle_match = re.search(r"shuffle_type=(\w*)", line)
+                if shuffle_match and shuffle_match.group(1):
+                    self._current_shuffle_type = shuffle_match.group(1)
+                elif self._current_device_mode != "shuffle":
+                    self._current_shuffle_type = ""
+                
+                # Extract album_idx as fallback for source name
+                idx_match = re.search(r"album_idx=(\d+)", line)
+                if idx_match:
+                    self._current_album_idx = int(idx_match.group(1))
+                    # Use album_idx as fallback ONLY if source is empty
+                    if not self._current_device_source:
+                        mode = self._current_device_mode or ""
+                        if mode == "playlist":
+                            self._current_device_source = f"Playlist #{self._current_album_idx + 1}"
+                        elif mode == "album":
+                            self._current_device_source = f"Album #{self._current_album_idx + 1}"
+                
+                self._update_now_playing_display()
+            
+            # Detect mode changes: "[MODE] album -> playlist" or "[MODE] album -> playlist, album_idx=0"
+            if "[MODE]" in line:
+                match = re.search(r"(\w+)\s*->\s*(\w+)", line)
+                if match:
+                    self._current_device_mode = match.group(2)
+                    # Clear source on mode change (will be re-detected from next playback log)
+                    self._current_device_source = ""
+                    if match.group(2) != "shuffle":
+                        self._current_shuffle_type = ""
+                    # Extract album_idx if present
+                    idx_match = re.search(r"album_idx=(\d+)", line)
+                    if idx_match:
+                        self._current_album_idx = int(idx_match.group(1))
+                        mode = match.group(2)
+                        if mode == "playlist":
+                            self._current_device_source = f"Playlist #{self._current_album_idx + 1}"
+                        elif mode == "album":
+                            self._current_device_source = f"Album #{self._current_album_idx + 1}"
+                    self._update_now_playing_display()
+                    return
+            
+            # Detect shuffle initialization:
+            #   "Mode: Shuffle (Library, 50 tracks)" or "Mode: Shuffle (My Album, 12 tracks)"
+            if "Mode: Shuffle" in line:
+                match = re.search(r"Mode: Shuffle \((.+?),\s*(\d+)\s*tracks?\)", line)
+                if match:
+                    source = match.group(1).strip()
+                    self._current_device_mode = "shuffle"
+                    self._current_device_source = source
+                    if source == "Library":
+                        self._current_shuffle_type = "library"
+                    else:
+                        # Source is an album or playlist name
+                        self._current_shuffle_type = "source"
+                    self._update_now_playing_display()
+                    return
+            
+            # Detect "Long press: next album/playlist" or "Shuffle: advancing to next album/playlist" patterns
+            if "next album" in line.lower() or "next playlist" in line.lower():
+                # Album/playlist changed, source will be re-detected from next playback log
+                self._current_device_source = ""
+            
+            # Detect AM sound events (PWM overlay or DFPlayer sequential)
+            if "AM: PWM overlay mode" in line:
+                self._am_wav_loaded = True  # PWM overlay active
+            elif "AM: DFPlayer sequential mode" in line:
+                self._am_wav_loaded = True  # DFPlayer fallback active
+            elif "AM: Playing static sound" in line:
+                self._am_wav_loaded = True
+            elif "AM: Static sound not confirmed" in line:
+                self._am_wav_loaded = False
+            
+            # Detect playback start: "Starting playback: 'title' by artist (folder=X, track=Y, start_ms=Z)"
+            #   or "Playback started successfully: 'title' by artist"
+            if "Starting playback:" in line or "_start_playback_for_current: Playing" in line or "Playback started successfully:" in line:
+                # Match: 'title' by artist
+                match = re.search(r"'([^']+)'\s+by\s+(.+?)(?:\s*\(|$)", line)
+                if match:
+                    title = match.group(1)
+                    artist = match.group(2).strip()
+                    self._current_track_title = title
+                    self._current_track_artist = artist
+                    self._update_now_playing_display()
+                    return
+            
+            # Detect track finished and advance: "Track finished: 'old' -> 'new'"
+            if "Track finished:" in line:
+                match = re.search(r"'([^']+)'\s*->\s*'([^']+)'", line)
+                if match:
+                    self._current_track_title = match.group(2)
+                    self._current_track_artist = "(auto-advanced)"
+                    self._update_now_playing_display()
+        except Exception:
+            pass  # Non-critical - don't let parsing errors affect streaming
+    
+    def _update_now_playing_display(self):
+        """Update the now playing label with current mode, source, track, and artist."""
+        try:
+            mode = self._current_device_mode or "Unknown"
+            title = getattr(self, '_current_track_title', '')
+            artist = getattr(self, '_current_track_artist', '')
+            source = getattr(self, '_current_device_source', '')
+            shuffle_type = getattr(self, '_current_shuffle_type', '')
+            
+            parts = []
+            
+            # Build mode display with shuffle distinction
+            if mode.lower() == "shuffle":
+                if shuffle_type == "library":
+                    mode_display = "Library Shuffle"
+                elif shuffle_type == "album" and source:
+                    mode_display = f"Album Shuffle ({source})"
+                elif shuffle_type == "playlist" and source:
+                    mode_display = f"Playlist Shuffle ({source})"
+                elif shuffle_type == "source" and source:
+                    mode_display = f"Shuffle ({source})"
+                elif source:
+                    mode_display = f"Shuffle ({source})"
+                else:
+                    mode_display = "Shuffle"
+            else:
+                mode_display = mode.title()
+            
+            parts.append(f"<span style='color: #dcdcaa;'>Mode: {mode_display}</span>")
+            
+            # Show source (album/playlist name) for non-shuffle modes
+            if mode.lower() != "shuffle" and source:
+                parts.append(f"<span style='color: #c586c0;'>{source}</span>")
+            
+            if title:
+                parts.append(f"<b style='color: #4ec9b0;'>&#9835; {title}</b>")
+            if artist:
+                parts.append(f"<span style='color: #9cdcfe;'>{artist}</span>")
+            
+            self.now_playing_label.setText("<br>".join(parts))
+        except Exception:
+            pass
+    
+    @QtCore.pyqtSlot()
+    def _display_stream_stopped(self):
+        """Update UI when streaming stops."""
+        try:
+            self.stream_output_btn.setText("Start Streaming")
+        except Exception as e:
+            self._debug_log(f"Error updating stream button: {e}", "error")
+    
+    def _check_amplifier(self) -> None:
+        """Run amplifier diagnostic checks."""
+        if not self._connected:
+            self._log("Not connected. Please connect first.", "error")
+            return
+        
+        if "check_amplifier" in self._active_operations:
+            self._debug_log("Amplifier check already in progress, ignoring", "warning")
+            return
+        
+        self._active_operations.add("check_amplifier")
+        # Get port name from combo box data (not text, which includes description)
+        port = self.port_combo.currentData()
+        if not port:
+            # Fallback: try to extract port from text if data is None
+            text = self.port_combo.currentText().strip()
+            if text and text.startswith("COM"):
+                port = text.split()[0] if ' ' in text else text
+            else:
+                self._log("No port selected", "error")
+                return
+        
+        self._log("=== Amplifier Diagnostic ===", "info")
+        self._log("Checking DFPlayer and amplifier connections...", "info")
+        
+        # Command to check DFPlayer status, volume, BUSY pin, and suggest amplifier checks
+        cmd = (
+            "from components.dfplayer_hardware import DFPlayerHardware\n"
+            "from machine import Pin\n"
+            "import time\n"
+            "print('=== DFPlayer Status ===')\n"
+            "hw = DFPlayerHardware()\n"
+            "print(f'DFPlayer Volume: {hw._df_volume}/30 (max)')\n"
+            "print(f'BUSY Pin (GP15): {hw.pin_busy.value()} (0=playing, 1=idle)')\n"
+            "print(f'UART TX (GP0): {Pin(0, Pin.OUT).value()}')\n"
+            "print(f'UART RX (GP1): {Pin(1, Pin.IN).value()}')\n"
+            "print('')\n"
+        )
+        # First command just gets basic status - we don't use the result
+        self._send_serial_command(port, cmd, timeout=10)
+        cmd_full = cmd + (
+            "print('=== Amplifier Troubleshooting ===')\n"
+            "print('1. Check amplifier power: Is it getting 5V/12V?')\n"
+            "print('2. Check DFPlayer output: SPK_1/SPK_2 or DAC connected to amp input?')\n"
+            "print('3. Check amplifier enable/shutdown pin (if present)')\n"
+            "print('4. Check gain/volume pot on amplifier (if present)')\n"
+            "print('5. Check ground connections: All GNDs connected?')\n"
+            "print('6. Try: hw._df_set_vol(30); hw._df_play_folder_track(1, 1)')\n"
+            "print('   Then check BUSY pin - should go to 0 (playing)')\n"
+            "print('')\n"
+            "print('=== Test Playback ===')\n"
+            "print('Sending test command: play folder 1, track 1...')\n"
+            "hw._df_set_vol(30)\n"
+            "time.sleep_ms(100)\n"
+            "hw._df_play_folder_track(1, 1)\n"
+            "time.sleep_ms(500)\n"
+            "busy_after = hw.pin_busy.value()\n"
+            "print(f'BUSY pin after playback command: {busy_after} (0=playing, 1=idle)')\n"
+            "if busy_after == 0:\n"
+            "  print('✓ DFPlayer is playing! Check amplifier connections.')\n"
+            "else:\n"
+            "  print('✗ DFPlayer not playing. Check SD card and file structure.')\n"
+        )
+        
+        def run_diagnostic():
+            max_retries = 3
+            retry_delay = 1.0
+            
+            try:
+                for attempt in range(max_retries):
+                    try:
+                        returncode, stdout, stderr = self._send_serial_command(port, cmd_full, timeout=15)
+                        
+                        if returncode == 0:
+                            output = stdout.strip() if stdout else ""
+                            if output:
+                                for line in output.split('\n'):
+                                    if line.strip():
+                                        self._log(line, "output")
+                            else:
+                                self._log("(No output)", "info")
+                            self._active_operations.discard("check_amplifier")
+                            break  # Success, exit retry loop
+                        else:
+                            error_msg = stderr or stdout or "Unknown error"
+                            # Check if it's a port conflict error
+                            if "failed to access" in error_msg.lower():
+                                if attempt < max_retries - 1:
+                                    self._log(f"Port conflict, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})", "info")
+                                    import time
+                                    time.sleep(retry_delay)
+                                    retry_delay *= 2  # Exponential backoff
+                                    continue
+                                else:
+                                    self._log(f"Error: {error_msg}", "error")
+                                    self._active_operations.discard("check_amplifier")
+                                    break
+                            else:
+                                self._log(f"Error: {error_msg}", "error")
+                                self._active_operations.discard("check_amplifier")
+                                break
+                    except subprocess.TimeoutExpired:
+                        if attempt < max_retries - 1:
+                            self._log(f"Timeout, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})", "info")
+                            import time
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                            continue
+                        else:
+                            self._active_operations.discard("check_amplifier")
+                            self._log("Diagnostic timed out after multiple retries", "error")
+                            break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            self._log(f"Error, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries}): {e}", "warning")
+                            import time
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                            continue
+                        else:
+                            self._active_operations.discard("check_amplifier")
+                            self._log(f"Error running diagnostic: {e}", "error")
+                            break
+            finally:
+                pass  # _send_serial_command handles streaming pause/resume
+        
+        threading.Thread(target=run_diagnostic, daemon=True).start()
+    
+    def _show_help(self) -> None:
+        """Show help with example commands."""
+        help_text = """
+Example Commands (sent to device):
+  print('Hello from Pico!')
+  import machine; machine.Pin(2).value()
+  from components.dfplayer_hardware import DFPlayerHardware; hw = DFPlayerHardware()
+  import os; os.listdir()
+  import gc; gc.mem_free()
+
+GUI Commands (not sent to device):
+  check_amplifier - Run amplifier diagnostic
+  help - Show this help message
+        """
+        self._log(help_text.strip(), "info")
+    
+    def _check_power_sense_setting(self) -> None:
+        """Check current power sense setting on device."""
+        if not self._connected:
+            return
+        
+        port = self.port_combo.currentData()
+        self._debug_log("Checking power sense setting...", "info")
+        
+        def check():
+            try:
+                cmd = (
+                    "try:\n"
+                    "    with open('skip_power_sense.txt', 'r') as f:\n"
+                    "        val = f.read().strip().lower()\n"
+                    "        print('true' if val in ('true', '1') else 'false')\n"
+                    "except:\n"
+                    "    print('false')"
+                )
+                returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=5)
+                self._debug_log(f"Power sense check return code: {returncode}", "info")
+                if returncode == 0:
+                    setting = stdout.strip().lower() == "true"
+                    self._debug_log(f"Power sense setting: {setting}", "info")
+                    # Update checkbox on main thread using QMetaObject.invokeMethod
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_update_power_sense_checkbox",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(int, 1 if setting else 0)
+                    )
+            except Exception as e:
+                self._debug_log(f"Error checking power sense: {e}\n{traceback.format_exc()}", "error")
+        
+        threading.Thread(target=check, daemon=True).start()
+    
+    def _toggle_power_sense(self, state: int) -> None:
+        """Toggle power sense check on/off."""
+        if not self._connected:
+            self.power_sense_checkbox.setChecked(False)
+            self._log("Not connected. Please connect first.", "error")
+            return
+        
+        if "toggle_power" in self._active_operations:
+            self._debug_log("Power sense toggle already in progress, ignoring", "warning")
+            return
+        
+        self._active_operations.add("toggle_power")
+        # state: 0 = unchecked, 2 = checked
+        enabled = self.power_sense_checkbox.isChecked()
+        port = self.port_combo.currentData()
+        
+        self._debug_log(f"Toggling power sense: enabled={enabled}", "info")
+        self._log(f"{'Disabling' if enabled else 'Enabling'} power sense check...", "info")
+        
+        def toggle():
+            try:
+                # Write the setting to a file on the device
+                value = "true" if enabled else "false"
+                cmd = (
+                    f"with open('skip_power_sense.txt', 'w') as f:\n"
+                    f"    f.write('{value}')"
+                )
+                self._debug_log(f"Executing power sense toggle command...", "info")
+                returncode, stdout, stderr = self._send_serial_command(port, cmd, timeout=5)
+                self._debug_log(f"Power sense toggle return code: {returncode}", "info")
+                
+                self._active_operations.discard("toggle_power")
+                
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_power_sense_toggle_result",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(int, returncode),
+                    QtCore.Q_ARG(str, stderr.strip() if stderr else ""),
+                    QtCore.Q_ARG(int, 1 if enabled else 0)
+                )
+            except subprocess.TimeoutExpired:
+                self._debug_log("Power sense toggle timed out", "error")
+                # Clear operation immediately
+                self._active_operations.discard("toggle_power")
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_power_sense_timeout",
+                    QtCore.Qt.ConnectionType.QueuedConnection
+                )
+            except Exception as e:
+                error_msg = f"Error toggling power sense: {e}\n{traceback.format_exc()}"
+                self._debug_log(error_msg, "error")
+                # Clear operation immediately
+                self._active_operations.discard("toggle_power")
+                error_msg_val = str(e)
+                # Use QMetaObject.invokeMethod for thread-safe UI update
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_power_sense_error",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, error_msg_val)
+                )
+        
+        threading.Thread(target=toggle, daemon=True).start()
+    
+    def _log(self, message: str, level: str = "info") -> None:
+        """Add a message to the console output. Thread-safe - can be called from any thread."""
+        # Check if we're on the main thread
+        if QtCore.QThread.currentThread() == self.thread():
+            # We're on the main thread, update UI directly
+            self._log_impl(message, level)
+        else:
+            # We're on a background thread, queue the update
+            try:
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_log_impl",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, message),
+                    QtCore.Q_ARG(str, level)
+                )
+            except Exception as e:
+                # Fallback to print if invokeMethod fails
+                print(f"[DeviceDebug] Failed to queue log message: {e}")
+                print(f"[DeviceDebug] {message}")
+    
+    @QtCore.pyqtSlot(str, str)
+    def _log_impl(self, message: str, level: str = "info") -> None:
+        """Internal implementation of log - must be called on main thread."""
+        timestamp = QtCore.QDateTime.currentDateTime().toString("hh:mm:ss")
+        
+        if level == "error":
+            color = "#f48771"  # Red
+            prefix = "[ERROR]"
+        elif level == "warning":
+            color = "#dcdcaa"  # Yellow
+            prefix = "[WARN]"
+        elif level == "success":
+            color = "#4ec9b0"  # Green
+            prefix = "[OK]"
+        elif level == "command":
+            color = "#569cd6"  # Blue
+            prefix = "[CMD]"
+        elif level == "output":
+            color = "#d4d4d4"  # Light gray
+            prefix = ""
+        else:
+            color = "#9cdcfe"  # Light blue
+            prefix = "[INFO]"
+        
+        formatted = f'<span style="color: {color};">{timestamp} {prefix} {message}</span>'
+        try:
+            if hasattr(self, 'console_output') and self.console_output:
+                self.console_output.append(formatted)
+                # Auto-scroll to bottom
+                scrollbar = self.console_output.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+        except Exception as e:
+            # Fallback to print if UI update fails
+            print(f"[DeviceDebug] {timestamp} {prefix} {message}")
+            print(f"[DeviceDebug] UI update error: {e}")
+    
+    def _debug_log(self, message: str, level: str = "info") -> None:
+        """Internal debug logging - logs to both console and Python console."""
+        if self._debug_logging:
+            # Log to Python console (for debugging crashes)
+            print(f"[DeviceDebug-DEBUG] {level.upper()}: {message}")
+            # Also log to GUI console with [DEBUG] prefix
+            try:
+                self._log(f"[DEBUG] {message}", level)
+            except Exception:
+                # If UI logging fails, at least print to console
+                pass
+    
+    def _toggle_debug_logging(self, state: int) -> None:
+        """Toggle debug logging on/off."""
+        self._debug_logging = self.debug_logging_checkbox.isChecked()
+        status = "enabled" if self._debug_logging else "disabled"
+        print(f"[DeviceDebug] Debug logging {status}")
+        if self._debug_logging:
+            self._log(f"Debug logging {status}", "info")
+    
+    @QtCore.pyqtSlot(int, str, str)
+    def _display_list_files_result(self, returncode: int, stdout: str, stderr: str):
+        """Display list files result on main thread."""
+        try:
+            if returncode == 0:
+                if stdout:
+                    self._log(stdout, "output")
+                else:
+                    self._log("(No files listed or empty output)", "info")
+            else:
+                self._log(f"Error: {stderr or stdout or 'Unknown error'}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying list files result: {e}\n{traceback.format_exc()}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_status_output(self, output: str):
+        """Display status command output on main thread."""
+        try:
+            if output:
+                self._log(output, "output")
+        except Exception as e:
+            self._debug_log(f"Error displaying status output: {e}\n{traceback.format_exc()}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_now_playing(self, json_str: str):
+        """Display now playing information on main thread."""
+        try:
+            import json
+            # Handle empty or invalid JSON gracefully
+            if not json_str or not json_str.strip():
+                self.now_playing_label.setText("No status available (device may not be responding)")
+                self.now_playing_label.setStyleSheet(
+                    "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
+                    "border: 1px solid #ffaa00; border-radius: 4px; color: #ffaa88;"
+                )
+                return
+            
+            try:
+                status = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                self._debug_log(f"Error parsing JSON from now playing: {e}, received: {json_str[:200]}", "error")
+                self.now_playing_label.setText(f"Error parsing status: {json_str[:100]}")
+                self.now_playing_label.setStyleSheet(
+                    "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
+                    "border: 1px solid #ff4444; border-radius: 4px; color: #ff8888;"
+                )
+                return
+            
+            if "error" in status:
+                error_msg = status.get("error", "Unknown error")
+                # Provide more helpful error messages
+                if "Firmware not accessible" in error_msg or "Firmware instance not found" in error_msg:
+                    help_text = (
+                        "Firmware not accessible. This usually means:\n"
+                        "• Device is not running main.py (may need to restart)\n"
+                        "• Firmware is in main loop and instance isn't accessible\n"
+                        "• Try: Soft Reset to restart the firmware"
+                    )
+                    self.now_playing_label.setText(f"Error: {error_msg}\n\n{help_text}")
+                else:
+                    self.now_playing_label.setText(f"Error: {error_msg}")
+                self.now_playing_label.setStyleSheet(
+                    "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
+                    "border: 1px solid #ff4444; border-radius: 4px; color: #ff8888;"
+                )
+                return
+            
+            # Extract status information
+            mode = status.get("mode", "Unknown")
+            source = status.get("source", "Unknown")
+            track_title = status.get("track_title", "Unknown")
+            track_artist = status.get("track_artist", "Unknown")
+            track_number = status.get("track_number", 0)
+            track_count = status.get("track_count", 0)
+            is_playing = status.get("is_playing", False)
+            power_on = status.get("power_on", False)
+            
+            # Build display text
+            playing_status = "▶ Playing" if is_playing else "⏸ Paused"
+            power_status = "ON" if power_on else "OFF"
+            
+            if mode == "shuffle":
+                display_text = (
+                    f"<b>Mode:</b> {mode.title()}<br>"
+                    f"<b>Status:</b> {playing_status} | Power: {power_status}<br>"
+                    f"<b>Track:</b> {track_number}/{track_count}<br>"
+                    f"<b>Title:</b> {track_title}<br>"
+                    f"<b>Artist:</b> {track_artist}"
+                )
+            elif mode == "radio":
+                display_text = (
+                    f"<b>Mode:</b> {mode.title()}<br>"
+                    f"<b>Station:</b> {source}<br>"
+                    f"<b>Status:</b> {playing_status} | Power: {power_status}<br>"
+                    f"<b>Track:</b> {track_number}/{track_count}<br>"
+                    f"<b>Now Playing:</b> {track_title}<br>"
+                    f"<b>Artist:</b> {track_artist}"
+                )
+            else:  # album or playlist
+                display_text = (
+                    f"<b>Mode:</b> {mode.title()}<br>"
+                    f"<b>Source:</b> {source}<br>"
+                    f"<b>Status:</b> {playing_status} | Power: {power_status}<br>"
+                    f"<b>Track:</b> {track_number}/{track_count}<br>"
+                    f"<b>Title:</b> {track_title}<br>"
+                    f"<b>Artist:</b> {track_artist}"
+                )
+            
+            self.now_playing_label.setText(display_text)
+            self.now_playing_label.setStyleSheet(
+                "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
+                "border: 1px solid #555; border-radius: 4px; color: #d4d4d4;"
+            )
+        except Exception as e:
+            self._debug_log(f"Error displaying now playing: {e}\n{traceback.format_exc()}", "error")
+            self.now_playing_label.setText(f"Error displaying status: {str(e)[:50]}")
+            self.now_playing_label.setStyleSheet(
+                "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
+                "border: 1px solid #ff4444; border-radius: 4px; color: #ff8888;"
+            )
+    
+    @QtCore.pyqtSlot(str)
+    def _display_soft_reset_result(self, stdout: str):
+        """Display soft reset result on main thread."""
+        try:
+            self._log("Soft reset sent - device should restart automatically", "success")
+            if stdout:
+                self._log(stdout, "output")
+        except Exception as e:
+            self._debug_log(f"Error displaying soft reset result: {e}\n{traceback.format_exc()}", "error")
+    
+    @QtCore.pyqtSlot(int, str, str, int)
+    def _display_command_result(self, returncode: int, stdout: str, stderr: str, was_streaming_int: int):
+        """Display command result on main thread."""
+        try:
+            if returncode == 0:
+                if stdout:
+                    self._log(stdout, "output")
+            else:
+                error = stderr or stdout or "Unknown error"
+                if error:
+                    self._log(f"Error: {error}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying command result: {e}\n{traceback.format_exc()}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_command_timeout(self):
+        """Display command timeout message on main thread."""
+        try:
+            self._log("Command timed out - device may be busy or command is taking too long", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying timeout: {e}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_command_error(self, error: str):
+        """Display command error message on main thread."""
+        try:
+            self._log(f"Error executing command: {error}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying error: {e}", "error")
+    
+    @QtCore.pyqtSlot(int)
+    def _update_power_sense_checkbox(self, checked_int: int):
+        """Update power sense checkbox on main thread."""
+        try:
+            checked = bool(checked_int)  # Convert int back to bool
+            self.power_sense_checkbox.setChecked(checked)
+        except Exception as e:
+            self._debug_log(f"Error updating checkbox: {e}", "error")
+    
+    @QtCore.pyqtSlot(int, str, int)
+    def _display_power_sense_toggle_result(self, returncode: int, stderr: str, enabled_int: int):
+        """Display power sense toggle result on main thread."""
+        enabled = bool(enabled_int)  # Convert int back to bool
+        try:
+            if returncode == 0:
+                status = "DISABLED" if enabled else "ENABLED"
+                self._log(f"✓ Power sense check {status}. Device will {'skip' if enabled else 'require'} power sense on next boot.", "success")
+            else:
+                self._log(f"Failed to set power sense: {stderr or 'Unknown error'}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying power sense result: {e}\n{traceback.format_exc()}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_power_sense_timeout(self):
+        """Display power sense toggle timeout on main thread."""
+        try:
+            self._log("Power sense toggle timed out", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying timeout: {e}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_power_sense_error(self, error: str):
+        """Display power sense toggle error on main thread."""
+        try:
+            self._log(f"Error: {error}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying error: {e}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_soft_reset_timeout(self):
+        """Display soft reset timeout on main thread."""
+        try:
+            self._log("Reset timed out - device may be unresponsive. Try disconnecting and reconnecting.", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying timeout: {e}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_soft_reset_timeout_success(self):
+        """Display soft reset timeout success message (timeout is normal for soft_reset)."""
+        try:
+            self._log("Soft reset sent - device is restarting (timeout is normal)", "success")
+        except Exception as e:
+            self._debug_log(f"Error displaying timeout success: {e}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_soft_reset_error(self, error: str):
+        """Display soft reset error on main thread."""
+        try:
+            self._log(f"Reset error: {error}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying error: {e}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_restart_firmware_result(self, output: str):
+        """Display restart firmware result on main thread."""
+        try:
+            self._log("Firmware restart initiated - device should be running main.py now", "success")
+            if output:
+                self._log(output, "output")
+        except Exception as e:
+            self._debug_log(f"Error displaying restart firmware result: {e}\n{traceback.format_exc()}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_restart_firmware_error(self, error: str):
+        """Display restart firmware error on main thread."""
+        try:
+            self._log(f"Error restarting firmware: {error}", "error")
+            self._log("Try using Soft Reset instead, or physically reset the device", "info")
+        except Exception as e:
+            self._debug_log(f"Error displaying restart firmware error: {e}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_restart_firmware_timeout(self):
+        """Display restart firmware timeout on main thread."""
+        try:
+            self._log("Firmware restart timed out - this is normal if firmware started running", "info")
+        except Exception as e:
+            self._debug_log(f"Error displaying restart firmware timeout: {e}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_list_files_timeout(self):
+        """Display list files timeout on main thread."""
+        try:
+            self._log("List files timed out - device may be busy or have many files", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying timeout: {e}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_list_files_error(self, error: str):
+        """Display list files error on main thread."""
+        try:
+            self._log(f"Error: {error}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying error: {e}", "error")
+    
+    @QtCore.pyqtSlot(str)
+    def _display_status_error(self, error: str):
+        """Display status command error on main thread."""
+        try:
+            self._log(f"Error: {error}", "error")
+        except Exception as e:
+            self._debug_log(f"Error displaying error: {e}", "error")
+    
+    @QtCore.pyqtSlot()
+    def _display_connection_timeout(self):
+        """Display connection timeout on main thread."""
+        try:
+            # Validate widget exists
+            if not self or not hasattr(self, 'connect_btn'):
+                return
+            
+            self._connected = False
+            self.connect_btn.setText("Connect")
+            self.connect_btn.setEnabled(True)
+            self.connection_status.setText("Connection timed out")
+            self.connection_status.setStyleSheet("color: red;")
+            self._log("✗ Connection timed out", "error")
+            self._restore_disconnected_state()
+        except Exception as e:
+            error_msg = f"Error in _display_connection_timeout: {e}\n{traceback.format_exc()}"
+            self._debug_log(error_msg, "error")
+            # Try to restore state even on error
+            try:
+                if hasattr(self, '_restore_disconnected_state'):
+                    self._restore_disconnected_state()
+            except:
+                pass
+    
+    @QtCore.pyqtSlot(str)
+    def _display_connection_error(self, error: str):
+        """Display connection error on main thread."""
+        try:
+            # Validate widget exists
+            if not self or not hasattr(self, 'connect_btn'):
+                return
+            
+            self._connected = False
+            self.connect_btn.setText("Connect")
+            self.connect_btn.setEnabled(True)
+            error_display = str(error)[:50] if error else "Unknown error"
+            self.connection_status.setText(f"Error: {error_display}")
+            self.connection_status.setStyleSheet("color: red;")
+            self._log(f"✗ Connection error: {error}", "error")
+            self._restore_disconnected_state()
+        except Exception as e:
+            error_msg = f"Error in _display_connection_error: {e}\n{traceback.format_exc()}"
+            self._debug_log(error_msg, "error")
+            # Try to restore state even on error
+            try:
+                if hasattr(self, '_restore_disconnected_state'):
+                    self._restore_disconnected_state()
+            except:
+                pass
+

@@ -374,7 +374,11 @@ class TestModeWidget(QtWidgets.QWidget):
         self.refresh_btn.clicked.connect(self.refresh_from_db)
 
         self.power_toggle = QtWidgets.QCheckBox("Power On (Rail 2)")
-        self.power_toggle.setChecked(True)
+        # Restore saved power state (default: on)
+        saved_power = self.db.get_setting("test_mode_power_on", "1")
+        initial_power = saved_power == "1"
+        self.power_toggle.setChecked(initial_power)
+        self.rail2_on = initial_power
         self.power_toggle.toggled.connect(self.toggle_power)
         self.knob_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.knob_slider.setRange(0, 100)
@@ -483,12 +487,15 @@ class TestModeWidget(QtWidgets.QWidget):
         self.audio_ready = self.hw_emulator._audio_ready
         self.am_sound = self.hw_emulator._am_sound
         
+        # Sync radio face power indicator with saved power state
+        self.radio_face.set_power(self.rail2_on)
+        
         self.refresh_from_db()
         # Check SD card sync status on initialization
         # Use QTimer to ensure widget is visible before checking
         QtCore.QTimer.singleShot(100, self._check_sd_sync)
         self._init_log_file()
-        # Auto-start playback on boot (like firmware does)
+        # Auto-start playback on boot only if power was on last time
         if self.rail2_on:
             QtCore.QTimer.singleShot(DF_BOOT_MS, self._power_on_handler)
 
@@ -1046,6 +1053,8 @@ class TestModeWidget(QtWidgets.QWidget):
         """Toggle power using RadioCore."""
         self.rail2_on = on
         self.radio_face.set_power(on)
+        # Persist power state so it's remembered across restarts
+        self.db.set_setting("test_mode_power_on", "1" if on else "0")
         if not on:
             self.core.power_off()
             self._sync_from_core()

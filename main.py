@@ -4,7 +4,7 @@
 # Hardware: Raspberry Pi Pico + DFPlayer Mini
 # Compatible with MicroPython
 
-from machine import Pin, Timer
+from machine import Pin
 import time
 
 # Import shared core logic
@@ -12,19 +12,12 @@ from radio_core import (
     RadioCore, 
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
-    FADE_IN_S, DF_BOOT_MS, LONG_PRESS_MS, TAP_WINDOW_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
+    FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
     ticks_ms, ticks_diff,
 )
 
 # Import hardware implementation
 from components.dfplayer_hardware import DFPlayerHardware
-
-# ===========================
-#      CONFIGURATION
-# ===========================
-
-MAX_ALBUM_NUM = 99
-ALBUM_PROBE_MS = 650
 
 # ===========================
 #      MAIN FIRMWARE CLASS
@@ -57,12 +50,19 @@ class VintageRadioFirmware:
         
         # BUSY pin state for track-finished detection
         self.prev_busy = 1
-        
-        # Track mode changes for AM overlay sequencing
-        self._pending_am_overlay = False
+        self._busy_high_since = 0  # Timestamp when BUSY first went HIGH (for debounce)
     
     def wait_for_power(self):
-        """Wait for power sense (GP14) to go HIGH."""
+        """Wait for power sense (GP14) to go HIGH, or skip if configured."""
+        # Check if power sense check is disabled
+        skip_power_check = self._check_skip_power_sense()
+        
+        if skip_power_check:
+            print("Power sense check DISABLED (configured via debug mode)")
+            self.rail2_on = True
+            self.last_sense = 1
+            return
+        
         print("Waiting for GP14 HIGH (power sense)...")
         last_hint = ticks_ms()
         
@@ -76,6 +76,17 @@ class VintageRadioFirmware:
         self.rail2_on = True
         self.last_sense = 1
     
+    def _check_skip_power_sense(self):
+        """Check if power sense check should be skipped (from config file)."""
+        try:
+            with open("skip_power_sense.txt", "r") as f:
+                content = f.read().strip().lower()
+                result = content == "true" or content == "1"
+                return result
+        except OSError:
+            # File doesn't exist - default to requiring power sense (safe)
+            return False
+    
     def boot_sequence(self):
         """Perform boot sequence: reset DFPlayer, load state, start playback with AM overlay.
         Matches baseline 5.9.1: one start inside AM overlay (no double-start).
@@ -86,14 +97,26 @@ class VintageRadioFirmware:
         # Load state only; do not start playback yet (we start with AM overlay below)
         self.core.init(skip_initial_playback=True)
         
+        # Report AM sound status
+        if self.hw.wav_data is not None:
+            print(f"AM sound: PWM overlay ENABLED ({len(self.hw.wav_data)} samples on Pico flash)")
+        else:
+            print(f"AM sound: PWM overlay disabled, using DFPlayer SD fallback (folder={self.hw._am_folder}, track={self.hw._am_track})")
+            print(f"AM sound: For overlay, copy AMradioSound.wav to Pico via 'Install to Pico'")
+        
         # Start with AM overlay (single start, same as baseline start_sequence_synced)
         tr = self.core._get_current_track()
         if tr:
             folder = tr.get("folder", 1)
             track = tr.get("track_number", 1)
+            title = tr.get("title", "Unknown")
+            artist = tr.get("artist", "Unknown")
+            print(f"Boot: Using track from metadata - '{title}' by {artist} (folder={folder:02d}, track={track:03d}, album_idx={self.core.current_album_index}, logical_track={self.core.current_track})")
         else:
             folder = self.core.current_album_index + 1
             track = self.core.current_track
+            print(f"Boot: No track dict, using fallback - folder={folder:02d}, track={track:03d}, album_idx={self.core.current_album_index}")
+            print(f"Boot: WARNING - This means metadata wasn't loaded correctly!")
         confirmed = self.hw.start_with_am(folder, track)
         
         if confirmed:
@@ -106,109 +129,89 @@ class VintageRadioFirmware:
             self.hw.play_track(folder, track)
     
     def handle_button(self):
-        """Handle button press and release events."""
+        """Handle button press and release events (edge detection only).
+        
+        With deferred timing, all actions happen in tick() via _resolve_input(),
+        not here. This method only detects edges and delegates to RadioCore.
+        """
         curr = 0 if self.hw.is_button_pressed() else 1
         now = ticks_ms()
         
         # Button press edge (1 -> 0)
         if self.last_button == 1 and curr == 0:
             self.press_start = now
+            print(f"Button PRESSED at {now}")
             self.core.on_button_press()
         
         # Button release edge (0 -> 1)
         elif self.last_button == 0 and curr == 1:
-            # Store old mode and shuffle state to detect changes
-            old_mode = self.core.mode
-            old_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
-            
-            # Delegate to RadioCore (same logic as GUI)
-            self.core.on_button_release()
-            
-            # Check if we need to play AM overlay:
-            # 1. Mode changed (normal mode switch)
-            # 2. Mode is shuffle AND shuffle_source_type changed (reshuffling)
-            new_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
-            mode_changed = old_mode != self.core.mode
-            shuffle_reshuffled = (
-                self.core.mode == MODE_SHUFFLE and 
-                old_shuffle_source != new_shuffle_source
-            )
-            
-            # Check if this was a long press with mode switching
             press_dur = ticks_diff(now, self.press_start)
-            
-            # For album changes (long press alone), we need to play AM overlay
-            if press_dur >= LONG_PRESS_MS and self.core.tap_count == 0:
-                # Long press alone = next album, which needs AM overlay
-                self._handle_album_change_with_am()
-            elif mode_changed or shuffle_reshuffled:
-                # Mode changed or shuffle reinitialized - play AM overlay first, then track
-                if mode_changed:
-                    print(f"Mode changed from {old_mode} to {self.core.mode}, playing AM overlay")
-                else:
-                    print(f"Shuffle reinitialized (source: {old_shuffle_source} -> {new_shuffle_source}), playing AM overlay")
-                
-                # Get the track RadioCore wants to play (use actual track for shuffle/radio)
-                tr = self.core._get_current_track()
-                if tr:
-                    folder = tr.get('folder', 1)
-                    track = tr.get('track_number', 1)
-                else:
-                    folder = self.core.current_album_index + 1
-                    track = self.core.current_track
-                
-                # Play AM overlay then start track (delay_playback prevents core from starting early)
-                self.hw.start_with_am(folder, track)
-            
+            print(f"Button RELEASED at {now}, duration: {press_dur}ms")
+            self.core.on_button_release()
             time.sleep_ms(40)  # Debounce
         
         self.last_button = curr
     
-    def _handle_album_change_with_am(self):
-        """Handle album change with AM overlay (long press alone)."""
-        folder = self.core.current_album_index + 1
-        track = self.core.current_track
-        
-        # Probe silently first
-        if self._probe_album_silent(folder, track):
-            # Album exists, play with AM
-            self.hw.start_with_am(folder, track)
+    def _play_am_for_change(self):
+        """Play AM overlay for mode/album change. Called when delay_playback is set."""
+        tr = self.core._get_current_track()
+        if tr:
+            folder = tr.get('folder', 1)
+            track = tr.get('track_number', 1)
+            title = tr.get('title', 'Unknown')
+            print(f"AM overlay triggered: '{title}' (folder={folder}, track={track})")
         else:
-            # Album doesn't exist, wrap to album 1
-            print(f"Album {folder} did not confirm. Wrapping to album 1.")
-            self.core.current_album_index = 0
-            self.core.current_track = 1
-            self.core._save_state("wrap to album 1")
-            self.hw.start_with_am(1, 1)
-    
-    def _probe_album_silent(self, folder, track):
-        """Silent probe to check if an album exists."""
-        print(f"Probe album (silent): folder {folder} track {track}")
-        self.hw._df_set_vol(0)
-        self.hw._df_stop()
-        time.sleep_ms(POST_CMD_GUARD_MS)
-        self.hw._df_play_folder_track(folder, track)
-        
-        start = ticks_ms()
-        while ticks_diff(ticks_ms(), start) < ALBUM_PROBE_MS:
-            if self.hw.pin_busy.value() == 0:
-                return True
-            time.sleep_ms(25)
-        return False
+            folder = self.core.current_album_index + 1
+            track = self.core.current_track
+            print(f"AM overlay triggered: folder={folder}, track={track} (no metadata)")
+        self.hw.start_with_am(folder, track)
     
     def handle_track_finished(self):
-        """Detect track finished via BUSY edge and trigger auto-advance."""
+        """Detect track finished via BUSY pin with debouncing.
+        
+        Instead of triggering on a single 0->1 edge (which can be caused by
+        brief glitches from volume changes or command sequencing), we require
+        BUSY to stay HIGH continuously for BUSY_DEBOUNCE_MS before triggering
+        the track-finished event.
+        """
+        BUSY_DEBOUNCE_MS = 500  # BUSY must stay HIGH for this long to confirm track end
+        
         if not self.rail2_on:
             return
         
         b = self.hw.pin_busy.value()
+        now = ticks_ms()
         
-        # Check for BUSY edge (0 -> 1 = track finished)
-        if self.prev_busy == 0 and b == 1:
-            # Check if we should ignore this edge
-            if ticks_diff(ticks_ms(), self.hw.ignore_busy_until) >= 0:
-                print("BUSY edge: track finished")
-                self.core.on_track_finished()
+        if b == 0:
+            # BUSY is LOW (playing) — reset debounce timer
+            self._busy_high_since = 0
+        elif b == 1 and self.prev_busy == 0:
+            # BUSY just went HIGH — start debounce timer
+            self._busy_high_since = now
+        
+        # Check if BUSY has been confirmed HIGH for long enough
+        if b == 1 and self._busy_high_since > 0:
+            if ticks_diff(now, self._busy_high_since) >= BUSY_DEBOUNCE_MS:
+                # Check if we should ignore this (e.g., just started a new track)
+                if ticks_diff(now, self.hw.ignore_busy_until) >= 0:
+                    print("BUSY confirmed HIGH: track finished")
+                    self._busy_high_since = 0  # Reset so we don't re-trigger
+                    
+                    # Get current track info before advancing
+                    old_tr = self.core._get_current_track()
+                    old_title = old_tr.get('title', 'Unknown') if old_tr else 'Unknown'
+                    old_album = self.core.current_album_index
+                    old_track = self.core.current_track
+                    
+                    # Advance to next track (this will save state and start playback)
+                    self.core.on_track_finished()
+                    
+                    # Get new track info after advancing
+                    new_tr = self.core._get_current_track()
+                    new_title = new_tr.get('title', 'Unknown') if new_tr else 'Unknown'
+                    new_album = self.core.current_album_index
+                    new_track = self.core.current_track
+                    print(f"Track finished: '{old_title}' -> '{new_title}' (album {old_album+1} track {old_track} -> album {new_album+1} track {new_track})")
         
         self.prev_busy = b
     
@@ -227,9 +230,17 @@ class VintageRadioFirmware:
                 self.hw.reset_dfplayer()
                 self.core.power_on_handler()
                 
-                # Play AM overlay on power-on
-                folder = self.core.current_album_index + 1
-                track = self.core.current_track
+                # Play AM overlay on power-on (use metadata for correct DFPlayer folder/track)
+                tr = self.core._get_current_track()
+                if tr:
+                    folder = tr.get('folder', 1)
+                    track = tr.get('track_number', 1)
+                    title = tr.get('title', 'Unknown')
+                    print(f"Power-on AM overlay: '{title}' (folder={folder}, track={track})")
+                else:
+                    folder = self.core.current_album_index + 1
+                    track = self.core.current_track
+                    print(f"Power-on AM overlay: folder={folder}, track={track} (no metadata)")
                 self.hw.start_with_am(folder, track)
             
             self.last_sense = sense
@@ -246,11 +257,17 @@ class VintageRadioFirmware:
         print("  triple-tap + hold = shuffle library")
         
         while True:
-            # Handle button events
+            # Handle button events (edge detection only)
             self.handle_button()
             
-            # Process tap window timeout
+            # Process deferred input (tap window timeout)
+            # Actions like mode switch, album change, etc. happen inside tick()
             self.core.tick()
+            
+            # After tick(), check if a mode/album change set delay_playback
+            # This means switch_mode() or _next_album() wants AM overlay before playback
+            if self.hw._delay_playback:
+                self._play_am_for_change()
             
             # Detect track finished
             self.handle_track_finished()
@@ -265,8 +282,12 @@ class VintageRadioFirmware:
 #      ENTRY POINT
 # ===========================
 
+# Global firmware instance (for debug access)
+firmware = None
+
 def main():
     """Main entry point for the firmware."""
+    global firmware
     firmware = VintageRadioFirmware()
     firmware.wait_for_power()
     firmware.boot_sequence()

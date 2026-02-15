@@ -14,6 +14,7 @@ from PyQt6.QtGui import QDesktopServices, QIcon
 
 from .audio_metadata import compute_file_hash, extract_metadata
 from .database import DatabaseManager
+from .device_debug import DeviceDebugWidget
 from .resource_paths import app_data_dir, project_root, resource_path
 from .sd_manager import SDManager
 from .test_mode import TestModeWidget
@@ -429,6 +430,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_album_combo = QtWidgets.QComboBox()
         self.sd_playlist_combo = QtWidgets.QComboBox()
         self.test_mode_widget = TestModeWidget(self.db)
+        self.device_debug_widget = DeviceDebugWidget()
 
         self._apply_saved_settings()
 
@@ -491,6 +493,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_playlists_tab(), "Playlists")
         tabs.addTab(self._build_sd_tab(), "Devices")
         tabs.addTab(self.test_mode_widget, "Test Mode")
+        tabs.addTab(self.device_debug_widget, "Device Debug")
         self.setCentralWidget(tabs)
 
     def _build_library_tab(self) -> QtWidgets.QWidget:
@@ -652,11 +655,14 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_ops_layout = QtWidgets.QVBoxLayout(sd_ops_group)
         actions_row = QtWidgets.QHBoxLayout()
         sync_btn = QtWidgets.QPushButton("Sync Library to SD")
-        sync_btn.setToolTip("Copy (and convert if needed) your full library to the storage root. Layout depends on Audio target: DFPlayer uses 01/, 02/, 001.mp3; Pi uses VintageRadio/library/.")
+        sync_btn.setToolTip("Copy (and convert if needed) your full library to the storage root. Layout depends on Audio target: DFPlayer uses 01/, 02/, 001.mp3; Pi uses VintageRadio/library/. Files that already exist and match will be skipped.")
         sync_btn.clicked.connect(self.sync_to_sd)
         validate_btn = QtWidgets.QPushButton("Validate SD")
         validate_btn.setToolTip("Check that every track in the library has a file on storage and report missing or mismatched files.")
         validate_btn.clicked.connect(self.validate_sd)
+        eject_btn = QtWidgets.QPushButton("Safely Remove SD Card")
+        eject_btn.setToolTip("Safely eject the SD card so it can be removed without data loss.")
+        eject_btn.clicked.connect(self.safely_remove_sd)
         import_btn = QtWidgets.QPushButton("Import from SD")
         import_btn.setToolTip("Import albums and playlists that were previously exported to this storage (e.g. from another machine) into your library.")
         import_btn.clicked.connect(self.import_from_sd)
@@ -665,6 +671,7 @@ class MainWindow(QtWidgets.QMainWindow):
         export_sd_contents_btn.clicked.connect(self.export_sd_contents_to_folder)
         actions_row.addWidget(sync_btn)
         actions_row.addWidget(validate_btn)
+        actions_row.addWidget(eject_btn)
         actions_row.addWidget(import_btn)
         actions_row.addWidget(export_sd_contents_btn)
         sd_ops_layout.addLayout(actions_row)
@@ -1347,8 +1354,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if not sd_root:
             return
         
+        # Ask user if they want a clean install (force re-sync all files)
+        force_clean = False
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "SD Card Sync",
+            "Sync library to SD card?\n\n"
+            "Files that already exist and match will be skipped.\n\n"
+            "Click 'Yes' for normal sync (skips existing files).\n"
+            "Click 'No' for clean install (re-syncs all files).",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Yes
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
+            return
+        if reply == QtWidgets.QMessageBox.StandardButton.No:
+            # User wants clean install
+            force_clean = True
+        
         # Show progress dialog
-        progress = QtWidgets.QProgressDialog("Syncing library to SD card...", "Cancel", 0, 0, self)
+        progress = QtWidgets.QProgressDialog(
+            "Syncing library to SD card..." + (" (clean install)" if force_clean else ""),
+            "Cancel", 0, 0, self
+        )
         progress.setWindowTitle("SD Card Sync")
         progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)  # Show immediately
@@ -1362,6 +1390,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 sd_root,
                 audio_target=self.audio_target,
                 pi_convert_audio=self.pi_convert_audio,
+                force_clean=force_clean,
             )
             progress.close()
             self.statusBar().showMessage(
@@ -1378,6 +1407,119 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"An error occurred during SD sync:\n{str(e)}"
             )
 
+    def safely_remove_sd(self) -> None:
+        """Safely eject/remove the SD card."""
+        sd_root = self._resolve_sd_root()
+        if not sd_root:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No SD Card",
+                "No SD card root selected. Please select an SD card first."
+            )
+            return
+        
+        try:
+            import platform
+            if platform.system() == "Windows":
+                # Use Windows API to eject the volume
+                import ctypes
+                from ctypes import wintypes
+                
+                # Get the drive letter from the path
+                drive_letter = sd_root.drive
+                if not drive_letter:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Cannot Eject",
+                        "Could not determine drive letter. Please eject manually using Windows Explorer."
+                    )
+                    return
+                
+                # Remove the colon (e.g., "E:" -> "E")
+                drive = drive_letter.rstrip(":")
+                
+                # Lock the volume
+                kernel32 = ctypes.windll.kernel32
+                volume_path = f"\\\\.\\{drive}:"
+                handle = kernel32.CreateFileW(
+                    volume_path,
+                    0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                    0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+                    None,
+                    0x3,  # OPEN_EXISTING
+                    0,  # No flags
+                    None
+                )
+                
+                if handle == -1:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Cannot Eject",
+                        f"Could not lock drive {drive}:. The drive may be in use.\n\n"
+                        "Please close any programs using the SD card and try again, "
+                        "or eject manually using Windows Explorer."
+                    )
+                    return
+                
+                try:
+                    # Eject the volume
+                    result = kernel32.DeviceIoControl(
+                        handle,
+                        0x2D4808,  # IOCTL_STORAGE_EJECT_MEDIA
+                        None,
+                        0,
+                        None,
+                        0,
+                        ctypes.byref(wintypes.DWORD()),
+                        None
+                    )
+                    
+                    if result:
+                        QtWidgets.QMessageBox.information(
+                            self,
+                            "SD Card Ejected",
+                            f"SD card ({drive}:) has been safely ejected.\n\n"
+                            "You can now safely remove it."
+                        )
+                    else:
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "Eject Failed",
+                            f"Could not eject drive {drive}:.\n\n"
+                            "Please try ejecting manually using Windows Explorer."
+                        )
+                finally:
+                    kernel32.CloseHandle(handle)
+            else:
+                # For Linux/Mac, use the standard eject command
+                import subprocess
+                result = subprocess.run(
+                    ["eject", str(sd_root)],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        "SD Card Ejected",
+                        f"SD card has been safely ejected.\n\n"
+                        "You can now safely remove it."
+                    )
+                else:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Eject Failed",
+                        f"Could not eject SD card: {result.stderr}\n\n"
+                        "Please try ejecting manually."
+                    )
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Eject Error",
+                f"An error occurred while trying to eject the SD card:\n{str(e)}\n\n"
+                "Please eject manually using your operating system's file manager."
+            )
+    
     def validate_sd(self) -> None:
         results = self.sd_manager.validate_sd()
         lines = []
@@ -1456,17 +1598,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if fw_src.exists():
             (dest / "components").mkdir(parents=True, exist_ok=True)
             shutil.copy2(fw_src, dest / "components" / "dfplayer_hardware.py")
-        am_wav = resource_path("AMradioSound.wav")
         vintage_dest = dest / "VintageRadio"
         vintage_dest.mkdir(parents=True, exist_ok=True)
-        if am_wav.exists():
-            shutil.copy2(am_wav, vintage_dest / "AMradioSound.wav")
         readme_txt = dest / "README_RP2040.txt"
         readme_txt.write_text(
             "RP2040 + DFPlayer. Copy main.py, radio_core.py, and components/\n"
-            "to the Pico. Put AMradioSound.wav in VintageRadio/ on the SD card.\n"
+            "to the Pico. AM sound is on SD card in folder 99/001.wav.\n"
             "SD layout: folders 01/, 02/, ... at SD root with 001.mp3, 002.mp3 inside;\n"
-            "VintageRadio/ for AMradioSound.wav, album_state.txt, radio_metadata.json.\n"
+            "folder 99/001.wav for AM static sound; VintageRadio/ for metadata.\n"
             "See README_RP2040.md in this folder for full setup.\n",
             encoding="utf-8",
         )
@@ -1480,17 +1619,43 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def install_to_pico(self) -> None:
-        """Copy application files to Pico via mpremote (requires: pip install mpremote, MicroPython on Pico)."""
-        mpremote = shutil.which("mpremote")
-        if not mpremote:
+        """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote)."""
+        # Try to use bundled mpremote first (if running as packaged exe)
+        mpremote_cmd = None
+        try:
+            import mpremote
+            # If mpremote is bundled, we can use it programmatically
+            # For now, fall back to CLI approach but use bundled Python to run it
+            import sys
+            if getattr(sys, 'frozen', False):
+                # Running as packaged executable - use bundled Python to run mpremote
+                import os
+                # Find Python executable in the bundle (PyInstaller includes it)
+                python_exe = sys.executable
+                # Try to run mpremote as a module
+                mpremote_cmd = [python_exe, "-m", "mpremote"]
+            else:
+                # Running as script - check for mpremote in PATH
+                mpremote_cmd = shutil.which("mpremote")
+                if mpremote_cmd:
+                    mpremote_cmd = [mpremote_cmd]
+        except ImportError:
+            # mpremote not available - check PATH
+            mpremote_cmd = shutil.which("mpremote")
+            if mpremote_cmd:
+                mpremote_cmd = [mpremote_cmd]
+        
+        if not mpremote_cmd:
             QtWidgets.QMessageBox.information(
                 self,
                 "Install to Pico",
-                "mpremote is not installed. Install it with:\n\n  pip install mpremote\n\n"
+                "mpremote is not available. In a packaged executable, mpremote should be bundled.\n\n"
+                "If running from source, install it with:\n\n  pip install mpremote\n\n"
                 "Then connect the Pico via USB (with MicroPython already installed) and try again.\n"
                 "See README_RP2040.md for how to install MicroPython on the Pico (one-time).",
             )
             return
+        
         root = self._project_root()
         if not (root / "main.py").exists() or not (root / "radio_core.py").exists():
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "Project files not found.")
@@ -1507,11 +1672,21 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()
         try:
             try:
+                # Create components directory
                 subprocess.run(
-                    [mpremote, "exec", "import os; os.mkdir('components')"],
+                    mpremote_cmd + ["exec", "import os; os.mkdir('components')"],
                     cwd=str(root), capture_output=True, text=True, timeout=15
                 )
             except Exception:
+                pass
+            try:
+                # Create VintageRadio directory (MicroPython doesn't have makedirs, so use mkdir with error handling)
+                subprocess.run(
+                    mpremote_cmd + ["exec", "import os; os.mkdir('VintageRadio')"],
+                    cwd=str(root), capture_output=True, text=True, timeout=15
+                )
+            except Exception:
+                # Directory might already exist, that's okay
                 pass
             for local, remote in [
                 ("main.py", "main.py"),
@@ -1521,7 +1696,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 src = root / local
                 if not src.exists():
                     continue
-                cmd = [mpremote, "cp", str(src), f":{remote}"]
+                cmd = mpremote_cmd + ["cp", str(src), f":{remote}"]
                 r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
                 if r.returncode != 0:
                     progress.close()
@@ -1531,8 +1706,72 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Failed to copy {local}.\n\nEnsure the Pico is connected via USB and running MicroPython.\n\n{r.stderr or r.stdout or ''}",
                     )
                     return
+            # Copy AMradioSound.wav to Pico flash for PWM overlay (GPIO 3)
+            # This enables the true AM static overlay effect where PWM static
+            # plays simultaneously with DFPlayer music fade-in.
+            # If not present, firmware falls back to DFPlayer SD card sequential mode.
+            am_wav_src = root / "AMradioSound.wav"
+            if am_wav_src.exists():
+                try:
+                    cmd = mpremote_cmd + ["cp", str(am_wav_src), ":VintageRadio/AMradioSound.wav"]
+                    r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0:
+                        print("AMradioSound.wav copied to Pico flash (PWM overlay enabled)")
+                    else:
+                        print(f"Warning: Failed to copy AMradioSound.wav to Pico: {r.stderr or r.stdout}")
+                        print("Fallback: AM sound will play from DFPlayer SD card (folder 99)")
+                except Exception as e:
+                    print(f"Warning: Could not copy AMradioSound.wav: {e}")
+            else:
+                print(f"AMradioSound.wav not found at {am_wav_src} — PWM overlay won't be available")
+                print("Fallback: AM sound will play from DFPlayer SD card (folder 99/001.wav)")
+            
+            # Copy radio_metadata.json to Pico flash memory (needed for track info)
+            # Try to find it on the SD card first (from sync), otherwise generate it
+            metadata_src = None
+            if self.sd_root:
+                metadata_src = Path(self.sd_root) / "VintageRadio" / "radio_metadata.json"
+                if not metadata_src.exists():
+                    metadata_src = None
+            
+            # If not found on SD, generate it temporarily
+            tmpdir_cleanup = None
+            if not metadata_src or not metadata_src.exists():
+                import tempfile
+                tmpdir = tempfile.mkdtemp()
+                tmpdir_cleanup = tmpdir
+                try:
+                    tmp_vintage = Path(tmpdir) / "VintageRadio"
+                    tmp_vintage.mkdir(parents=True, exist_ok=True)
+                    # Generate metadata file
+                    self.sd_manager._write_metadata(tmp_vintage)
+                    metadata_src = tmp_vintage / "radio_metadata.json"
+                except Exception as e:
+                    print(f"Warning: Could not generate metadata file: {e}")
+                    metadata_src = None
+            
+            if metadata_src and metadata_src.exists():
+                try:
+                    cmd = mpremote_cmd + ["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"]
+                    r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0:
+                        print("Metadata file copied to Pico")
+                    else:
+                        print(f"Warning: Failed to copy metadata file: {r.stderr or r.stdout}")
+                except Exception as e:
+                    print(f"Warning: Could not copy metadata file: {e}")
+            else:
+                print("Warning: Could not find or generate radio_metadata.json. Tracks may not be identified correctly.")
+            
+            # Clean up temp directory if we created one
+            if tmpdir_cleanup:
+                try:
+                    shutil.rmtree(tmpdir_cleanup)
+                except:
+                    pass
+            
             progress.close()
-            self.statusBar().showMessage("Installed to Pico successfully.", 5000)
+            self.statusBar().showMessage("Installed to Pico successfully (including metadata files). AM sound is on DFPlayer SD card.", 5000)
         except subprocess.TimeoutExpired:
             progress.close()
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "Timed out. Check Pico connection and try again.")
