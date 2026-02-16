@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -2221,37 +2222,55 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def _resolve_mpremote_cmd(self) -> Optional[List[str]]:
-        """Find the mpremote command (bundled or system-installed)."""
-        try:
-            import mpremote
-            # When frozen, use python -m mpremote via the bundled Python
-            # When not frozen, try to find mpremote executable
-            if getattr(sys, 'frozen', False):
-                # In frozen app, we need to use python -m mpremote
-                # But sys.executable is the .exe, so we can't use it directly
-                # Instead, use mpremote as a module via pythonw.exe if available
-                exe_dir = Path(sys.executable).parent
-                for python_name in ("pythonw.exe", "python.exe"):
-                    bundled_python = exe_dir / "_internal" / python_name
-                    if bundled_python.exists():
-                        return [str(bundled_python), "-m", "mpremote"]
-                # Fallback: try to find system Python
-                system_python = shutil.which("pythonw") or shutil.which("python")
-                if system_python:
+        """Find the mpremote command (bundled or system-installed).
+        
+        Priority order (frozen app):
+        1. Standalone mpremote executable (if available)
+        2. System Python with mpremote (avoids DLL conflicts with bundled Python)
+        3. Bundled Python (last resort, may have DLL conflicts on some systems)
+        """
+        # First, try standalone mpremote executable (works everywhere)
+        cmd = shutil.which("mpremote")
+        if cmd:
+            return [cmd]
+        
+        # Try system Python first (avoids DLL version conflicts)
+        # This works if user has Python installed with mpremote
+        system_python = shutil.which("pythonw") or shutil.which("python")
+        if system_python:
+            # Test if mpremote is available via system Python
+            try:
+                import subprocess
+                result = subprocess.run(
+                    [system_python, "-m", "mpremote", "--version"],
+                    capture_output=True,
+                    timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                if result.returncode == 0:
                     return [system_python, "-m", "mpremote"]
-            else:
-                # Not frozen: try mpremote executable first, then python -m mpremote
-                cmd = shutil.which("mpremote")
-                if cmd:
-                    return [cmd]
-                # Fallback to python -m mpremote
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                pass  # System Python doesn't have mpremote, continue to next option
+        
+        # If frozen and system Python didn't work, try bundled Python
+        if getattr(sys, 'frozen', False):
+            exe_dir = Path(sys.executable).parent
+            for python_name in ("pythonw.exe", "python.exe"):
+                bundled_python = exe_dir / "_internal" / python_name
+                if bundled_python.exists():
+                    # When using bundled Python, set PATH to prioritize bundled DLLs
+                    # This helps avoid conflicts with system Python DLLs
+                    return [str(bundled_python), "-m", "mpremote"]
+        
+        # Not frozen: try python -m mpremote with current interpreter
+        if not getattr(sys, 'frozen', False):
+            try:
+                import mpremote
                 python_cmd = shutil.which("python") or sys.executable
                 return [python_cmd, "-m", "mpremote"]
-        except ImportError:
-            # mpremote not importable, try to find executable
-            cmd = shutil.which("mpremote")
-            if cmd:
-                return [cmd]
+            except ImportError:
+                pass
+        
         return None
 
     @staticmethod
@@ -2290,6 +2309,21 @@ class MainWindow(QtWidgets.QMainWindow):
         creation_flags = 0
         if sys.platform == "win32":
             creation_flags = subprocess.CREATE_NO_WINDOW
+        
+        # Set environment for bundled Python to use its own DLLs
+        # This prevents conflicts with system Python DLLs (e.g., python311.dll vs python313.dll)
+        env = None
+        if getattr(sys, 'frozen', False) and len(mpremote_cmd) > 0:
+            # Check if we're using bundled Python (path contains _internal)
+            python_exe = mpremote_cmd[0] if mpremote_cmd else None
+            if python_exe and "_internal" in python_exe:
+                exe_dir = Path(sys.executable).parent
+                internal_dir = exe_dir / "_internal"
+                if internal_dir.exists():
+                    # Prepend _internal to PATH so bundled DLLs are found first
+                    env = os.environ.copy()
+                    current_path = env.get("PATH", "")
+                    env["PATH"] = str(internal_dir) + os.pathsep + current_path
 
         # ── Create directories ──
         _report("Creating directories on Pico...")
@@ -2299,6 +2333,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     mpremote_cmd + ["exec", f"import os; os.mkdir('{dirname}')"],
                     cwd=str(root), capture_output=True, text=True, timeout=15,
                     creationflags=creation_flags,
+                    env=env,
                 )
             except Exception:
                 pass  # directory may already exist
@@ -2314,6 +2349,7 @@ class MainWindow(QtWidgets.QMainWindow):
             r = subprocess.run(
                 cmd, cwd=str(root), capture_output=True, text=True, timeout=30,
                 creationflags=creation_flags,
+                env=env,
             )
             if r.returncode != 0:
                 raise RuntimeError(
@@ -2337,6 +2373,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 r = subprocess.run(
                     cmd, cwd=str(root), capture_output=True, text=True, timeout=30,
                     creationflags=creation_flags,
+                    env=env,
                 )
                 if r.returncode == 0:
                     print("AMradioSound.wav copied to Pico flash (PWM overlay enabled)")
@@ -2374,6 +2411,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 subprocess.run(
                     cmd, cwd=str(root), capture_output=True, text=True, timeout=30,
                     creationflags=creation_flags,
+                    env=env,
                 )
             except Exception as e:
                 print(f"Warning: metadata copy failed: {e}")
