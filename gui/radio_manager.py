@@ -5,8 +5,10 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import threading
+import traceback
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QUrl
@@ -19,6 +21,157 @@ from .resource_paths import app_data_dir, project_root, resource_path
 from .sd_manager import SDManager
 from .test_mode import TestModeWidget
 from . import sd_manager as sd_manager_module
+
+
+# ───────────────────────────────────────────────────────────
+#  Background worker for long-running tasks
+# ───────────────────────────────────────────────────────────
+
+class _BackgroundWorker(QtCore.QObject):
+    """Runs a callable in a QThread and emits signals for progress / completion."""
+    progress = QtCore.pyqtSignal(int, int, str)   # current, total, message
+    finished = QtCore.pyqtSignal(object)           # result (any Python object)
+    error = QtCore.pyqtSignal(str)                 # error message
+
+    def __init__(self, fn: Callable, *args, **kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            result = self._fn(*self._args, **self._kwargs)
+            self.finished.emit(result)
+        except Exception as exc:
+            self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+
+class TaskProgressDialog(QtWidgets.QDialog):
+    """
+    A non-blocking progress dialog that runs *func* in a background thread.
+
+    Usage::
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="SD Card Sync",
+            func=self.sd_manager.sync_library,
+            args=(sd_root,),
+            kwargs={"force_clean": True, "progress_callback": dlg.report_progress},
+        )
+        dlg.on_success = lambda result: print("done", result)
+        dlg.exec()
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+        title: str,
+        func: Callable,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        cancelable: bool = False,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
+
+        # --- UI ---
+        layout = QtWidgets.QVBoxLayout(self)
+        self._status_label = QtWidgets.QLabel("Starting...")
+        self._status_label.setWordWrap(True)
+        layout.addWidget(self._status_label)
+
+        self._progress_bar = QtWidgets.QProgressBar()
+        self._progress_bar.setRange(0, 0)  # indeterminate initially
+        layout.addWidget(self._progress_bar)
+
+        self._detail_label = QtWidgets.QLabel("")
+        self._detail_label.setStyleSheet("color: gray; font-size: 11px;")
+        self._detail_label.setWordWrap(True)
+        layout.addWidget(self._detail_label)
+
+        if cancelable:
+            btn_layout = QtWidgets.QHBoxLayout()
+            btn_layout.addStretch()
+            self._cancel_btn = QtWidgets.QPushButton("Cancel")
+            self._cancel_btn.clicked.connect(self.reject)
+            btn_layout.addWidget(self._cancel_btn)
+            layout.addLayout(btn_layout)
+
+        # --- Callbacks set by caller ---
+        self.on_success: Optional[Callable[[Any], None]] = None
+        self.on_error: Optional[Callable[[str], None]] = None
+
+        # --- Thread setup ---
+        self._thread = QtCore.QThread()
+        kw = dict(kwargs or {})
+        kw["progress_callback"] = self._progress_callback
+        self._worker = _BackgroundWorker(func, *args, **kw)
+        self._worker.moveToThread(self._thread)
+
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+
+    def _progress_callback(self, current: int, total: int, message: str):
+        """Thread-safe: emit signal that will be received on the main thread."""
+        self._worker.progress.emit(current, total, message)
+
+    @QtCore.pyqtSlot(int, int, str)
+    def _on_progress(self, current: int, total: int, message: str):
+        if total > 0:
+            self._progress_bar.setRange(0, total)
+            self._progress_bar.setValue(current)
+        self._status_label.setText(message)
+
+    @QtCore.pyqtSlot(object)
+    def _on_finished(self, result):
+        self._progress_bar.setRange(0, 1)
+        self._progress_bar.setValue(1)
+        self._status_label.setText("Complete!")
+        self._cleanup_thread()
+        if self.on_success:
+            self.on_success(result)
+        self.accept()
+
+    @QtCore.pyqtSlot(str)
+    def _on_error(self, error_msg: str):
+        self._cleanup_thread()
+        if self.on_error:
+            self.on_error(error_msg)
+        else:
+            QtWidgets.QMessageBox.critical(self, self.windowTitle(), f"Error:\n\n{error_msg}")
+        self.reject()
+
+    def _cleanup_thread(self):
+        try:
+            self._thread.quit()
+            self._thread.wait(5000)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Start the thread after the dialog is shown
+        QtCore.QTimer.singleShot(100, self._thread.start)
+
+    def closeEvent(self, event):
+        if self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(3000)
+        super().closeEvent(event)
+
+    def reject(self):
+        if self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(3000)
+        super().reject()
 
 
 class LibraryTable(QtWidgets.QTableWidget):
@@ -208,10 +361,66 @@ class ReorderTable(QtWidgets.QTableWidget):
         )
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSortingEnabled(False)
+        self._pending_order: Optional[List[int]] = None
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        super().dropEvent(event)
-        self.order_changed.emit()
+        # Don't use Qt's InternalMove – it loses UserRole data and nukes songs.
+        # Instead, compute the new order manually, stash it, and let the
+        # connected persist handler read it from _pending_order.
+        #
+        # CRITICAL: We must NOT let Qt think this was a MoveAction, because
+        # QAbstractItemView::startDrag() removes source rows from the model
+        # when drag->exec() returns MoveAction.  That removal happens AFTER
+        # dropEvent returns, destroying the rows we just refreshed from DB.
+        # Setting the drop action to CopyAction prevents that cleanup.
+        if event.source() is not self:
+            super().dropEvent(event)
+            return
+
+        # Collect every song ID in current visual order
+        all_ids: List[tuple] = []
+        for row in range(self.rowCount()):
+            item = self.item(row, 0)
+            if item is not None:
+                song_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if song_id is not None:
+                    all_ids.append((row, int(song_id)))
+
+        selected_rows = sorted(set(idx.row() for idx in self.selectedIndexes()))
+        if not selected_rows or not all_ids:
+            event.ignore()
+            return
+
+        # Where did the user drop?
+        drop_pos = event.position().toPoint()
+        target_row = self.indexAt(drop_pos).row()
+        if target_row < 0:
+            target_row = len(all_ids)
+
+        # Split into "moving" and "staying"
+        selected_set = set(selected_rows)
+        moving = [sid for r, sid in all_ids if r in selected_set]
+        staying = [sid for r, sid in all_ids if r not in selected_set]
+
+        # Adjust insertion point for rows removed above it
+        insert_at = target_row
+        for r in selected_rows:
+            if r < target_row:
+                insert_at -= 1
+        insert_at = max(0, min(insert_at, len(staying)))
+
+        new_order = staying[:insert_at] + moving + staying[insert_at:]
+
+        self._pending_order = new_order
+
+        # Tell Qt this was a Copy (not Move) so startDrag() won't remove
+        # the source rows after we return.
+        event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+        event.accept()
+
+        # Defer the persist + refresh to AFTER Qt finishes its drag cleanup,
+        # so any residual model manipulation by Qt doesn't clobber our table.
+        QtCore.QTimer.singleShot(0, self.order_changed.emit)
 
 
 class CollectionDropTable(ReorderTable):
@@ -247,6 +456,27 @@ class CollectionDropTable(ReorderTable):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+
+class ReorderListWidget(QtWidgets.QListWidget):
+    """A QListWidget that supports drag-and-drop reordering of its items."""
+
+    order_changed = QtCore.pyqtSignal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+        self.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        super().dropEvent(event)
+        self.order_changed.emit()
 
 
 class InstallMicroPythonDialog(QtWidgets.QDialog):
@@ -399,12 +629,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.library_search.setPlaceholderText("Search by title, artist, format, or path")
         self.library_search.textChanged.connect(self.refresh_library)
 
-        self.album_list = QtWidgets.QListWidget()
+        self.album_list = ReorderListWidget()
+        self.album_list.order_changed.connect(self._persist_album_list_order)
         self.album_songs_table = self._create_song_table(reorderable=True)
         self.album_songs_table.order_changed.connect(self.persist_album_order)
         if isinstance(self.album_songs_table, CollectionDropTable):
             self.album_songs_table.files_dropped.connect(self.import_files_to_album)
-        self.playlist_list = QtWidgets.QListWidget()
+        self.playlist_list = ReorderListWidget()
+        self.playlist_list.order_changed.connect(self._persist_playlist_list_order)
         self.playlist_songs_table = self._create_song_table(reorderable=True)
         self.playlist_songs_table.order_changed.connect(self.persist_playlist_order)
         if isinstance(self.playlist_songs_table, CollectionDropTable):
@@ -486,13 +718,27 @@ class MainWindow(QtWidgets.QMainWindow):
         sync_action.triggered.connect(self.sync_to_sd)
         tools_menu.addAction(sync_action)
 
+        help_menu = self.menuBar().addMenu("Help")
+
+        view_log_action = QtGui.QAction("View Session Log", self)
+        view_log_action.triggered.connect(self._view_session_log)
+        help_menu.addAction(view_log_action)
+
+        open_log_folder_action = QtGui.QAction("Open Logs Folder", self)
+        open_log_folder_action.triggered.connect(self._open_logs_folder)
+        help_menu.addAction(open_log_folder_action)
+
+        copy_log_path_action = QtGui.QAction("Copy Log Path to Clipboard", self)
+        copy_log_path_action.triggered.connect(self._copy_log_path)
+        help_menu.addAction(copy_log_path_action)
+
     def _build_tabs(self) -> None:
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self._build_library_tab(), "Library")
         tabs.addTab(self._build_albums_tab(), "Albums")
         tabs.addTab(self._build_playlists_tab(), "Playlists")
         tabs.addTab(self._build_sd_tab(), "Devices")
-        tabs.addTab(self.test_mode_widget, "Test Mode")
+        tabs.addTab(self.test_mode_widget, "Emulator")
         tabs.addTab(self.device_debug_widget, "Device Debug")
         self.setCentralWidget(tabs)
 
@@ -528,8 +774,20 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(widget)
 
         left_panel = QtWidgets.QVBoxLayout()
-        left_panel.addWidget(QtWidgets.QLabel("Albums"))
+        left_panel.addWidget(QtWidgets.QLabel("Albums (drag to reorder)"))
         left_panel.addWidget(self.album_list)
+
+        # Move up / down buttons for album list
+        album_move_btns = QtWidgets.QHBoxLayout()
+        album_up_btn = QtWidgets.QPushButton("Move Up")
+        album_down_btn = QtWidgets.QPushButton("Move Down")
+        album_up_btn.setToolTip("Move the selected album up in the list")
+        album_down_btn.setToolTip("Move the selected album down in the list")
+        album_up_btn.clicked.connect(lambda: self._move_list_item(self.album_list, -1))
+        album_down_btn.clicked.connect(lambda: self._move_list_item(self.album_list, 1))
+        album_move_btns.addWidget(album_up_btn)
+        album_move_btns.addWidget(album_down_btn)
+        left_panel.addLayout(album_move_btns)
 
         album_buttons = QtWidgets.QHBoxLayout()
         create_btn = QtWidgets.QPushButton("New Album")
@@ -571,8 +829,20 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(widget)
 
         left_panel = QtWidgets.QVBoxLayout()
-        left_panel.addWidget(QtWidgets.QLabel("Playlists"))
+        left_panel.addWidget(QtWidgets.QLabel("Playlists (drag to reorder)"))
         left_panel.addWidget(self.playlist_list)
+
+        # Move up / down buttons for playlist list
+        playlist_move_btns = QtWidgets.QHBoxLayout()
+        playlist_up_btn = QtWidgets.QPushButton("Move Up")
+        playlist_down_btn = QtWidgets.QPushButton("Move Down")
+        playlist_up_btn.setToolTip("Move the selected playlist up in the list")
+        playlist_down_btn.setToolTip("Move the selected playlist down in the list")
+        playlist_up_btn.clicked.connect(lambda: self._move_list_item(self.playlist_list, -1))
+        playlist_down_btn.clicked.connect(lambda: self._move_list_item(self.playlist_list, 1))
+        playlist_move_btns.addWidget(playlist_up_btn)
+        playlist_move_btns.addWidget(playlist_down_btn)
+        left_panel.addLayout(playlist_move_btns)
 
         playlist_buttons = QtWidgets.QHBoxLayout()
         create_btn = QtWidgets.QPushButton("New Playlist")
@@ -904,6 +1174,89 @@ class MainWindow(QtWidgets.QMainWindow):
         self.import_files(files)
 
     def import_files(self, files: Iterable[Path]) -> List[int]:
+        file_list = [p for p in files if p.exists() and p.is_file()]
+        if not file_list:
+            return []
+        
+        # For small imports (≤3 files), do it inline to keep it snappy
+        if len(file_list) <= 3:
+            return self._import_files_sync(file_list)
+        
+        # For larger imports, run in background thread with progress
+        self._pending_import_ids: List[int] = []
+        
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Importing Files",
+            func=self._import_files_worker,
+            args=(file_list, self.db),
+            kwargs={},
+        )
+
+        def on_success(result):
+            added, skipped, added_ids = result
+            self._pending_import_ids = added_ids
+            self.refresh_library()
+            self.statusBar().showMessage(
+                f"Import complete. Added: {added}, Skipped: {skipped}", 5000
+            )
+
+        def on_error(msg):
+            self.refresh_library()
+            QtWidgets.QMessageBox.warning(self, "Import Error", f"Error during import:\n\n{msg}")
+
+        dlg.on_success = on_success
+        dlg.on_error = on_error
+        dlg.exec()
+        return getattr(self, '_pending_import_ids', [])
+
+    @staticmethod
+    def _import_files_worker(
+        file_list: List[Path],
+        db: DatabaseManager,
+        progress_callback: Optional[callable] = None,
+    ) -> Tuple[int, int, List[int]]:
+        """Background worker: import files into the database."""
+        added = 0
+        skipped = 0
+        added_ids: List[int] = []
+        total = len(file_list)
+
+        for i, path in enumerate(file_list):
+            if progress_callback:
+                progress_callback(i, total, f"Importing: {path.name}")
+            try:
+                metadata = extract_metadata(path)
+                file_hash = compute_file_hash(path)
+                existing = db.get_song_by_hash_size(file_hash, metadata["file_size"])
+                if existing is None:
+                    existing = db.get_song_by_path(metadata["file_path"])
+                if existing is not None:
+                    skipped += 1
+                    # Still track the ID so callers can add it to collections
+                    added_ids.append(int(existing["id"]))
+                    continue
+                song_id = db.add_song(
+                    original_filename=metadata["original_filename"],
+                    file_path=metadata["file_path"],
+                    title=metadata["title"],
+                    artist=metadata["artist"],
+                    duration=metadata["duration"],
+                    file_hash=file_hash,
+                    file_size=metadata["file_size"],
+                    format=metadata["format"],
+                )
+                added += 1
+                added_ids.append(song_id)
+            except Exception:
+                skipped += 1
+
+        if progress_callback:
+            progress_callback(total, total, "Import complete!")
+        return added, skipped, added_ids
+
+    def _import_files_sync(self, files: Iterable[Path]) -> List[int]:
+        """Synchronous import for small batches (≤3 files)."""
         added = 0
         skipped = 0
         added_ids: List[int] = []
@@ -913,12 +1266,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 metadata = extract_metadata(path)
                 file_hash = compute_file_hash(path)
-                if (
-                    self.db.get_song_by_hash_size(file_hash, metadata["file_size"])
-                    is not None
-                    or self.db.get_song_by_path(metadata["file_path"]) is not None
-                ):
+                existing = self.db.get_song_by_hash_size(file_hash, metadata["file_size"])
+                if existing is None:
+                    existing = self.db.get_song_by_path(metadata["file_path"])
+                if existing is not None:
                     skipped += 1
+                    # Still track the ID so callers can add it to collections
+                    added_ids.append(int(existing["id"]))
                     continue
                 song_id = self.db.add_song(
                     original_filename=metadata["original_filename"],
@@ -1369,43 +1723,34 @@ class MainWindow(QtWidgets.QMainWindow):
         if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
             return
         if reply == QtWidgets.QMessageBox.StandardButton.No:
-            # User wants clean install
             force_clean = True
         
-        # Show progress dialog
-        progress = QtWidgets.QProgressDialog(
-            "Syncing library to SD card..." + (" (clean install)" if force_clean else ""),
-            "Cancel", 0, 0, self
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="SD Card Sync" + (" (clean install)" if force_clean else ""),
+            func=self.sd_manager.sync_library,
+            args=(sd_root,),
+            kwargs={
+                "audio_target": self.audio_target,
+                "pi_convert_audio": self.pi_convert_audio,
+                "force_clean": force_clean,
+            },
         )
-        progress.setWindowTitle("SD Card Sync")
-        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)  # Show immediately
-        progress.setValue(0)
-        progress.setMaximum(0)  # Indeterminate progress
-        progress.show()
-        QtWidgets.QApplication.processEvents()  # Update UI
-        
-        try:
-            copied, skipped = self.sd_manager.sync_library(
-                sd_root,
-                audio_target=self.audio_target,
-                pi_convert_audio=self.pi_convert_audio,
-                force_clean=force_clean,
-            )
-            progress.close()
+
+        def on_success(result):
+            copied, skipped = result
             self.statusBar().showMessage(
-                f"SD sync complete. Copied: {copied}, skipped: {skipped}", 5000
+                f"SD sync complete. Copied: {copied}, Skipped: {skipped}", 5000
             )
-            # Refresh test mode to pick up new SD card paths (including radio stations)
             if hasattr(self, 'test_mode_widget') and self.test_mode_widget:
                 self.test_mode_widget.refresh_from_db()
-        except Exception as e:
-            progress.close()
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Sync Error",
-                f"An error occurred during SD sync:\n{str(e)}"
-            )
+
+        def on_error(msg):
+            QtWidgets.QMessageBox.critical(self, "Sync Error", f"An error occurred during SD sync:\n\n{msg}")
+
+        dlg.on_success = on_success
+        dlg.on_error = on_error
+        dlg.exec()
 
     def safely_remove_sd(self) -> None:
         """Safely eject/remove the SD card."""
@@ -1618,33 +1963,135 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = InstallMicroPythonDialog(self)
         dlg.exec()
 
-    def install_to_pico(self) -> None:
-        """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote)."""
-        # Try to use bundled mpremote first (if running as packaged exe)
-        mpremote_cmd = None
+    def _resolve_mpremote_cmd(self) -> Optional[List[str]]:
+        """Find the mpremote command (bundled or system-installed)."""
         try:
             import mpremote
-            # If mpremote is bundled, we can use it programmatically
-            # For now, fall back to CLI approach but use bundled Python to run it
-            import sys
             if getattr(sys, 'frozen', False):
-                # Running as packaged executable - use bundled Python to run mpremote
-                import os
-                # Find Python executable in the bundle (PyInstaller includes it)
-                python_exe = sys.executable
-                # Try to run mpremote as a module
-                mpremote_cmd = [python_exe, "-m", "mpremote"]
+                return [sys.executable, "-m", "mpremote"]
             else:
-                # Running as script - check for mpremote in PATH
-                mpremote_cmd = shutil.which("mpremote")
-                if mpremote_cmd:
-                    mpremote_cmd = [mpremote_cmd]
+                cmd = shutil.which("mpremote")
+                if cmd:
+                    return [cmd]
         except ImportError:
-            # mpremote not available - check PATH
-            mpremote_cmd = shutil.which("mpremote")
-            if mpremote_cmd:
-                mpremote_cmd = [mpremote_cmd]
+            cmd = shutil.which("mpremote")
+            if cmd:
+                return [cmd]
+        return None
+
+    @staticmethod
+    def _install_to_pico_worker(
+        mpremote_cmd: List[str],
+        root: Path,
+        sd_root: Optional[str],
+        sd_manager: SDManager,
+        progress_callback: Optional[callable] = None,
+    ) -> str:
+        """Background worker: copy firmware files to Pico via mpremote.
         
+        Returns a status message string. Raises on fatal error.
+        """
+        import tempfile as _tempfile
+
+        files_to_copy = [
+            ("main.py", "main.py"),
+            ("radio_core.py", "radio_core.py"),
+            ("components/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
+        ]
+        # Count total steps: mkdir×2 + files + AM WAV + metadata
+        total = 2 + len(files_to_copy) + 1 + 1
+        step = 0
+
+        def _report(msg: str):
+            nonlocal step
+            if progress_callback:
+                progress_callback(step, total, msg)
+            step += 1
+
+        # Create directories
+        _report("Creating directories on Pico...")
+        for dirname in ("components", "VintageRadio"):
+            try:
+                subprocess.run(
+                    mpremote_cmd + ["exec", f"import os; os.mkdir('{dirname}')"],
+                    cwd=str(root), capture_output=True, text=True, timeout=15,
+                )
+            except Exception:
+                pass
+        step = 2
+
+        # Copy firmware files
+        for local, remote in files_to_copy:
+            _report(f"Copying {local}...")
+            src = root / local
+            if not src.exists():
+                continue
+            cmd = mpremote_cmd + ["cp", str(src), f":{remote}"]
+            r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to copy {local}.\n\n"
+                    f"Ensure the Pico is connected via USB and running MicroPython.\n\n"
+                    f"{r.stderr or r.stdout or ''}"
+                )
+
+        # Copy AMradioSound.wav for PWM overlay
+        _report("Copying AM radio sound...")
+        am_wav_src = root / "AMradioSound.wav"
+        if am_wav_src.exists():
+            try:
+                cmd = mpremote_cmd + ["cp", str(am_wav_src), ":VintageRadio/AMradioSound.wav"]
+                r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+                if r.returncode == 0:
+                    print("AMradioSound.wav copied to Pico flash (PWM overlay enabled)")
+                else:
+                    print(f"Warning: Failed to copy AMradioSound.wav: {r.stderr or r.stdout}")
+            except Exception as e:
+                print(f"Warning: Could not copy AMradioSound.wav: {e}")
+        else:
+            print("AMradioSound.wav not found — PWM overlay won't be available")
+
+        # Copy radio_metadata.json
+        _report("Copying metadata...")
+        metadata_src = None
+        if sd_root:
+            candidate = Path(sd_root) / "VintageRadio" / "radio_metadata.json"
+            if candidate.exists():
+                metadata_src = candidate
+
+        tmpdir_cleanup = None
+        if not metadata_src:
+            tmpdir = _tempfile.mkdtemp()
+            tmpdir_cleanup = tmpdir
+            try:
+                tmp_vintage = Path(tmpdir) / "VintageRadio"
+                tmp_vintage.mkdir(parents=True, exist_ok=True)
+                sd_manager._write_metadata(tmp_vintage)
+                metadata_src = tmp_vintage / "radio_metadata.json"
+            except Exception as e:
+                print(f"Warning: Could not generate metadata: {e}")
+                metadata_src = None
+
+        if metadata_src and metadata_src.exists():
+            try:
+                cmd = mpremote_cmd + ["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"]
+                subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+            except Exception as e:
+                print(f"Warning: metadata copy failed: {e}")
+
+        if tmpdir_cleanup:
+            try:
+                shutil.rmtree(tmpdir_cleanup)
+            except Exception:
+                pass
+
+        if progress_callback:
+            progress_callback(total, total, "Done!")
+        return "Installed to Pico successfully (including metadata files)."
+
+    def install_to_pico(self) -> None:
+        """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote)."""
+        mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
             QtWidgets.QMessageBox.information(
                 self,
@@ -1655,129 +2102,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 "See README_RP2040.md for how to install MicroPython on the Pico (one-time).",
             )
             return
-        
+
         root = self._project_root()
         if not (root / "main.py").exists() or not (root / "radio_core.py").exists():
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "Project files not found.")
             return
-        comp_src = root / "components" / "dfplayer_hardware.py"
-        if not comp_src.exists():
+        if not (root / "components" / "dfplayer_hardware.py").exists():
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "components/dfplayer_hardware.py not found.")
             return
-        progress = QtWidgets.QProgressDialog("Installing to Pico...", None, 0, 0, self)
-        progress.setWindowTitle("Install to Pico")
-        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
-        QtWidgets.QApplication.processEvents()
-        try:
-            try:
-                # Create components directory
-                subprocess.run(
-                    mpremote_cmd + ["exec", "import os; os.mkdir('components')"],
-                    cwd=str(root), capture_output=True, text=True, timeout=15
-                )
-            except Exception:
-                pass
-            try:
-                # Create VintageRadio directory (MicroPython doesn't have makedirs, so use mkdir with error handling)
-                subprocess.run(
-                    mpremote_cmd + ["exec", "import os; os.mkdir('VintageRadio')"],
-                    cwd=str(root), capture_output=True, text=True, timeout=15
-                )
-            except Exception:
-                # Directory might already exist, that's okay
-                pass
-            for local, remote in [
-                ("main.py", "main.py"),
-                ("radio_core.py", "radio_core.py"),
-                ("components/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
-            ]:
-                src = root / local
-                if not src.exists():
-                    continue
-                cmd = mpremote_cmd + ["cp", str(src), f":{remote}"]
-                r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
-                if r.returncode != 0:
-                    progress.close()
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Install to Pico",
-                        f"Failed to copy {local}.\n\nEnsure the Pico is connected via USB and running MicroPython.\n\n{r.stderr or r.stdout or ''}",
-                    )
-                    return
-            # Copy AMradioSound.wav to Pico flash for PWM overlay (GPIO 3)
-            # This enables the true AM static overlay effect where PWM static
-            # plays simultaneously with DFPlayer music fade-in.
-            # If not present, firmware falls back to DFPlayer SD card sequential mode.
-            am_wav_src = root / "AMradioSound.wav"
-            if am_wav_src.exists():
-                try:
-                    cmd = mpremote_cmd + ["cp", str(am_wav_src), ":VintageRadio/AMradioSound.wav"]
-                    r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
-                    if r.returncode == 0:
-                        print("AMradioSound.wav copied to Pico flash (PWM overlay enabled)")
-                    else:
-                        print(f"Warning: Failed to copy AMradioSound.wav to Pico: {r.stderr or r.stdout}")
-                        print("Fallback: AM sound will play from DFPlayer SD card (folder 99)")
-                except Exception as e:
-                    print(f"Warning: Could not copy AMradioSound.wav: {e}")
-            else:
-                print(f"AMradioSound.wav not found at {am_wav_src} — PWM overlay won't be available")
-                print("Fallback: AM sound will play from DFPlayer SD card (folder 99/001.wav)")
-            
-            # Copy radio_metadata.json to Pico flash memory (needed for track info)
-            # Try to find it on the SD card first (from sync), otherwise generate it
-            metadata_src = None
-            if self.sd_root:
-                metadata_src = Path(self.sd_root) / "VintageRadio" / "radio_metadata.json"
-                if not metadata_src.exists():
-                    metadata_src = None
-            
-            # If not found on SD, generate it temporarily
-            tmpdir_cleanup = None
-            if not metadata_src or not metadata_src.exists():
-                import tempfile
-                tmpdir = tempfile.mkdtemp()
-                tmpdir_cleanup = tmpdir
-                try:
-                    tmp_vintage = Path(tmpdir) / "VintageRadio"
-                    tmp_vintage.mkdir(parents=True, exist_ok=True)
-                    # Generate metadata file
-                    self.sd_manager._write_metadata(tmp_vintage)
-                    metadata_src = tmp_vintage / "radio_metadata.json"
-                except Exception as e:
-                    print(f"Warning: Could not generate metadata file: {e}")
-                    metadata_src = None
-            
-            if metadata_src and metadata_src.exists():
-                try:
-                    cmd = mpremote_cmd + ["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"]
-                    r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
-                    if r.returncode == 0:
-                        print("Metadata file copied to Pico")
-                    else:
-                        print(f"Warning: Failed to copy metadata file: {r.stderr or r.stdout}")
-                except Exception as e:
-                    print(f"Warning: Could not copy metadata file: {e}")
-            else:
-                print("Warning: Could not find or generate radio_metadata.json. Tracks may not be identified correctly.")
-            
-            # Clean up temp directory if we created one
-            if tmpdir_cleanup:
-                try:
-                    shutil.rmtree(tmpdir_cleanup)
-                except:
-                    pass
-            
-            progress.close()
-            self.statusBar().showMessage("Installed to Pico successfully (including metadata files). AM sound is on DFPlayer SD card.", 5000)
-        except subprocess.TimeoutExpired:
-            progress.close()
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", "Timed out. Check Pico connection and try again.")
-        except Exception as e:
-            progress.close()
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", f"Error: {e}")
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Install to Pico",
+            func=self._install_to_pico_worker,
+            args=(mpremote_cmd, root, self.sd_root, self.sd_manager),
+            kwargs={},
+        )
+
+        def on_success(msg):
+            self.statusBar().showMessage(str(msg), 5000)
+
+        def on_error(msg):
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", f"Error:\n\n{msg}")
+
+        dlg.on_success = on_success
+        dlg.on_error = on_error
+        dlg.exec()
 
     def deploy_to_pi(self) -> None:
         """Copy application files to Raspberry Pi via SCP (requires SSH access)."""
@@ -2021,16 +2371,67 @@ class MainWindow(QtWidgets.QMainWindow):
         if album_item is None:
             return
         album_id = int(album_item.data(QtCore.Qt.ItemDataRole.UserRole))
-        self.db.replace_album_tracks(album_id, self._table_song_ids(self.album_songs_table))
+        order = getattr(self.album_songs_table, '_pending_order', None)
+        if order is not None:
+            self.album_songs_table._pending_order = None
+            self.db.replace_album_tracks(album_id, order)
+        else:
+            self.db.replace_album_tracks(album_id, self._table_song_ids(self.album_songs_table))
+        self.refresh_album_songs()
 
     def persist_playlist_order(self) -> None:
         playlist_item = self.playlist_list.currentItem()
         if playlist_item is None:
             return
         playlist_id = int(playlist_item.data(QtCore.Qt.ItemDataRole.UserRole))
-        self.db.replace_playlist_tracks(
-            playlist_id, self._table_song_ids(self.playlist_songs_table)
-        )
+        order = getattr(self.playlist_songs_table, '_pending_order', None)
+        if order is not None:
+            self.playlist_songs_table._pending_order = None
+            self.db.replace_playlist_tracks(playlist_id, order)
+        else:
+            self.db.replace_playlist_tracks(
+                playlist_id, self._table_song_ids(self.playlist_songs_table)
+            )
+        self.refresh_playlist_songs()
+
+    # ── Album / Playlist list reordering ──────────────────────────────
+
+    def _list_widget_ids(self, list_widget: QtWidgets.QListWidget) -> List[int]:
+        """Return the ordered list of IDs stored in a QListWidget."""
+        ids: List[int] = []
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if item is not None:
+                ids.append(int(item.data(QtCore.Qt.ItemDataRole.UserRole)))
+        return ids
+
+    def _move_list_item(self, list_widget: QtWidgets.QListWidget, direction: int) -> None:
+        """Move the currently selected item up (-1) or down (+1)."""
+        row = list_widget.currentRow()
+        if row < 0:
+            return
+        new_row = row + direction
+        if new_row < 0 or new_row >= list_widget.count():
+            return
+        # Block signals while we rearrange so currentItemChanged doesn't fire
+        list_widget.blockSignals(True)
+        item = list_widget.takeItem(row)
+        list_widget.insertItem(new_row, item)
+        list_widget.setCurrentRow(new_row)
+        list_widget.blockSignals(False)
+        # Persist & notify
+        if list_widget is self.album_list:
+            self._persist_album_list_order()
+        elif list_widget is self.playlist_list:
+            self._persist_playlist_list_order()
+
+    def _persist_album_list_order(self) -> None:
+        """Save the current album list order to the database."""
+        self.db.update_album_order(self._list_widget_ids(self.album_list))
+
+    def _persist_playlist_list_order(self) -> None:
+        """Save the current playlist list order to the database."""
+        self.db.update_playlist_order(self._list_widget_ids(self.playlist_list))
 
     def _update_album_details(self) -> None:
         item = self.album_list.currentItem()
@@ -2259,6 +2660,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.db.update_song(int(song_id), fields)
             self.refresh_library()
 
+    # ── Session log helpers ────────────────────────────────────
+
+    def _view_session_log(self) -> None:
+        """Open the current session log in the system's default text editor."""
+        from .session_log import get_session_log_path
+        log_path = get_session_log_path()
+        if log_path and log_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
+        else:
+            QtWidgets.QMessageBox.information(
+                self, "Session Log", "No session log found for this session."
+            )
+
+    def _open_logs_folder(self) -> None:
+        """Open the logs folder in the system file manager."""
+        from .session_log import get_log_dir
+        log_dir = get_log_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir)))
+
+    def _copy_log_path(self) -> None:
+        """Copy the current session log path to the clipboard."""
+        from .session_log import get_session_log_path
+        log_path = get_session_log_path()
+        if log_path:
+            clipboard = QtWidgets.QApplication.clipboard()
+            clipboard.setText(str(log_path))
+            self.statusBar().showMessage(f"Log path copied: {log_path}", 5000)
+        else:
+            self.statusBar().showMessage("No session log active", 3000)
+
     @staticmethod
     def _format_duration(value: Optional[float]) -> str:
         if value is None:
@@ -2288,6 +2719,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def run_app() -> None:
+    # Initialize session logging BEFORE anything else
+    from .session_log import init_session_logging
+    log_path = init_session_logging(app_version="1.0.0")
+    print(f"Vintage Radio GUI starting...")
+
     app = QtWidgets.QApplication(sys.argv)
     
     # Set application icon (radio icon; taskbar/dock)

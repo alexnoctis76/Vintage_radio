@@ -1,10 +1,10 @@
 """
-Hardware Emulator for GUI Test Mode
+Hardware Emulator for GUI Emulator
 
 This module implements the HardwareInterface from radio_core.py
 using pygame for audio playback and the database for storage.
 
-This allows the GUI test mode to run the exact same logic as the firmware.
+This allows the GUI emulator to run the exact same logic as the firmware.
 """
 
 from pathlib import Path
@@ -195,13 +195,13 @@ class PygameHardwareEmulator(HardwareInterface):
         """
         if not self._audio_ready:
             self.log("Audio not ready")
-            return
+            return False
         
         # If playback is delayed (for AM overlay sequencing), store the request
         if self._delay_playback:
             self._pending_playback = (folder, track, start_ms)
             self.log(f"Playback delayed (AM overlay sequencing): folder={folder}, track={track}, start_ms={start_ms}")
-            return
+            return True  # Playback request accepted (queued for after AM overlay)
         
         # Normal playback (delay disabled or not in use)
         
@@ -216,12 +216,12 @@ class PygameHardwareEmulator(HardwareInterface):
         
         if not song:
             self.log(f"Track not found: folder={folder}, track={track}")
-            return
+            return False
         
         path = self._resolve_path(song)
         if not path:
             self.log(f"File not found for track: {song.get('title', 'Unknown')}")
-            return
+            return False
         
         # Determine initial volume (0 if fade_in, otherwise current volume)
         initial_volume = 0 if fade_in else self._volume
@@ -245,14 +245,14 @@ class PygameHardwareEmulator(HardwareInterface):
                     self._ignore_track_finished_until = time.time() + 1.5
 
                     self.log(f"Playing: {song.get('title', 'Unknown')} (start={start_ms}ms, VLC - native seeking for ALL formats)")
-                    return
+                    return True
                 except Exception as e:
                     self.log(f"VLC playback failed: {e}, falling back to pygame")
             
             # Fall back to pygame only if mixer is initialized (otherwise skip to avoid mixer error)
             if not pygame.mixer.get_init():
                 self.log("Pygame mixer not initialized; playback unavailable")
-                return
+                return False
             
             # Fall back to pygame (requires temp files for seeking non-OGG formats)
             # 
@@ -302,7 +302,7 @@ class PygameHardwareEmulator(HardwareInterface):
                     self._ignore_track_finished_until = time.time() + 1.5
                     self._current_sound = None
                     self._current_channel = None
-                    return
+                    return True
                 except Exception as e:
                     # Fallback to normal playback if pydub/ffmpeg fails
                     self.log(f"Pydub seeking failed ({e}), falling back to normal playback")
@@ -333,8 +333,10 @@ class PygameHardwareEmulator(HardwareInterface):
             self._current_sound = None
             self._current_channel = None
             self._current_temp_file = None
+            return True
         except Exception as e:
             self.log(f"Playback error: {e}")
+            return False
     
     def _find_track(self, folder: int, track: int) -> Optional[Dict]:
         """Find track by folder/track number."""
@@ -374,7 +376,7 @@ class PygameHardwareEmulator(HardwareInterface):
         1. SD card path (if exists) - this is what firmware uses
         2. Original library path (fallback if SD card not mounted)
         
-        This ensures GUI test mode uses the same files as the firmware.
+        This ensures the GUI emulator uses the same files as the firmware.
         """
         # Try SD path first (like firmware does)
         sd_path = song.get('sd_path')
@@ -557,7 +559,7 @@ class PygameHardwareEmulator(HardwareInterface):
             albums.append({
                 'id': album['id'],
                 'name': album['name'],
-                'tracks': [self._enrich_track(t, idx + 1, album['id']) for idx, t in enumerate(tracks)],
+                'tracks': [self._enrich_track(t, idx + 1) for idx, t in enumerate(tracks)],
             })
         return albums
     
@@ -578,11 +580,16 @@ class PygameHardwareEmulator(HardwareInterface):
         tracks = self.db.list_songs()
         return [self._enrich_track(t, idx + 1) for idx, t in enumerate(tracks)]
     
-    def _enrich_track(self, track: Dict, track_number: int, folder: int = 1) -> Dict:
-        """Add folder/track_number to track dict for DFPlayer compatibility."""
+    def _enrich_track(self, track: Dict, fallback_track_number: int) -> Dict:
+        """Add folder/track_number to track dict using sd_mapping if available."""
         result = dict(track)
-        result['track_number'] = track_number
-        result['folder'] = folder
+        mapping = self.db.get_sd_mapping(track['id'])
+        if mapping:
+            result['folder'] = mapping['folder_number']
+            result['track_number'] = mapping['track_number']
+        else:
+            result.setdefault('folder', 1)
+            result.setdefault('track_number', fallback_track_number)
         return result
     
     def check_track_finished(self) -> bool:

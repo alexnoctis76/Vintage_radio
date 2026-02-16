@@ -4,6 +4,8 @@ This app makes it easier to load and manage music for the [Vintage AM Radio](htt
 
 The GUI provides a modern interface for organizing music files, syncing to SD cards, and testing firmware behavior. You can **drag and drop files or folders** into the Library, Albums, or Playlists views to import music quickly.
 
+![Main Interface Overview](docs/images/main-overview.png)
+
 In the future I will be adding metadata support to automatically create albums from file metadata, and finalize support for the raspberry pi 2 W and raspberry pi 3 (currently implemented, but not fully tested with hardware)
 
 ## Features
@@ -13,7 +15,7 @@ In the future I will be adding metadata support to automatically create albums f
 - **Album & Playlist Creation**: Create custom albums and playlists with drag-and-drop support
 - **Metadata Extraction**: Automatic extraction of title, artist, duration, and format information
 - **SD Card Sync**: Sync your library to SD cards with automatic format conversion (to MP3 for hardware compatibility)
-- **Test Mode**: Full emulation of the radio device with visual radio face and interactive controls
+- **Emulator**: Full emulation of the radio device with visual radio face and interactive controls
 
 ### Playback Modes
 - **Album Mode**: Play tracks in album order
@@ -42,7 +44,7 @@ pip install -r requirements.txt
 **Core Dependencies:**
 - `PyQt6>=6.6.0` - GUI framework
 - `mutagen>=1.47.0` - Audio metadata extraction
-- `pygame>=2.5.2` - Audio playback (test mode)
+- `pygame>=2.5.2` - Audio playback (emulator)
 - `psutil>=5.9.0` - System utilities (SD card detection)
 - `pydub>=0.25.1` - Audio processing
 - `python-vlc>=3.0.20123` - Advanced audio playback (optional, for better seeking support)
@@ -50,13 +52,13 @@ pip install -r requirements.txt
 ### Required for file conversion (sync to SD)
 To convert non-MP3 files (FLAC, WAV, OGG, etc.) to MP3 when syncing to SD card or exporting, **one of the following is required**:
 
-- **VLC Media Player** (recommended) – [Download from VideoLAN](https://www.videolan.org/vlc/). Install on your system; the app will use it for conversion and for better seeking in Test Mode.
+- **VLC Media Player** (recommended) – [Download from VideoLAN](https://www.videolan.org/vlc/). Install on your system; the app will use it for conversion and for better seeking in the Emulator.
 - **FFmpeg** – [Download from FFmpeg](https://ffmpeg.org/download.html) and add it to your system PATH. The app uses pydub with FFmpeg as a fallback when VLC is not installed.
 
 Without either VLC or FFmpeg, only MP3 files can be synced (other formats will be skipped).
 
 ### Optional
-- **VLC** also improves playback and seeking in Test Mode. **FFmpeg** is only used when VLC is not available for conversion.
+- **VLC** also improves playback and seeking in the Emulator. **FFmpeg** is only used when VLC is not available for conversion.
 
 ## Installation
 (This is if you are compiling the app yourself. If you download one of the ZIPs from the release, the only additional thing you need is VLC media player)
@@ -99,6 +101,7 @@ python gui/radio_manager.py
 1. **Import Music Files (Library)**
    - **Drag and drop** audio files or entire folders into the Library tab, or use Import Files / Import Folder. The library shows all tracks in a searchable table with title, artist, duration, and format; you can edit or remove entries from here and use **Sync to SD** when ready.
    - ![Library: search, import, and sync to SD](docs/images/library.png)
+   - The library supports searching by title, artist, format, or file path, making it easy to find specific tracks in large collections.
 
 2. **Create Albums**
    - In the Albums tab, create a new album, then **drag and drop** files or folders onto the drop area (or add selected songs from the library). Select an album to see its track list, reorder by dragging, and use the buttons to rename, edit the description, or remove tracks.
@@ -112,13 +115,20 @@ python gui/radio_manager.py
 4. **Sync to SD and Devices**
    - The Devices tab is where you set the **SD / media root** (or drag a folder onto it), run **Sync Library to SD**, validate the card, and export album or playlist contents. You can also export for RP2040 (Pico), install to Pico, or deploy to Raspberry Pi.
    - ![Devices: SD root, sync, validate, export, Pico, and Pi](docs/images/devices.png)
+   - When syncing, a progress dialog shows real-time status with accurate progress tracking for each file being copied or converted.
+   - ![Sync Progress: Real-time sync status with file-by-file progress](docs/images/sync-progress.png)
 
-5. **Test Mode**
-   - The Test Mode tab emulates the radio: power on/off, volume knob, and mode buttons (Album, Playlist, Shuffle, Radio). Use the virtual dial and tap/hold controls to change tracks and stations; the event log at the bottom shows playback and state. Sync your library to SD first so Test Mode can use the same files as the hardware.
-   - ![Test Mode: Shuffle with radio face and event log](docs/images/test-mode-shuffle.png)
-   - ![Test Mode: Radio mode and station info](docs/images/test-mode-radio.png)
+5. **Emulator**
+   - The Emulator tab emulates the radio: power on/off, volume knob, and mode buttons (Album, Playlist, Shuffle, Radio). Use the virtual dial and tap/hold controls to change tracks and stations; the event log at the bottom shows playback and state. Sync your library to SD first so the Emulator can use the same files as the hardware.
+   - ![Emulator: Album mode with radio face and playback controls](docs/images/emulator-album.png)
+   - ![Emulator: Shuffle with radio face and event log](docs/images/emulator-shuffle.png)
+   - ![Emulator: Radio mode and station info](docs/images/emulator-radio.png)
 
-### Button Controls (Works on Physical Device and Test Mode - try clicking the button on the test mode radio and using the dial!)
+6. **Device Debug Console**
+   - The Device Debug tab provides advanced debugging capabilities for the physical hardware. Connect to your device via serial port (COM port on Windows), send Python commands directly to the firmware, view debug logs showing DFPlayer commands and device responses, and interact with the device in real-time. The console displays detailed communication logs including volume changes, track playback commands, and volume adjustments. This is useful for troubleshooting hardware issues and testing firmware behavior.
+   - ![Device Debug: Connected device with console output showing DFPlayer commands and Now Playing status](docs/images/device-debug.png)
+
+### Button Controls (Works on Physical Device and Emulator - try clicking the button on the emulator radio and using the dial!)
 
 - **Single Tap**: Next track
 - **Tap + Hold**: Toggle Album/Playlist mode
@@ -167,7 +177,7 @@ Vintage_radio/
 ├── gui/                        # GUI application code
 │   ├── __init__.py
 │   ├── radio_manager.py       # Main window
-│   ├── test_mode.py           # Test mode emulator
+│   ├── test_mode.py           # Emulator widget
 │   ├── database.py            # Database operations
 │   ├── sd_manager.py          # SD card sync
 │   ├── hardware_emulator.py   # Hardware emulation
@@ -191,10 +201,10 @@ Vintage_radio/
 
 ### Shared Core Logic
 The `radio_core.py` module contains the core state machine logic used by both:
-- The GUI test mode (emulation)
+- The GUI emulator
 - The actual firmware (hardware)
 
-This ensures that the test mode accurately represents device behavior.
+This ensures that the emulator accurately represents device behavior.
 
 ### Hardware Abstraction
 The system uses a `HardwareInterface` abstraction layer:
@@ -213,7 +223,7 @@ The system uses a `HardwareInterface` abstraction layer:
 ## Development
 
 ### Testing
-The test mode provides a complete emulation of the device:
+The emulator provides a complete emulation of the device:
 - Visual radio face with interactive controls
 - Full audio playback
 - All modes and button combinations

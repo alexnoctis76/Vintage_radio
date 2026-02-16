@@ -99,44 +99,70 @@ class PiHardware(HardwareInterface):
         except Exception as e:
             self.log(f"No valid radio_metadata.json: {e}")
             return
-        folders = data.get("folders", {})
         self._albums = []
         self._playlists = []
         self._folder_track_to_song = {}
         self._songs_sd_path = {}
-        for song_id, song in data.get("songs", {}).items():
+        songs = data.get("songs", {})
+        for song_id, song in songs.items():
             sd_path = song.get("sd_path")
             if sd_path:
                 self._songs_sd_path[song_id] = _resolve_sd_path(sd_path) or sd_path
-        for folder_key, folder in folders.items():
-            try:
-                folder_id = int(folder_key)
-            except (ValueError, TypeError):
-                continue
-            folder_type = folder.get("type", "album")
-            name = folder.get("name", f"Folder {folder_id}")
-            tracks_data = folder.get("tracks", [])
-            tracks = []
-            for idx, t in enumerate(tracks_data):
-                song_id = t.get("song_id", idx + 1)
-                track_num = t.get("track", idx + 1)
-                self._folder_track_to_song[(folder_id, track_num)] = song_id
-                track = {
-                    "id": song_id,
-                    "title": t.get("title", f"Track {idx + 1}"),
-                    "artist": t.get("artist", "Unknown"),
-                    "duration": t.get("duration", 180),
-                    "folder": folder_id,
-                    "track_number": track_num,
-                }
-                tracks.append(track)
-            if tracks:
-                self._known_tracks[folder_id] = len(tracks)
-            entry = {"id": folder_id, "name": name, "tracks": tracks}
-            if folder_type == "playlist":
-                self._playlists.append(entry)
-            else:
-                self._albums.append(entry)
+
+        # Helper to build a track dict and register it
+        def _build_track(t, idx, fallback_folder=1):
+            song_id = t.get("song_id", idx + 1)
+            song_data = songs.get(str(song_id), {})
+            folder = t.get("folder", song_data.get("folder", fallback_folder))
+            track_num = t.get("track", song_data.get("track", idx + 1))
+            self._folder_track_to_song[(folder, track_num)] = song_id
+            return {
+                "id": song_id,
+                "title": song_data.get("title", t.get("title", f"Track {idx + 1}")),
+                "artist": song_data.get("artist", t.get("artist", "Unknown")),
+                "duration": song_data.get("duration", t.get("duration", 180)),
+                "folder": folder,
+                "track_number": track_num,
+            }
+
+        # ── New format: "albums" + "playlists" lists ──
+        new_albums = data.get("albums")
+        new_playlists = data.get("playlists")
+        if new_albums is not None or new_playlists is not None:
+            for collection_list, ctype in ((new_albums or [], "album"), (new_playlists or [], "playlist")):
+                for col in collection_list:
+                    name = col.get("name", "Unknown")
+                    col_id = col.get("id", 0)
+                    tracks = [_build_track(t, idx) for idx, t in enumerate(col.get("tracks", []))]
+                    # Record known tracks per physical folder
+                    for tr in tracks:
+                        prev = self._known_tracks.get(tr["folder"], 0)
+                        if tr["track_number"] > prev:
+                            self._known_tracks[tr["folder"]] = tr["track_number"]
+                    entry = {"id": col_id, "name": name, "tracks": tracks}
+                    if ctype == "playlist":
+                        self._playlists.append(entry)
+                    else:
+                        self._albums.append(entry)
+        else:
+            # ── Legacy format: "folders" dict ──
+            for folder_key, folder in data.get("folders", {}).items():
+                try:
+                    folder_id = int(folder_key)
+                except (ValueError, TypeError):
+                    continue
+                folder_type = folder.get("type", "album")
+                name = folder.get("name", f"Folder {folder_id}")
+                tracks = [_build_track(t, idx, fallback_folder=folder_id)
+                          for idx, t in enumerate(folder.get("tracks", []))]
+                if tracks:
+                    self._known_tracks[folder_id] = len(tracks)
+                entry = {"id": folder_id, "name": name, "tracks": tracks}
+                if folder_type == "playlist":
+                    self._playlists.append(entry)
+                else:
+                    self._albums.append(entry)
+
         self.log(f"Loaded metadata: {len(self._albums)} albums, {len(self._playlists)} playlists")
 
     def _path_for(self, folder: int, track: int) -> Optional[str]:

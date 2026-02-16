@@ -46,7 +46,7 @@ class DatabaseManager:
         self.backup_retention = backup_retention
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._apply_pragmas()
         self._apply_migrations()
@@ -62,6 +62,7 @@ class DatabaseManager:
     def _apply_migrations(self) -> None:
         self._ensure_settings_table()
         current = self._get_schema_version()
+        print(f"[DB] Current schema version: {current}")
         if current < 1:
             self._create_schema_v1()
             self._set_schema_version(1)
@@ -69,6 +70,17 @@ class DatabaseManager:
         if current < 2:
             self._migrate_to_v2()
             self._set_schema_version(2)
+            current = 2
+        if current < 3:
+            print("[DB] Running migration to v3...")
+            self._migrate_to_v3()
+            self._set_schema_version(3)
+            current = 3
+            print("[DB] Migration to v3 complete")
+        # Safety: ensure sort_order column exists even if version was already 3
+        # (handles cases where version was bumped but ALTER TABLE didn't succeed)
+        self._ensure_sort_order_columns()
+        print(f"[DB] Schema version after migrations: {current}")
 
     def _ensure_settings_table(self) -> None:
         self.conn.execute(
@@ -179,6 +191,53 @@ class DatabaseManager:
             self.conn.execute("ALTER TABLE songs ADD COLUMN sd_path TEXT;")
             self.conn.commit()
 
+    def _migrate_to_v3(self) -> None:
+        """Add sort_order column to albums and playlists for user-defined ordering."""
+        for table in ("albums", "playlists"):
+            columns = self.conn.execute(f"PRAGMA table_info({table});").fetchall()
+            col_names = [col["name"] for col in columns]
+            if "sort_order" not in col_names:
+                print(f"[DB Migration v3] Adding sort_order column to {table}")
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN sort_order INTEGER DEFAULT 0;")
+            else:
+                print(f"[DB Migration v3] sort_order column already exists in {table}")
+        self.conn.commit()
+        # Initialize sort_order based on current alphabetical order
+        for table in ("albums", "playlists"):
+            rows = self.conn.execute(
+                f"SELECT id FROM {table} ORDER BY name COLLATE NOCASE;"
+            ).fetchall()
+            for idx, row in enumerate(rows):
+                self.conn.execute(
+                    f"UPDATE {table} SET sort_order = ? WHERE id = ?;",
+                    (idx, row["id"]),
+                )
+        self.conn.commit()
+        print("[DB Migration v3] sort_order initialized for all albums and playlists")
+
+    def _ensure_sort_order_columns(self) -> None:
+        """Safety check: add sort_order column if missing (e.g. version was
+        bumped but the ALTER TABLE never actually ran)."""
+        for table in ("albums", "playlists"):
+            columns = self.conn.execute(f"PRAGMA table_info({table});").fetchall()
+            col_names = [col["name"] for col in columns]
+            if "sort_order" not in col_names:
+                print(f"[DB] sort_order column missing from {table}, adding now...")
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN sort_order INTEGER DEFAULT 0;"
+                )
+                # Initialize sort_order based on current alphabetical order
+                rows = self.conn.execute(
+                    f"SELECT id FROM {table} ORDER BY name COLLATE NOCASE;"
+                ).fetchall()
+                for idx, row in enumerate(rows):
+                    self.conn.execute(
+                        f"UPDATE {table} SET sort_order = ? WHERE id = ?;",
+                        (idx, row["id"]),
+                    )
+                self.conn.commit()
+                print(f"[DB] sort_order column added and initialized for {table}")
+
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         row = self.conn.execute(
             "SELECT value FROM settings WHERE key = ?;", (key,)
@@ -229,7 +288,7 @@ class DatabaseManager:
 
     def list_albums(self) -> List[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM albums ORDER BY name COLLATE NOCASE;"
+            "SELECT * FROM albums ORDER BY sort_order, name COLLATE NOCASE;"
         ).fetchall()
 
     def get_album_by_id(self, album_id: int) -> Optional[sqlite3.Row]:
@@ -239,7 +298,7 @@ class DatabaseManager:
 
     def list_playlists(self) -> List[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM playlists ORDER BY name COLLATE NOCASE;"
+            "SELECT * FROM playlists ORDER BY sort_order, name COLLATE NOCASE;"
         ).fetchall()
 
     def get_playlist_by_id(self, playlist_id: int) -> Optional[sqlite3.Row]:
@@ -355,9 +414,12 @@ class DatabaseManager:
         self._maybe_backup()
 
     def create_album(self, name: str, description: Optional[str] = None) -> int:
+        max_order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM albums;"
+        ).fetchone()[0]
         self.conn.execute(
-            "INSERT INTO albums (name, description) VALUES (?, ?);",
-            (name, description),
+            "INSERT INTO albums (name, description, sort_order) VALUES (?, ?, ?);",
+            (name, description, max_order + 1),
         )
         self.conn.commit()
         album_id = self.conn.execute("SELECT last_insert_rowid();").fetchone()[0]
@@ -380,9 +442,12 @@ class DatabaseManager:
         self._maybe_backup()
 
     def create_playlist(self, name: str, description: Optional[str] = None) -> int:
+        max_order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM playlists;"
+        ).fetchone()[0]
         self.conn.execute(
-            "INSERT INTO playlists (name, description) VALUES (?, ?);",
-            (name, description),
+            "INSERT INTO playlists (name, description, sort_order) VALUES (?, ?, ?);",
+            (name, description, max_order + 1),
         )
         self.conn.commit()
         playlist_id = self.conn.execute("SELECT last_insert_rowid();").fetchone()[0]
@@ -401,6 +466,26 @@ class DatabaseManager:
 
     def delete_playlist(self, playlist_id: int) -> None:
         self.conn.execute("DELETE FROM playlists WHERE id = ?;", (playlist_id,))
+        self.conn.commit()
+        self._maybe_backup()
+
+    def update_album_order(self, album_ids: List[int]) -> None:
+        """Persist the display order of albums.  *album_ids* is the ordered list."""
+        with self.conn:
+            for idx, aid in enumerate(album_ids):
+                self.conn.execute(
+                    "UPDATE albums SET sort_order = ? WHERE id = ?;", (idx, aid)
+                )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def update_playlist_order(self, playlist_ids: List[int]) -> None:
+        """Persist the display order of playlists.  *playlist_ids* is the ordered list."""
+        with self.conn:
+            for idx, pid in enumerate(playlist_ids):
+                self.conn.execute(
+                    "UPDATE playlists SET sort_order = ? WHERE id = ?;", (idx, pid)
+                )
         self.conn.commit()
         self._maybe_backup()
 

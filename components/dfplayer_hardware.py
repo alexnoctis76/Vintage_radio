@@ -4,7 +4,7 @@ DFPlayer Hardware Interface for MicroPython
 This module implements the HardwareInterface from radio_core.py
 for the actual DFPlayer Mini hardware on the Raspberry Pi Pico.
 
-This allows the firmware to run the exact same logic as the GUI test mode.
+This allows the firmware to run the exact same logic as the GUI emulator.
 """
 
 from machine import Pin, PWM, Timer, UART
@@ -737,70 +737,97 @@ class DFPlayerHardware(HardwareInterface):
                 print(f"AM sound: folder={self._am_folder:02d}, track={self._am_track:03d}")
             else:
                 print("AM sound: not in metadata, using default folder=99, track=1")
-            
-            folders = data.get("folders", {})
+
             songs = data.get("songs", {})
             self._albums = []
             self._playlists = []
-            
-            print(f"Loading metadata: {len(folders)} folders, {len(songs)} songs")
-            
+        except Exception as e:
+            print("Error reading metadata header:", e)
+            return
+
+        # Helper: parse a list of collections (albums or playlists) from the
+        # deduplicated format.  Each collection failure is logged but does not
+        # prevent other collections from loading.
+        def _parse_collections(collection_list, ctype):
+            for col in (collection_list or []):
+                try:
+                    name = col.get("name", "Unknown")
+                    col_id = col.get("id", 0)
+                    tracks_data = col.get("tracks", [])
+                    tracks = []
+                    for idx, t in enumerate(tracks_data):
+                        song_id = t.get("song_id", idx + 1)
+                        song_data = songs.get(str(song_id), {})
+                        folder = t.get("folder", song_data.get("folder", 1))
+                        track_num = t.get("track", song_data.get("track", idx + 1))
+                        tracks.append({
+                            "id": song_id,
+                            "title": song_data.get("title", f"Track {idx + 1}"),
+                            "artist": song_data.get("artist", "Unknown"),
+                            "duration": song_data.get("duration", 180),
+                            "folder": folder,
+                            "track_number": track_num,
+                        })
+                        prev = self._known_tracks.get(folder, 0)
+                        if track_num > prev:
+                            self._known_tracks[folder] = track_num
+                    entry = {"id": col_id, "name": name, "tracks": tracks}
+                    if ctype == "playlist":
+                        self._playlists.append(entry)
+                    else:
+                        self._albums.append(entry)
+                    label = "Album" if ctype == "album" else "Playlist"
+                    print(f"  {label}: '{name}' - {len(tracks)} tracks")
+                except Exception as e:
+                    print(f"  ERROR loading {ctype} '{col.get('name', '?')}': {e}")
+
+        # ── New deduplicated format: "albums" + "playlists" lists ──
+        new_albums = data.get("albums")
+        new_playlists = data.get("playlists")
+        if new_albums is not None or new_playlists is not None:
+            print(f"Deduplicated format: {len(new_albums or [])} albums, {len(new_playlists or [])} playlists, {len(songs)} songs")
+            _parse_collections(new_albums, "album")
+            _parse_collections(new_playlists, "playlist")
+        else:
+            # ── Legacy format: "folders" dict (one folder per album/playlist) ──
+            folders = data.get("folders", {})
+            print(f"Legacy format: {len(folders)} folders, {len(songs)} songs")
             if not folders:
                 print("WARNING: No folders found in metadata!")
                 return
-            
             for folder_id_str, folder in folders.items():
                 try:
                     folder_id = int(folder_id_str)
-                except:
+                except Exception:
                     print(f"Skipping invalid folder key: {folder_id_str}")
                     continue
-                
                 folder_type = folder.get("type", "album")
                 name = folder.get("name", f"Folder {folder_id}")
                 tracks_data = folder.get("tracks", [])
-                
                 tracks = []
                 for idx, t in enumerate(tracks_data):
-                    song_id = t.get('song_id', idx + 1)
-                    # Look up song details from songs object
+                    song_id = t.get("song_id", idx + 1)
                     song_data = songs.get(str(song_id), {})
-                    track = {
-                        'id': song_id,
-                        'title': song_data.get('title', t.get('title', f'Track {idx + 1}')),
-                        'artist': song_data.get('artist', t.get('artist', 'Unknown')),
-                        'duration': song_data.get('duration', t.get('duration', 180)),
-                        'folder': folder_id,
-                        'track_number': t.get('track', idx + 1),
-                    }
-                    tracks.append(track)
-                
-                entry = {
-                    'id': folder_id,
-                    'name': name,
-                    'tracks': tracks,
-                }
-                
+                    tfolder = t.get("folder", folder_id)
+                    ttrack = t.get("sd_track", t.get("track", idx + 1))
+                    tracks.append({
+                        "id": song_id,
+                        "title": song_data.get("title", t.get("title", f"Track {idx + 1}")),
+                        "artist": song_data.get("artist", t.get("artist", "Unknown")),
+                        "duration": song_data.get("duration", t.get("duration", 180)),
+                        "folder": tfolder,
+                        "track_number": ttrack,
+                    })
+                entry = {"id": folder_id, "name": name, "tracks": tracks}
                 if folder_type == "playlist":
                     self._playlists.append(entry)
                 else:
                     self._albums.append(entry)
-                
-                # Record known track count
                 if tracks:
                     self._known_tracks[folder_id] = len(tracks)
                     print(f"  Folder {folder_id:02d} ({folder_type}): '{name}' - {len(tracks)} tracks")
-                    # Log first few tracks for debugging
-                    for i, tr in enumerate(tracks[:3]):
-                        print(f"    Track {tr['track_number']:03d}: '{tr['title']}' by {tr['artist']}")
-                    if len(tracks) > 3:
-                        print(f"    ... and {len(tracks) - 3} more tracks")
-            
-            print(f"Loaded metadata: {len(self._albums)} albums, {len(self._playlists)} playlists")
-            print(f"Total folders: {len(self._albums) + len(self._playlists)}")
-            
-        except Exception as e:
-            print("No valid radio_metadata.json:", e)
+
+        print(f"Loaded metadata: {len(self._albums)} albums, {len(self._playlists)} playlists")
     
     def _note_track_learned(self, folder, track):
         """Note that a track was confirmed to play."""

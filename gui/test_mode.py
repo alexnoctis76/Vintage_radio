@@ -1,4 +1,4 @@
-"""Test mode emulator for Vintage Radio behavior.
+"""Emulator for Vintage Radio behavior.
 
 This module provides a GUI test environment that runs the SAME core logic
 as the firmware (main.py). The shared logic is in radio_core.py.
@@ -283,10 +283,10 @@ class RadioFaceView(QtWidgets.QGraphicsView):
 
 class TestModeWidget(QtWidgets.QWidget):
     """
-    GUI Test Mode that uses the SAME RadioCore logic as the firmware.
+    GUI Emulator that uses the SAME RadioCore logic as the firmware.
     
     This widget delegates all state machine operations to RadioCore,
-    ensuring identical behavior between the GUI test mode and the actual device.
+    ensuring identical behavior between the GUI emulator and the actual device.
     """
     
     def __init__(self, db: DatabaseManager, parent: Optional[QtWidgets.QWidget] = None) -> None:
@@ -504,10 +504,35 @@ class TestModeWidget(QtWidgets.QWidget):
         if not self.rail2_on:
             return
         
+        # Remember mode before tick so we can detect changes
+        old_mode = self.mode
+        old_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
+        
         # Let RadioCore process timing-based events (tap window timeout)
         if self.core.tick():
             self._sync_from_core()
             self._update_status("Action from core tick.")
+            
+            # Detect mode change or shuffle reinitialisation that happened inside tick()
+            new_shuffle_source = getattr(self.core, '_shuffle_source_type', None)
+            mode_changed = old_mode != self.mode
+            shuffle_reshuffled = (
+                self.mode == "shuffle" and
+                (old_shuffle_source != new_shuffle_source or
+                 (old_mode == "shuffle" and self.hw_emulator._delay_playback))
+            )
+            
+            if (mode_changed or shuffle_reshuffled) and self.hw_emulator._delay_playback:
+                if mode_changed:
+                    self._log(f"Mode changed from {old_mode} to {self.mode} via core tick, triggering AM overlay")
+                else:
+                    self._log(f"Shuffle reinitialized via core tick, triggering AM overlay")
+                self._play_am_overlay_for_mode_switch()
+            elif self.hw_emulator._pending_playback is not None:
+                # RadioCore queued playback (e.g. next album) but no mode change
+                # Execute immediately with AM overlay for source changes, or plain for track changes
+                self._log("Pending playback from core tick, executing with AM overlay")
+                self._play_am_overlay_for_mode_switch()
         
         # Check if track finished (skip in radio mode while waiting for AM overlay)
         # Otherwise we stop for AM overlay, track-finished fires, core advances and
@@ -649,7 +674,7 @@ class TestModeWidget(QtWidgets.QWidget):
         if self.radio_mode_start_time is None:
             self.radio_mode_start_time = None
         
-        self._update_status("Loaded albums for test mode.")
+            self._update_status("Loaded albums for emulator.")
         # Check SD card sync status
         self._check_sd_sync()
 
@@ -930,11 +955,11 @@ class TestModeWidget(QtWidgets.QWidget):
             # During initialization, just log the message
             line = message
         
+        # Always echo to stdout for session log capture
+        print(f"[Emulator] {line}")
         # Append to GUI log widget if it exists
         if hasattr(self, 'log') and self.log is not None:
             self.log.append(line)
-        else:
-            print(f"[TestMode] {line}")
         
         # Also write to file if configured
         if hasattr(self, 'log_path') and self.log_path is not None:
@@ -1346,7 +1371,7 @@ class TestModeWidget(QtWidgets.QWidget):
         log_dir = app_data_dir() / "agent_workshop"
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
-            self.log_path = log_dir / "test_mode.log"
+            self.log_path = log_dir / "emulator.log"
             if not self.log_path.exists():
                 self.log_path.write_text("", encoding="utf-8")
         except OSError:

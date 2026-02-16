@@ -239,6 +239,7 @@ class SDManager:
         audio_target: Optional[str] = None,
         pi_convert_audio: Optional[bool] = None,
         force_clean: bool = False,
+        progress_callback: Optional[callable] = None,
     ) -> Tuple[int, int]:
         """
         Sync library to SD card. Layout and naming depend on audio_target:
@@ -249,23 +250,30 @@ class SDManager:
         
         Args:
             force_clean: If True, re-sync all files even if they already exist and match.
+            progress_callback: Optional callback(current, total, message) for progress updates.
         """
         target = audio_target or "dfplayer_rp2040"
         pi_convert = pi_convert_audio if pi_convert_audio is not None else True
         if target == "dfplayer_rp2040":
-            return self._sync_library_dfplayer(sd_root, force_clean=force_clean)
-        return self._sync_library_pi(sd_root, convert_to_mp3=pi_convert, force_clean=force_clean)
+            return self._sync_library_dfplayer(sd_root, force_clean=force_clean, progress_callback=progress_callback)
+        return self._sync_library_pi(sd_root, convert_to_mp3=pi_convert, force_clean=force_clean, progress_callback=progress_callback)
 
-    def _sync_library_dfplayer(self, sd_root: Path, force_clean: bool = False) -> Tuple[int, int]:
-        """DFPlayer layout: sd_root/01/, 02/, ... with 001.mp3, 002.mp3; VintageRadio/ for metadata only.
-        
-        The AM WAV file is also copied to folder 99/001.wav on the SD card so the
-        DFPlayer can play the AM static sound through the speaker. (Previously it
-        was only on the Pico flash and played via PWM on a GPIO pin that typically
-        isn't wired to the speaker.)
-        
+    def _sync_library_dfplayer(self, sd_root: Path, force_clean: bool = False,
+                               progress_callback: Optional[callable] = None) -> Tuple[int, int]:
+        """DFPlayer layout – **deduplicated**.
+
+        Each unique song is written to the SD card exactly once, spread across
+        numbered folders ``01/``, ``02/``, ... (max 255 tracks per folder, the
+        DFPlayer track-number limit).  The mapping ``song_id -> (folder, track)``
+        is stored in the ``sd_mapping`` database table and embedded in the
+        ``radio_metadata.json`` so the firmware can look up the real location of
+        any track regardless of which album/playlist it belongs to.
+
+        Folder 99 is reserved for the AM radio WAV file.
+
         Args:
-            force_clean: If True, re-sync all files even if they already exist and match.
+            force_clean: If True, re-sync all files even if they already exist.
+            progress_callback: Optional callback(current, total, message).
         """
         vintage_root = self.vintage_root(sd_root)
         vintage_root.mkdir(parents=True, exist_ok=True)
@@ -277,28 +285,222 @@ class SDManager:
             print("ffmpeg/pydub available for conversion")
         if not vlc_available and not (ffmpeg_available and PYDUB_AVAILABLE):
             print("Warning: No conversion tools available (VLC or ffmpeg/pydub)")
+
+        # ── Collect every unique song referenced by any album or playlist ──
+        all_songs = self.db.list_songs()
+        # Build a lookup so we can get full row by ID
+        song_by_id: Dict[int, any] = {s["id"]: s for s in all_songs}
+
+        # Gather the set of song IDs actually used in albums/playlists
+        used_song_ids: List[int] = []
+        seen_ids: set = set()
+        albums = self.db.list_albums()
+        playlists = self.db.list_playlists()
+        for album in albums:
+            for track in self.db.list_album_songs(album["id"]):
+                if track["id"] not in seen_ids:
+                    used_song_ids.append(track["id"])
+                    seen_ids.add(track["id"])
+        for playlist in playlists:
+            for track in self.db.list_playlist_songs(playlist["id"]):
+                if track["id"] not in seen_ids:
+                    used_song_ids.append(track["id"])
+                    seen_ids.add(track["id"])
+
+        if not used_song_ids:
+            print("No songs to sync (no albums or playlists)")
+            if progress_callback:
+                progress_callback(1, 1, "Nothing to sync")
+            self._copy_am_wav_to_dfplayer_sd(sd_root)
+            self._write_metadata(vintage_root)
+            return 0, 0
+
+        # ── Assign each song a stable (folder, track_number) slot ──
+        # DFPlayer supports track numbers 001-255 per folder.
+        MAX_TRACKS_PER_FOLDER = 255
+        RESERVED_FOLDER = 99  # AM WAV
+
+        # Check existing sd_mapping first so already-synced songs keep their slot
+        song_slot: Dict[int, Tuple[int, int]] = {}  # song_id -> (folder, track)
+        occupied: set = set()  # (folder, track) pairs already assigned
+
+        if not force_clean:
+            for sid in used_song_ids:
+                mapping = self.db.get_sd_mapping(sid)
+                if mapping:
+                    f, t = mapping["folder_number"], mapping["track_number"]
+                    if f != RESERVED_FOLDER:
+                        song_slot[sid] = (f, t)
+                        occupied.add((f, t))
+
+        # Assign slots for any songs that don't have one yet
+        next_folder = 1
+        next_track = 1
+        # If there are existing slots, start after the highest used
+        if occupied:
+            max_folder = max(f for f, _ in occupied)
+            max_track_in_last = max(t for f, t in occupied if f == max_folder)
+            next_folder = max_folder
+            next_track = max_track_in_last + 1
+            if next_track > MAX_TRACKS_PER_FOLDER:
+                next_folder += 1
+                next_track = 1
+
+        for sid in used_song_ids:
+            if sid in song_slot:
+                continue
+            if next_folder == RESERVED_FOLDER:
+                next_folder += 1
+                next_track = 1
+            song_slot[sid] = (next_folder, next_track)
+            occupied.add((next_folder, next_track))
+            next_track += 1
+            if next_track > MAX_TRACKS_PER_FOLDER:
+                next_folder += 1
+                next_track = 1
+
+        # ── Phase 1: Scan songs and identify what needs to be copied ──
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        can_convert = vlc_available or (ffmpeg_available and PYDUB_AVAILABLE)
         copied = 0
         skipped = 0
-        folder_index = 1
-        for album in self.db.list_albums():
-            tracks = self.db.list_album_songs(album["id"])
-            c, s = self._write_folder_tracks_dfplayer(
-                sd_root, folder_index, tracks, vlc_available, ffmpeg_available, force_clean=force_clean
-            )
-            copied += c
-            skipped += s
-            folder_index += 1
-        for playlist in self.db.list_playlists():
-            tracks = self.db.list_playlist_songs(playlist["id"])
-            c, s = self._write_folder_tracks_dfplayer(
-                sd_root, folder_index, tracks, vlc_available, ffmpeg_available, force_clean=force_clean
-            )
-            copied += c
-            skipped += s
-            folder_index += 1
-        # Copy AM WAV to folder 99 on the SD card for DFPlayer playback
+        pending_tasks = []
+        scan_total = len(used_song_ids)
+
+        for i, sid in enumerate(used_song_ids):
+            song = song_by_id.get(sid)
+            if not song:
+                skipped += 1
+                continue
+            file_path = Path(song["file_path"])
+            if not file_path.exists():
+                print(f"Source file missing, skipping: {file_path}")
+                skipped += 1
+                continue
+
+            folder_num, track_num = song_slot[sid]
+            folder_path = sd_root / f"{folder_num:02d}"
+            folder_path.mkdir(parents=True, exist_ok=True)
+            target_path = folder_path / f"{track_num:03d}.mp3"
+
+            title = song["title"] or song["original_filename"]
+            if progress_callback:
+                progress_callback(i, scan_total, f"Checking: {title}")
+
+            # Skip check (fast size comparison)
+            if not force_clean and target_path.exists():
+                try:
+                    target_size = target_path.stat().st_size
+                    source_ext = file_path.suffix.lower()
+                    already_matches = False
+                    if source_ext == ".mp3":
+                        source_size = file_path.stat().st_size
+                        already_matches = (target_size == source_size)
+                    else:
+                        already_matches = (target_size > 1024)
+
+                    if already_matches:
+                        # Update mapping in DB
+                        self.db.set_sd_mapping(sid, folder_num, track_num)
+                        existing_sd = self._row_get(song, "sd_path")
+                        target_str = str(target_path)
+                        if existing_sd != target_str:
+                            self.db.update_song_sd_path(sid, target_str)
+                        skipped += 1
+                        continue
+                except (OSError, Exception):
+                    pass
+
+            source_ext = file_path.suffix.lower()
+            action = "copy" if source_ext == ".mp3" else "convert"
+            pending_tasks.append((sid, file_path, target_path, folder_num, track_num, action, title))
+
+        # ── Phase 2: Copy/convert files + cleanup + AM WAV + metadata ──
+        # Now we know how many files actually need syncing, so progress is accurate.
+        total_work = len(pending_tasks) + 3  # files + cleanup + AM WAV + metadata
+        work_done = 0
+
+        def _process_one(task):
+            sid, file_path, target_path, folder_num, track_num, action, title = task
+            try:
+                if action == "copy":
+                    shutil.copy2(file_path, target_path)
+                    return ("ok", sid, str(target_path), folder_num, track_num, title)
+                else:
+                    if self._convert_to_mp3(file_path, target_path):
+                        return ("ok", sid, str(target_path), folder_num, track_num, title)
+                    else:
+                        if not can_convert:
+                            print(f"Cannot convert {file_path.name} (no converter), skipping")
+                        else:
+                            print(f"Failed to convert {file_path.name}, skipping")
+                        return ("skip", sid, None, folder_num, track_num, title)
+            except OSError as e:
+                print(f"Error syncing {file_path.name}: {e}")
+                return ("skip", sid, None, folder_num, track_num, title)
+
+        if pending_tasks:
+            if progress_callback:
+                progress_callback(0, total_work, f"Syncing {len(pending_tasks)} files to SD card...")
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(_process_one, t): t for t in pending_tasks}
+                for future in as_completed(futures):
+                    status, sid, sd_path, folder_num, track_num, title = future.result()
+                    if status == "ok":
+                        self.db.set_sd_mapping(sid, folder_num, track_num)
+                        self.db.update_song_sd_path(sid, sd_path)
+                        copied += 1
+                    else:
+                        skipped += 1
+                    work_done += 1
+                    if progress_callback:
+                        progress_callback(work_done, total_work, f"Synced: {title}")
+        else:
+            if progress_callback:
+                progress_callback(0, total_work, "All files already up to date")
+
+        # ── Clean up stale folders (folders with no assigned songs) ──
+        work_done += 1
+        if progress_callback:
+            progress_callback(work_done, total_work, "Cleaning up stale files...")
+        used_folders = {f for f, _ in song_slot.values()}
+        for item in sd_root.iterdir():
+            if item.is_dir() and item.name.isdigit():
+                folder_num = int(item.name)
+                if folder_num != RESERVED_FOLDER and folder_num not in used_folders:
+                    print(f"Removing stale folder: {item}")
+                    shutil.rmtree(item, ignore_errors=True)
+
+        # Also remove stale files within used folders (track numbers no longer needed)
+        folder_tracks: Dict[int, set] = {}
+        for f, t in song_slot.values():
+            folder_tracks.setdefault(f, set()).add(t)
+        for folder_num, valid_tracks in folder_tracks.items():
+            folder_path = sd_root / f"{folder_num:02d}"
+            if not folder_path.exists():
+                continue
+            for f in folder_path.iterdir():
+                if f.suffix.lower() == ".mp3" and f.stem.isdigit():
+                    track_num = int(f.stem)
+                    if track_num not in valid_tracks:
+                        print(f"Removing stale track: {f}")
+                        f.unlink(missing_ok=True)
+
+        # ── AM WAV and metadata ──
+        work_done += 1
+        if progress_callback:
+            progress_callback(work_done, total_work, "Copying AM radio sound...")
         self._copy_am_wav_to_dfplayer_sd(sd_root)
+
+        work_done += 1
+        if progress_callback:
+            progress_callback(work_done, total_work, "Writing metadata...")
         self._write_metadata(vintage_root)
+
+        if progress_callback:
+            progress_callback(total_work, total_work, "Sync complete!")
+
+        print(f"SD sync complete: {copied} copied, {skipped} skipped, {len(used_song_ids)} unique songs")
         return copied, skipped
 
     def _copy_am_wav_to_dfplayer_sd(self, sd_root: Path) -> bool:
@@ -370,6 +572,15 @@ class SDManager:
             print(f"Error copying AM WAV to SD: {e}")
             return False
 
+    @staticmethod
+    def _row_get(row, key, default=None):
+        """Safe .get()-like access for sqlite3.Row or dict objects."""
+        try:
+            val = row[key]
+            return val if val is not None else default
+        except (KeyError, IndexError):
+            return default
+
     def _write_folder_tracks_dfplayer(
         self,
         sd_root: Path,
@@ -378,75 +589,102 @@ class SDManager:
         vlc_available: bool,
         ffmpeg_available: bool,
         force_clean: bool = False,
+        max_workers: int = 4,
     ) -> Tuple[int, int]:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         folder_path = sd_root / f"{folder_index:02d}"
         folder_path.mkdir(parents=True, exist_ok=True)
         copied = 0
         skipped = 0
+
+        # ── Phase 1: classify each track as skip / copy / convert ──
+        pending_tasks = []  # (track_num, song_id, file_path, target_path, action)
+
         for track_num, song in enumerate(tracks, start=1):
             file_path = Path(song["file_path"])
             if not file_path.exists():
                 skipped += 1
                 continue
             target_path = folder_path / f"{track_num:03d}.mp3"
-            
+
             # Check if file already exists and matches (skip if not force_clean)
+            # Uses fast size comparison only — no hashing (reading entire files
+            # from an SD card for SHA-256 is extremely slow).
             if not force_clean and target_path.exists():
-                # Check if existing file matches source (by hash if available, otherwise by size)
                 try:
                     target_size = target_path.stat().st_size
-                    source_size = file_path.stat().st_size
-                    
-                    # For MP3 files, compare directly
                     source_ext = file_path.suffix.lower()
+                    already_matches = False
                     if source_ext == ".mp3":
-                        # If source is MP3, compare file hashes
-                        if song.get("file_hash"):
-                            source_hash = song["file_hash"]
-                            target_hash = compute_file_hash(target_path)
-                            if source_hash == target_hash:
-                                # File already exists and matches - skip
-                                self.db.update_song_sd_path(song["id"], str(target_path))
-                                skipped += 1
-                                continue
-                        elif target_size == source_size:
-                            # No hash available, but sizes match - likely the same file
-                            self.db.update_song_sd_path(song["id"], str(target_path))
-                            skipped += 1
-                            continue
+                        # MP3 source -> target is a direct copy, sizes must match
+                        source_size = file_path.stat().st_size
+                        already_matches = (target_size == source_size)
                     else:
-                        # Source is not MP3 - check if converted file exists and is reasonable size
-                        # (converted MP3s are usually smaller than source, so we can't compare sizes directly)
-                        # Just check if target exists and has reasonable size (> 1KB)
-                        if target_size > 1024:
-                            # File exists and has content - assume it's valid (user can force clean if needed)
-                            self.db.update_song_sd_path(song["id"], str(target_path))
-                            skipped += 1
-                            continue
-                except (OSError, Exception) as e:
-                    # Error checking existing file - proceed with copy
-                    pass
-            
-            source_ext = file_path.suffix.lower()
-            try:
-                if source_ext == ".mp3":
-                    shutil.copy2(file_path, target_path)
-                else:
-                    if not self._convert_to_mp3(file_path, target_path):
-                        if not vlc_available and not (ffmpeg_available and PYDUB_AVAILABLE):
-                            print(f"Cannot convert {file_path.name}, skipping")
-                        else:
-                            print(f"Failed to convert {file_path.name}, skipping")
+                        # Non-MP3 source -> target is a conversion; verify it exists
+                        # with a reasonable size (> 1KB means it was converted)
+                        already_matches = (target_size > 1024)
+
+                    if already_matches:
+                        # Only update DB if the path actually changed
+                        existing_sd = self._row_get(song, "sd_path")
+                        target_str = str(target_path)
+                        if existing_sd != target_str:
+                            self.db.update_song_sd_path(song["id"], target_str)
                         skipped += 1
                         continue
-                self.db.update_song_sd_path(song["id"], str(target_path))
-                copied += 1
+                except (OSError, Exception):
+                    pass
+
+            source_ext = file_path.suffix.lower()
+            action = "copy" if source_ext == ".mp3" else "convert"
+            pending_tasks.append((track_num, song["id"], file_path, target_path, action))
+
+        if not pending_tasks:
+            return copied, skipped
+
+        # ── Phase 2: process copy/convert tasks in parallel ──
+        can_convert = vlc_available or (ffmpeg_available and PYDUB_AVAILABLE)
+
+        def _process_one(task):
+            """Worker: runs in thread pool. Returns (status, song_id, sd_path)."""
+            _track_num, song_id, file_path, target_path, action = task
+            try:
+                if action == "copy":
+                    shutil.copy2(file_path, target_path)
+                    return ("ok", song_id, str(target_path))
+                else:  # convert
+                    if self._convert_to_mp3(file_path, target_path):
+                        return ("ok", song_id, str(target_path))
+                    else:
+                        if not can_convert:
+                            print(f"Cannot convert {file_path.name} (no converter available), skipping")
+                        else:
+                            print(f"Failed to convert {file_path.name}, skipping")
+                        return ("skip", song_id, None)
             except OSError as e:
                 print(f"Error syncing {file_path.name}: {e}")
-                skipped += 1
+                return ("skip", song_id, None)
+
+        print(f"  Processing {len(pending_tasks)} track(s) with up to {max_workers} workers...")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_process_one, t): t for t in pending_tasks}
+            for future in as_completed(futures):
+                try:
+                    status, song_id, sd_path = future.result()
+                    if status == "ok":
+                        self.db.update_song_sd_path(song_id, sd_path)
+                        copied += 1
+                    else:
+                        skipped += 1
+                except Exception as e:
+                    print(f"  Unexpected error in worker: {e}")
+                    skipped += 1
+
         return copied, skipped
 
-    def _sync_library_pi(self, sd_root: Path, convert_to_mp3: bool, force_clean: bool = False) -> Tuple[int, int]:
+    def _sync_library_pi(self, sd_root: Path, convert_to_mp3: bool, force_clean: bool = False,
+                          progress_callback: Optional[callable] = None) -> Tuple[int, int]:
         """Pi layout: VintageRadio/library/ with original-style filenames; convert or copy per convert_to_mp3."""
         vintage_root = self.vintage_root(sd_root)
         vintage_root.mkdir(parents=True, exist_ok=True)
@@ -460,7 +698,12 @@ class SDManager:
             print("Warning: No conversion tools available (VLC or ffmpeg/pydub)")
         copied = 0
         skipped = 0
-        for song in self.db.list_songs():
+        all_songs = self.db.list_songs()
+        total_steps = len(all_songs) + 1  # +1 for metadata
+        for i, song in enumerate(all_songs):
+            title = song["title"] or song["original_filename"] or "Unknown"
+            if progress_callback:
+                progress_callback(i, total_steps, f"Syncing: {title}")
             file_path = Path(song["file_path"])
             if not file_path.exists():
                 skipped += 1
@@ -478,15 +721,15 @@ class SDManager:
                     try:
                         existing_size = existing_path.stat().st_size
                         if existing_size > 0:
-                            # Check if file matches by hash if available
-                            if song.get("file_hash"):
-                                existing_hash = compute_file_hash(existing_path)
-                                if existing_hash == song["file_hash"]:
-                                    # File already exists and matches - skip
+                            # Fast check: if source is MP3 (direct copy), compare sizes
+                            # For converted files, just check target exists with content
+                            if source_ext == ".mp3":
+                                source_size = file_path.stat().st_size
+                                if existing_size == source_size:
                                     skipped += 1
                                     continue
                             else:
-                                # No hash, but file exists and has size - skip
+                                # Converted file — exists with content, assume valid
                                 skipped += 1
                                 continue
                     except (OSError, Exception):
@@ -508,7 +751,11 @@ class SDManager:
             except OSError as e:
                 print(f"Error syncing {file_path.name}: {e}")
                 skipped += 1
+        if progress_callback:
+            progress_callback(total_steps - 1, total_steps, "Writing metadata...")
         self._write_metadata(vintage_root)
+        if progress_callback:
+            progress_callback(total_steps, total_steps, "Sync complete!")
         return copied, skipped
 
     def validate_sd(self) -> Dict[str, List[Dict[str, str]]]:
@@ -717,57 +964,95 @@ class SDManager:
         return {"albums": imported_albums, "playlists": imported_playlists}
 
     def _write_metadata(self, vintage_root: Path) -> None:
-        metadata = {
-            "folders": {},
+        """Write ``radio_metadata.json`` with deduplicated SD layout.
+
+        Each track entry in an album/playlist includes the **actual** DFPlayer
+        folder and track number (from ``sd_mapping``) so the firmware can call
+        ``playFolder(folder, track)`` directly.  Albums and playlists are purely
+        logical groupings -- they no longer correspond to physical folders.
+
+        The file is kept compact so MicroPython on the Pico can parse it
+        within its limited RAM (~256 KB).  Only fields the firmware actually
+        needs are included (title, artist, duration, folder, track).
+        """
+        metadata: Dict = {
+            "albums": [],
+            "playlists": [],
             "songs": {},
             "am_sound": {
                 "folder": 99,
                 "track": 1,
             },
         }
-        folder_index = 1
+
+        # Build a quick lookup: song_id -> (folder, track)
+        sd_map: Dict[int, Tuple[int, int]] = {}
+        for song in self.db.list_songs():
+            mapping = self.db.get_sd_mapping(song["id"])
+            if mapping:
+                sd_map[song["id"]] = (mapping["folder_number"], mapping["track_number"])
+
+        # ── Albums ──
         for album in self.db.list_albums():
             tracks = self.db.list_album_songs(album["id"])
-            folder_key = f"{folder_index:02d}"
-            metadata["folders"][folder_key] = {
-                "type": "album",
+            track_list = []
+            for idx, song in enumerate(tracks):
+                folder, track_num = sd_map.get(song["id"], (1, idx + 1))
+                track_list.append({
+                    "song_id": song["id"],
+                    "folder": folder,
+                    "track": track_num,
+                })
+            metadata["albums"].append({
                 "id": album["id"],
                 "name": album["name"],
-                "tracks": [
-                    {"song_id": song["id"], "track": idx + 1}
-                    for idx, song in enumerate(tracks)
-                ],
-            }
-            folder_index += 1
+                "tracks": track_list,
+            })
+
+        # ── Playlists ──
         for playlist in self.db.list_playlists():
             tracks = self.db.list_playlist_songs(playlist["id"])
-            folder_key = f"{folder_index:02d}"
-            metadata["folders"][folder_key] = {
-                "type": "playlist",
+            track_list = []
+            for idx, song in enumerate(tracks):
+                folder, track_num = sd_map.get(song["id"], (1, idx + 1))
+                track_list.append({
+                    "song_id": song["id"],
+                    "folder": folder,
+                    "track": track_num,
+                })
+            metadata["playlists"].append({
                 "id": playlist["id"],
                 "name": playlist["name"],
-                "tracks": [
-                    {"song_id": song["id"], "track": idx + 1}
-                    for idx, song in enumerate(tracks)
-                ],
-            }
-            folder_index += 1
+                "tracks": track_list,
+            })
 
+        # ── Song details (compact: only fields the firmware needs) ──
+        # Includes sd_path for Pi hardware file resolution.
+        # Excludes hash and original_file (not used by firmware).
         for song in self.db.list_songs():
-            metadata["songs"][str(song["id"])] = {
+            entry: Dict = {
                 "title": song["title"],
                 "artist": song["artist"],
-                "original_file": song["original_filename"],
-                "hash": song["file_hash"],
-                "sd_path": song["sd_path"],
+                "duration": song["duration"],
+                "sd_path": song["sd_path"] or "",
             }
+            mapping = sd_map.get(song["id"])
+            if mapping:
+                entry["folder"] = mapping[0]
+                entry["track"] = mapping[1]
+            metadata["songs"][str(song["id"])] = entry
 
         metadata_path = vintage_root / "radio_metadata.json"
         try:
+            # Write compact JSON (no indent) to minimize file size for MicroPython
             with metadata_path.open("w", encoding="utf-8") as handle:
-                json.dump(metadata, handle, indent=2)
-        except OSError:
-            pass
+                json.dump(metadata, handle, separators=(",", ":"))
+            file_size = metadata_path.stat().st_size
+            print(f"Metadata written: {len(metadata['albums'])} albums, "
+                  f"{len(metadata['playlists'])} playlists, "
+                  f"{len(metadata['songs'])} songs ({file_size:,} bytes)")
+        except OSError as e:
+            print(f"Error writing metadata: {e}")
 
     def _ensure_am_wav(self, vintage_root: Path) -> None:
         """Ensure AM WAV file is copied to SD card in DFPlayer-compatible format.

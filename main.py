@@ -1,5 +1,5 @@
 # Vintage Radio Firmware - Using Shared RadioCore
-# This firmware uses the same logic as the GUI test mode via radio_core.py
+# This firmware uses the same logic as the GUI emulator via radio_core.py
 #
 # Hardware: Raspberry Pi Pico + DFPlayer Mini
 # Compatible with MicroPython
@@ -28,7 +28,7 @@ class VintageRadioFirmware:
     Main firmware class that runs the Vintage Radio.
     
     Uses RadioCore for state machine logic and DFPlayerHardware for hardware access.
-    This ensures the firmware runs the exact same logic as the GUI test mode.
+    This ensures the firmware runs the exact same logic as the GUI emulator.
     """
     
     def __init__(self):

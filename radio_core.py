@@ -3,7 +3,7 @@ Vintage Radio Core Logic Module
 
 This module contains the shared state machine logic used by both:
 - The MicroPython firmware (main.py) running on the device
-- The PyQt GUI test mode (gui/test_mode.py) for emulation
+- The PyQt GUI emulator (gui/test_mode.py) for emulation
 
 Hardware operations are abstracted via callbacks, so the same logic
 runs identically on real hardware and in emulation.
