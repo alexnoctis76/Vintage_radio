@@ -2216,6 +2216,15 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             import mpremote
             if getattr(sys, 'frozen', False):
+                # When frozen, sys.executable is the .exe, which causes Windows to open
+                # a new window. Try to find the bundled Python interpreter instead.
+                exe_dir = Path(sys.executable).parent
+                # PyInstaller bundles Python in _internal/python.exe or _internal/pythonw.exe
+                for python_name in ("pythonw.exe", "python.exe"):
+                    bundled_python = exe_dir / "_internal" / python_name
+                    if bundled_python.exists():
+                        return [str(bundled_python), "-m", "mpremote"]
+                # Fallback: use sys.executable but subprocess will hide the window
                 return [sys.executable, "-m", "mpremote"]
             else:
                 cmd = shutil.which("mpremote")
@@ -2258,11 +2267,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Create directories
         _report("Creating directories on Pico...")
+        # Use CREATE_NO_WINDOW on Windows to prevent new console windows
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
         for dirname in ("components", "VintageRadio"):
             try:
                 subprocess.run(
                     mpremote_cmd + ["exec", f"import os; os.mkdir('{dirname}')"],
                     cwd=str(root), capture_output=True, text=True, timeout=15,
+                    creationflags=creation_flags,
                 )
             except Exception:
                 pass
@@ -2275,7 +2289,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if not src.exists():
                 continue
             cmd = mpremote_cmd + ["cp", str(src), f":{remote}"]
-            r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+            r = subprocess.run(
+                cmd, cwd=str(root), capture_output=True, text=True, timeout=30,
+                creationflags=creation_flags,
+            )
             if r.returncode != 0:
                 raise RuntimeError(
                     f"Failed to copy {local}.\n\n"
@@ -2289,7 +2306,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if am_wav_src.exists():
             try:
                 cmd = mpremote_cmd + ["cp", str(am_wav_src), ":VintageRadio/AMradioSound.wav"]
-                r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+                r = subprocess.run(
+                    cmd, cwd=str(root), capture_output=True, text=True, timeout=30,
+                    creationflags=creation_flags,
+                )
                 if r.returncode == 0:
                     print("AMradioSound.wav copied to Pico flash (PWM overlay enabled)")
                 else:
@@ -2323,7 +2343,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if metadata_src and metadata_src.exists():
             try:
                 cmd = mpremote_cmd + ["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"]
-                subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=30)
+                subprocess.run(
+                    cmd, cwd=str(root), capture_output=True, text=True, timeout=30,
+                    creationflags=creation_flags,
+                )
             except Exception as e:
                 print(f"Warning: metadata copy failed: {e}")
 
