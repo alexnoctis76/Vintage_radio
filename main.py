@@ -118,15 +118,28 @@ class VintageRadioFirmware:
             print(f"Boot: No track dict, using fallback - folder={folder:02d}, track={track:03d}, album_idx={self.core.current_album_index}")
             print(f"Boot: WARNING - This means metadata wasn't loaded correctly!")
         confirmed = self.hw.start_with_am(folder, track)
+        # Reset BUSY tracking — the overlay blocked the main loop so prev_busy
+        # may be stale (e.g. was 0 from a previous playing track). Without this,
+        # the code would see a false 0→1 edge and auto-advance immediately.
+        self.prev_busy = 1
+        self._busy_high_since = 0
         
         if confirmed:
             print("Boot playback confirmed")
         else:
+            # Match original baseline second-chance:
+            # df_reset() → df_set_vol(DFPLAYER_VOL) → df_stop() → guard → df_play → wait_busy(1500)
             print("Boot playback not confirmed - attempting second chance")
-            self.hw.reset_dfplayer()
-            self.hw.set_volume(100)
+            self.hw._df_reset()
+            self.hw._df_set_vol(self.hw._df_volume)
+            self.hw._df_stop()
             time.sleep_ms(POST_CMD_GUARD_MS)
-            self.hw.play_track(folder, track)
+            self.hw._df_play_folder_track(folder, track)
+            if self.hw._wait_for_busy_low(1500):
+                print("Second-chance confirmed (BUSY LOW)")
+                self.hw._note_track_learned(folder, track)
+            else:
+                print("Second-chance still not confirmed (possible BUSY wiring issue)")
     
     def handle_button(self):
         """Handle button press and release events (edge detection only).
@@ -165,6 +178,9 @@ class VintageRadioFirmware:
             track = self.core.current_track
             print(f"AM overlay triggered: folder={folder}, track={track} (no metadata)")
         self.hw.start_with_am(folder, track)
+        # Reset BUSY tracking after blocking AM overlay (same reason as boot_sequence)
+        self.prev_busy = 1
+        self._busy_high_since = 0
     
     def handle_track_finished(self):
         """Detect track finished via BUSY pin with debouncing.
@@ -174,7 +190,7 @@ class VintageRadioFirmware:
         BUSY to stay HIGH continuously for BUSY_DEBOUNCE_MS before triggering
         the track-finished event.
         """
-        BUSY_DEBOUNCE_MS = 500  # BUSY must stay HIGH for this long to confirm track end
+        BUSY_DEBOUNCE_MS = 1500  # BUSY must stay HIGH for this long to confirm track end
         
         if not self.rail2_on:
             return
@@ -242,6 +258,9 @@ class VintageRadioFirmware:
                     track = self.core.current_track
                     print(f"Power-on AM overlay: folder={folder}, track={track} (no metadata)")
                 self.hw.start_with_am(folder, track)
+                # Reset BUSY tracking after blocking AM overlay
+                self.prev_busy = 1
+                self._busy_high_since = 0
             
             self.last_sense = sense
     
@@ -262,12 +281,18 @@ class VintageRadioFirmware:
             
             # Process deferred input (tap window timeout)
             # Actions like mode switch, album change, etc. happen inside tick()
+            old_track_idx = self.core.current_track
             self.core.tick()
+            
+            # If tick() changed the track (button-driven skip), reset debounce
+            if self.core.current_track != old_track_idx:
+                self._busy_high_since = 0
             
             # After tick(), check if a mode/album change set delay_playback
             # This means switch_mode() or _next_album() wants AM overlay before playback
             if self.hw._delay_playback:
                 self._play_am_for_change()
+                self._busy_high_since = 0
             
             # Detect track finished
             self.handle_track_finished()

@@ -2324,7 +2324,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Copy AMradioSound.wav ──
         _report("Copying AM radio sound...")
-        am_wav_src = root / "AMradioSound.wav"
+        # Use resource_path() to find AMradioSound.wav in gui/resources
+        # (works both from source and when frozen by PyInstaller)
+        from gui.resource_paths import resource_path
+        am_wav_src = resource_path("AMradioSound.wav")
+        if not am_wav_src.exists():
+            # Fallback to project root (for development without gui/resources)
+            am_wav_src = root / "AMradioSound.wav"
         if am_wav_src.exists():
             try:
                 cmd = mpremote_cmd + ["cp", str(am_wav_src), ":VintageRadio/AMradioSound.wav"]

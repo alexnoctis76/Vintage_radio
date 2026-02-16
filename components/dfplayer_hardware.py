@@ -46,7 +46,7 @@ PIN_BUSY        = 15      # DFPlayer BUSY (0 = playing, 1 = idle)
 #      CONSTANTS
 # ===========================
 
-DFPLAYER_VOL    = 20  # Max volume (0-30 scale) - temporarily set to max since no potentiometer
+DFPLAYER_VOL    = 28  # Max volume (0-30 scale) - matches original baseline 5.9.1
 VOLUME_SCALE    = 1.0
 WAV_FILE        = "VintageRadio/AMradioSound.wav"
 PWM_CARRIER     = 125_000
@@ -124,10 +124,10 @@ class DFPlayerHardware(HardwareInterface):
         # This is critical for the LED to light up and for proper initialization
         self._df_reset()
         
-        # Volume - set to max temporarily (no potentiometer connected)
+        # Volume — matches original baseline: fixed at DFPLAYER_VOL (28)
+        # The potentiometer controls power on/off via GP14, not volume.
         self._volume = 100
-        self._df_volume = 20  # Max DFPlayer volume (0-30 scale) - temporarily max since no potentiometer
-        # Set volume immediately to ensure it's at max
+        self._df_volume = DFPLAYER_VOL
         self._df_set_vol(self._df_volume)
         
         # Ignore BUSY edges after manual skips
@@ -264,7 +264,7 @@ class DFPlayerHardware(HardwareInterface):
     
     def _df_set_vol(self, v):
         """Set DFPlayer volume (0-30)."""
-        v = max(0, min(20, v))
+        v = max(0, min(30, v))
         print("DF: set volume", v)
         self._df_send(0x06, 0x00, v)
     
@@ -369,15 +369,19 @@ class DFPlayerHardware(HardwareInterface):
         print(f"play_track: Starting folder={folder}, track={track}, start_ms={start_ms}")
         self._df_stop()
         time.sleep_ms(POST_CMD_GUARD_MS)
-        # Ensure volume is at max before playing
+        # Ensure volume is at DFPLAYER_VOL before playing
         self._df_set_vol(self._df_volume)
+        # Guard between set_vol and play — DFPlayer needs time to process
+        time.sleep_ms(POST_CMD_GUARD_MS)
         self._df_play_folder_track(folder, track)
         
         # Wait for playback to start
         if self._wait_for_busy_low():
             print("BUSY went LOW -> playback started")
             self._note_track_learned(folder, track)
-            self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 2000)
+            # Ignore BUSY for 4s after play — DFPlayer clones can glitch BUSY
+            # HIGH briefly during the first few seconds of playback.
+            self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
             
             # If start_ms > 0, seek to that position
             if start_ms > 0:
@@ -391,7 +395,7 @@ class DFPlayerHardware(HardwareInterface):
         print("No BUSY LOW -> not confirmed")
         # Still set ignore window to prevent false track-finished triggers
         # (DFPlayer may start playing after the confirmation timeout)
-        self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 2000)
+        self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
         return False
     
     def stop(self):
@@ -401,8 +405,8 @@ class DFPlayerHardware(HardwareInterface):
     def set_volume(self, level):
         """Set volume (0-100)."""
         self._volume = max(0, min(100, level))
-        # Map 0-100 to 0-30 for DFPlayer
-        self._df_volume = int((self._volume / 100.0) * 20)
+        # Map 0-100 to 0-DFPLAYER_VOL for DFPlayer (capped at 28)
+        self._df_volume = int((self._volume / 100.0) * DFPLAYER_VOL)
         self._df_set_vol(self._df_volume)
     
     def play_am_overlay(self):
@@ -430,6 +434,11 @@ class DFPlayerHardware(HardwareInterface):
         self.np[0] = (0, 10, 0)
         self.np.write()
         
+        # Match original baseline: set volume to 0 before AM overlay
+        # (original start_sequence_synced and play_album_change_with_am both
+        # call df_set_vol(0) before play_am_and_fade_df_confirming)
+        self._df_set_vol(0)
+        
         if self.wav_data is not None:
             confirmed = self._play_am_overlay_pwm(folder, track)
         else:
@@ -440,23 +449,36 @@ class DFPlayerHardware(HardwareInterface):
         
         self._am_overlay_active = False
         self._delay_playback = False
-        self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 2000)
+        self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
         
         return confirmed
     
     def _play_am_overlay_pwm(self, folder=None, track=None):
-        """MODE A: True overlay — AM static on GPIO PWM + DFPlayer music fade-in."""
+        """MODE A: True overlay — AM static on GPIO PWM + DFPlayer music fade-in.
+        
+        Matches original baseline play_am_and_fade_df_confirming():
+        - Volume already set to 0 by _play_am_and_fade() caller
+        - df_stop() → guard → df_play_folder_track() (no extra set_vol before play)
+        - Fade from 0 to DFPLAYER_VOL during AM playback
+        """
         print("AM: PWM overlay mode (GPIO 3 + DFPlayer simultaneous)")
         
-        # Start the music track on DFPlayer at low volume immediately
+        # Start the music track on DFPlayer (volume already at 0 from caller)
+        # Matches original: df_stop() → POST_CMD_GUARD_MS → df_play_folder_track()
         confirmed = False
-        min_vol = 5
         if folder is not None and track is not None:
             self._df_stop()
             time.sleep_ms(POST_CMD_GUARD_MS)
-            self._df_set_vol(min_vol)
-            print(f"AM: Starting music at low vol (folder={folder}, track={track})")
+            print(f"AM: Starting music at volume 0 (folder={folder}, track={track})")
             self._df_play_folder_track(folder, track)
+            # Give DFPlayer time to process the play command and begin reading
+            # from SD card BEFORE starting the 8kHz Timer ISR. Without this,
+            # the ISR can starve the CPU and interfere with DFPlayer startup.
+            time.sleep_ms(300)
+            # Check if BUSY already went LOW during that wait
+            if self.pin_busy.value() == 0:
+                confirmed = True
+                print("AM: BUSY LOW -> music playing (confirmed before overlay)")
         
         # Start PWM AM static sound simultaneously
         print("AM: Starting PWM static on GPIO", PIN_AUDIO)
@@ -506,25 +528,25 @@ class DFPlayerHardware(HardwareInterface):
         self.tim.init(freq=self.wav_sr, mode=Timer.PERIODIC, callback=isr_cb)
         
         # Fade in DFPlayer volume while AM static plays
+        # Matches original: df_set_vol(int((step / fade_steps) * DFPLAYER_VOL))
         fade_steps = 20
         fade_delay = int((FADE_IN_S * 1000) / fade_steps)
         if fade_delay < 40:
             fade_delay = 40
         
-        confirm_deadline = time.ticks_add(time.ticks_ms(), BUSY_CONFIRM_MS)
-        vol_range = self._df_volume - min_vol
-        
         try:
             for step in range(fade_steps + 1):
-                vol = min_vol + int((step / fade_steps) * vol_range)
+                # Match original: fade from 0 to DFPLAYER_VOL
+                vol = int((step / fade_steps) * self._df_volume)
                 self._df_set_vol(vol)
                 
                 t_start = time.ticks_ms()
                 while time.ticks_diff(time.ticks_ms(), t_start) < fade_delay:
-                    if (not confirmed) and time.ticks_diff(time.ticks_ms(), confirm_deadline) <= 0:
-                        if self.pin_busy.value() == 0:
-                            confirmed = True
-                            print("AM: BUSY LOW -> music playing (confirmed during overlay)")
+                    # Check BUSY throughout the entire overlay (no deadline)
+                    # Some tracks take longer to start (e.g., larger files)
+                    if not confirmed and self.pin_busy.value() == 0:
+                        confirmed = True
+                        print("AM: BUSY LOW -> music playing (confirmed during overlay)")
                     if state["done"]:
                         break
                     time.sleep_ms(10)
@@ -532,11 +554,11 @@ class DFPlayerHardware(HardwareInterface):
                 if state["done"]:
                     break
             
-            # Wait for AM WAV to finish if it hasn't yet
+            # Wait for AM WAV to finish if it hasn't yet, keep checking BUSY
             while not state["done"]:
-                if (not confirmed) and time.ticks_diff(time.ticks_ms(), confirm_deadline) <= 0:
-                    if self.pin_busy.value() == 0:
-                        confirmed = True
+                if not confirmed and self.pin_busy.value() == 0:
+                    confirmed = True
+                    print("AM: BUSY LOW -> music playing (confirmed late during overlay)")
                 time.sleep_ms(20)
         
         finally:
@@ -566,9 +588,14 @@ class DFPlayerHardware(HardwareInterface):
         return confirmed
     
     def _play_am_dfplayer_sequential(self, folder=None, track=None):
-        """MODE B: Fallback — play AM from DFPlayer SD card, then switch to music."""
+        """MODE B: Fallback — play AM from DFPlayer SD card, then switch to music.
+        
+        Volume already set to 0 by _play_am_and_fade() caller.
+        Plays AM sound at current volume, then switches to music with fade-in.
+        """
         print("AM: DFPlayer sequential mode (folder 99 on SD card)")
         
+        # Play AM sound at full volume so it's audible
         self._df_stop()
         time.sleep_ms(POST_CMD_GUARD_MS)
         self._df_set_vol(self._df_volume)
@@ -589,8 +616,9 @@ class DFPlayerHardware(HardwareInterface):
             self._df_stop()
             time.sleep_ms(POST_CMD_GUARD_MS)
             
-            min_vol = 5
-            self._df_set_vol(min_vol)
+            # Start music at volume 0, then fade up (matches original approach)
+            self._df_set_vol(0)
+            time.sleep_ms(POST_CMD_GUARD_MS)
             
             print(f"AM: Switching to music (folder={folder}, track={track})")
             self._df_play_folder_track(folder, track)
@@ -599,15 +627,14 @@ class DFPlayerHardware(HardwareInterface):
             if confirmed:
                 print("AM: Music started (BUSY confirmed)")
             
-            # Fade in volume
+            # Fade from 0 to DFPLAYER_VOL
             fade_steps = 15
             fade_delay = int((FADE_IN_S * 1000) / fade_steps)
             if fade_delay < 40:
                 fade_delay = 40
             
-            vol_range = self._df_volume - min_vol
             for step in range(1, fade_steps + 1):
-                vol = min_vol + int((step / fade_steps) * vol_range)
+                vol = int((step / fade_steps) * self._df_volume)
                 self._df_set_vol(vol)
                 time.sleep_ms(fade_delay)
             
@@ -966,7 +993,7 @@ class DFPlayerHardware(HardwareInterface):
         # Test 4: Send volume command
         try:
             print("Sending volume command...")
-            self._df_set_vol(20)
+            self._df_set_vol(DFPLAYER_VOL)
             results['volume_sent'] = True
             print("✓ Volume command sent")
         except Exception as e:
