@@ -4,7 +4,7 @@ This app makes it easier to load and manage music for the [Vintage AM Radio](htt
 
 The GUI provides a modern interface for organizing music files, syncing to SD cards, and testing firmware behavior. You can **drag and drop files or folders** into the Library, Albums, or Playlists views to import music quickly.
 
-![Main Interface Overview](docs/images/main-overview.png)
+![Main Interface Overview](docs/images/library.png)
 
 In the future I will be adding metadata support to automatically create albums from file metadata, and finalize support for the raspberry pi 2 W and raspberry pi 3 (currently implemented, but not fully tested with hardware)
 
