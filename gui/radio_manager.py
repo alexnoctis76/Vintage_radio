@@ -2146,6 +2146,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not sd_root:
             return
 
+        # Prompt user for destination directory to copy files to
+        dest_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select Destination Directory for Imported Files",
+            str(Path.home()),
+        )
+        if not dest_dir:
+            return  # User cancelled
+
         def _on_import_success(results: Dict) -> None:
             self.refresh_albums()
             self.refresh_playlists()
@@ -2163,7 +2172,7 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
             title="Import from SD Card",
             func=self.sd_manager.import_from_sd,
-            args=(sd_root,),
+            args=(sd_root, Path(dest_dir)),
         )
         dlg.on_success = _on_import_success
         dlg.exec()
@@ -2215,22 +2224,31 @@ class MainWindow(QtWidgets.QMainWindow):
         """Find the mpremote command (bundled or system-installed)."""
         try:
             import mpremote
+            # When frozen, use python -m mpremote via the bundled Python
+            # When not frozen, try to find mpremote executable
             if getattr(sys, 'frozen', False):
-                # When frozen, sys.executable is the .exe, which causes Windows to open
-                # a new window. Try to find the bundled Python interpreter instead.
+                # In frozen app, we need to use python -m mpremote
+                # But sys.executable is the .exe, so we can't use it directly
+                # Instead, use mpremote as a module via pythonw.exe if available
                 exe_dir = Path(sys.executable).parent
-                # PyInstaller bundles Python in _internal/python.exe or _internal/pythonw.exe
                 for python_name in ("pythonw.exe", "python.exe"):
                     bundled_python = exe_dir / "_internal" / python_name
                     if bundled_python.exists():
                         return [str(bundled_python), "-m", "mpremote"]
-                # Fallback: use sys.executable but subprocess will hide the window
-                return [sys.executable, "-m", "mpremote"]
+                # Fallback: try to find system Python
+                system_python = shutil.which("pythonw") or shutil.which("python")
+                if system_python:
+                    return [system_python, "-m", "mpremote"]
             else:
+                # Not frozen: try mpremote executable first, then python -m mpremote
                 cmd = shutil.which("mpremote")
                 if cmd:
                     return [cmd]
+                # Fallback to python -m mpremote
+                python_cmd = shutil.which("python") or sys.executable
+                return [python_cmd, "-m", "mpremote"]
         except ImportError:
+            # mpremote not importable, try to find executable
             cmd = shutil.which("mpremote")
             if cmd:
                 return [cmd]
@@ -2244,8 +2262,11 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_manager: SDManager,
         progress_callback: Optional[callable] = None,
     ) -> str:
-        """Background worker: copy firmware files to Pico via mpremote.
-        
+        """Background worker: copy firmware files to Pico via mpremote CLI.
+
+        Uses mpremote command-line interface (bundled with the app) to copy files.
+        All subprocess calls use CREATE_NO_WINDOW on Windows to prevent new windows.
+
         Returns a status message string. Raises on fatal error.
         """
         import tempfile as _tempfile
@@ -2255,7 +2276,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("radio_core.py", "radio_core.py"),
             ("components/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         ]
-        # Count total steps: mkdir×2 + files + AM WAV + metadata
+        # Total steps: mkdir×2 + files + AM WAV + metadata
         total = 2 + len(files_to_copy) + 1 + 1
         step = 0
 
@@ -2265,12 +2286,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 progress_callback(step, total, msg)
             step += 1
 
-        # Create directories
-        _report("Creating directories on Pico...")
         # Use CREATE_NO_WINDOW on Windows to prevent new console windows
         creation_flags = 0
         if sys.platform == "win32":
             creation_flags = subprocess.CREATE_NO_WINDOW
+
+        # ── Create directories ──
+        _report("Creating directories on Pico...")
         for dirname in ("components", "VintageRadio"):
             try:
                 subprocess.run(
@@ -2279,10 +2301,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     creationflags=creation_flags,
                 )
             except Exception:
-                pass
+                pass  # directory may already exist
         step = 2
 
-        # Copy firmware files
+        # ── Copy firmware files ──
         for local, remote in files_to_copy:
             _report(f"Copying {local}...")
             src = root / local
@@ -2300,7 +2322,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{r.stderr or r.stdout or ''}"
                 )
 
-        # Copy AMradioSound.wav for PWM overlay
+        # ── Copy AMradioSound.wav ──
         _report("Copying AM radio sound...")
         am_wav_src = root / "AMradioSound.wav"
         if am_wav_src.exists():
@@ -2317,9 +2339,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 print(f"Warning: Could not copy AMradioSound.wav: {e}")
         else:
-            print("AMradioSound.wav not found — PWM overlay won't be available")
+            print("AMradioSound.wav not found - PWM overlay won't be available")
 
-        # Copy radio_metadata.json
+        # ── Copy radio_metadata.json ──
         _report("Copying metadata...")
         metadata_src = None
         if sd_root:

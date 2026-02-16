@@ -948,6 +948,7 @@ class SDManager:
     def import_from_sd(
         self,
         sd_root: Path,
+        dest_dir: Optional[Path] = None,
         progress_callback: Optional[callable] = None,
     ) -> Dict[str, int]:
         """Import albums and playlists from an SD card.
@@ -956,7 +957,9 @@ class SDManager:
         reconstruct albums and playlists.  Audio files are resolved from their
         DFPlayer folder/track paths (e.g. ``01/044.mp3``).  Songs that already
         exist in the library (matched by hash+size) are reused; new files are
-        added to the library with the SD path as their source.
+        copied to ``dest_dir`` (if provided) and added to the library with the
+        copied file path.  If ``dest_dir`` is None, files are added with the SD
+        path as their source (legacy behavior).
         """
         imported_albums = 0
         imported_playlists = 0
@@ -965,7 +968,7 @@ class SDManager:
 
         metadata_path = vintage_root / "radio_metadata.json"
         if not metadata_path.exists():
-            # Fall back to legacy folder-based import
+            # Fall back to legacy folder-based import (doesn't support dest_dir)
             return self._import_from_sd_legacy(sd_root)
 
         if progress_callback:
@@ -996,15 +999,16 @@ class SDManager:
 
             if progress_callback:
                 progress_callback(current_step, total_steps, f"Scanning: {song_title}")
-            current_step += 1
 
             if folder is None or track is None:
+                current_step += 1
                 continue
 
             # Resolve file on SD card
             sd_file = sd_root / f"{folder:02d}" / f"{track:03d}.mp3"
             if not sd_file.exists():
                 print(f"SD file not found for song {meta_song_id}: {sd_file}")
+                current_step += 1
                 continue
 
             # Check if already in library (by hash+size)
@@ -1014,9 +1018,37 @@ class SDManager:
 
             if existing:
                 meta_to_local[meta_song_id] = int(existing["id"])
+                current_step += 1
             else:
+                # Copy file to destination directory if provided
+                if dest_dir:
+                    if progress_callback:
+                        progress_callback(current_step, total_steps, f"Copying: {song_title}")
+                    # Create destination directory if it doesn't exist
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    # Copy file to destination, preserving filename
+                    dest_file = dest_dir / sd_file.name
+                    # If file already exists at destination, use a unique name
+                    if dest_file.exists():
+                        counter = 1
+                        stem = dest_file.stem
+                        suffix = dest_file.suffix
+                        while dest_file.exists():
+                            dest_file = dest_dir / f"{stem}_{counter}{suffix}"
+                            counter += 1
+                    try:
+                        shutil.copy2(sd_file, dest_file)
+                        file_path = str(dest_file)
+                    except OSError as e:
+                        print(f"Failed to copy {sd_file.name} to {dest_dir}: {e}")
+                        # Fall back to using SD path if copy fails
+                        file_path = str(sd_file)
+                else:
+                    # No destination directory - use SD path (legacy behavior)
+                    file_path = str(sd_file)
+
                 # Import as new song
-                metadata = extract_metadata(sd_file)
+                metadata = extract_metadata(sd_file)  # Extract from source file
                 # Prefer title/artist from radio_metadata.json over file tags
                 title = song_info.get("title") or metadata["title"]
                 artist = song_info.get("artist") or metadata["artist"]
@@ -1024,19 +1056,21 @@ class SDManager:
 
                 song_id = self.db.add_song(
                     original_filename=sd_file.name,
-                    file_path=str(sd_file),
+                    file_path=file_path,  # Use copied file path if dest_dir provided
                     title=title,
                     artist=artist,
                     duration=duration,
                     file_hash=file_hash,
                     file_size=file_size,
                     format=metadata["format"],
-                    sd_path=str(sd_file),
+                    sd_path=str(sd_file),  # Keep SD path for reference
                 )
                 meta_to_local[meta_song_id] = song_id
                 # Store the DFPlayer mapping
                 self.db.set_sd_mapping(song_id, folder, track)
                 imported_songs += 1
+            
+            current_step += 1
 
         # Import albums
         for album_data in albums_data:
