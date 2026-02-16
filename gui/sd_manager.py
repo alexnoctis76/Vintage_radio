@@ -946,6 +946,115 @@ class SDManager:
         return folder
 
     def import_from_sd(self, sd_root: Path) -> Dict[str, int]:
+        """Import albums and playlists from an SD card.
+
+        Reads ``radio_metadata.json`` from the ``VintageRadio/`` directory to
+        reconstruct albums and playlists.  Audio files are resolved from their
+        DFPlayer folder/track paths (e.g. ``01/044.mp3``).  Songs that already
+        exist in the library (matched by hash+size) are reused; new files are
+        added to the library with the SD path as their source.
+        """
+        imported_albums = 0
+        imported_playlists = 0
+        imported_songs = 0
+        vintage_root = self.vintage_root(sd_root)
+
+        metadata_path = vintage_root / "radio_metadata.json"
+        if not metadata_path.exists():
+            # Fall back to legacy folder-based import
+            return self._import_from_sd_legacy(sd_root)
+
+        try:
+            with metadata_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Failed to read radio_metadata.json: {e}")
+            return {"albums": 0, "playlists": 0, "songs": 0}
+
+        songs_meta = data.get("songs", {})
+
+        # Build a map: song_id (from metadata) -> local song_id (in our DB)
+        meta_to_local: Dict[str, int] = {}
+
+        for meta_song_id, song_info in songs_meta.items():
+            folder = song_info.get("folder")
+            track = song_info.get("track")
+            if folder is None or track is None:
+                continue
+
+            # Resolve file on SD card
+            sd_file = sd_root / f"{folder:02d}" / f"{track:03d}.mp3"
+            if not sd_file.exists():
+                print(f"SD file not found for song {meta_song_id}: {sd_file}")
+                continue
+
+            # Check if already in library (by hash+size)
+            file_hash = compute_file_hash(sd_file)
+            file_size = sd_file.stat().st_size
+            existing = self.db.get_song_by_hash_size(file_hash, file_size)
+
+            if existing:
+                meta_to_local[meta_song_id] = int(existing["id"])
+            else:
+                # Import as new song
+                metadata = extract_metadata(sd_file)
+                # Prefer title/artist from radio_metadata.json over file tags
+                title = song_info.get("title") or metadata["title"]
+                artist = song_info.get("artist") or metadata["artist"]
+                duration = song_info.get("duration") or metadata["duration"]
+
+                song_id = self.db.add_song(
+                    original_filename=sd_file.name,
+                    file_path=str(sd_file),
+                    title=title,
+                    artist=artist,
+                    duration=duration,
+                    file_hash=file_hash,
+                    file_size=file_size,
+                    format=metadata["format"],
+                    sd_path=str(sd_file),
+                )
+                meta_to_local[meta_song_id] = song_id
+                # Store the DFPlayer mapping
+                self.db.set_sd_mapping(song_id, folder, track)
+                imported_songs += 1
+
+        # Import albums
+        for album_data in data.get("albums", []):
+            album_name = album_data.get("name", "Unknown Album")
+            album_id = self.db.create_album(album_name)
+            has_tracks = False
+            for idx, track_entry in enumerate(album_data.get("tracks", []), start=1):
+                meta_sid = str(track_entry.get("song_id", ""))
+                local_sid = meta_to_local.get(meta_sid)
+                if local_sid is not None:
+                    self.db.add_song_to_album(album_id, local_sid, idx)
+                    has_tracks = True
+            if has_tracks:
+                imported_albums += 1
+                print(f"Imported album: '{album_name}' ({len(album_data.get('tracks', []))} tracks)")
+
+        # Import playlists
+        for playlist_data in data.get("playlists", []):
+            playlist_name = playlist_data.get("name", "Unknown Playlist")
+            playlist_id = self.db.create_playlist(playlist_name)
+            has_tracks = False
+            for idx, track_entry in enumerate(playlist_data.get("tracks", []), start=1):
+                meta_sid = str(track_entry.get("song_id", ""))
+                local_sid = meta_to_local.get(meta_sid)
+                if local_sid is not None:
+                    self.db.add_song_to_playlist(playlist_id, local_sid, idx)
+                    has_tracks = True
+            if has_tracks:
+                imported_playlists += 1
+                print(f"Imported playlist: '{playlist_name}' ({len(playlist_data.get('tracks', []))} tracks)")
+
+        print(f"Import from SD complete: {imported_albums} albums, "
+              f"{imported_playlists} playlists, {imported_songs} new songs")
+        return {"albums": imported_albums, "playlists": imported_playlists, "songs": imported_songs}
+
+    def _import_from_sd_legacy(self, sd_root: Path) -> Dict[str, int]:
+        """Legacy import: looks for *_album and *_playlist folders in VintageRadio/."""
         imported_albums = 0
         imported_playlists = 0
         vintage_root = self.vintage_root(sd_root)

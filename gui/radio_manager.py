@@ -1916,9 +1916,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_albums()
         self.refresh_playlists()
         self.refresh_library()
-        self.sd_status.setPlainText(
-            f"Imported albums: {results['albums']}\nImported playlists: {results['playlists']}"
-        )
+        songs_count = results.get('songs', 0)
+        status_lines = [
+            f"Imported albums: {results['albums']}",
+            f"Imported playlists: {results['playlists']}",
+        ]
+        if songs_count:
+            status_lines.append(f"New songs added to library: {songs_count}")
+        self.sd_status.setPlainText("\n".join(status_lines))
 
     def _project_root(self) -> Path:
         """Project root (parent of gui package, or bundle root when frozen)."""
