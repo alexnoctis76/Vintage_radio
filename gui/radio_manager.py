@@ -480,47 +480,76 @@ class ReorderListWidget(QtWidgets.QListWidget):
 
 
 class InstallMicroPythonDialog(QtWidgets.QDialog):
-    """One-time setup: copy MicroPython .uf2 to Pico in BOOTSEL mode."""
+    """One-time setup: copy MicroPython .uf2 to Pico in BOOTSEL mode.
+
+    Automatically fetches the latest two stable UF2 firmware releases from
+    the MicroPython GitHub repository for both Pico and Pico W boards.
+    Falls back to manual file browse if the fetch fails (e.g. no internet).
+    """
 
     MICROPYTHON_PICO_URL = "https://micropython.org/download/RPI_PICO/"
     MICROPYTHON_PICO_W_URL = "https://micropython.org/download/RPI_PICO_W/"
+
+    # Board key -> (download page URL, firmware slug used in filenames)
+    _BOARDS = {
+        "Pico": ("https://micropython.org/download/RPI_PICO/", "RPI_PICO"),
+        "Pico W": ("https://micropython.org/download/RPI_PICO_W/", "RPI_PICO_W"),
+    }
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Install MicroPython on Pico")
         self.setModal(True)
+        self.setMinimumWidth(520)
+        self._downloaded_path: Optional[Path] = None
         self._build_ui()
         self._refresh_drives()
+        # Fetch firmware list in background
+        self._fetch_thread: Optional[threading.Thread] = None
+        self._start_firmware_fetch()
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         instructions = (
             "1. Hold the BOOTSEL button on the Pico.\n"
             "2. Plug the Pico into USB. It will appear as a drive (e.g. RPI-RP2).\n"
-            "3. Download the MicroPython .uf2 for your board (link below), then select it and the Pico drive here.\n"
-            "4. Click Copy to Pico. The Pico will reboot with MicroPython (one-time setup)."
+            "3. Select a firmware version below (auto-fetched), or browse for a .uf2 file.\n"
+            "4. Click Install to Pico. The Pico will reboot with MicroPython (one-time setup)."
         )
         layout.addWidget(QtWidgets.QLabel(instructions))
-        link_layout = QtWidgets.QHBoxLayout()
-        link_btn = QtWidgets.QPushButton("Open MicroPython download (Pico)")
-        link_btn.setToolTip("Standard Pico (no wireless)")
-        link_btn.clicked.connect(lambda: QDesktopServices.openUrl(QtCore.QUrl(self.MICROPYTHON_PICO_URL)))
-        link_w_btn = QtWidgets.QPushButton("Open download (Pico W)")
-        link_w_btn.setToolTip("Pico W (Wi-Fi)")
-        link_w_btn.clicked.connect(lambda: QDesktopServices.openUrl(QtCore.QUrl(self.MICROPYTHON_PICO_W_URL)))
-        link_layout.addWidget(link_btn)
-        link_layout.addWidget(link_w_btn)
-        link_layout.addStretch()
-        layout.addLayout(link_layout)
+
+        # ── Board selector ──
         form = QtWidgets.QFormLayout()
+        self.board_combo = QtWidgets.QComboBox()
+        self.board_combo.addItem("Pico", "Pico")
+        self.board_combo.addItem("Pico W", "Pico W")
+        self.board_combo.currentIndexChanged.connect(self._on_board_changed)
+        form.addRow("Board:", self.board_combo)
+
+        # ── Firmware version selector ──
+        self.firmware_combo = QtWidgets.QComboBox()
+        self.firmware_combo.setToolTip("Select a firmware version to download and install")
+        self.firmware_combo.addItem("Fetching latest firmware...", None)
+        self.firmware_combo.setEnabled(False)
+        firmware_row = QtWidgets.QHBoxLayout()
+        firmware_row.addWidget(self.firmware_combo, 1)
+        self._refresh_firmware_btn = QtWidgets.QPushButton("Refresh")
+        self._refresh_firmware_btn.setToolTip("Re-fetch firmware list from GitHub")
+        self._refresh_firmware_btn.clicked.connect(self._start_firmware_fetch)
+        firmware_row.addWidget(self._refresh_firmware_btn)
+        form.addRow("Firmware:", firmware_row)
+
+        # ── Or browse manually ──
         self.uf2_edit = QtWidgets.QLineEdit()
-        self.uf2_edit.setPlaceholderText("Path to .uf2 file")
+        self.uf2_edit.setPlaceholderText("Or browse for a local .uf2 file...")
         browse_btn = QtWidgets.QPushButton("Browse...")
         browse_btn.clicked.connect(self._browse_uf2)
         uf2_row = QtWidgets.QHBoxLayout()
         uf2_row.addWidget(self.uf2_edit)
         uf2_row.addWidget(browse_btn)
-        form.addRow("UF2 file:", uf2_row)
+        form.addRow("Local file:", uf2_row)
+
+        # ── Pico drive ──
         self.drive_combo = QtWidgets.QComboBox()
         self.drive_combo.setToolTip("Select the Pico drive (shown when BOOTSEL is held and Pico is connected)")
         refresh_drives_btn = QtWidgets.QPushButton("Refresh")
@@ -530,12 +559,130 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         drive_row.addWidget(refresh_drives_btn)
         form.addRow("Pico drive:", drive_row)
         layout.addLayout(form)
-        copy_btn = QtWidgets.QPushButton("Copy to Pico")
+
+        # ── Links ──
+        link_layout = QtWidgets.QHBoxLayout()
+        link_btn = QtWidgets.QPushButton("MicroPython downloads (Pico)")
+        link_btn.setToolTip("Open MicroPython download page for standard Pico")
+        link_btn.setFlat(True)
+        link_btn.setStyleSheet("color: #0066cc; text-decoration: underline; text-align: left;")
+        link_btn.clicked.connect(lambda: QDesktopServices.openUrl(QtCore.QUrl(self.MICROPYTHON_PICO_URL)))
+        link_w_btn = QtWidgets.QPushButton("Downloads (Pico W)")
+        link_w_btn.setToolTip("Open MicroPython download page for Pico W")
+        link_w_btn.setFlat(True)
+        link_w_btn.setStyleSheet("color: #0066cc; text-decoration: underline; text-align: left;")
+        link_w_btn.clicked.connect(lambda: QDesktopServices.openUrl(QtCore.QUrl(self.MICROPYTHON_PICO_W_URL)))
+        link_layout.addWidget(link_btn)
+        link_layout.addWidget(link_w_btn)
+        link_layout.addStretch()
+        layout.addLayout(link_layout)
+
+        # ── Install button ──
+        copy_btn = QtWidgets.QPushButton("Install to Pico")
         copy_btn.clicked.connect(self._copy_to_pico)
         layout.addWidget(copy_btn)
+
         self.status_label = QtWidgets.QLabel("")
-        self.status_label.setStyleSheet("color: green;")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        # Store fetched firmware data: {board_key: [(display_name, download_url, file_name), ...]}
+        self._firmware_data: Dict[str, list] = {}
+
+    # ── Firmware fetching ──
+
+    def _start_firmware_fetch(self) -> None:
+        """Kick off background fetch of firmware releases from GitHub."""
+        self.firmware_combo.clear()
+        self.firmware_combo.addItem("Fetching latest firmware...", None)
+        self.firmware_combo.setEnabled(False)
+        self._refresh_firmware_btn.setEnabled(False)
+        self.status_label.setText("")
+        self._fetch_thread = threading.Thread(target=self._fetch_firmware_releases, daemon=True)
+        self._fetch_thread.start()
+
+    def _fetch_firmware_releases(self) -> None:
+        """Background: scrape micropython.org download pages for UF2 links."""
+        import urllib.request
+        import json as _json
+        import re as _re
+
+        result: Dict[str, list] = {}
+
+        for board_key, (page_url, slug) in self._BOARDS.items():
+            entries: list = []
+            try:
+                req = urllib.request.Request(page_url, headers={"User-Agent": "VintageRadio"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    html = resp.read().decode("utf-8")
+
+                # Find .uf2 links — they appear in order newest-first on the page
+                uf2_links = _re.findall(r'href="(/resources/firmware/[^"]*\.uf2)"', html)
+                for link in uf2_links:
+                    filename = link.rsplit("/", 1)[-1]
+                    # Extract version from filename like RPI_PICO-20251209-v1.27.0.uf2
+                    m = _re.search(r"-(\d{8})-(v[\d.]+)\.uf2$", filename)
+                    if m:
+                        date_str, version = m.group(1), m.group(2)
+                        display = f"{version}  ({date_str[:4]}-{date_str[4:6]}-{date_str[6:]})"
+                    else:
+                        display = filename
+                    download_url = "https://micropython.org" + link
+                    entries.append((display, download_url, filename))
+                    if len(entries) >= 2:
+                        break
+            except Exception as e:
+                print(f"Failed to fetch firmware for {board_key}: {e}")
+            result[board_key] = entries
+
+        if not any(result.values()):
+            QtCore.QMetaObject.invokeMethod(
+                self, "_on_fetch_error", QtCore.Qt.ConnectionType.QueuedConnection,
+                QtCore.Q_ARG(str, "Could not find firmware on micropython.org"),
+            )
+            return
+
+        QtCore.QMetaObject.invokeMethod(
+            self, "_on_fetch_success", QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, _json.dumps(result)),
+        )
+
+    @QtCore.pyqtSlot(str)
+    def _on_fetch_success(self, data_json: str) -> None:
+        import json as _json
+        self._firmware_data = _json.loads(data_json)
+        self._refresh_firmware_btn.setEnabled(True)
+        self._populate_firmware_combo()
+
+    @QtCore.pyqtSlot(str)
+    def _on_fetch_error(self, error_msg: str) -> None:
+        self._refresh_firmware_btn.setEnabled(True)
+        self.firmware_combo.clear()
+        self.firmware_combo.addItem("(Could not fetch - use Browse instead)", None)
+        self.firmware_combo.setEnabled(False)
+        self.status_label.setText(f"Could not fetch firmware list: {error_msg}")
+        self.status_label.setStyleSheet("color: #cc6600;")
+
+    def _populate_firmware_combo(self) -> None:
+        """Fill the firmware combo with entries for the currently selected board."""
+        board_key = self.board_combo.currentData()
+        entries = self._firmware_data.get(board_key, [])
+        self.firmware_combo.clear()
+        if entries:
+            for display, url, filename in entries:
+                self.firmware_combo.addItem(display, {"url": url, "filename": filename})
+            self.firmware_combo.setEnabled(True)
+            self.status_label.setText("")
+            self.status_label.setStyleSheet("")
+        else:
+            self.firmware_combo.addItem("(No firmware found - use Browse instead)", None)
+            self.firmware_combo.setEnabled(False)
+
+    def _on_board_changed(self, _index: int) -> None:
+        if self._firmware_data:
+            self._populate_firmware_combo()
+
+    # ── Manual browse ──
 
     def _browse_uf2(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -547,6 +694,8 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         if path:
             self.uf2_edit.setText(path)
 
+    # ── Drives ──
+
     def _refresh_drives(self) -> None:
         self.drive_combo.clear()
         for path, label in SDManager.detect_sd_roots():
@@ -555,28 +704,101 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         if self.drive_combo.count() == 0:
             self.drive_combo.addItem("(No removable drives found)", None)
 
+    # ── Install ──
+
     def _copy_to_pico(self) -> None:
-        uf2_path = Path(self.uf2_edit.text().strip())
-        if not uf2_path.is_file() or uf2_path.suffix.lower() != ".uf2":
+        # Determine UF2 source: manual browse takes priority, then combo selection
+        manual_path = self.uf2_edit.text().strip()
+        if manual_path:
+            uf2_path = Path(manual_path)
+            if not uf2_path.is_file() or uf2_path.suffix.lower() != ".uf2":
+                QtWidgets.QMessageBox.warning(
+                    self, "Install MicroPython on Pico",
+                    "The file path entered is not a valid .uf2 file.",
+                )
+                return
+            self._install_uf2(uf2_path)
+            return
+
+        # Use selected firmware from combo — need to download first
+        fw_data = self.firmware_combo.currentData()
+        if not fw_data or not isinstance(fw_data, dict):
             QtWidgets.QMessageBox.warning(
-                self,
-                "Install MicroPython on Pico",
-                "Please select a valid .uf2 file (e.g. from the MicroPython download page).",
+                self, "Install MicroPython on Pico",
+                "No firmware selected. Either select a version from the dropdown or browse for a local .uf2 file.",
             )
             return
+
+        # Verify drive first before downloading
+        drive_data = self.drive_combo.currentData()
+        if drive_data is None or not Path(drive_data).is_dir():
+            QtWidgets.QMessageBox.warning(
+                self, "Install MicroPython on Pico",
+                "No Pico drive selected. Hold BOOTSEL, plug in the Pico, then click Refresh.",
+            )
+            return
+
+        # Download to temp and then install
+        url = fw_data["url"]
+        filename = fw_data["filename"]
+        self.status_label.setStyleSheet("color: #333;")
+        self.status_label.setText(f"Downloading {filename}...")
+        self.setEnabled(False)
+        QtWidgets.QApplication.processEvents()
+
+        download_thread = threading.Thread(
+            target=self._download_and_install, args=(url, filename), daemon=True
+        )
+        download_thread.start()
+
+    def _download_and_install(self, url: str, filename: str) -> None:
+        import urllib.request
+        import tempfile
+
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="vintage_radio_uf2_"))
+            dest = tmp_dir / filename
+            urllib.request.urlretrieve(url, str(dest))
+            self._downloaded_path = dest
+            QtCore.QMetaObject.invokeMethod(
+                self, "_on_download_success", QtCore.Qt.ConnectionType.QueuedConnection,
+            )
+        except Exception as e:
+            QtCore.QMetaObject.invokeMethod(
+                self, "_on_download_error", QtCore.Qt.ConnectionType.QueuedConnection,
+                QtCore.Q_ARG(str, str(e)),
+            )
+
+    @QtCore.pyqtSlot()
+    def _on_download_success(self) -> None:
+        self.setEnabled(True)
+        if self._downloaded_path and self._downloaded_path.is_file():
+            self.status_label.setText(f"Downloaded: {self._downloaded_path.name}")
+            self.status_label.setStyleSheet("color: green;")
+            self._install_uf2(self._downloaded_path)
+        else:
+            self.status_label.setText("Download failed (file not found).")
+            self.status_label.setStyleSheet("color: red;")
+
+    @QtCore.pyqtSlot(str)
+    def _on_download_error(self, error_msg: str) -> None:
+        self.setEnabled(True)
+        self.status_label.setText(f"Download failed: {error_msg}")
+        self.status_label.setStyleSheet("color: red;")
+
+    def _install_uf2(self, uf2_path: Path) -> None:
+        """Copy a .uf2 file to the selected Pico drive."""
         drive_data = self.drive_combo.currentData()
         if drive_data is None:
             QtWidgets.QMessageBox.warning(
-                self,
-                "Install MicroPython on Pico",
+                self, "Install MicroPython on Pico",
                 "No Pico drive selected. Hold BOOTSEL, plug in the Pico, then click Refresh.",
             )
             return
         dest_dir = Path(drive_data)
         if not dest_dir.is_dir():
             QtWidgets.QMessageBox.warning(
-                self,
-                "Install MicroPython on Pico",
+                self, "Install MicroPython on Pico",
                 f"Drive not found: {dest_dir}. Unplug and replug the Pico (with BOOTSEL held), then Refresh.",
             )
             return
@@ -585,16 +807,27 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
             shutil.copy2(uf2_path, dest_file)
         except OSError as e:
             QtWidgets.QMessageBox.warning(
-                self,
-                "Install MicroPython on Pico",
+                self, "Install MicroPython on Pico",
                 f"Could not copy to Pico: {e}",
             )
             return
-        self.status_label.setText("Firmware copied. Pico will reboot with MicroPython.")
+
+        # Clean up downloaded temp file
+        if self._downloaded_path and self._downloaded_path.exists():
+            try:
+                tmp_dir = self._downloaded_path.parent
+                self._downloaded_path.unlink()
+                tmp_dir.rmdir()
+            except OSError:
+                pass
+            self._downloaded_path = None
+
+        self.status_label.setText("Firmware copied! Pico will reboot with MicroPython.")
+        self.status_label.setStyleSheet("color: green;")
         QtWidgets.QMessageBox.information(
-            self,
-            "Install MicroPython on Pico",
-            "MicroPython firmware copied. The Pico will reboot shortly. You can then use \"Install to Pico\" to deploy the app.",
+            self, "Install MicroPython on Pico",
+            "MicroPython firmware copied. The Pico will reboot shortly.\n\n"
+            "You can then use \"Install to Pico\" to deploy the app.",
         )
 
 
@@ -1912,18 +2145,28 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_root = self._resolve_sd_root()
         if not sd_root:
             return
-        results = self.sd_manager.import_from_sd(sd_root)
-        self.refresh_albums()
-        self.refresh_playlists()
-        self.refresh_library()
-        songs_count = results.get('songs', 0)
-        status_lines = [
-            f"Imported albums: {results['albums']}",
-            f"Imported playlists: {results['playlists']}",
-        ]
-        if songs_count:
-            status_lines.append(f"New songs added to library: {songs_count}")
-        self.sd_status.setPlainText("\n".join(status_lines))
+
+        def _on_import_success(results: Dict) -> None:
+            self.refresh_albums()
+            self.refresh_playlists()
+            self.refresh_library()
+            songs_count = results.get('songs', 0)
+            status_lines = [
+                f"Imported albums: {results['albums']}",
+                f"Imported playlists: {results['playlists']}",
+            ]
+            if songs_count:
+                status_lines.append(f"New songs added to library: {songs_count}")
+            self.sd_status.setPlainText("\n".join(status_lines))
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Import from SD Card",
+            func=self.sd_manager.import_from_sd,
+            args=(sd_root,),
+        )
+        dlg.on_success = _on_import_success
+        dlg.exec()
 
     def _project_root(self) -> Path:
         """Project root (parent of gui package, or bundle root when frozen)."""

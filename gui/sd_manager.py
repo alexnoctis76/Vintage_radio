@@ -945,7 +945,11 @@ class SDManager:
             json.dump(metadata, handle, indent=2)
         return folder
 
-    def import_from_sd(self, sd_root: Path) -> Dict[str, int]:
+    def import_from_sd(
+        self,
+        sd_root: Path,
+        progress_callback: Optional[callable] = None,
+    ) -> Dict[str, int]:
         """Import albums and playlists from an SD card.
 
         Reads ``radio_metadata.json`` from the ``VintageRadio/`` directory to
@@ -964,6 +968,9 @@ class SDManager:
             # Fall back to legacy folder-based import
             return self._import_from_sd_legacy(sd_root)
 
+        if progress_callback:
+            progress_callback(0, 0, "Reading metadata from SD card...")
+
         try:
             with metadata_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -972,6 +979,12 @@ class SDManager:
             return {"albums": 0, "playlists": 0, "songs": 0}
 
         songs_meta = data.get("songs", {})
+        albums_data = data.get("albums", [])
+        playlists_data = data.get("playlists", [])
+
+        # Total steps: songs + albums + playlists + 1 (finalizing)
+        total_steps = len(songs_meta) + len(albums_data) + len(playlists_data) + 1
+        current_step = 0
 
         # Build a map: song_id (from metadata) -> local song_id (in our DB)
         meta_to_local: Dict[str, int] = {}
@@ -979,6 +992,12 @@ class SDManager:
         for meta_song_id, song_info in songs_meta.items():
             folder = song_info.get("folder")
             track = song_info.get("track")
+            song_title = song_info.get("title", f"Song {meta_song_id}")
+
+            if progress_callback:
+                progress_callback(current_step, total_steps, f"Scanning: {song_title}")
+            current_step += 1
+
             if folder is None or track is None:
                 continue
 
@@ -1020,8 +1039,12 @@ class SDManager:
                 imported_songs += 1
 
         # Import albums
-        for album_data in data.get("albums", []):
+        for album_data in albums_data:
             album_name = album_data.get("name", "Unknown Album")
+            if progress_callback:
+                progress_callback(current_step, total_steps, f"Importing album: {album_name}")
+            current_step += 1
+
             album_id = self.db.create_album(album_name)
             has_tracks = False
             for idx, track_entry in enumerate(album_data.get("tracks", []), start=1):
@@ -1035,8 +1058,12 @@ class SDManager:
                 print(f"Imported album: '{album_name}' ({len(album_data.get('tracks', []))} tracks)")
 
         # Import playlists
-        for playlist_data in data.get("playlists", []):
+        for playlist_data in playlists_data:
             playlist_name = playlist_data.get("name", "Unknown Playlist")
+            if progress_callback:
+                progress_callback(current_step, total_steps, f"Importing playlist: {playlist_name}")
+            current_step += 1
+
             playlist_id = self.db.create_playlist(playlist_name)
             has_tracks = False
             for idx, track_entry in enumerate(playlist_data.get("tracks", []), start=1):
@@ -1048,6 +1075,9 @@ class SDManager:
             if has_tracks:
                 imported_playlists += 1
                 print(f"Imported playlist: '{playlist_name}' ({len(playlist_data.get('tracks', []))} tracks)")
+
+        if progress_callback:
+            progress_callback(total_steps, total_steps, "Import complete!")
 
         print(f"Import from SD complete: {imported_albums} albums, "
               f"{imported_playlists} playlists, {imported_songs} new songs")
