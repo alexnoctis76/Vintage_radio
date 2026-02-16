@@ -38,3 +38,23 @@ Click on **Install to Pico**.
 
 # Test it out
 That's it, your device should be ready to test (you may need to click the RESET button one more time on your RP2040)
+
+# Physical Button Commands
+
+## Basic Controls
+- **Tap** = Next track (quick press and release)
+- **Double-tap** = Previous track (two quick taps)
+- **Triple-tap** = Restart album (three quick taps)
+- **Hold** = Next album/playlist (press and hold for 500ms+)
+
+## Combination Controls
+- **Tap + Hold** = Toggle Album/Playlist mode
+  - *How to do it:* Tap once (release), then press and hold
+- **Double-tap + Hold** = Shuffle current album/playlist
+  - *How to do it:* Double-tap (release after each tap), then press and hold
+- **Triple-tap + Hold** = Shuffle entire library
+  - *How to do it:* Triple-tap (release after each tap), then press and hold
+
+_**Note:**_ For combination commands, complete the taps first (release after each tap), then press and hold. The system recognizes the taps and combines them with the hold gesture.
+
+All button commands work on both the physical device and the emulator.
