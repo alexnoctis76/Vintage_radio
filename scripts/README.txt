@@ -30,7 +30,11 @@ TROUBLESHOOTING - If the app crashes:
 2. Navigate to the app folder: cd ~/Downloads/Vintage-Radio-macOS
 3. Run the app from Terminal to see error messages:
    "./Vintage Radio.app/Contents/MacOS/Vintage Radio"
+   (Note: You cannot run "./Vintage Radio.app" directly - it's a directory)
 4. Share the error message for support
+
+Alternative: Use the "open" command:
+   open "Vintage Radio.app"
 
 Note: Works on both Intel and Apple Silicon Macs.
 

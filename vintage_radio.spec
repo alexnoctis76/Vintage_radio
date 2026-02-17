@@ -77,7 +77,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=True if sys.platform == 'darwin' else False,  # Strip symbols on macOS to reduce size
     upx=True,
-    console=False,
+    console=True if sys.platform == 'darwin' else False,  # Enable console on macOS to see crash errors
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
