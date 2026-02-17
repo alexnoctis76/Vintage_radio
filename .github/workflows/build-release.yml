@@ -3,8 +3,8 @@
 # To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
 # Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
 #
-# macOS note: We build on macos-13 (Intel/x86_64) so the binary runs on ALL Macs.
-# Intel Macs run it natively; Apple Silicon Macs run it via Rosetta 2 (auto-installed).
+# macOS note: We cross-compile for x86_64 via Rosetta on the ARM64 runner.
+# The resulting binary runs on ALL Macs (Intel natively, Apple Silicon via Rosetta 2).
 #
 # Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
 # add a Personal Access Token (classic) with scope "repo" as a repo secret named RELEASE_TOKEN.
@@ -27,8 +27,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
-          # macos-13 is Intel (x86_64) - builds run on ALL Macs via Rosetta 2
-          - os: macos-13
+          - os: macos-latest
             artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
@@ -41,7 +40,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Rosetta 2 (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Install dependencies (macOS - x86_64 via Rosetta)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          arch -x86_64 python3 -m pip install --upgrade pip
+          arch -x86_64 python3 -m pip install -r requirements.txt
+          arch -x86_64 python3 -m pip install pyinstaller
+
+      - name: Install dependencies (Windows)
+        if: matrix.os == 'windows-latest'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -53,7 +64,29 @@ jobs:
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
-      - name: Build with PyInstaller
+      - name: Create macOS .icns from PNG (macOS only)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          mkdir -p vintage_radio.iconset
+          sips -z 16 16     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_16x16.png
+          sips -z 32 32     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_16x16@2x.png
+          sips -z 32 32     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_32x32.png
+          sips -z 64 64     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_32x32@2x.png
+          sips -z 128 128   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_128x128.png
+          sips -z 256 256   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_128x128@2x.png
+          sips -z 256 256   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_256x256.png
+          sips -z 512 512   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_256x256@2x.png
+          sips -z 512 512   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_512x512.png
+          sips -z 1024 1024 gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_512x512@2x.png
+          iconutil -c icns vintage_radio.iconset -o gui/resources/vintage_radio.icns
+          rm -rf vintage_radio.iconset
+
+      - name: Build with PyInstaller (macOS - x86_64 via Rosetta)
+        if: startsWith(matrix.os, 'macos')
+        run: arch -x86_64 python3 -m PyInstaller vintage_radio.spec
+
+      - name: Build with PyInstaller (Windows)
+        if: matrix.os == 'windows-latest'
         run: pyinstaller vintage_radio.spec
 
       - name: Package macOS app bundle
@@ -61,17 +94,25 @@ jobs:
         run: |
           echo "=== PyInstaller output ==="
           ls -la dist/
-          ls -la "dist/Vintage Radio/" || true
 
-          echo ""
-          echo "=== Wrapping in .app bundle ==="
-          # PyInstaller puts .app contents directly into "dist/Vintage Radio/"
-          # Rename to a proper .app bundle so macOS recognises it as an application
-          mv "dist/Vintage Radio" "dist/Vintage Radio.app"
+          # The spec BUNDLE() step creates dist/Vintage Radio.app/
+          # If it exists, use it directly; otherwise wrap the folder
+          if [ -d "dist/Vintage Radio.app" ]; then
+            echo "Found .app bundle from BUNDLE() step"
+            APP_SOURCE="dist/Vintage Radio.app"
+          elif [ -d "dist/Vintage Radio" ]; then
+            echo "No .app bundle found, wrapping folder"
+            mv "dist/Vintage Radio" "dist/Vintage Radio.app"
+            APP_SOURCE="dist/Vintage Radio.app"
+          else
+            echo "ERROR: No build output found!"
+            ls -la dist/
+            exit 1
+          fi
 
-          # Create a distribution folder with the .app and the helper script
+          # Create distribution folder with .app and helper script
           mkdir -p "dist/package"
-          mv "dist/Vintage Radio.app" "dist/package/"
+          mv "$APP_SOURCE" "dist/package/"
           cp scripts/open_vintage_radio.command "dist/package/"
           chmod +x "dist/package/open_vintage_radio.command"
 
