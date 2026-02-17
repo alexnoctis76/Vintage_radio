@@ -75,7 +75,7 @@ exe = EXE(
     name='Vintage Radio',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    strip=True if sys.platform == 'darwin' else False,  # Strip symbols on macOS to reduce size
     upx=True,
     console=False,
     disable_windowed_traceback=False,
@@ -91,7 +91,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=False,
+    strip=True if sys.platform == 'darwin' else False,  # Strip symbols on macOS to reduce size
     upx=True,
     upx_exclude=[],
     name='Vintage Radio',

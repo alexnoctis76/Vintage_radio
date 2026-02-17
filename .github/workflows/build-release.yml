@@ -3,8 +3,9 @@
 # To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
 # Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
 #
-# macOS note: We cross-compile for x86_64 via Rosetta on the ARM64 runner.
-# The resulting binary runs on ALL Macs (Intel natively, Apple Silicon via Rosetta 2).
+# macOS note: We use macos-13 (Intel) so the x86_64 binary runs on ALL Macs:
+#   - Intel Macs: runs natively
+#   - Apple Silicon Macs: runs via Rosetta 2 (automatic, no user action needed)
 #
 # Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
 # add a Personal Access Token (classic) with scope "repo" as a repo secret named RELEASE_TOKEN.
@@ -27,7 +28,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
-          - os: macos-latest
+          - os: macos-13
             artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
@@ -40,16 +41,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Rosetta 2 (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: softwareupdate --install-rosetta --agree-to-license || true
-
-      - name: Install dependencies (macOS - x86_64 via Rosetta)
+      - name: Install dependencies (macOS)
         if: startsWith(matrix.os, 'macos')
         run: |
-          arch -x86_64 python3 -m pip install --upgrade pip
-          arch -x86_64 python3 -m pip install -r requirements.txt
-          arch -x86_64 python3 -m pip install pyinstaller
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
 
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows-latest'
@@ -81,9 +78,9 @@ jobs:
           iconutil -c icns vintage_radio.iconset -o gui/resources/vintage_radio.icns
           rm -rf vintage_radio.iconset
 
-      - name: Build with PyInstaller (macOS - x86_64 via Rosetta)
+      - name: Build with PyInstaller (macOS)
         if: startsWith(matrix.os, 'macos')
-        run: arch -x86_64 python3 -m PyInstaller vintage_radio.spec
+        run: python -m PyInstaller vintage_radio.spec
 
       - name: Build with PyInstaller (Windows)
         if: matrix.os == 'windows-latest'
@@ -110,11 +107,10 @@ jobs:
             exit 1
           fi
 
-          # Create distribution folder with .app and helper script
+          # Create distribution folder with .app and README
           mkdir -p "dist/package"
           mv "$APP_SOURCE" "dist/package/"
-          cp scripts/open_vintage_radio.command "dist/package/"
-          chmod +x "dist/package/open_vintage_radio.command"
+          cp scripts/README.txt "dist/package/"
 
           echo ""
           echo "=== Final package contents ==="
