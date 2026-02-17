@@ -54,10 +54,12 @@ Desktop application for managing your music library and syncing it to a vintage-
 
 - **Windows** - Unzip `Vintage-Radio-Windows.zip`, open the `Vintage Radio` folder, and run `Vintage Radio.exe`.
 - **macOS** - Unzip `Vintage-Radio-macOS.zip`, open the `Vintage Radio` folder:
-  1. **First time only:** Right-click `open_vintage_radio.command` → "Open" → "Open" in the security dialog. This removes the macOS quarantine and launches the app.
+  1. **First time only:** 
+     - Remove quarantine: Open Terminal, run `cd ~/Downloads/Vintage-Radio-macOS && xattr -dr com.apple.quarantine "Vintage Radio.app"` (adjust path)
+     - Allow in System Settings: Try opening the app, then go to System Settings > Privacy & Security > Click "Open Anyway" next to the blocked app message
   2. **After that:** Just double-click `Vintage Radio.app` directly.
   - Works on both Intel and Apple Silicon Macs (Apple Silicon runs via Rosetta 2).
-  - **Alternative:** Right-click `Vintage Radio.app` → "Open" → "Open" in the dialog, or run `xattr -dr com.apple.quarantine .` in the folder via Terminal.
+  - See `README.txt` in the folder for step-by-step instructions with screenshots guidance.
 
 ## Before You Start
 

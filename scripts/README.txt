@@ -32,7 +32,9 @@ TROUBLESHOOTING - If the app crashes:
    "./Vintage Radio.app/Contents/MacOS/Vintage Radio"
 4. Share the error message for support
 
-Note: This is required because the app isn't code-signed by Apple.
+Note: Works on both Intel and Apple Silicon Macs.
+
+The security steps are required because the app isn't code-signed.
 Code signing requires an Apple Developer account ($99/year).
 
 ========================================

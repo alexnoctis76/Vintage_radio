@@ -3,7 +3,7 @@
 # To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
 # Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
 #
-# macOS note: We use macos-13 (Intel) so the x86_64 binary runs on ALL Macs:
+# macOS note: We build on macos-13 (Intel) so the x86_64 binary runs on ALL Macs:
 #   - Intel Macs: runs natively
 #   - Apple Silicon Macs: runs via Rosetta 2 (automatic, no user action needed)
 #
