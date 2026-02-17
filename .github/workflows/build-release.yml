@@ -56,21 +56,41 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller vintage_radio.spec
 
-      - name: Verify macOS binary architecture
+      - name: Package macOS app bundle
         if: startsWith(matrix.os, 'macos')
         run: |
-          echo "Binary architecture:"
-          file "dist/Vintage Radio/Vintage Radio"
+          echo "=== PyInstaller output ==="
+          ls -la dist/
+          ls -la "dist/Vintage Radio/" || true
+
           echo ""
-          echo "Expected: x86_64 (runs on all Macs via Rosetta 2)"
+          echo "=== Wrapping in .app bundle ==="
+          # PyInstaller puts .app contents directly into "dist/Vintage Radio/"
+          # Rename to a proper .app bundle so macOS recognises it as an application
+          mv "dist/Vintage Radio" "dist/Vintage Radio.app"
 
-      - name: Copy macOS helper scripts
+          # Create a distribution folder with the .app and the helper script
+          mkdir -p "dist/package"
+          mv "dist/Vintage Radio.app" "dist/package/"
+          cp scripts/open_vintage_radio.command "dist/package/"
+          chmod +x "dist/package/open_vintage_radio.command"
+
+          echo ""
+          echo "=== Final package contents ==="
+          ls -la "dist/package/"
+          echo ""
+          echo "=== Binary architecture ==="
+          file "dist/package/Vintage Radio.app/Contents/MacOS/Vintage Radio"
+
+      - name: Upload artifact (macOS)
         if: startsWith(matrix.os, 'macos')
-        run: |
-          cp scripts/open_vintage_radio.command "dist/Vintage Radio/"
-          chmod +x "dist/Vintage Radio/open_vintage_radio.command"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/package/
 
-      - name: Upload artifact
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
