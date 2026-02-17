@@ -3,6 +3,9 @@
 # To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
 # Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
 #
+# macOS note: We build on macos-13 (Intel/x86_64) so the binary runs on ALL Macs.
+# Intel Macs run it natively; Apple Silicon Macs run it via Rosetta 2 (auto-installed).
+#
 # Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
 # add a Personal Access Token (classic) with scope "repo" as a repo secret named RELEASE_TOKEN.
 
@@ -24,7 +27,8 @@ jobs:
         include:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
-          - os: macos-latest
+          # macos-13 is Intel (x86_64) - builds run on ALL Macs via Rosetta 2
+          - os: macos-13
             artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
@@ -35,7 +39,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -49,39 +53,28 @@ jobs:
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
-      - name: Create macOS .icns from PNG (macOS only)
-        if: matrix.os == 'macos-latest'
-        run: |
-          mkdir -p vintage_radio.iconset
-          sips -z 16 16     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_16x16.png
-          sips -z 32 32     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_16x16@2x.png
-          sips -z 32 32     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_32x32.png
-          sips -z 64 64     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_32x32@2x.png
-          sips -z 128 128   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_128x128.png
-          sips -z 256 256   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_128x128@2x.png
-          sips -z 256 256   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_256x256.png
-          sips -z 512 512   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_256x256@2x.png
-          sips -z 512 512   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_512x512.png
-          sips -z 1024 1024 gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_512x512@2x.png
-          iconutil -c icns vintage_radio.iconset -o gui/resources/vintage_radio.icns
-          rm -rf vintage_radio.iconset
-
       - name: Build with PyInstaller
         run: pyinstaller vintage_radio.spec
 
-      - name: Upload artifact (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Verify macOS binary architecture
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          echo "Binary architecture:"
+          file "dist/Vintage Radio/Vintage Radio"
+          echo ""
+          echo "Expected: x86_64 (runs on all Macs via Rosetta 2)"
+
+      - name: Copy macOS helper scripts
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          cp scripts/open_vintage_radio.command "dist/Vintage Radio/"
+          chmod +x "dist/Vintage Radio/open_vintage_radio.command"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/Vintage Radio/
-
-      - name: Upload artifact (macOS)
-        if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/Vintage Radio.app/
 
   # Create/update a GitHub Release and attach built binaries (on tag push or release published)
   upload-release:
