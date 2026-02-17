@@ -2,6 +2,9 @@
 Vintage Radio - macOS First Run
 ========================================
 
+IMPORTANT: This app requires macOS 11 (Big Sur) or later.
+If you're running macOS 10.15 (Catalina) or earlier, please upgrade your macOS.
+
 macOS blocks unsigned apps. Follow these steps:
 
 STEP 1 - Remove Quarantine (Terminal):
@@ -25,18 +28,33 @@ STEP 2 - Allow in System Settings:
 
 After this one-time setup, you can just double-click the app normally.
 
+WHY THE COMMAND STRUCTURE?
+On macOS, ".app" bundles are actually directories (not single files). The executable
+is inside: Vintage Radio.app/Contents/MacOS/Vintage Radio
+
+To run from Terminal, you have two options:
+1. Run the executable directly:
+   ./Vintage Radio.app/Contents/MacOS/Vintage Radio
+
+2. Use the macOS "open" command (recommended):
+   open "Vintage Radio.app"
+
+You cannot run "./Vintage Radio.app" directly because it's a directory, not an executable.
+
 TROUBLESHOOTING - If the app crashes:
 1. Open Terminal
 2. Navigate to the app folder: cd ~/Downloads/Vintage-Radio-macOS
 3. Run the app from Terminal to see error messages:
    "./Vintage Radio.app/Contents/MacOS/Vintage Radio"
-   (Note: You cannot run "./Vintage Radio.app" directly - it's a directory)
 4. Share the error message for support
 
-Alternative: Use the "open" command:
-   open "Vintage Radio.app"
+Common error: "Library not loaded: UniformTypeIdentifiers.framework"
+→ This means you're on macOS 10.15 or earlier. Upgrade to macOS 11+.
 
-Note: Works on both Intel and Apple Silicon Macs.
+SYSTEM REQUIREMENTS:
+- macOS 11 (Big Sur) or later
+- Works on both Intel and Apple Silicon Macs
+- Note: macOS 10.15 (Catalina) and earlier are NOT supported due to PyQt6 requirements
 
 The security steps are required because the app isn't code-signed.
 Code signing requires an Apple Developer account ($99/year).

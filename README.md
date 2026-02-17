@@ -32,6 +32,11 @@ In the future I will be adding metadata support to automatically create albums f
 
 ## Requirements
 
+### System Requirements
+- **Windows**: Windows 10 or later
+- **macOS**: macOS 11 (Big Sur) or later (Intel or Apple Silicon)
+  - ⚠️ **macOS 10.15 (Catalina) and earlier are NOT supported** - PyQt6 requires macOS 11+
+
 ### Python
 - Python 3.8 or higher
 
