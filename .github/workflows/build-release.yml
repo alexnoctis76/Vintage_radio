@@ -49,14 +49,39 @@ jobs:
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
+      - name: Create macOS .icns from PNG (macOS only)
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir -p vintage_radio.iconset
+          sips -z 16 16     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_16x16.png
+          sips -z 32 32     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_16x16@2x.png
+          sips -z 32 32     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_32x32.png
+          sips -z 64 64     gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_32x32@2x.png
+          sips -z 128 128   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_128x128.png
+          sips -z 256 256   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_128x128@2x.png
+          sips -z 256 256   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_256x256.png
+          sips -z 512 512   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_256x256@2x.png
+          sips -z 512 512   gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_512x512.png
+          sips -z 1024 1024 gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_512x512@2x.png
+          iconutil -c icns vintage_radio.iconset -o gui/resources/vintage_radio.icns
+          rm -rf vintage_radio.iconset
+
       - name: Build with PyInstaller
         run: pyinstaller vintage_radio.spec
 
-      - name: Upload artifact
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/Vintage Radio/
+
+      - name: Upload artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/Vintage Radio.app/
 
   # Create/update a GitHub Release and attach built binaries (on tag push or release published)
   upload-release:

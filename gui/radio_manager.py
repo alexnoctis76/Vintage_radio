@@ -2255,11 +2255,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # If frozen and system Python didn't work, try bundled Python
         if getattr(sys, 'frozen', False):
             exe_dir = Path(sys.executable).parent
-            for python_name in ("pythonw.exe", "python.exe"):
+            # Include both macOS names (python3, python) and Windows names (pythonw.exe, python.exe)
+            for python_name in ("python3", "python", "pythonw.exe", "python.exe"):
                 bundled_python = exe_dir / "_internal" / python_name
                 if bundled_python.exists():
-                    # When using bundled Python, set PATH to prioritize bundled DLLs
-                    # This helps avoid conflicts with system Python DLLs
+                    # When using bundled Python, set PATH to prioritize bundled DLLs/dylibs
+                    # This helps avoid conflicts with system Python libraries
                     return [str(bundled_python), "-m", "mpremote"]
         
         # Not frozen: try python -m mpremote with current interpreter

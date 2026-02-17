@@ -22,10 +22,18 @@ datas = [
     (str(project_dir / 'components'), 'components'),
 ]
 
-# Application icon (radio icon). Windows exe requires .ico; pass only .ico to avoid build failure without Pillow.
-# To create .ico: pip install Pillow && python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
+# Application icon
+# Windows: .ico  (created by workflow or manually with Pillow)
+# macOS:   .icns (created by workflow using sips + iconutil)
 icon_ico = project_dir / 'gui' / 'resources' / 'vintage_radio.ico'
-icon_path = str(icon_ico) if icon_ico.exists() else None
+icon_icns = project_dir / 'gui' / 'resources' / 'vintage_radio.icns'
+
+if sys.platform == 'darwin' and icon_icns.exists():
+    icon_path = str(icon_icns)
+elif icon_ico.exists():
+    icon_path = str(icon_ico)
+else:
+    icon_path = None
 
 a = Analysis(
     ['run_vintage_radio.py'],
@@ -88,3 +96,16 @@ coll = COLLECT(
     upx_exclude=[],
     name='Vintage Radio',
 )
+
+# macOS: create a .app bundle so the app integrates properly with Finder/Dock
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='Vintage Radio.app',
+        icon=icon_path,
+        bundle_identifier='com.vintageradio.musicmanager',
+        info_plist={
+            'CFBundleShortVersionString': '0.1.0',
+            'NSHighResolutionCapable': True,
+        },
+    )

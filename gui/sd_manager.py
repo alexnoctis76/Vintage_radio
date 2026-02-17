@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import platform
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -35,10 +36,18 @@ class SDManager:
             mount = part.mountpoint
             if not mount:
                 continue
-            if mount.upper().startswith(system_drive.upper()):
-                continue
+            # Skip the system drive (Windows: C:\, macOS: /)
+            if sys.platform == "win32":
+                if mount.upper().startswith(system_drive.upper()):
+                    continue
+            else:
+                # On macOS/Linux, skip the root filesystem and system volumes
+                if mount == "/" or mount.startswith("/System"):
+                    continue
             opts = part.opts.lower()
-            if "removable" in opts or part.fstype.lower() in {"fat", "fat32", "exfat"}:
+            fstype = part.fstype.lower()
+            # "msdos" is how macOS reports FAT32 volumes
+            if "removable" in opts or fstype in {"fat", "fat32", "exfat", "msdos"}:
                 path = Path(mount)
                 label = _get_volume_label(path)
                 roots.append((path, label))
@@ -1358,6 +1367,10 @@ class SDManager:
 
 def _get_volume_label(path: Path) -> str:
     if os.name != "nt":
+        # On macOS, the volume label is the folder name under /Volumes/
+        # e.g. /Volumes/SDCARD -> "SDCARD"
+        if sys.platform == "darwin" and str(path).startswith("/Volumes/"):
+            return path.name
         return ""
     try:
         import ctypes
