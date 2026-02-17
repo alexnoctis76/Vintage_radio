@@ -2,8 +2,13 @@
 # ============================================================
 # Vintage Radio - macOS Launcher
 # ============================================================
-# Double-click this file to remove the macOS quarantine flag
-# and launch Vintage Radio.
+# IMPORTANT: If macOS says "cannot be opened because it is from
+# an unidentified developer", you need to RIGHT-CLICK this file
+# and select "Open" → "Open" in the dialog (first time only).
+#
+# This script removes the macOS quarantine flag and launches
+# Vintage Radio. After the first run, you can just double-click
+# Vintage Radio.app directly.
 #
 # Why is this needed?
 # macOS Gatekeeper blocks unsigned apps downloaded from the
