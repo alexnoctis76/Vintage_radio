@@ -3,9 +3,9 @@
 # To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
 # Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
 #
-# macOS note: We build on macos-14 (ARM64) so the ARM64 binary runs on ALL Macs:
-#   - Apple Silicon Macs: runs natively
-#   - Intel Macs: runs via Rosetta 2 (automatic, no user action needed)
+# macOS note: We build on macos-15-intel (x86_64) so the binary runs on ALL Macs:
+#   - Intel Macs (including macOS 10.15+): runs natively
+#   - Apple Silicon Macs: runs via Rosetta 2 (automatic, no user action needed)
 #
 # Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
 # add a Personal Access Token (classic) with scope "repo" as a repo secret named RELEASE_TOKEN.
@@ -28,7 +28,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
-          - os: macos-14
+          - os: macos-15-intel
             artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
