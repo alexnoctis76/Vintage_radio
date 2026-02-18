@@ -107,5 +107,6 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleShortVersionString': '0.1.0',
             'NSHighResolutionCapable': True,
+            'LSMinimumSystemVersion': '11.0',  # Support macOS 11+ (Big Sur)
         },
     )

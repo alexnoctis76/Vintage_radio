@@ -3,8 +3,8 @@
 # To create your first release: git tag v0.1.0-beta && git push origin v0.1.0-beta
 # Also runs on: push to release (build only), release publish (attach to that release), or manual "Run workflow".
 #
-# macOS note: We build on macos-15-intel (x86_64) so the binary runs on ALL Macs:
-#   - Intel Macs (including macOS 10.15+): runs natively
+# macOS note: We build on macos-12 (x86_64) so the binary runs on macOS 11+:
+#   - Intel Macs (macOS 11+): runs natively
 #   - Apple Silicon Macs: runs via Rosetta 2 (automatic, no user action needed)
 #
 # Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
@@ -28,7 +28,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
-          - os: macos-15-intel
+          - os: macos-12
             artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
@@ -80,6 +80,8 @@ jobs:
 
       - name: Build with PyInstaller (macOS)
         if: startsWith(matrix.os, 'macos')
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: python -m PyInstaller vintage_radio.spec
 
       - name: Build with PyInstaller (Windows)
