@@ -108,5 +108,6 @@ if sys.platform == 'darwin':
             'CFBundleShortVersionString': '0.1.0',
             'NSHighResolutionCapable': True,
             'LSMinimumSystemVersion': '11.0',  # Support macOS 11+ (Big Sur)
+            'LSArchitecturePriority': ['arm64', 'x86_64'],  # Support both Apple Silicon and Intel
         },
     )
