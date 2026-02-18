@@ -75,9 +75,9 @@ exe = EXE(
     name='Vintage Radio',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True if sys.platform == 'darwin' else False,  # Strip symbols on macOS to reduce size
-    upx=True,
-    console=True if sys.platform == 'darwin' else False,  # Enable console on macOS to see crash errors
+    strip=False,
+    upx=False if sys.platform == 'darwin' else True,  # UPX can cause segfaults on macOS
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -91,8 +91,8 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=True if sys.platform == 'darwin' else False,  # Strip symbols on macOS to reduce size
-    upx=True,
+    strip=False,
+    upx=False if sys.platform == 'darwin' else True,  # UPX can cause segfaults on macOS
     upx_exclude=[],
     name='Vintage Radio',
 )
