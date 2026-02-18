@@ -57,7 +57,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['gui/qt_runtime_hook.py'] if sys.platform == 'darwin' else [],
     excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
