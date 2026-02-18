@@ -109,5 +109,7 @@ if sys.platform == 'darwin':
             'NSHighResolutionCapable': True,
             'LSMinimumSystemVersion': '11.0',  # Support macOS 11+ (Big Sur)
             'LSArchitecturePriority': ['arm64', 'x86_64'],  # Support both Apple Silicon and Intel
+            'CFBundlePackageType': 'APPL',  # Ensure proper bundle type
+            'CFBundleExecutable': 'Vintage Radio',  # Explicit executable name
         },
     )
