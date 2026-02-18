@@ -88,6 +88,54 @@ pip install -r requirements.txt
 
 4. Install VLC media player
    if you havent already, please install VLC media player, this is required for the app to work.
+
+## Building for macOS Locally
+
+If you want to build the macOS app on your own Mac (recommended for compatibility with your macOS version):
+
+1. **Clone the repository** (if you haven't already):
+   ```bash
+   git clone <repository-url>
+   cd Vintage_radio
+   ```
+
+2. **Create and activate a virtual environment**:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   pip install pyinstaller
+   ```
+
+4. **Run the build script**:
+   ```bash
+   chmod +x scripts/build_macos.sh
+   ./scripts/build_macos.sh
+   ```
+
+   Or build manually:
+   ```bash
+   # Create icon (if needed)
+   mkdir -p vintage_radio.iconset
+   sips -z 16 16 gui/resources/vintage_radio.png --out vintage_radio.iconset/icon_16x16.png
+   # ... (see scripts/build_macos.sh for full icon creation commands)
+   iconutil -c icns vintage_radio.iconset -o gui/resources/vintage_radio.icns
+   rm -rf vintage_radio.iconset
+   
+   # Build
+   export MACOSX_DEPLOYMENT_TARGET=11.0
+   python3 -m PyInstaller vintage_radio.spec
+   ```
+
+5. **Find your app**:
+   The built app will be at `dist/Vintage Radio.app`
+
+**Why build locally?** Building on your Mac ensures PyQt6 libraries are compatible with your macOS version. GitHub Actions builds may use Qt libraries that require newer macOS versions.
+
 ## Usage
 
 ### Running the Application
