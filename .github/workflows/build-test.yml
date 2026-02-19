@@ -20,7 +20,9 @@ jobs:
           - os: windows-latest
             artifact: Vintage-Radio-Windows-test
           - os: macos-latest
-            artifact: Vintage-Radio-macOS-test
+            artifact: Vintage-Radio-macOS-AppleSilicon-test
+          - os: macos-13
+            artifact: Vintage-Radio-macOS-Intel-test
 
     runs-on: ${{ matrix.os }}
 
@@ -33,7 +35,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install macOS build dependencies (macOS only)
-        if: matrix.os == 'macos-latest'
+        if: runner.os == 'macOS'
         run: brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
 
       - name: Install dependencies
@@ -43,13 +45,13 @@ jobs:
           pip install pyinstaller
 
       - name: Create Windows .ico from PNG (Windows only)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: |
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
       - name: Generate macOS .icns icon (macOS only)
-        if: matrix.os == 'macos-latest'
+        if: runner.os == 'macOS'
         run: |
           python3 -c "
           from PyQt6.QtSvg import QSvgRenderer
@@ -78,15 +80,15 @@ jobs:
         run: pyinstaller vintage_radio.spec --noconfirm
 
       - name: Verify macOS app bundle
-        if: matrix.os == 'macos-latest'
+        if: runner.os == 'macOS'
         run: |
           test -d "dist/Vintage Radio.app" || (echo "Expected dist/Vintage Radio.app not found. dist contents:" && ls -la dist && exit 1)
           test -f "dist/Vintage Radio.app/Contents/MacOS/Vintage Radio" || (echo "App executable missing" && exit 1)
           test -f "dist/Vintage Radio.app/Contents/Info.plist" || (echo "Info.plist missing" && exit 1)
-          echo "Vintage Radio.app bundle OK (icon in Contents/Resources if .icns was built)"
+          echo "Vintage Radio.app bundle OK"
 
       - name: Upload artifact (Windows)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -94,7 +96,7 @@ jobs:
           retention-days: 7
 
       - name: Upload artifact (macOS)
-        if: matrix.os == 'macos-latest'
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
