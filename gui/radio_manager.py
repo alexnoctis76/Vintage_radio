@@ -783,21 +783,21 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         import re as _re
         import ssl
 
-        # Helper to fetch a URL with multiple SSL strategies
+        # Helper to fetch a URL with multiple SSL strategies (certifi first for macOS SSL issues)
         def fetch_url(req: urllib.request.Request, timeout: int = 15) -> str:
-            # 1) Try default SSL behavior
+            # 1) Try certifi CA bundle first (fixes macOS "unable to get local issuer certificate")
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                import certifi
+                ctx = ssl.create_default_context(cafile=certifi.where())
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                     return resp.read().decode("utf-8")
-            except Exception as e_default:
-                # 2) Try using certifi CA bundle if available
+            except Exception as e_certifi:
+                # 2) Try default SSL behavior
                 try:
-                    import certifi
-                    ctx = ssl.create_default_context(cafile=certifi.where())
-                    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
                         return resp.read().decode("utf-8")
-                except Exception:
-                    # 3) As a last resort, disable SSL verification (less secure but works on misconfigured systems)
+                except Exception as e_default:
+                    # 3) As last resort, disable SSL verification (less secure)
                     try:
                         ctx = ssl.create_default_context()
                         ctx.check_hostname = False
@@ -805,8 +805,7 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
                         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                             return resp.read().decode("utf-8")
                     except Exception as e_all:
-                        # Re-raise the original error for logging by caller
-                        raise e_all from e_default
+                        raise e_all from e_certifi
 
         result: Dict[str, list] = {}
         errors: Dict[str, str] = {}
@@ -962,11 +961,24 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
     def _download_and_install(self, url: str, filename: str) -> None:
         import urllib.request
         import tempfile
+        import ssl
+
+        def _download_with_ssl(url: str, dest_path: Path) -> None:
+            """Download URL to file using certifi CA bundle (fixes macOS SSL verify failed)."""
+            req = urllib.request.Request(url, headers={"User-Agent": "VintageRadio/1.0"})
+            # Prefer certifi so HTTPS works on macOS when system certs are not in Python's trust store
+            try:
+                import certifi
+                ctx = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+                dest_path.write_bytes(resp.read())
 
         try:
             tmp_dir = Path(tempfile.mkdtemp(prefix="vintage_radio_uf2_"))
             dest = tmp_dir / filename
-            urllib.request.urlretrieve(url, str(dest))
+            _download_with_ssl(url, dest)
             self._downloaded_path = dest
             QtCore.QMetaObject.invokeMethod(
                 self, "_on_download_success", QtCore.Qt.ConnectionType.QueuedConnection,
