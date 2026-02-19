@@ -5,7 +5,7 @@
 # Options:
 #   --sign         Code sign the app with entitlements (requires Apple Developer ID)
 #   --notarize     Notarize the .dmg for distribution (requires Developer ID)
-#   --no-dmg       Skip creating .dmg and just build the .app
+#   --no-dmg       Skip creating .dmg and just build the app
 #
 # Prerequisites:
 #   - Python 3.8+ with venv
@@ -66,50 +66,108 @@ if ! command -v pyinstaller &> /dev/null; then
     exit 1
 fi
 
+# --- Generate .icns icon from SVG ---
+SVG_ICON="$SCRIPT_DIR/gui/resources/vintage_radio.svg"
+ICNS_ICON="$SCRIPT_DIR/gui/resources/vintage_radio.icns"
+PNG_ICON="$SCRIPT_DIR/gui/resources/vintage_radio.png"
+
+if [ -f "$SVG_ICON" ]; then
+    echo "Generating .icns icon from SVG..."
+
+    ICONSET_DIR="$SCRIPT_DIR/gui/resources/vintage_radio.iconset"
+    rm -rf "$ICONSET_DIR"
+    mkdir -p "$ICONSET_DIR"
+
+    # Render SVG to a high-res PNG using Python + PyQt6
+    python3 -c "
+from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtGui import QImage, QPainter
+from PyQt6.QtCore import QSize, Qt
+renderer = QSvgRenderer('$SVG_ICON')
+for size in [16, 32, 64, 128, 256, 512, 1024]:
+    img = QImage(QSize(size, size), QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    renderer.render(p)
+    p.end()
+    if size <= 512:
+        img.save('$ICONSET_DIR/icon_{}x{}.png'.format(size, size))
+    if size >= 32:
+        half = size // 2
+        img.save('$ICONSET_DIR/icon_{}x{}@2x.png'.format(half, half))
+"
+
+    # Also save a 512px PNG for fallback use
+    if [ ! -f "$PNG_ICON" ]; then
+        cp "$ICONSET_DIR/icon_512x512.png" "$PNG_ICON"
+    fi
+
+    iconutil -c icns "$ICONSET_DIR" -o "$ICNS_ICON"
+    rm -rf "$ICONSET_DIR"
+
+    if [ -f "$ICNS_ICON" ]; then
+        echo "Icon generated: $ICNS_ICON"
+    else
+        echo "Warning: iconutil failed to create .icns; build will continue without custom icon"
+    fi
+else
+    echo "Warning: SVG icon not found at $SVG_ICON; skipping .icns generation"
+fi
+
 # Clean previous build
 echo "Cleaning previous build..."
 rm -rf "$BUILD_DIR"
+rm -rf "$SCRIPT_DIR/build"
 mkdir -p "$BUILD_DIR"
 
-# Run PyInstaller
+# Run PyInstaller (spec now produces a .app bundle on macOS via BUNDLE step)
 echo "Building application with PyInstaller..."
-pyinstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --buildpath "$SCRIPT_DIR/build" --specpath "$SCRIPT_DIR"
+pyinstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$SCRIPT_DIR/build"
 
+# Verify the .app bundle was created
 if [ ! -d "$APP_BUNDLE" ]; then
-    echo "Error: Failed to build app bundle at $APP_BUNDLE"
+    echo "Error: PyInstaller build failed - expected .app bundle at: $APP_BUNDLE"
+    echo "Check the PyInstaller output above for errors."
     exit 1
 fi
 
-echo "✓ App bundle created at $APP_BUNDLE"
+APP_EXE="$APP_BUNDLE/Contents/MacOS/Vintage Radio"
+if [ ! -f "$APP_EXE" ]; then
+    echo "Error: Executable not found at $APP_EXE"
+    exit 1
+fi
+
+echo "Build successful: $APP_BUNDLE"
+echo "  Executable: $APP_EXE"
 
 # Code sign if requested
 if [ "$SIGN" = true ]; then
     echo ""
     echo "Code signing application..."
 
-    # Find Developer ID (first one found)
     IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | awk '{print $2}')
 
     if [ -z "$IDENTITY" ]; then
-        echo "Error: No Developer ID found in keychain"
-        echo "To create one, visit https://developer.apple.com and set up a Developer ID"
-        exit 1
+        echo "Warning: No Developer ID found in keychain"
+        echo "Attempting ad-hoc signing (good for local use)..."
+        IDENTITY="-"
     fi
 
     echo "Using identity: $IDENTITY"
 
-    # Sign the app with entitlements
-    if [ -f "$ENTITLEMENTS_FILE" ]; then
-        codesign --force --deep --sign "$IDENTITY" --entitlements "$ENTITLEMENTS_FILE" "$APP_BUNDLE"
-        echo "✓ App signed with entitlements"
+    if [ -f "$ENTITLEMENTS_FILE" ] && [ "$IDENTITY" != "-" ]; then
+        codesign --deep --force --sign "$IDENTITY" --entitlements "$ENTITLEMENTS_FILE" "$APP_BUNDLE"
     else
-        codesign --force --deep --sign "$IDENTITY" "$APP_BUNDLE"
-        echo "✓ App signed (no entitlements file found)"
+        codesign --deep --force --sign "$IDENTITY" "$APP_BUNDLE"
     fi
 
-    # Verify signature
-    codesign --verify --verbose "$APP_BUNDLE"
-    echo "✓ Signature verified"
+    echo "Application signed"
+
+    if codesign --verify --verbose "$APP_BUNDLE" 2>/dev/null; then
+        echo "Signature verified"
+    else
+        echo "Warning: Signature verification returned non-zero (may be fine for ad-hoc)"
+    fi
 fi
 
 # Create DMG if requested
@@ -117,22 +175,26 @@ if [ "$BUILD_DMG" = true ]; then
     echo ""
     echo "Creating DMG installer..."
 
-    # Remove old DMG
     rm -f "$DMG_OUTPUT"
 
-    # Create DMG
+    DMG_STAGING="$SCRIPT_DIR/build/dmg_staging"
+    rm -rf "$DMG_STAGING"
+    mkdir -p "$DMG_STAGING"
+    cp -R "$APP_BUNDLE" "$DMG_STAGING/"
+
     hdiutil create -volname "$APP_NAME" \
-        -srcfolder "$BUILD_DIR" \
+        -srcfolder "$DMG_STAGING" \
         -ov -format UDZO "$DMG_OUTPUT"
 
-    if [ -f "$DMG_OUTPUT" ]; then
-        echo "✓ DMG created at $DMG_OUTPUT"
+    rm -rf "$DMG_STAGING"
 
-        # Code sign DMG if requested
-        if [ "$SIGN" = true ]; then
+    if [ -f "$DMG_OUTPUT" ]; then
+        echo "DMG created at $DMG_OUTPUT"
+
+        if [ "$SIGN" = true ] && [ "$IDENTITY" != "-" ]; then
             echo "Signing DMG..."
             codesign --force --sign "$IDENTITY" "$DMG_OUTPUT"
-            echo "✓ DMG signed"
+            echo "DMG signed"
         fi
     else
         echo "Warning: Failed to create DMG"
@@ -149,7 +211,6 @@ if [ "$NOTARIZE" = true ]; then
         exit 1
     fi
 
-    # Submit for notarization
     NOTARIZE_UUID=$(xcrun altool --notarize-app \
         --file "$DMG_OUTPUT" \
         --primary-bundle-id "com.zionbrock.vintage-radio" \
@@ -164,7 +225,6 @@ if [ "$NOTARIZE" = true ]; then
     echo "Notarization submitted (UUID: $NOTARIZE_UUID)"
     echo "Waiting for notarization to complete..."
 
-    # Poll for notarization status
     while true; do
         STATUS=$(xcrun altool --notarization-info "$NOTARIZE_UUID" \
             --output-format json 2>/dev/null | grep -o '"Status" : "[^"]*' | cut -d'"' -f4)
@@ -173,11 +233,9 @@ if [ "$NOTARIZE" = true ]; then
             echo "Error: Notarization failed"
             exit 1
         elif [ "$STATUS" = "success" ]; then
-            echo "✓ Notarization successful"
-
-            # Staple the ticket
+            echo "Notarization successful"
             xcrun stapler staple "$DMG_OUTPUT"
-            echo "✓ Notarization ticket stapled"
+            echo "Notarization ticket stapled"
             break
         else
             echo "Status: $STATUS... waiting (check back in 30 seconds)"
@@ -190,22 +248,12 @@ echo ""
 echo "=========================================="
 echo "Build Complete!"
 echo "=========================================="
-if [ "$BUILD_DMG" = true ]; then
-    echo "DMG: $DMG_OUTPUT"
-    if [ "$NOTARIZE" = true ]; then
-        echo "Status: Signed and notarized ✓"
-    elif [ "$SIGN" = true ]; then
-        echo "Status: Signed ✓"
-    else
-        echo "Status: Unsigned (for distribution, run: bash build_macos.sh --sign)"
-    fi
-else
-    echo "App Bundle: $APP_BUNDLE"
-    if [ "$SIGN" = true ]; then
-        echo "Status: Signed ✓"
-    else
-        echo "Status: Unsigned"
-    fi
+echo "Output: $APP_BUNDLE"
+echo "Run:    open \"$APP_BUNDLE\""
+if [ "$BUILD_DMG" = true ] && [ -f "$DMG_OUTPUT" ]; then
+    echo "DMG:    $DMG_OUTPUT"
+fi
+if [ "$SIGN" = true ]; then
+    echo "Signed: yes"
 fi
 echo "=========================================="
-

@@ -53,14 +53,48 @@ jobs:
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
+      - name: Generate macOS .icns icon (macOS only)
+        if: matrix.os == 'macos-latest'
+        run: |
+          python3 -c "
+          from PyQt6.QtSvg import QSvgRenderer
+          from PyQt6.QtGui import QImage, QPainter
+          from PyQt6.QtCore import QSize, Qt
+          renderer = QSvgRenderer('gui/resources/vintage_radio.svg')
+          import os, pathlib
+          iconset = 'gui/resources/vintage_radio.iconset'
+          os.makedirs(iconset, exist_ok=True)
+          for size in [16, 32, 64, 128, 256, 512, 1024]:
+              img = QImage(QSize(size, size), QImage.Format.Format_ARGB32)
+              img.fill(Qt.GlobalColor.transparent)
+              p = QPainter(img)
+              renderer.render(p)
+              p.end()
+              if size <= 512:
+                  img.save(f'{iconset}/icon_{size}x{size}.png')
+              if size >= 32:
+                  half = size // 2
+                  img.save(f'{iconset}/icon_{half}x{half}@2x.png')
+          "
+          iconutil -c icns gui/resources/vintage_radio.iconset -o gui/resources/vintage_radio.icns
+          rm -rf gui/resources/vintage_radio.iconset
+
       - name: Build with PyInstaller
         run: pyinstaller vintage_radio.spec --noconfirm
 
-      - name: Upload artifact
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/Vintage Radio/
+
+      - name: Upload artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/Vintage Radio.app
 
   # Create/update a GitHub Release and attach built binaries (on tag push or release published)
   upload-release:
