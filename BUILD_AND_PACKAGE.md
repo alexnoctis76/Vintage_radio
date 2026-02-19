@@ -2,6 +2,14 @@
 
 This guide covers building the Vintage Radio application from source on Windows, macOS, and Linux, and packaging it for distribution.
 
+## Packaging locally (summary)
+
+1. **One-time setup**: Python 3.8+, venv, `pip install -r requirements.txt pyinstaller`. On macOS also install SDL2 so pygame builds: `brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf`.
+2. **macOS**: From repo root run `bash build_macos.sh` (unsigned app) or `bash build_macos.sh --no-dmg` for app only. Optional: `--sign` for code signing, `--notarize` for notarized DMG.
+3. **Windows**: Run `build_windows.bat` (or `pyinstaller vintage_radio.spec`). Run `dist\Vintage Radio\Vintage Radio.exe`.
+4. **Linux**: Run `bash build_linux.sh` (or `pyinstaller vintage_radio.spec`). Run `dist/Vintage Radio/Vintage Radio`.
+5. **Without scripts**: `pyinstaller vintage_radio.spec --noconfirm` on any OS; output is in `dist/Vintage Radio/` (run the executable inside).
+
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
