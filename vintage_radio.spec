@@ -80,6 +80,9 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# On macOS, build universal2 so the app runs on both Intel and Apple Silicon
+_exe_target_arch = "universal2" if platform.system() == "Darwin" else None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -93,7 +96,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch=_exe_target_arch,
     codesign_identity=None,
     entitlements_file=entitlements_file if platform.system() == "Darwin" else None,
     icon=icon_path,

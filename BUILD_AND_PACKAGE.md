@@ -239,6 +239,13 @@ xattr -cr "/path/to/Vintage Radio.app"
 
 Then open the app as usual. Alternatively: right-click the app → **Open** → confirm "Open" once; macOS may allow it without the command.
 
+### "Not supported on this Mac" / "bad CPU type in executable"
+The macOS build is produced as a **Universal2** binary (Intel and Apple Silicon). If you see this error, you may be running the **raw executable** inside a folder instead of the **app**. After downloading the macOS artifact:
+
+1. Unzip the artifact; you should see **Vintage Radio.app** (one app with icon), not a folder named "Vintage Radio" containing a file.
+2. Run **Vintage Radio.app** (double-click or `open "Vintage Radio.app"`). Do not run the `Vintage Radio` executable file inside a folder.
+3. If you still get "not supported on this Mac", the CI build may have fallen back to a single architecture. Build locally with Python from [python.org](https://www.python.org/) (Universal2 installer) and run `bash build_macos.sh`.
+
 ### Serial Port Not Detected (macOS/Linux)
 - Ensure the Pico is connected via USB
 - On macOS, check System Report > USB for the device
