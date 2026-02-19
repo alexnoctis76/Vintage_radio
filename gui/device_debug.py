@@ -75,7 +75,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         port_layout.addWidget(QtWidgets.QLabel("COM Port:"))
         self.port_combo = QtWidgets.QComboBox()
         self.port_combo.setEditable(True)
-        self.port_combo.setMinimumWidth(150)
+        self.port_combo.setMinimumWidth(320)
         port_layout.addWidget(self.port_combo)
         
         self.scan_btn = QtWidgets.QPushButton("Scan Ports")
@@ -440,6 +440,21 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self._log("Please select a COM port first", "error")
             return
         
+        # Verify port still exists (e.g. after device reset it may have a new path on macOS)
+        if SERIAL_AVAILABLE:
+            try:
+                available = [p.device for p in serial.tools.list_ports.comports()]
+                if available and str(port) not in available:
+                    self._scan_ports()
+                    self._log(
+                        f"Port {port} no longer exists (device may have reset). "
+                        "Scanned for ports — please select the device again and click Connect.",
+                        "warning"
+                    )
+                    return
+            except Exception as e:
+                self._debug_log(f"Could not verify port: {e}", "warning")
+        
         if not SERIAL_AVAILABLE:
             self._log("pyserial not available. Install with: pip install pyserial", "error")
             return
@@ -684,6 +699,15 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             else:
                 self._debug_log(f"Connection failed with return code {returncode}", "error")
                 self._log(f"Connection failed: {stderr or stdout}", "error")
+                # If port is missing (e.g. after device reset, macOS re-enumerates with new path)
+                err_text = (stderr or stdout or "").lower()
+                if "no such file or directory" in err_text or "could not open port" in err_text:
+                    self._scan_ports()
+                    self._log(
+                        "Port no longer available (device may have reset or been unplugged). "
+                        "Scanned for ports — please select the device again and click Connect.",
+                        "warning"
+                    )
                 self._restore_disconnected_state()
         except Exception as e:
             error_msg = f"Error in _execute_ui_update: {e}\n{traceback.format_exc()}"

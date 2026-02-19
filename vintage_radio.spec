@@ -1,11 +1,18 @@
 # PyInstaller spec for Vintage Radio Music Manager
 # Build: pyinstaller vintage_radio.spec   (or pyinstaller --noconfirm vintage_radio.spec to skip prompt)
 # Output: dist/Vintage Radio/ (one-folder; run the exe or .app inside)
+#
+# Platform-specific notes:
+#   Windows: Produces Vintage Radio.exe in dist/Vintage Radio/
+#   macOS: Produces Vintage Radio.app in dist/
+#   Linux: Produces Vintage Radio executable in dist/Vintage Radio/
+#
 # Note: Close any running Vintage Radio app before rebuilding, or you may get "Access is denied" when PyInstaller cleans the output dir.
 # The SyntaxWarnings during build come from the pydub dependency; they are harmless and the build still succeeds.
 # If the exe icon looks wrong in Explorer (e.g. small icons), try renaming the exe so Windows refreshes its icon cache.
 
 import sys
+import platform
 from pathlib import Path
 
 block_cipher = None
@@ -22,10 +29,21 @@ datas = [
     (str(project_dir / 'components'), 'components'),
 ]
 
-# Application icon (radio icon). Windows exe requires .ico; pass only .ico to avoid build failure without Pillow.
+# Application icon (radio icon). Windows exe requires .ico; macOS and Linux use .png or .icns
 # To create .ico: pip install Pillow && python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 icon_ico = project_dir / 'gui' / 'resources' / 'vintage_radio.ico'
-icon_path = str(icon_ico) if icon_ico.exists() else None
+icon_png = project_dir / 'gui' / 'resources' / 'vintage_radio.png'
+icon_path = None
+
+if platform.system() == "Windows":
+    icon_path = str(icon_ico) if icon_ico.exists() else None
+elif platform.system() == "Darwin":
+    icon_path = str(icon_png) if icon_png.exists() else None
+else:  # Linux and others
+    icon_path = str(icon_png) if icon_png.exists() else None
+
+# macOS entitlements (for code signing)
+entitlements_file = str(project_dir / 'macos_entitlements.plist') if (project_dir / 'macos_entitlements.plist').exists() else None
 
 a = Analysis(
     ['run_vintage_radio.py'],
@@ -74,7 +92,7 @@ exe = EXE(
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
-    entitlements_file=None,
+    entitlements_file=entitlements_file if platform.system() == "Darwin" else None,
     icon=icon_path,
 )
 

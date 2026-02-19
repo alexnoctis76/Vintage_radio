@@ -310,7 +310,20 @@ class TestModeWidget(QtWidgets.QWidget):
             log_callback=self._log,
             am_wav_path=am_wav if am_wav.exists() else None,
         )
-        
+
+        # Ensure emulator audio is initialized after any other potential init
+        try:
+            # Re-initialize audio inside the emulator to ensure mixer is set up correctly
+            # (some systems may have audio devices initialized by other modules)
+            self.hw_emulator._init_audio()
+        except Exception:
+            # If reinit fails, rely on the emulator's earlier init and continue
+            pass
+
+        # Reflect emulator audio state in the widget
+        self.audio_ready = getattr(self.hw_emulator, '_audio_ready', False)
+        self.am_sound = getattr(self.hw_emulator, '_am_sound', None)
+
         # Initialize RadioCore - THE SAME LOGIC AS FIRMWARE
         self.core = RadioCore(self.hw_emulator)
         self.resume_position_ms: Optional[int] = None
@@ -319,7 +332,6 @@ class TestModeWidget(QtWidgets.QWidget):
         self.resume_track: Optional[int] = None
         self.audio_ready = False
         self.am_sound = None
-        self.am_channel = None
         self.target_volume = 1.0
         self._playback_timer = QtCore.QTimer(self)
         self._playback_timer.setInterval(200)
@@ -335,6 +347,9 @@ class TestModeWidget(QtWidgets.QWidget):
         self._tap_thread_timer: Optional[threading.Timer] = None
         self.tap_count = 0
         self._last_tap_time: Optional[float] = None  # time.monotonic() of last tap
+        self._last_tune_value: Optional[int] = None
+        self._last_tuned_station: Optional[int] = None
+        self.am_channel = None
         self.rail2_on = True
         self._press_timer = QtCore.QElapsedTimer()
         self._long_press_fired = False
@@ -803,8 +818,16 @@ class TestModeWidget(QtWidgets.QWidget):
         """Helper button: simulate long press - uses RadioCore."""
         if not self.rail2_on:
             return
-        # Use RadioCore's long press handling
-        self.core._handle_long_press()
+        # Use RadioCore's long press handling; pass current tap count so core can
+        # interpret combinations (e.g. 1 tap+hold = toggle mode)
+        try:
+            self.core._handle_long_press_with_taps(self.core.tap_count)
+        except Exception:
+            # Fallback: if internals change, call the generic handler without args
+            try:
+                self.core._handle_long_press_with_taps(0)
+            except Exception:
+                pass
         self._sync_from_core()
         self._update_status("Long press action.")
     
@@ -1599,7 +1622,7 @@ class TestModeWidget(QtWidgets.QWidget):
 
     def _current_track_count(self) -> int:
         if self.mode == "radio":
-            if self.radio_stations and self.radio_station_index < len(self.radio_stations):
+            if self.radio_stations and self.radio_station_index < self.radio_stations:
                 return max(len(self.radio_stations[self.radio_station_index].tracks), 1)
             return 1
         if self.mode == "shuffle":
@@ -1622,12 +1645,7 @@ class TestModeWidget(QtWidgets.QWidget):
         if mode == "shuffle":
             if self.mode == "shuffle":
                 # Already in shuffle - reshuffle the current source
-                if self.core._shuffle_source_type:
-                    # Reshuffle current album/playlist
-                    self.core._init_current_shuffle()
-                else:
-                    # Reshuffle library
-                    self.core._init_library_shuffle()
+                self.core._init_current_shuffle()
                 # Reshuffling doesn't change mode, so no AM overlay needed
                 self._sync_from_core()
                 return

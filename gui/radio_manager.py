@@ -345,7 +345,13 @@ class MetadataDialog(QtWidgets.QDialog):
         return fields
 
 
+_TABLE_REORDER_MIME = "application/x-vintage-radio-table-reorder"
+
+
 class ReorderTable(QtWidgets.QTableWidget):
+    """QTableWidget with drag-to-reorder. Uses fully custom drag/drop so Qt
+    never performs InternalMove (which nukes rows on macOS).
+    """
     order_changed = QtCore.pyqtSignal()
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
@@ -353,7 +359,8 @@ class ReorderTable(QtWidgets.QTableWidget):
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
-        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(QtCore.Qt.DropAction.CopyAction)
         self.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -364,63 +371,115 @@ class ReorderTable(QtWidgets.QTableWidget):
         self.setSortingEnabled(False)
         self._pending_order: Optional[List[int]] = None
 
+    # -- snapshot helpers --------------------------------------------------
+
+    def _snapshot_all(self) -> List[tuple]:
+        """Return [(row, song_id, [col_texts]), ...] for every row."""
+        result: List[tuple] = []
+        for row in range(self.rowCount()):
+            item = self.item(row, 0)
+            if item is None:
+                continue
+            song_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if song_id is None:
+                continue
+            cols = []
+            for c in range(self.columnCount()):
+                it = self.item(row, c)
+                cols.append(it.text() if it is not None else "")
+            result.append((row, int(song_id), cols))
+        return result
+
+    def _rebuild_table(self, new_order: List[int],
+                       id_to_cols: Dict[int, List[str]]) -> None:
+        """Replace table contents with rows in *new_order*."""
+        self.setSortingEnabled(False)
+        self.blockSignals(True)
+        try:
+            self.setRowCount(len(new_order))
+            for new_row, sid in enumerate(new_order):
+                cols = id_to_cols.get(sid, [""] * self.columnCount())
+                for c, text in enumerate(cols):
+                    item = QtWidgets.QTableWidgetItem(text)
+                    if c == 0:
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    self.setItem(new_row, c, item)
+        finally:
+            self.blockSignals(False)
+            self.setSortingEnabled(True)
+
+    # -- accept our custom mime during drag-over ----------------------------
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasFormat(_TABLE_REORDER_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
+        if event.mimeData().hasFormat(_TABLE_REORDER_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    # -- drag (our own QDrag, no super) ------------------------------------
+
+    def startDrag(self, supportedActions: QtCore.Qt.DropActions) -> None:
+        rows = sorted(set(idx.row() for idx in self.selectedIndexes()))
+        sids: List[int] = []
+        for r in rows:
+            item = self.item(r, 0)
+            if item is None:
+                continue
+            sid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if sid is not None:
+                sids.append(int(sid))
+        if not sids:
+            return
+        mime = QtCore.QMimeData()
+        mime.setData(_TABLE_REORDER_MIME,
+                     ",".join(str(s) for s in sids).encode("utf-8"))
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(QtCore.Qt.DropAction.CopyAction)
+
+    # -- drop --------------------------------------------------------------
+
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        # Don't use Qt's InternalMove – it loses UserRole data and nukes songs.
-        # Instead, compute the new order manually, stash it, and let the
-        # connected persist handler read it from _pending_order.
-        #
-        # CRITICAL: We must NOT let Qt think this was a MoveAction, because
-        # QAbstractItemView::startDrag() removes source rows from the model
-        # when drag->exec() returns MoveAction.  That removal happens AFTER
-        # dropEvent returns, destroying the rows we just refreshed from DB.
-        # Setting the drop action to CopyAction prevents that cleanup.
-        if event.source() is not self:
+        if event.source() is not self or not event.mimeData().hasFormat(_TABLE_REORDER_MIME):
             super().dropEvent(event)
             return
 
-        # Collect every song ID in current visual order
-        all_ids: List[tuple] = []
-        for row in range(self.rowCount()):
-            item = self.item(row, 0)
-            if item is not None:
-                song_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                if song_id is not None:
-                    all_ids.append((row, int(song_id)))
-
-        selected_rows = sorted(set(idx.row() for idx in self.selectedIndexes()))
-        if not selected_rows or not all_ids:
+        raw = bytes(event.mimeData().data(_TABLE_REORDER_MIME)).decode("utf-8")
+        try:
+            moving = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            event.ignore()
+            return
+        if not moving:
             event.ignore()
             return
 
-        # Where did the user drop?
+        snap = self._snapshot_all()
+        current_sids = [sid for (_, sid, _) in snap]
+        id_to_cols: Dict[int, List[str]] = {sid: cols for (_, sid, cols) in snap}
+        moving_set = set(moving)
+        staying = [s for s in current_sids if s not in moving_set]
+
         drop_pos = event.position().toPoint()
-        target_row = self.indexAt(drop_pos).row()
+        viewport_pos = self.viewport().mapFrom(self, drop_pos)
+        target_row = self.indexAt(viewport_pos).row()
         if target_row < 0:
-            target_row = len(all_ids)
-
-        # Split into "moving" and "staying"
-        selected_set = set(selected_rows)
-        moving = [sid for r, sid in all_ids if r in selected_set]
-        staying = [sid for r, sid in all_ids if r not in selected_set]
-
-        # Adjust insertion point for rows removed above it
-        insert_at = target_row
-        for r in selected_rows:
-            if r < target_row:
-                insert_at -= 1
-        insert_at = max(0, min(insert_at, len(staying)))
+            target_row = len(staying)
+        insert_at = max(0, min(target_row, len(staying)))
 
         new_order = staying[:insert_at] + moving + staying[insert_at:]
-
         self._pending_order = new_order
+        self._rebuild_table(new_order, id_to_cols)
 
-        # Tell Qt this was a Copy (not Move) so startDrag() won't remove
-        # the source rows after we return.
         event.setDropAction(QtCore.Qt.DropAction.CopyAction)
         event.accept()
-
-        # Defer the persist + refresh to AFTER Qt finishes its drag cleanup,
-        # so any residual model manipulation by Qt doesn't clobber our table.
         QtCore.QTimer.singleShot(0, self.order_changed.emit)
 
 
@@ -459,8 +518,13 @@ class CollectionDropTable(ReorderTable):
         super().dropEvent(event)
 
 
+_REORDER_MIME = "application/x-vintage-radio-list-reorder"
+
+
 class ReorderListWidget(QtWidgets.QListWidget):
-    """A QListWidget that supports drag-and-drop reordering of its items."""
+    """A QListWidget that supports drag-and-drop reordering. Uses custom drag/drop
+    so Qt never modifies the model (avoids InternalMove nuking items on macOS).
+    """
 
     order_changed = QtCore.pyqtSignal()
 
@@ -469,15 +533,119 @@ class ReorderListWidget(QtWidgets.QListWidget):
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
-        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
-        self.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(QtCore.Qt.DropAction.CopyAction)
         self.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
 
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasFormat(_REORDER_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
+        if event.mimeData().hasFormat(_REORDER_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def startDrag(self, supportedActions: QtCore.Qt.DropActions) -> None:
+        """Start drag with our mime data (UIDs only). We do not call super() so Qt
+        never performs InternalMove or removes any rows.
+        """
+        rows = sorted(set(idx.row() for idx in self.selectedIndexes()))
+        uids: List[int] = []
+        for row in rows:
+            it = self.item(row)
+            if it is None:
+                continue
+            uid = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            if uid is not None:
+                uids.append(int(uid))
+        if not uids:
+            return
+        mime = QtCore.QMimeData()
+        mime.setData(_REORDER_MIME, ",".join(str(u) for u in uids).encode("utf-8"))
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(QtCore.Qt.DropAction.CopyAction)
+
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        super().dropEvent(event)
-        self.order_changed.emit()
+        if event.source() is not self:
+            super().dropEvent(event)
+            return
+        if not event.mimeData().hasFormat(_REORDER_MIME):
+            event.ignore()
+            return
+
+        raw = bytes(event.mimeData().data(_REORDER_MIME)).decode("utf-8")
+        try:
+            moving = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            event.ignore()
+            return
+        if not moving:
+            event.ignore()
+            return
+
+        # Current list order (row -> uid, and uid -> item for text/icon)
+        all_ids: List[tuple] = []
+        for row in range(self.count()):
+            item = self.item(row)
+            if item is None:
+                continue
+            uid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if uid is None:
+                continue
+            all_ids.append((row, int(uid), item.text(), item))
+        current_uids = [uid for (_, uid, _, _) in all_ids]
+        staying = [u for u in current_uids if u not in moving]
+        if len(staying) + len(moving) != len(current_uids):
+            event.ignore()
+            return
+
+        drop_pos = event.position().toPoint()
+        viewport_pos = self.viewport().mapFrom(self, drop_pos)
+        target_row = self.indexAt(viewport_pos).row()
+        if target_row < 0:
+            target_row = len(staying)
+        insert_at = max(0, min(target_row, len(staying)))
+        new_order = staying[:insert_at] + moving + staying[insert_at:]
+
+        id_to_item: Dict[int, tuple] = {}
+        for (_r, uid, text, item) in all_ids:
+            id_to_item[uid] = (text, item)
+        new_items: List[QtWidgets.QListWidgetItem] = []
+        for uid in new_order:
+            text, orig = id_to_item.get(uid, ("", None))
+            new_item = QtWidgets.QListWidgetItem(text)
+            new_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            if orig is not None:
+                try:
+                    new_item.setIcon(orig.icon())
+                except Exception:
+                    pass
+            new_items.append(new_item)
+
+        self.blockSignals(True)
+        try:
+            self.clear()
+            for ni in new_items:
+                self.addItem(ni)
+            if moving:
+                first = moving[0]
+                for idx in range(self.count()):
+                    if self.item(idx) and self.item(idx).data(QtCore.Qt.ItemDataRole.UserRole) == first:
+                        self.setCurrentRow(idx)
+                        break
+        finally:
+            self.blockSignals(False)
+
+        event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+        event.accept()
+        QtCore.QTimer.singleShot(0, self.order_changed.emit)
 
 
 class InstallMicroPythonDialog(QtWidgets.QDialog):
@@ -603,19 +771,51 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         self._fetch_thread.start()
 
     def _fetch_firmware_releases(self) -> None:
-        """Background: scrape micropython.org download pages for UF2 links."""
+        """Background: scrape micropython.org download pages for UF2 links.
+
+        This function is resilient to macOS Python SSL issues: it first attempts a
+        normal HTTPS request, then retries using certifi's CA bundle if available,
+        and finally falls back to an unverified SSL context as last resort.
+        """
         import urllib.request
+        import urllib.error
         import json as _json
         import re as _re
+        import ssl
+
+        # Helper to fetch a URL with multiple SSL strategies
+        def fetch_url(req: urllib.request.Request, timeout: int = 15) -> str:
+            # 1) Try default SSL behavior
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode("utf-8")
+            except Exception as e_default:
+                # 2) Try using certifi CA bundle if available
+                try:
+                    import certifi
+                    ctx = ssl.create_default_context(cafile=certifi.where())
+                    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                        return resp.read().decode("utf-8")
+                except Exception:
+                    # 3) As a last resort, disable SSL verification (less secure but works on misconfigured systems)
+                    try:
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                            return resp.read().decode("utf-8")
+                    except Exception as e_all:
+                        # Re-raise the original error for logging by caller
+                        raise e_all from e_default
 
         result: Dict[str, list] = {}
+        errors: Dict[str, str] = {}
 
         for board_key, (page_url, slug) in self._BOARDS.items():
             entries: list = []
             try:
-                req = urllib.request.Request(page_url, headers={"User-Agent": "VintageRadio"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    html = resp.read().decode("utf-8")
+                req = urllib.request.Request(page_url, headers={"User-Agent": "VintageRadio/1.0"})
+                html = fetch_url(req, timeout=15)
 
                 # Find .uf2 links — they appear in order newest-first on the page
                 uf2_links = _re.findall(r'href="(/resources/firmware/[^"]*\.uf2)"', html)
@@ -633,13 +833,20 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
                     if len(entries) >= 2:
                         break
             except Exception as e:
-                print(f"Failed to fetch firmware for {board_key}: {e}")
+                errors[board_key] = f"{type(e).__name__}: {e}"
             result[board_key] = entries
 
         if not any(result.values()):
+            # Build a helpful error message including per-board details if available
+            if errors:
+                details = "; ".join(f"{k}: {v}" for k, v in errors.items())
+                msg = f"Could not find firmware on micropython.org. Errors: {details}"
+            else:
+                msg = "Could not find firmware on micropython.org"
+
             QtCore.QMetaObject.invokeMethod(
                 self, "_on_fetch_error", QtCore.Qt.ConnectionType.QueuedConnection,
-                QtCore.Q_ARG(str, "Could not find firmware on micropython.org"),
+                QtCore.Q_ARG(str, msg),
             )
             return
 
@@ -1999,12 +2206,11 @@ class MainWindow(QtWidgets.QMainWindow):
         
         try:
             import platform
-            if platform.system() == "Windows":
-                # Use Windows API to eject the volume
+            system = platform.system()
+            if system == "Windows":
+                # Existing Windows API handling preserved
                 import ctypes
                 from ctypes import wintypes
-                
-                # Get the drive letter from the path
                 drive_letter = sd_root.drive
                 if not drive_letter:
                     QtWidgets.QMessageBox.warning(
@@ -2013,11 +2219,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Could not determine drive letter. Please eject manually using Windows Explorer."
                     )
                     return
-                
-                # Remove the colon (e.g., "E:" -> "E")
                 drive = drive_letter.rstrip(":")
-                
-                # Lock the volume
                 kernel32 = ctypes.windll.kernel32
                 volume_path = f"\\\\.\\{drive}:"
                 handle = kernel32.CreateFileW(
@@ -2029,19 +2231,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     0,  # No flags
                     None
                 )
-                
                 if handle == -1:
                     QtWidgets.QMessageBox.warning(
                         self,
                         "Cannot Eject",
-                        f"Could not lock drive {drive}:. The drive may be in use.\n\n"
-                        "Please close any programs using the SD card and try again, "
-                        "or eject manually using Windows Explorer."
+                        f"Could not lock drive {drive}:. The drive may be in use.\n\nPlease close any programs using the SD card and try again, or eject manually using Windows Explorer."
                     )
                     return
-                
                 try:
-                    # Eject the volume
                     result = kernel32.DeviceIoControl(
                         handle,
                         0x2D4808,  # IOCTL_STORAGE_EJECT_MEDIA
@@ -2052,51 +2249,95 @@ class MainWindow(QtWidgets.QMainWindow):
                         ctypes.byref(wintypes.DWORD()),
                         None
                     )
-                    
                     if result:
                         QtWidgets.QMessageBox.information(
                             self,
                             "SD Card Ejected",
-                            f"SD card ({drive}:) has been safely ejected.\n\n"
-                            "You can now safely remove it."
+                            f"SD card ({drive}:) has been safely ejected.\n\nYou can now safely remove it."
                         )
                     else:
                         QtWidgets.QMessageBox.warning(
                             self,
                             "Eject Failed",
-                            f"Could not eject drive {drive}:.\n\n"
-                            "Please try ejecting manually using Windows Explorer."
+                            f"Could not eject drive {drive}:.\n\nPlease try ejecting manually using Windows Explorer."
                         )
                 finally:
                     kernel32.CloseHandle(handle)
-            else:
-                # For Linux/Mac, use the standard eject command
-                import subprocess
-                result = subprocess.run(
-                    ["eject", str(sd_root)],
-                    capture_output=True,
-                    text=True
-                )
-                if result.returncode == 0:
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        "SD Card Ejected",
-                        f"SD card has been safely ejected.\n\n"
-                        "You can now safely remove it."
+            elif system == "Darwin":
+                # macOS: use diskutil to eject the volume
+                try:
+                    result = subprocess.run(
+                        ["diskutil", "eject", str(sd_root)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
                     )
-                else:
+                    if result.returncode == 0:
+                        QtWidgets.QMessageBox.information(
+                            self,
+                            "SD Card Ejected",
+                            "SD card has been safely ejected.\n\nYou can now safely remove it."
+                        )
+                    else:
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "Eject Failed",
+                            f"Could not eject SD card: {result.stderr or result.stdout}\n\nPlease try ejecting manually using Finder or Disk Utility."
+                        )
+                except FileNotFoundError:
                     QtWidgets.QMessageBox.warning(
                         self,
-                        "Eject Failed",
-                        f"Could not eject SD card: {result.stderr}\n\n"
-                        "Please try ejecting manually."
+                        "Eject Unavailable",
+                        "diskutil not found on this system. Please eject the SD card manually using Finder or Disk Utility."
+                    )
+            else:
+                # For Linux and other Unix-like systems, try umount first, then fallback to eject
+                try:
+                    result = subprocess.run(
+                        ["umount", str(sd_root)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if result.returncode == 0:
+                        QtWidgets.QMessageBox.information(
+                            self,
+                            "SD Card Ejected",
+                            "SD card has been safely unmounted.\n\nYou can now safely remove it."
+                        )
+                        return
+                except Exception:
+                    pass
+                try:
+                    result = subprocess.run(
+                        ["eject", str(sd_root)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if result.returncode == 0:
+                        QtWidgets.QMessageBox.information(
+                            self,
+                            "SD Card Ejected",
+                            "SD card has been safely ejected.\n\nYou can now safely remove it."
+                        )
+                    else:
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "Eject Failed",
+                            f"Could not eject SD card: {result.stderr or result.stdout}\n\nPlease try ejecting manually."
+                        )
+                except FileNotFoundError:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Eject Unavailable",
+                        "Eject command not found. Please eject the SD card manually using your OS file manager."
                     )
         except Exception as e:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Eject Error",
-                f"An error occurred while trying to eject the SD card:\n{str(e)}\n\n"
-                "Please eject manually using your operating system's file manager."
+                f"An error occurred while trying to eject the SD card:\n{str(e)}\n\nPlease eject manually using your operating system's file manager."
             )
     
     def validate_sd(self) -> None:
@@ -3007,7 +3248,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
         else:
             QtWidgets.QMessageBox.information(
-                self, "Session Log", "No session log found for this session."
+                None, "Session Log", "No session log found for this session."
             )
 
     def _open_logs_folder(self) -> None:
@@ -3062,12 +3303,52 @@ def run_app() -> None:
     print(f"Vintage Radio GUI starting...")
 
     app = QtWidgets.QApplication(sys.argv)
-    
+
     # Set application icon (radio icon; taskbar/dock)
     icon_path = resource_path("vintage_radio.png")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
-    
+
+    # Startup diagnostic: check whether VLC or ffmpeg+pydub are available for audio conversion.
+    try:
+        from .sd_manager import SDManager, PYDUB_AVAILABLE
+        sd_check = SDManager(None)
+        vlc_ok = sd_check._check_vlc()
+        ffmpeg_ok = sd_check._check_ffmpeg()
+        if not vlc_ok and not ffmpeg_ok:
+            # Build platform-specific install hints
+            import platform
+            system = platform.system()
+            if system == "Darwin":
+                hint = (
+                    "Install VLC (VideoLAN) application: https://www.videolan.org/vlc/\n"
+                    "Or via Homebrew: brew install --cask vlc\n"
+                    "Install ffmpeg (for pydub): brew install ffmpeg\n"
+                    "Then in your virtualenv: pip install python-vlc pydub certifi"
+                )
+            elif system == "Windows":
+                hint = (
+                    "Install VLC: https://www.videolan.org/vlc/ (ensure 'Add to PATH' if available)\n"
+                    "Install ffmpeg: https://ffmpeg.org/download.html (add to PATH)\n"
+                    "Then in your environment: pip install python-vlc pydub certifi"
+                )
+            else:
+                hint = (
+                    "Install VLC (package manager or https://www.videolan.org/vlc/)\n"
+                    "Install ffmpeg (e.g. apt install ffmpeg)\n"
+                    "Then: pip install python-vlc pydub certifi"
+                )
+            QtWidgets.QMessageBox.information(
+                None,
+                "Conversion tools not found",
+                "No audio conversion tools were detected on your system.\n\n"
+                "To enable conversion (recommended), install VLC or ffmpeg + pydub.\n\n"
+                f"Hints:\n{hint}",
+            )
+    except Exception:
+        # If diagnostic fails, ignore silently — normal app functionality is unaffected.
+        pass
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

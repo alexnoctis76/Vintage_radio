@@ -28,8 +28,10 @@ except ImportError:
 try:
     import vlc
     VLC_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError when libvlc/libvlccore.dylib not installed (e.g. VLC app not present)
     VLC_AVAILABLE = False
+    vlc = None
 
 from .database import DatabaseManager
 
@@ -412,14 +414,23 @@ class PygameHardwareEmulator(HardwareInterface):
                     pass
             # Stop Sound object if playing (pygame)
             if self._current_channel:
-                self._current_channel.stop()
+                try:
+                    self._current_channel.stop()
+                except Exception:
+                    pass
                 self._current_channel = None
                 self._current_sound = None
-            # Stop mixer.music only if pygame mixer was initialized
-            if pygame.mixer.get_init():
-                pygame.mixer.music.stop()
+            # Stop mixer.music only if pygame and mixer were initialized
+            if pygame and getattr(pygame, 'mixer', None) and pygame.mixer.get_init():
+                try:
+                    pygame.mixer.music.stop()
+                except Exception:
+                    pass
                 if self._am_channel:
-                    self._am_channel.stop()
+                    try:
+                        self._am_channel.stop()
+                    except Exception:
+                        pass
             # Clean up temporary file if one was created for seeking
             if self._current_temp_file and self._current_temp_file.exists():
                 try:
@@ -439,9 +450,15 @@ class PygameHardwareEmulator(HardwareInterface):
         if self._audio_ready:
             try:
                 if self._vlc_player:
-                    self._vlc_player.audio_set_volume(self._volume)
-                elif pygame:
-                    pygame.mixer.music.set_volume(self._volume / 100.0)
+                    try:
+                        self._vlc_player.audio_set_volume(self._volume)
+                    except Exception:
+                        pass
+                elif pygame and getattr(pygame, 'mixer', None) and pygame.mixer.get_init():
+                    try:
+                        pygame.mixer.music.set_volume(self._volume / 100.0)
+                    except Exception:
+                        pass
             except Exception:
                 pass
     
@@ -453,13 +470,18 @@ class PygameHardwareEmulator(HardwareInterface):
             if self._vlc_player and VLC_AVAILABLE:
                 state = self._vlc_player.get_state()
                 return state in (vlc.State.Playing, vlc.State.Buffering)
-            elif pygame:
+            elif pygame and getattr(pygame, 'mixer', None):
                 # Check Sound object if using one
                 if self._current_channel:
-                    return self._current_channel.get_busy()
-                
+                    try:
+                        return self._current_channel.get_busy()
+                    except Exception:
+                        return False
                 # Check mixer.music
-                return self._is_playing and pygame.mixer.music.get_busy()
+                try:
+                    return self._is_playing and pygame.mixer.music.get_busy()
+                except Exception:
+                    return False
         except Exception:
             return False
     
@@ -476,19 +498,20 @@ class PygameHardwareEmulator(HardwareInterface):
                     elapsed_ms = int((time.time() * 1000) - self._playback_start_time)
                     return self._playback_start_offset_ms + elapsed_ms
                 return pos_ms
-            elif pygame:
+            elif pygame and getattr(pygame, 'mixer', None):
                 # If using Sound object (WAV files), calculate position differently
                 if self._current_sound and self._current_channel and self._current_channel.get_busy():
                     # For Sound objects, we track elapsed time from start
                     elapsed_ms = int((time.time() * 1000) - self._playback_start_time)
                     actual_pos = self._playback_start_offset_ms + elapsed_ms
                     return actual_pos
-                
                 # Default: use mixer.music position
-                pygame_pos = pygame.mixer.music.get_pos()
-                if pygame_pos < 0:
+                try:
+                    pygame_pos = pygame.mixer.music.get_pos()
+                    if pygame_pos < 0:
+                        pygame_pos = 0
+                except Exception:
                     pygame_pos = 0
-                
                 # Add the start offset to get the actual position in the original file
                 actual_pos = self._playback_start_offset_ms + pygame_pos
                 return actual_pos
@@ -499,7 +522,7 @@ class PygameHardwareEmulator(HardwareInterface):
     
     def am_overlay_available(self) -> bool:
         """Return True if AM overlay can be played (VLC or pygame)."""
-        if self._vlc_am_player and self._vlc_am_player.get_media():
+        if self._vlc_am_player and getattr(self._vlc_am_player, 'get_media', None) and self._vlc_am_player.get_media():
             return True
         return self._am_sound is not None
 
@@ -512,18 +535,24 @@ class PygameHardwareEmulator(HardwareInterface):
         if not self._audio_ready:
             return
         try:
-            if self._vlc_am_player and self._vlc_am_player.get_media():
+            if self._vlc_am_player and getattr(self._vlc_am_player, 'get_media', None) and self._vlc_am_player.get_media():
                 # VLC AM overlay - restart from start each time
-                self._vlc_am_player.set_time(0)
-                self._vlc_am_player.play()
-                self.log("AM overlay playing (VLC)")
-            elif self._am_sound:
+                try:
+                    self._vlc_am_player.set_time(0)
+                    self._vlc_am_player.play()
+                    self.log("AM overlay playing (VLC)")
+                except Exception as e:
+                    self.log(f"AM overlay error: {e}")
+            elif self._am_sound and pygame and getattr(pygame, 'mixer', None) and pygame.mixer.get_init():
                 # pygame AM overlay
-                self._am_channel = pygame.mixer.find_channel()
-                if self._am_channel:
-                    self._am_channel.set_volume(1.0)
-                    self._am_channel.play(self._am_sound)
-                    self.log("AM overlay playing (pygame)")
+                try:
+                    self._am_channel = pygame.mixer.find_channel()
+                    if self._am_channel:
+                        self._am_channel.set_volume(1.0)
+                        self._am_channel.play(self._am_sound)
+                        self.log("AM overlay playing (pygame)")
+                except Exception as e:
+                    self.log(f"AM overlay error: {e}")
         except Exception as e:
             self.log(f"AM overlay error: {e}")
     

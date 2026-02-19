@@ -29,19 +29,91 @@ class SDManager:
 
     @staticmethod
     def detect_sd_roots() -> List[Tuple[Path, str]]:
+        """
+        Detect external storage devices (SD cards, USB drives) across platforms.
+
+        Windows: Uses removable flag and filesystem type (FAT, FAT32, ExFAT)
+        macOS: Scans /Volumes excluding system volumes
+        Linux: Scans /mnt and /media for external mounts
+        """
         roots: List[Tuple[Path, str]] = []
-        system_drive = os.environ.get("SystemDrive", "C:")
-        for part in psutil.disk_partitions(all=False):
-            mount = part.mountpoint
-            if not mount:
-                continue
-            if mount.upper().startswith(system_drive.upper()):
-                continue
-            opts = part.opts.lower()
-            if "removable" in opts or part.fstype.lower() in {"fat", "fat32", "exfat"}:
-                path = Path(mount)
-                label = _get_volume_label(path)
-                roots.append((path, label))
+        system = platform.system()
+
+        if system == "Windows":
+            # Windows: Use psutil to detect removable drives
+            system_drive = os.environ.get("SystemDrive", "C:")
+            for part in psutil.disk_partitions(all=False):
+                mount = part.mountpoint
+                if not mount:
+                    continue
+                # Skip system drive
+                if mount.upper().startswith(system_drive.upper()):
+                    continue
+                # Check for removable flag or typical external filesystem types
+                opts = part.opts.lower()
+                fstype = part.fstype.lower()
+                if "removable" in opts or fstype in {"fat", "fat32", "exfat"}:
+                    path = Path(mount)
+                    if path.exists():
+                        label = _get_volume_label(path)
+                        roots.append((path, label))
+
+        elif system == "Darwin":
+            # macOS: Scan /Volumes for mounted external drives
+            # Exclude system volumes, recovery, installer, and temporary volumes
+            system_volume_keywords = {
+                "Macintosh HD", "System", "Recovery", "Install", "Installer",
+                ".localized", ".disabled", "MobileBackups", "Update", "TimeMachine",
+                "Shared Support", "Caches", "VM", "Temp"
+            }
+
+            volumes_path = Path("/Volumes")
+            if volumes_path.exists():
+                try:
+                    for item in volumes_path.iterdir():
+                        # Skip system volume names and hidden volumes
+                        name = item.name
+
+                        # Skip if name matches system patterns
+                        if name.startswith("."):
+                            continue
+                        if any(keyword.lower() in name.lower() for keyword in system_volume_keywords):
+                            continue
+
+                        # Verify it's actually a mount point and accessible
+                        if item.is_dir() and os.access(item, os.R_OK):
+                            label = item.name
+                            roots.append((item, label))
+                except (OSError, PermissionError):
+                    pass
+
+        elif system == "Linux":
+            # Linux: Check common mount points for external drives
+            mount_points = [Path("/mnt"), Path("/media")]
+            for mount_base in mount_points:
+                if not mount_base.exists():
+                    continue
+                try:
+                    for item in mount_base.iterdir():
+                        # Skip system mounts and hidden directories
+                        if item.name.startswith("."):
+                            continue
+                        # Check if it's a readable directory
+                        if item.is_dir() and os.access(item, os.R_OK):
+                            # Try to filter out system mounts by checking psutil
+                            is_system_mount = False
+                            for part in psutil.disk_partitions(all=True):
+                                if part.mountpoint == str(item):
+                                    # Skip root filesystem and common system mounts
+                                    if part.fstype in {"ext4", "btrfs", "tmpfs", "devtmpfs", "squashfs"}:
+                                        is_system_mount = True
+                                    break
+                            if not is_system_mount:
+                                label = item.name
+                                roots.append((item, label))
+                except (OSError, PermissionError):
+                    pass
+
         return roots
 
     @staticmethod
@@ -84,12 +156,28 @@ class SDManager:
     def _check_vlc(self) -> bool:
         """
         Check if VLC is available (can be used for audio conversion).
+
+        Returns True if either the python-vlc (libvlc) binding is importable
+        or a VLC executable is detectable on the system (PATH or common app
+        locations). This makes VLC conversion more reliable on macOS where
+        the CLI may not be installed by default.
         """
+        # 1) python-vlc (libvlc) available?
         try:
-            # Try to find VLC executable
-            # Common locations: vlc (Linux/Mac), "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe" (Windows)
+            import vlc as _vlc
+            return True
+        except Exception:
+            pass
+
+        # 2) Executable-based VLC detection
+        try:
+            # macOS app bundle path
+            if platform.system() == "Darwin":
+                mac_path = Path("/Applications/VLC.app/Contents/MacOS/VLC")
+                if mac_path.exists():
+                    return True
+            # Windows common install locations or CLI in PATH
             if platform.system() == "Windows":
-                # Try common Windows paths
                 vlc_paths = [
                     "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
                     "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
@@ -97,26 +185,22 @@ class SDManager:
                 for vlc_path in vlc_paths:
                     if Path(vlc_path).exists():
                         return True
-                # Try vlc in PATH
-                result = subprocess.run(
-                    ['vlc', '--version'],
-                    capture_output=True,
-                    timeout=2
-                )
-                return result.returncode == 0
-            else:
-                # Linux/Mac - vlc should be in PATH
-                result = subprocess.run(
-                    ['vlc', '--version'],
-                    capture_output=True,
-                    timeout=2
-                )
-                return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # Try invoking vlc --version on PATH
+            result = subprocess.run(["vlc", "--version"], capture_output=True, timeout=2)
+            return result.returncode == 0
+        except Exception:
             return False
     
     def _get_vlc_path(self) -> str:
-        """Get the path to VLC executable."""
+        """Get the best path to a VLC executable for subprocess calls.
+
+        On macOS prefer the application bundle binary. On Windows prefer
+        the Program Files paths. Otherwise fall back to 'vlc' (PATH).
+        """
+        if platform.system() == "Darwin":
+            mac_path = Path("/Applications/VLC.app/Contents/MacOS/VLC")
+            if mac_path.exists():
+                return str(mac_path)
         if platform.system() == "Windows":
             vlc_paths = [
                 "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
@@ -125,25 +209,59 @@ class SDManager:
             for vlc_path in vlc_paths:
                 if Path(vlc_path).exists():
                     return vlc_path
-        # Try vlc in PATH
+        # Fallback to PATH name
         return "vlc"
     
     def _convert_to_mp3_vlc(self, source_path: Path, target_path: Path) -> bool:
         """
-        Convert audio file to MP3 using VLC command-line interface.
-        Returns True if successful, False otherwise.
+        Convert audio file to MP3 using VLC. Try libVLC (python-vlc) first
+        because it's typically more reliable on macOS and avoids spawning a
+        subprocess; fall back to calling the VLC CLI executable.
         """
-        if not self._check_vlc():
-            return False
-        
+        # Try python-vlc (libVLC) first
         try:
-            vlc_path = self._get_vlc_path()
-            # VLC command-line conversion syntax:
-            # vlc --intf dummy --sout "#transcode{acodec=mp3,ab=192}:std{access=file,mux=dummy,dst=output.mp3}" input.flac vlc://quit
-            # Note: VLC requires the destination path to be absolute
+            import vlc
+            # Build libvlc instance with dummy interface
+            instance = vlc.Instance(['--intf', 'dummy', '--quiet'])
+            # Build media with sout chain to transcode audio to MP3
             abs_target = str(target_path.resolve())
             abs_source = str(source_path.resolve())
-            
+            sout = f"#transcode{{acodec=mp3,ab=192}}:std{{access=file,mux=dummy,dst={abs_target}}}"
+            media = instance.media_new(abs_source, f":sout={sout}")
+            player = instance.media_player_new()
+            player.set_media(media)
+            # play() is asynchronous — use events to wait for end
+            playing = player.play()
+            # Some libvlc builds return -1/0 — we still need to wait for completion
+            # Wait until the file is converted or timeout
+            import time
+            start = time.time()
+            timeout = 300
+            # Poll for existence of target file as conversion completes
+            while True:
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
+                    return True
+                if time.time() - start > timeout:
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
+                    print(f"libVLC conversion timed out for {source_path.name}")
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            # Import or runtime error — fall back to CLI
+            print(f"libVLC conversion unavailable or failed: {e}")
+
+        # Fallback to CLI VLC
+        try:
+            vlc_path = self._get_vlc_path()
+            abs_target = str(target_path.resolve())
+            abs_source = str(source_path.resolve())
             cmd = [
                 vlc_path,
                 '--intf', 'dummy',
@@ -152,31 +270,35 @@ class SDManager:
                 abs_source,
                 'vlc://quit'
             ]
-            
-            print(f"Attempting VLC conversion: {source_path.name} -> {target_path.name}")
+            print(f"Attempting VLC (exec) conversion: {source_path.name} -> {target_path.name} using {vlc_path}")
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=300,  # 5 minute timeout for conversion
+                timeout=300,  # 5 minute timeout
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            
             if result.returncode == 0 and target_path.exists() and target_path.stat().st_size > 0:
                 print(f"VLC conversion successful: {source_path.name}")
                 return True
             else:
                 print(f"VLC conversion failed for {source_path.name}: return code {result.returncode}")
                 if result.stderr:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore')
-                    if error_msg.strip():
-                        print(f"VLC error: {error_msg[:200]}")  # First 200 chars
+                    try:
+                        error_msg = result.stderr.decode('utf-8', errors='ignore')
+                        if error_msg.strip():
+                            print(f"VLC stderr: {error_msg[:400]}")
+                    except Exception:
+                        pass
                 if result.stdout:
-                    stdout_msg = result.stdout.decode('utf-8', errors='ignore')
-                    if stdout_msg.strip():
-                        print(f"VLC output: {stdout_msg[:200]}")
+                    try:
+                        stdout_msg = result.stdout.decode('utf-8', errors='ignore')
+                        if stdout_msg.strip():
+                            print(f"VLC stdout: {stdout_msg[:400]}")
+                    except Exception:
+                        pass
                 return False
         except Exception as e:
-            print(f"VLC conversion error for {source_path.name}: {e}")
+            print(f"VLC exec conversion error for {source_path.name}: {e}")
             return False
     
     def _convert_to_mp3(self, source_path: Path, target_path: Path) -> bool:
