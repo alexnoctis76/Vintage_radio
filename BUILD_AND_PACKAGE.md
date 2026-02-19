@@ -5,7 +5,7 @@ This guide covers building the Vintage Radio application from source on Windows,
 ## Packaging locally (summary)
 
 1. **One-time setup**: Python 3.8+, venv, `pip install -r requirements.txt pyinstaller`. On macOS also install SDL2 so pygame builds: `brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf`.
-2. **macOS**: From repo root run `bash build_macos.sh` (unsigned app) or `bash build_macos.sh --no-dmg` for app only. Optional: `--sign` for code signing, `--notarize` for notarized DMG.
+2. **macOS**: From repo root run `bash build_macos.sh` (unsigned app) or `bash build_macos.sh --no-dmg` for app only. Optional: `--sign` for code signing, `--notarize` for notarized DMG. **Note:** CI only produces an Apple Silicon build; Intel Mac users must build locally.
 3. **Windows**: Run `build_windows.bat` (or `pyinstaller vintage_radio.spec`). Run `dist\Vintage Radio\Vintage Radio.exe`.
 4. **Linux**: Run `bash build_linux.sh` (or `pyinstaller vintage_radio.spec`). Run `dist/Vintage Radio/Vintage Radio`.
 5. **Without scripts**: `pyinstaller vintage_radio.spec --noconfirm` on any OS; output is in `dist/Vintage Radio/` (run the executable inside).
@@ -240,11 +240,15 @@ xattr -cr "/path/to/Vintage Radio.app"
 Then open the app as usual. Alternatively: right-click the app → **Open** → confirm "Open" once; macOS may allow it without the command.
 
 ### "Not supported on this Mac" / "bad CPU type in executable"
-The macOS build is produced as a **Universal2** binary (Intel and Apple Silicon). If you see this error, you may be running the **raw executable** inside a folder instead of the **app**. After downloading the macOS artifact:
+**GitHub Actions only builds for Apple Silicon (M1/M2/M3).** If you have an **Intel Mac**, the CI macOS artifact will not run on your machine. Build locally instead:
 
-1. Unzip the artifact; you should see **Vintage Radio.app** (one app with icon), not a folder named "Vintage Radio" containing a file.
-2. Run **Vintage Radio.app** (double-click or `open "Vintage Radio.app"`). Do not run the `Vintage Radio` executable file inside a folder.
-3. If you still get "not supported on this Mac", the CI build may have fallen back to a single architecture. Build locally with Python from [python.org](https://www.python.org/) (Universal2 installer) and run `bash build_macos.sh`.
+```bash
+# Intel Mac: build on your machine (produces native Intel .app)
+bash build_macos.sh
+# Output: dist/Vintage Radio.app
+```
+
+If you have an Apple Silicon Mac and see this error, make sure you are running **Vintage Radio.app** (double-click or `open "Vintage Radio.app"`), not the raw `Vintage Radio` executable inside a folder.
 
 ### Serial Port Not Detected (macOS/Linux)
 - Ensure the Pico is connected via USB
@@ -257,6 +261,9 @@ The macOS build is produced as a **Universal2** binary (Intel and Apple Silicon)
 - On macOS, check `/Volumes` for your drive
 - On Linux, check `/mnt` and `/media`
 - On Windows, the drive should appear in File Explorer
+
+### Clean install / SD sync fails on packaged macOS app
+The packaged app on macOS stores the library database and backups in **~/Library/Application Support/Vintage Radio/** (not inside the app bundle). This avoids writing into a read-only or replaced bundle. If you had an older build that wrote next to the executable, copy `radio_manager.db` and `backups/` from inside the app’s `Contents/MacOS/` folder into `~/Library/Application Support/Vintage Radio/` if you want to keep that data. The app also extends `PATH` at launch so tools like ffmpeg (e.g. from Homebrew) are found when running SD sync or conversions.
 
 ## Building on Windows from Previous Source
 

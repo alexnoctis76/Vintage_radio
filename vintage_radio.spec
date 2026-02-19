@@ -14,6 +14,8 @@ import sys
 import platform
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
 
 # Project root (directory containing this spec)
@@ -65,9 +67,10 @@ a = Analysis(
         'psutil',
         'pydub',
         'mpremote',
-        'mpremote.pyboard',
         'mpremote.commands',
-    ],
+        'mpremote.main',
+        'platformdirs',
+    ] + collect_submodules('mpremote'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

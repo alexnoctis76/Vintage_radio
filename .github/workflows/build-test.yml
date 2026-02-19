@@ -20,9 +20,7 @@ jobs:
           - os: windows-latest
             artifact: Vintage-Radio-Windows-test
           - os: macos-latest
-            artifact: Vintage-Radio-macOS-AppleSilicon-test
-          - os: macos-13
-            artifact: Vintage-Radio-macOS-Intel-test
+            artifact: Vintage-Radio-macOS-test
 
     runs-on: ${{ matrix.os }}
 

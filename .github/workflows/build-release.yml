@@ -25,9 +25,7 @@ jobs:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
           - os: macos-latest
-            artifact: Vintage-Radio-macOS-AppleSilicon
-          - os: macos-13
-            artifact: Vintage-Radio-macOS-Intel
+            artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
 
@@ -125,16 +123,10 @@ jobs:
           zip -r ../../Vintage-Radio-Windows.zip .
           cd ../..
 
-      - name: Zip macOS Apple Silicon build
+      - name: Zip macOS build
         run: |
-          cd artifacts/Vintage-Radio-macOS-AppleSilicon
-          zip -r ../../Vintage-Radio-macOS-AppleSilicon.zip .
-          cd ../..
-
-      - name: Zip macOS Intel build
-        run: |
-          cd artifacts/Vintage-Radio-macOS-Intel
-          zip -r ../../Vintage-Radio-macOS-Intel.zip .
+          cd artifacts/Vintage-Radio-macOS
+          zip -r ../../Vintage-Radio-macOS.zip .
           cd ../..
 
       - name: Create Release and upload binaries
@@ -145,7 +137,6 @@ jobs:
           generate_release_notes: true
           files: |
             Vintage-Radio-Windows.zip
-            Vintage-Radio-macOS-AppleSilicon.zip
-            Vintage-Radio-macOS-Intel.zip
+            Vintage-Radio-macOS.zip
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

@@ -1,5 +1,6 @@
 """Path helpers for resources and project root. Works from source and when frozen (PyInstaller)."""
 
+import os
 from pathlib import Path
 import sys
 
@@ -28,10 +29,44 @@ def project_root() -> Path:
 
 
 def app_data_dir() -> Path:
-    """Writable directory for db, backups (exe dir when frozen, else project root)."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return project_root()
+    """Writable directory for db, backups.
+
+    When running from source: project root.
+    When frozen (packaged): on macOS uses ~/Library/Application Support/Vintage Radio/
+    so the app bundle is not written to (avoids read-only or replacement issues).
+    On Windows/Linux frozen apps use the directory containing the executable.
+    """
+    if not getattr(sys, "frozen", False):
+        return project_root()
+    try:
+        import platform
+        if platform.system() == "Darwin":
+            import platformdirs
+            path = Path(platformdirs.user_data_dir(appname="Vintage Radio", roaming=False))
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    except Exception:
+        pass
+    return Path(sys.executable).resolve().parent
+
+
+def subprocess_env() -> dict:
+    """Environment for subprocess calls. When frozen on macOS, PATH is extended
+    so tools like ffmpeg (e.g. from Homebrew) are found when the app is launched
+    from Finder (which often has a minimal PATH).
+    """
+    if not getattr(sys, "frozen", False):
+        return os.environ
+    try:
+        import platform
+        if platform.system() == "Darwin":
+            extra = os.pathsep.join(["/usr/local/bin", "/opt/homebrew/bin"])
+            path = os.environ.get("PATH", "")
+            if extra not in path:
+                return {**os.environ, "PATH": extra + os.pathsep + path}
+    except Exception:
+        pass
+    return os.environ
 
 
 def resource_path(*parts: str) -> Path:
