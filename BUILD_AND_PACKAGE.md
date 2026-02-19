@@ -229,12 +229,15 @@ bash build_macos.sh --sign
 # (Script will prompt for certificate)
 ```
 
-### App won't launch on macOS
-If you get "App is damaged or can't be opened":
+### App won't launch on macOS / "damaged" after downloading
+If you get **"Vintage Radio is damaged and can't be opened"** (common when the app was downloaded from the web, e.g. a GitHub Actions artifact), macOS Gatekeeper is blocking it because the app is not notarized. Fix:
+
 ```bash
-# Remove quarantine flag (macOS Gatekeeper)
-xattr -d com.apple.quarantine "/path/to/Vintage Radio.app"
+# Remove quarantine attributes from the app bundle (use your actual path)
+xattr -cr "/path/to/Vintage Radio.app"
 ```
+
+Then open the app as usual. Alternatively: right-click the app → **Open** → confirm "Open" once; macOS may allow it without the command.
 
 ### Serial Port Not Detected (macOS/Linux)
 - Ensure the Pico is connected via USB

@@ -82,6 +82,14 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller vintage_radio.spec --noconfirm
 
+      - name: Verify macOS app bundle
+        if: matrix.os == 'macos-latest'
+        run: |
+          test -d "dist/Vintage Radio.app" || (echo "Expected dist/Vintage Radio.app not found. dist contents:" && ls -la dist && exit 1)
+          test -f "dist/Vintage Radio.app/Contents/MacOS/Vintage Radio" || (echo "App executable missing" && exit 1)
+          test -f "dist/Vintage Radio.app/Contents/Info.plist" || (echo "Info.plist missing" && exit 1)
+          echo "Vintage Radio.app bundle OK (icon in Contents/Resources if .icns was built)"
+
       - name: Upload artifact (Windows)
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
@@ -94,7 +102,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/Vintage Radio.app
+          path: dist
 
   # Create/update a GitHub Release and attach built binaries (on tag push or release published)
   upload-release:
