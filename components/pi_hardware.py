@@ -310,9 +310,14 @@ class PiHardware(HardwareInterface):
         return self._playlists
 
     def get_all_tracks(self) -> List[Dict]:
+        seen_ids = set()
         out = []
-        for album in self._albums:
-            out.extend(album.get("tracks", []))
+        for collection in self._albums + self._playlists:
+            for track in collection.get("tracks", []):
+                tid = track.get("id")
+                if tid not in seen_ids:
+                    seen_ids.add(tid)
+                    out.append(track)
         return out
 
     def is_power_on(self) -> bool:

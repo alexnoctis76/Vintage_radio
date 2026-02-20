@@ -18,6 +18,7 @@ from PyQt6.QtGui import QDesktopServices, QIcon
 from .audio_metadata import compute_file_hash, extract_metadata
 from .database import DatabaseManager
 from .device_debug import DeviceDebugWidget
+from .library_manager import LibraryRegistry
 from .resource_paths import app_data_dir, project_root, resource_path
 from .sd_manager import SDManager
 from .test_mode import TestModeWidget
@@ -1095,15 +1096,18 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Vintage Radio Music Manager")
         self.resize(1000, 700)
-        
-        # Set window icon (radio icon)
+
         icon_path = resource_path("vintage_radio.png")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
-        self.db = DatabaseManager()
+        self._lib_registry = LibraryRegistry()
+        slug = self._lib_registry.active_library()
+        db_path = self._lib_registry.db_path_for(slug)
+        self.db = DatabaseManager(db_path=db_path)
+        self._update_window_title()
+
         self._undo_stack: List[dict] = []
         self._redo_stack: List[dict] = []
         self.sd_manager = SDManager(self.db)
@@ -1161,6 +1165,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_saved_settings()
 
         self._build_menu()
+        self._build_library_toolbar()
         self._build_tabs()
         self._set_button_cursors()
         self._refresh_all()
@@ -1225,6 +1230,148 @@ class MainWindow(QtWidgets.QMainWindow):
         copy_log_path_action = QtGui.QAction("Copy Log Path to Clipboard", self)
         copy_log_path_action.triggered.connect(self._copy_log_path)
         help_menu.addAction(copy_log_path_action)
+
+    # ── Library switcher toolbar ──────────────────────────────
+
+    def _build_library_toolbar(self) -> None:
+        tb = QtWidgets.QToolBar("Library")
+        tb.setMovable(False)
+        tb.setIconSize(QtCore.QSize(16, 16))
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
+
+        label = QtWidgets.QLabel("  Library: ")
+        label.setStyleSheet("font-weight: bold;")
+        tb.addWidget(label)
+
+        self._lib_combo = QtWidgets.QComboBox()
+        self._lib_combo.setMinimumWidth(180)
+        self._lib_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+        tb.addWidget(self._lib_combo)
+        self._populate_lib_combo()
+        self._lib_combo.currentIndexChanged.connect(self._on_lib_combo_changed)
+
+        new_btn = QtWidgets.QPushButton("New")
+        new_btn.setToolTip("Create a new library")
+        new_btn.clicked.connect(self._new_library)
+        tb.addWidget(new_btn)
+
+        rename_btn = QtWidgets.QPushButton("Rename")
+        rename_btn.setToolTip("Rename the current library")
+        rename_btn.clicked.connect(self._rename_library)
+        tb.addWidget(rename_btn)
+
+        delete_btn = QtWidgets.QPushButton("Delete")
+        delete_btn.setToolTip("Delete the current library")
+        delete_btn.clicked.connect(self._delete_library)
+        tb.addWidget(delete_btn)
+
+    def _populate_lib_combo(self) -> None:
+        combo = self._lib_combo
+        combo.blockSignals(True)
+        combo.clear()
+        active_slug = self._lib_registry.active_library()
+        for lib in self._lib_registry.list_libraries():
+            combo.addItem(lib["name"], lib["slug"])
+            if lib["slug"] == active_slug:
+                combo.setCurrentIndex(combo.count() - 1)
+        combo.blockSignals(False)
+
+    def _on_lib_combo_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        slug = self._lib_combo.itemData(index)
+        if slug and slug != self._lib_registry.active_library():
+            self._switch_library(slug)
+
+    def _new_library(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "New Library", "Library name:"
+        )
+        if not ok or not name.strip():
+            return
+        try:
+            slug = self._lib_registry.create_library(name.strip())
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "New Library", str(e))
+            return
+        self._populate_lib_combo()
+        self._switch_library(slug)
+
+    def _rename_library(self) -> None:
+        slug = self._lib_registry.active_library()
+        old_name = self._lib_registry.active_library_name()
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename Library", "New name:", text=old_name
+        )
+        if not ok or not name.strip() or name.strip() == old_name:
+            return
+        self._lib_registry.rename_library(slug, name.strip())
+        self._populate_lib_combo()
+        self._update_window_title()
+
+    def _delete_library(self) -> None:
+        slug = self._lib_registry.active_library()
+        name = self._lib_registry.active_library_name()
+        libs = self._lib_registry.list_libraries()
+        if len(libs) <= 1:
+            QtWidgets.QMessageBox.information(
+                self, "Delete Library", "Cannot delete the only library."
+            )
+            return
+        reply = QtWidgets.QMessageBox.warning(
+            self,
+            "Delete Library",
+            f"Permanently delete library \"{name}\" and all its data?\n\nThis cannot be undone.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self.db.close()
+        self._lib_registry.delete_library(slug)
+        new_slug = self._lib_registry.active_library()
+        self.db = DatabaseManager(db_path=self._lib_registry.db_path_for(new_slug))
+        self._propagate_db()
+        self._populate_lib_combo()
+        self._apply_saved_settings()
+        self._refresh_all()
+        self._update_window_title()
+        if hasattr(self, "test_mode_widget") and self.test_mode_widget:
+            self.test_mode_widget.refresh_from_db()
+
+    def _switch_library(self, slug: str) -> None:
+        """Close the current DB, open the one for *slug*, and refresh everything."""
+        if slug == self._lib_registry.active_library():
+            return
+        self.db.close()
+        self._lib_registry.set_active(slug)
+        self.db = DatabaseManager(db_path=self._lib_registry.db_path_for(slug))
+        self._propagate_db()
+        self._populate_lib_combo()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._apply_saved_settings()
+        self._refresh_all()
+        self._update_window_title()
+        if hasattr(self, "test_mode_widget") and self.test_mode_widget:
+            self.test_mode_widget.refresh_from_db()
+
+    def _propagate_db(self) -> None:
+        """Push the current self.db to all sub-components that hold a reference."""
+        self.sd_manager.db = self.db
+        if hasattr(self, "test_mode_widget") and self.test_mode_widget:
+            self.test_mode_widget.db = self.db
+            if hasattr(self.test_mode_widget, "hw_emulator"):
+                self.test_mode_widget.hw_emulator.db = self.db
+            if hasattr(self.test_mode_widget, "sd_manager"):
+                self.test_mode_widget.sd_manager.db = self.db
+
+    def _update_window_title(self) -> None:
+        name = self._lib_registry.active_library_name()
+        self.setWindowTitle(f"Vintage Radio Music Manager - {name}")
 
     def _build_tabs(self) -> None:
         tabs = QtWidgets.QTabWidget()

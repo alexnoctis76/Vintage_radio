@@ -882,13 +882,17 @@ class DFPlayerHardware(HardwareInterface):
         return self._playlists
     
     def get_all_tracks(self):
-        """Return all tracks from all albums."""
-        # Ensure metadata is loaded (lazy loading)
+        """Return all unique tracks from all albums and playlists."""
         if not self._albums and not self._playlists:
             self._load_metadata()
+        seen_ids = set()
         all_tracks = []
-        for album in self._albums:
-            all_tracks.extend(album.get('tracks', []))
+        for collection in self._albums + self._playlists:
+            for track in collection.get('tracks', []):
+                tid = track.get('id')
+                if tid not in seen_ids:
+                    seen_ids.add(tid)
+                    all_tracks.append(track)
         return all_tracks
     
     # ===========================
