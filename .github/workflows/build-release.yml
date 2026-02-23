@@ -24,7 +24,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
-          - os: macos-latest
+          - os: macos-15
             artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
@@ -56,14 +56,18 @@ jobs:
       - name: Generate macOS .icns icon (macOS only)
         if: runner.os == 'macOS'
         run: |
-          python3 -c "
+          ICONSET='gui/resources/vintage_radio.iconset'
+          ICNS='gui/resources/vintage_radio.icns'
+          rm -rf "$ICONSET"
+          if [ -f 'gui/resources/vintage_radio.svg' ]; then
+            echo "Generating .icns from SVG..."
+            python3 -c "
           from PyQt6.QtSvg import QSvgRenderer
           from PyQt6.QtGui import QImage, QPainter
           from PyQt6.QtCore import QSize, Qt
+          import os
           renderer = QSvgRenderer('gui/resources/vintage_radio.svg')
-          import os, pathlib
-          iconset = 'gui/resources/vintage_radio.iconset'
-          os.makedirs(iconset, exist_ok=True)
+          os.makedirs('$ICONSET', exist_ok=True)
           for size in [16, 32, 64, 128, 256, 512, 1024]:
               img = QImage(QSize(size, size), QImage.Format.Format_ARGB32)
               img.fill(Qt.GlobalColor.transparent)
@@ -71,13 +75,28 @@ jobs:
               renderer.render(p)
               p.end()
               if size <= 512:
-                  img.save(f'{iconset}/icon_{size}x{size}.png')
+                  img.save(f'$ICONSET/icon_{size}x{size}.png')
               if size >= 32:
                   half = size // 2
-                  img.save(f'{iconset}/icon_{half}x{half}@2x.png')
-          "
-          iconutil -c icns gui/resources/vintage_radio.iconset -o gui/resources/vintage_radio.icns
-          rm -rf gui/resources/vintage_radio.iconset
+                  img.save(f'$ICONSET/icon_{half}x{half}@2x.png')
+          " && iconutil -c icns "$ICONSET" -o "$ICNS" && rm -rf "$ICONSET" && echo "Icon from SVG OK"
+          elif [ -f 'gui/resources/vintage_radio.png' ]; then
+            echo "Generating .icns from PNG..."
+            mkdir -p "$ICONSET"
+            for size in 16 32 64 128 256 512; do
+              sips -z $size $size gui/resources/vintage_radio.png --out "$ICONSET/icon_${size}x${size}.png"
+              [ $size -ge 32 ] && half=$((size/2)) && sips -z $half $half gui/resources/vintage_radio.png --out "$ICONSET/icon_${half}x${half}@2x.png"
+            done
+            iconutil -c icns "$ICONSET" -o "$ICNS"
+            rm -rf "$ICONSET"
+            echo "Icon from PNG OK"
+          else
+            echo "No SVG or PNG icon found; build will use spec default"
+          fi
+
+      - name: Clean build directories (macOS only)
+        if: runner.os == 'macOS'
+        run: rm -rf dist build
 
       - name: Build with PyInstaller
         run: pyinstaller vintage_radio.spec --noconfirm
@@ -102,7 +121,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist
+          path: dist/Vintage Radio.app
 
   # Create/update a GitHub Release and attach built binaries (on tag push or release published)
   upload-release:
@@ -126,7 +145,7 @@ jobs:
       - name: Zip macOS build
         run: |
           cd artifacts/Vintage-Radio-macOS
-          zip -r ../../Vintage-Radio-macOS.zip .
+          zip -r ../../Vintage-Radio-macOS.zip "Vintage Radio.app"
           cd ../..
 
       - name: Create Release and upload binaries

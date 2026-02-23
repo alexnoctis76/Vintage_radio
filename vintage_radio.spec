@@ -74,7 +74,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'tkinter', '_tkinter', 'unittest', 'test', 'distutils',
+        'email', 'html', 'http', 'xml', 'pydoc', 'doctest',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -124,6 +127,6 @@ if platform.system() == "Darwin":
             'CFBundleDisplayName': 'Vintage Radio',
             'CFBundleShortVersionString': '1.0.0',
             'NSHighResolutionCapable': True,
-            'LSMinimumSystemVersion': '10.13',
+            'LSMinimumSystemVersion': '15.0',
         },
     )

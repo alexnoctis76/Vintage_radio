@@ -413,8 +413,33 @@ class DatabaseManager:
         self.conn.commit()
         self._maybe_backup()
 
-    def update_song_sd_path(self, song_id: int, sd_path: str) -> None:
-        self.update_song(song_id, {"sd_path": sd_path})
+    def update_song_sd_path(self, song_id: int, sd_path: Optional[str]) -> None:
+        path_str = "" if sd_path is None else str(sd_path)
+        self.update_song(song_id, {"sd_path": path_str})
+
+    def update_song_sd_paths_batch(self, updates: List[tuple]) -> None:
+        """Update sd_path and modified_at for many songs in one transaction. items: [(song_id, sd_path), ...]."""
+        if not updates:
+            return
+        now = datetime.utcnow().isoformat()
+        rows = [(path_str if path_str is not None else "", now, song_id) for song_id, path_str in updates]
+        self.conn.executemany(
+            "UPDATE songs SET sd_path = ?, modified_at = ? WHERE id = ?;",
+            rows,
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def set_sd_mappings_batch(self, mappings: List[tuple]) -> None:
+        """Insert/replace many sd_mapping rows in one transaction. items: [(song_id, folder_number, track_number), ...]."""
+        if not mappings:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO sd_mapping (song_id, folder_number, track_number) VALUES (?, ?, ?);",
+            mappings,
+        )
+        self.conn.commit()
+        self._maybe_backup()
 
     def delete_song(self, song_id: int) -> None:
         self.conn.execute("DELETE FROM songs WHERE id = ?;", (song_id,))

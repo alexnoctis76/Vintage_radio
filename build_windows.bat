@@ -57,7 +57,7 @@ if "%CLEAN%"=="true" (
 
 REM Run PyInstaller
 echo Building application with PyInstaller...
-pyinstaller "%SPEC_FILE%" --noconfirm --distpath "%BUILD_DIR%" --buildpath "%SCRIPT_DIR%build" --specpath "%SCRIPT_DIR%"
+pyinstaller "%SPEC_FILE%" --noconfirm --distpath "%BUILD_DIR%" --workpath "%SCRIPT_DIR%build"
 
 if not exist "%EXE_PATH%" (
     echo Error: Failed to build executable at %EXE_PATH%

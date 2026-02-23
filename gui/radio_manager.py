@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices, QIcon
+from PyQt6.QtGui import QDesktopServices, QFont, QIcon
 
 from .audio_metadata import compute_file_hash, extract_metadata
 from .database import DatabaseManager
@@ -79,13 +79,19 @@ class TaskProgressDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setMinimumWidth(420)
+        # Wide enough for long song titles when UI is zoomed in (was 420)
+        self.setMinimumWidth(580)
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
 
         # --- UI ---
         layout = QtWidgets.QVBoxLayout(self)
         self._status_label = QtWidgets.QLabel("Starting...")
         self._status_label.setWordWrap(True)
+        self._status_label.setMinimumWidth(520)
+        self._status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            self._status_label.sizePolicy().verticalPolicy(),
+        )
         layout.addWidget(self._status_label)
 
         self._progress_bar = QtWidgets.QProgressBar()
@@ -707,14 +713,21 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         "Pico W": ("https://micropython.org/download/RPI_PICO_W/", "RPI_PICO_W"),
     }
 
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, preselect_rpi_rp2: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Install MicroPython on Pico")
         self.setModal(True)
         self.setMinimumWidth(520)
         self._downloaded_path: Optional[Path] = None
+        self._preselect_rpi_rp2 = preselect_rpi_rp2
         self._build_ui()
         self._refresh_drives()
+        if preselect_rpi_rp2:
+            for i in range(self.drive_combo.count()):
+                text = self.drive_combo.itemText(i)
+                if "RPI-RP2" in text.upper():
+                    self.drive_combo.setCurrentIndex(i)
+                    break
         # Fetch firmware list in background
         self._fetch_thread: Optional[threading.Thread] = None
         self._start_firmware_fetch()
@@ -1086,17 +1099,14 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
 
         self.status_label.setText("Firmware copied! Pico will reboot with MicroPython.")
         self.status_label.setStyleSheet("color: green;")
-        QtWidgets.QMessageBox.information(
-            self, "Install MicroPython on Pico",
-            "MicroPython firmware copied. The Pico will reboot shortly.\n\n"
-            "You can then use \"Install to Pico\" to deploy the app.",
-        )
+        # Close dialog so caller can run app install automatically (no extra message box)
+        self.accept()
 
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.resize(1000, 700)
+        self._apply_default_window_geometry()
 
         icon_path = resource_path("vintage_radio.png")
         if icon_path.exists():
@@ -1169,7 +1179,103 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_tabs()
         self._set_button_cursors()
         self._refresh_all()
-    
+        self._build_status_bar_zoom()
+        self._apply_ui_zoom()
+
+    def _apply_default_window_geometry(self) -> None:
+        """Size and center window to a fraction of available screen (min/max bounds)."""
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            self.resize(1000, 700)
+            return
+        screen = app.primaryScreen()
+        if not screen:
+            self.resize(1000, 700)
+            return
+        rect = screen.availableGeometry()
+        w = min(max(int(rect.width() * 0.85), 800), 1600)
+        h = min(max(int(rect.height() * 0.85), 550), 1000)
+        x = rect.x() + (rect.width() - w) // 2
+        y = rect.y() + (rect.height() - h) // 2
+        self.setGeometry(x, y, w, h)
+
+    def _build_status_bar_zoom(self) -> None:
+        """Add zoom +/- buttons at bottom left of the status bar (pill style with label)."""
+        pill = QtWidgets.QFrame()
+        pill.setObjectName("ZoomPill")
+        pill.setStyleSheet(
+            "#ZoomPill { background-color: #e8e8e8; border-radius: 999px; padding: 2px 8px 2px 10px; }"
+        )
+        zoom_layout = QtWidgets.QHBoxLayout(pill)
+        zoom_layout.setContentsMargins(4, 2, 6, 2)
+        zoom_layout.setSpacing(4)
+        zoom_label = QtWidgets.QLabel("Zoom")
+        zoom_label.setStyleSheet("font-weight: bold; color: #333;")
+        zoom_layout.addWidget(zoom_label)
+        zoom_out_btn = QtWidgets.QPushButton("−")
+        zoom_out_btn.setToolTip("Zoom out")
+        zoom_out_btn.setFixedWidth(26)
+        zoom_out_btn.clicked.connect(self._on_zoom_out)
+        zoom_in_btn = QtWidgets.QPushButton("+")
+        zoom_in_btn.setToolTip("Zoom in")
+        zoom_in_btn.setFixedWidth(26)
+        zoom_in_btn.clicked.connect(self._on_zoom_in)
+        zoom_layout.addWidget(zoom_out_btn)
+        zoom_layout.addWidget(zoom_in_btn)
+        zoom_layout.addSpacing(2)
+        self.statusBar().addWidget(pill)
+
+    def _apply_ui_zoom(self) -> None:
+        """Apply UI zoom level via application font scale. Uses a fixed base point size so direction stays correct."""
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            return
+        # Store the true base point size only once (before we've ever scaled), so zoom in/out always scale from the same base
+        if not getattr(self, "_ui_zoom_base_pt", None):
+            base_pt = app.font().pointSize()
+            self._ui_zoom_base_pt = base_pt if base_pt and base_pt > 0 else 10
+        base_pt = self._ui_zoom_base_pt
+        new_pt = max(1, int(base_pt * self._ui_zoom_level / 100))
+        base_font = app.font()
+        new_font = QFont(base_font)
+        new_font.setPointSize(new_pt)
+        app.setFont(new_font)
+        fm = QtGui.QFontMetrics(app.font())
+        # Keep "Library:" heading in sync with zoom (toolbar labels can miss font inheritance)
+        if hasattr(self, "_library_heading_label") and self._library_heading_label is not None:
+            label_font = QFont(app.font())
+            label_font.setBold(True)
+            self._library_heading_label.setFont(label_font)
+        # Keep library combo wide enough for names at current zoom
+        if hasattr(self, "_lib_combo") and self._lib_combo is not None:
+            self._lib_combo.setMinimumWidth(max(180, fm.averageCharWidth() * 22))
+        # Prevent clipping when zoomed: scale minimum sizes with font/zoom
+        min_w = min(1200, max(700, int(650 * self._ui_zoom_level // 100)))
+        min_h = min(900, max(500, int(450 * self._ui_zoom_level // 100)))
+        self.setMinimumSize(min_w, min_h)
+        cw = self.centralWidget()
+        if cw is not None:
+            cw.setMinimumWidth(max(650, fm.averageCharWidth() * 72))
+            if isinstance(cw, QtWidgets.QTabWidget):
+                cw.tabBar().setExpanding(False)
+        if hasattr(self, "library_table") and self.library_table is not None:
+            self.library_table.horizontalHeader().setMinimumSectionSize(
+                max(40, fm.averageCharWidth() * 8)
+            )
+        # Keep library-tab button row wide enough so "Sync to SD" etc. don't clip
+        if hasattr(self, "_library_controls_widget") and self._library_controls_widget is not None:
+            self._library_controls_widget.setMinimumWidth(max(400, fm.averageCharWidth() * 55))
+
+    def _on_zoom_in(self) -> None:
+        self._ui_zoom_level = min(200, self._ui_zoom_level + 10)
+        self.db.set_setting("ui_zoom_level", str(self._ui_zoom_level))
+        self._apply_ui_zoom()
+
+    def _on_zoom_out(self) -> None:
+        self._ui_zoom_level = max(80, self._ui_zoom_level - 10)
+        self.db.set_setting("ui_zoom_level", str(self._ui_zoom_level))
+        self._apply_ui_zoom()
+
     def _set_button_cursors(self) -> None:
         """Set pointing hand cursor for all buttons in the application."""
         pointer = QtCore.Qt.CursorShape.PointingHandCursor
@@ -1212,6 +1318,17 @@ class MainWindow(QtWidgets.QMainWindow):
         redo_action.triggered.connect(self.redo_last_action)
         edit_menu.addAction(redo_action)
 
+        view_menu = self.menuBar().addMenu("View")
+        self._view_basic_action = QtGui.QAction("Basic", self)
+        self._view_basic_action.setCheckable(True)
+        self._view_basic_action.triggered.connect(lambda: self._set_devices_view_mode("basic"))
+        view_menu.addAction(self._view_basic_action)
+        self._view_advanced_action = QtGui.QAction("Advanced", self)
+        self._view_advanced_action.setCheckable(True)
+        self._view_advanced_action.triggered.connect(lambda: self._set_devices_view_mode("advanced"))
+        view_menu.addAction(self._view_advanced_action)
+        self._update_view_menu_checked()
+
         tools_menu = self.menuBar().addMenu("Tools")
         sync_action = QtGui.QAction("Sync to SD", self)
         sync_action.triggered.connect(self.sync_to_sd)
@@ -1231,6 +1348,24 @@ class MainWindow(QtWidgets.QMainWindow):
         copy_log_path_action.triggered.connect(self._copy_log_path)
         help_menu.addAction(copy_log_path_action)
 
+    def _update_view_menu_checked(self) -> None:
+        """Sync View menu check state with current devices_view_mode."""
+        if hasattr(self, "_view_basic_action") and hasattr(self, "_view_advanced_action"):
+            self._view_basic_action.setChecked(self.devices_view_mode == "basic")
+            self._view_advanced_action.setChecked(self.devices_view_mode == "advanced")
+
+    def _set_devices_view_mode(self, mode: str) -> None:
+        """Set Devices tab view mode (basic or advanced) and persist."""
+        if mode not in ("basic", "advanced"):
+            return
+        self.devices_view_mode = mode
+        self.db.set_setting("view_mode", mode)
+        self._update_view_menu_checked()
+        if hasattr(self, "_devices_stack") and self._devices_stack is not None:
+            self._devices_stack.setCurrentIndex(0 if mode == "basic" else 1)
+        if mode == "basic" and hasattr(self, "_check_basic_sd_pico_warning"):
+            self._check_basic_sd_pico_warning()
+
     # ── Library switcher toolbar ──────────────────────────────
 
     def _build_library_toolbar(self) -> None:
@@ -1239,12 +1374,22 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setIconSize(QtCore.QSize(16, 16))
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
 
-        label = QtWidgets.QLabel("  Library: ")
-        label.setStyleSheet("font-weight: bold;")
-        tb.addWidget(label)
+        self._library_heading_label = QtWidgets.QLabel("  Library: ")
+        self._library_heading_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+        tb.addWidget(self._library_heading_label)
 
+        app = QtWidgets.QApplication.instance()
+        if app:
+            lib_font = QFont(app.font())
+            lib_font.setBold(True)
+            self._library_heading_label.setFont(lib_font)
         self._lib_combo = QtWidgets.QComboBox()
-        self._lib_combo.setMinimumWidth(180)
+        if app:
+            fm = QtGui.QFontMetrics(app.font())
+            self._lib_combo.setMinimumWidth(max(180, fm.averageCharWidth() * 22))
         self._lib_combo.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Preferred,
@@ -1402,6 +1547,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """When switching to Device Debug tab, check SD/library sync and show warning if needed."""
         if index == self._device_debug_tab_index:
             self._check_device_tab_sync()
+        # When switching to Devices tab (index 3), update basic-view SD+Pico warning if in basic mode
+        if index == 3 and self.devices_view_mode == "basic" and hasattr(self, "_check_basic_sd_pico_warning"):
+            self._check_basic_sd_pico_warning()
 
     def _check_device_tab_sync(self) -> None:
         """If library and SD card are out of sync, show a warning on the Device Debug tab.
@@ -1453,7 +1601,9 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
-        controls = QtWidgets.QHBoxLayout()
+        controls_widget = QtWidgets.QWidget()
+        controls = QtWidgets.QHBoxLayout(controls_widget)
+        controls.setContentsMargins(0, 0, 0, 0)
         import_btn = QtWidgets.QPushButton("Import Files")
         import_btn.clicked.connect(self.open_import_dialog)
         import_folder_btn = QtWidgets.QPushButton("Import Folder")
@@ -1471,8 +1621,9 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(edit_btn)
         controls.addWidget(delete_btn)
 
+        self._library_controls_widget = controls_widget
         layout.addWidget(self.library_search)
-        layout.addLayout(controls)
+        layout.addWidget(controls_widget)
         layout.addWidget(self.library_table)
         return widget
 
@@ -1590,7 +1741,7 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
-        # ---- Storage & target ----
+        # ---- Storage (shared: root + Detect + Browse) ----
         storage_group = QtWidgets.QGroupBox("Storage & target")
         storage_layout = QtWidgets.QVBoxLayout(storage_group)
         root_layout = QtWidgets.QHBoxLayout()
@@ -1605,6 +1756,68 @@ class MainWindow(QtWidgets.QMainWindow):
         root_layout.addWidget(detect_btn)
         root_layout.addWidget(browse_btn)
         storage_layout.addLayout(root_layout)
+        layout.addWidget(storage_group)
+
+        # ---- Stacked content: Basic (0) | Advanced (1) ----
+        self._devices_stack = QtWidgets.QStackedWidget()
+        self._devices_stack.addWidget(self._build_sd_tab_basic_content())
+        self._devices_stack.addWidget(self._build_sd_tab_advanced_content())
+        self._devices_stack.setCurrentIndex(0 if self.devices_view_mode == "basic" else 1)
+        if self.devices_view_mode == "basic":
+            self._check_basic_sd_pico_warning()
+        layout.addWidget(self._devices_stack)
+
+        layout.addWidget(QtWidgets.QLabel("Validation / import status:"))
+        layout.addWidget(self.sd_status, 1)
+        return widget
+
+    def _build_sd_tab_basic_content(self) -> QtWidgets.QWidget:
+        """Basic Devices view: Sync, Eject, auto-eject option, single Setup Pico button."""
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+
+        self._basic_sd_pico_warning = QtWidgets.QLabel()
+        self._basic_sd_pico_warning.setWordWrap(True)
+        self._basic_sd_pico_warning.setStyleSheet("color: #c00; font-weight: bold;")
+        self._basic_sd_pico_warning.setVisible(False)
+        layout.addWidget(self._basic_sd_pico_warning)
+
+        sd_ops_group = QtWidgets.QGroupBox("SD card / media operations")
+        sd_ops_layout = QtWidgets.QVBoxLayout(sd_ops_group)
+        row = QtWidgets.QHBoxLayout()
+        sync_btn = QtWidgets.QPushButton("Sync Library to SD")
+        sync_btn.setToolTip("Copy your full library to the storage root for DFPlayer + RP2040.")
+        sync_btn.clicked.connect(self.sync_to_sd)
+        eject_btn = QtWidgets.QPushButton("Safely Remove SD Card")
+        eject_btn.setToolTip("Safely eject the SD card so it can be removed without data loss.")
+        eject_btn.clicked.connect(self.safely_remove_sd)
+        self._auto_eject_after_sync_cb = QtWidgets.QCheckBox("Automatically safely remove SD card after syncing")
+        self._auto_eject_after_sync_cb.setChecked(self.db.get_setting("auto_eject_after_sync", "0") == "1")
+        self._auto_eject_after_sync_cb.stateChanged.connect(self._on_auto_eject_after_sync_changed)
+        row.addWidget(sync_btn)
+        row.addWidget(eject_btn)
+        row.addWidget(self._auto_eject_after_sync_cb)
+        row.addStretch()
+        sd_ops_layout.addLayout(row)
+        layout.addWidget(sd_ops_group)
+
+        rp2040_group = QtWidgets.QGroupBox("RP2040 (Pico)")
+        rp2040_layout = QtWidgets.QHBoxLayout(rp2040_group)
+        setup_pico_btn = QtWidgets.QPushButton("Setup Pico")
+        setup_pico_btn.setToolTip("Install firmware (if needed) and copy the app to your Pico. Connect the Pico via USB.")
+        setup_pico_btn.clicked.connect(self._setup_pico_smart)
+        rp2040_layout.addWidget(setup_pico_btn)
+        rp2040_layout.addStretch()
+        layout.addWidget(rp2040_group)
+
+        layout.addStretch()
+        return page
+
+    def _build_sd_tab_advanced_content(self) -> QtWidgets.QWidget:
+        """Advanced Devices view: audio target, full SD ops, RP2040 options, Raspberry Pi."""
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+
         target_layout = QtWidgets.QHBoxLayout()
         target_layout.addWidget(QtWidgets.QLabel("Audio target:"))
         self.audio_target_combo = QtWidgets.QComboBox()
@@ -1618,16 +1831,15 @@ class MainWindow(QtWidgets.QMainWindow):
         target_layout.addWidget(self.audio_target_combo)
         target_layout.addWidget(QtWidgets.QLabel("Used for sync layout and export options."))
         target_layout.addStretch()
-        storage_layout.addLayout(target_layout)
+        layout.addLayout(target_layout)
+
         self.pi_convert_checkbox = QtWidgets.QCheckBox("Convert non-MP3 to MP3 when syncing for Pi")
         self.pi_convert_checkbox.setToolTip("When Raspberry Pi is the audio target: if checked, non-MP3 files are converted to MP3 during sync; if unchecked, files are copied as-is (e.g. FLAC, WAV).")
         self.pi_convert_checkbox.setChecked(self.pi_convert_audio)
         self.pi_convert_checkbox.stateChanged.connect(self._on_pi_convert_changed)
         self._update_pi_convert_visibility()
-        storage_layout.addWidget(self.pi_convert_checkbox)
-        layout.addWidget(storage_group)
+        layout.addWidget(self.pi_convert_checkbox)
 
-        # ---- SD card operations ----
         sd_ops_group = QtWidgets.QGroupBox("SD card / media operations")
         sd_ops_layout = QtWidgets.QVBoxLayout(sd_ops_group)
         actions_row = QtWidgets.QHBoxLayout()
@@ -1640,6 +1852,9 @@ class MainWindow(QtWidgets.QMainWindow):
         eject_btn = QtWidgets.QPushButton("Safely Remove SD Card")
         eject_btn.setToolTip("Safely eject the SD card so it can be removed without data loss.")
         eject_btn.clicked.connect(self.safely_remove_sd)
+        self._auto_eject_after_sync_cb_advanced = QtWidgets.QCheckBox("Automatically safely remove SD card after syncing")
+        self._auto_eject_after_sync_cb_advanced.setChecked(self.db.get_setting("auto_eject_after_sync", "0") == "1")
+        self._auto_eject_after_sync_cb_advanced.stateChanged.connect(self._on_auto_eject_after_sync_changed)
         import_btn = QtWidgets.QPushButton("Import from SD")
         import_btn.setToolTip("Import albums and playlists that were previously exported to this storage (e.g. from another machine) into your library.")
         import_btn.clicked.connect(self.import_from_sd)
@@ -1649,6 +1864,7 @@ class MainWindow(QtWidgets.QMainWindow):
         actions_row.addWidget(sync_btn)
         actions_row.addWidget(validate_btn)
         actions_row.addWidget(eject_btn)
+        actions_row.addWidget(self._auto_eject_after_sync_cb_advanced)
         actions_row.addWidget(import_btn)
         actions_row.addWidget(export_sd_contents_btn)
         sd_ops_layout.addLayout(actions_row)
@@ -1669,7 +1885,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_ops_layout.addLayout(export_collections_row)
         layout.addWidget(sd_ops_group)
 
-        # ---- RP2040 (Pico) ----
         rp2040_group = QtWidgets.QGroupBox("RP2040 (Pico)")
         rp2040_layout = QtWidgets.QHBoxLayout(rp2040_group)
         export_rp2040_btn = QtWidgets.QPushButton("Export for RP2040")
@@ -1687,7 +1902,6 @@ class MainWindow(QtWidgets.QMainWindow):
         rp2040_layout.addStretch()
         layout.addWidget(rp2040_group)
 
-        # ---- Raspberry Pi ----
         pi_group = QtWidgets.QGroupBox("Raspberry Pi")
         pi_layout = QtWidgets.QHBoxLayout(pi_group)
         export_pi_btn = QtWidgets.QPushButton("Export for Raspberry Pi")
@@ -1701,9 +1915,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pi_layout.addStretch()
         layout.addWidget(pi_group)
 
-        layout.addWidget(QtWidgets.QLabel("Validation / import status:"))
-        layout.addWidget(self.sd_status, 1)
-        return widget
+        return page
 
     def _on_audio_target_changed(self) -> None:
         self.audio_target = self.audio_target_combo.currentData() or "dfplayer_rp2040"
@@ -1717,6 +1929,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_pi_convert_visibility(self) -> None:
         if hasattr(self, "pi_convert_checkbox"):
             self.pi_convert_checkbox.setVisible(self.audio_target == "raspberry_pi")
+
+    def _on_auto_eject_after_sync_changed(self) -> None:
+        sender = self.sender()
+        if isinstance(sender, QtWidgets.QCheckBox):
+            checked = sender.isChecked()
+        elif hasattr(self, "_auto_eject_after_sync_cb") and self._auto_eject_after_sync_cb is not None:
+            checked = self._auto_eject_after_sync_cb.isChecked()
+        else:
+            checked = False
+        self.db.set_setting("auto_eject_after_sync", "1" if checked else "0")
+        # Keep the other view's checkbox in sync (Basic vs Advanced)
+        if hasattr(self, "_auto_eject_after_sync_cb") and self._auto_eject_after_sync_cb is not None and sender is not self._auto_eject_after_sync_cb:
+            self._auto_eject_after_sync_cb.blockSignals(True)
+            self._auto_eject_after_sync_cb.setChecked(checked)
+            self._auto_eject_after_sync_cb.blockSignals(False)
+        if hasattr(self, "_auto_eject_after_sync_cb_advanced") and self._auto_eject_after_sync_cb_advanced is not None and sender is not self._auto_eject_after_sync_cb_advanced:
+            self._auto_eject_after_sync_cb_advanced.blockSignals(True)
+            self._auto_eject_after_sync_cb_advanced.setChecked(checked)
+            self._auto_eject_after_sync_cb_advanced.blockSignals(False)
 
     def _create_song_table(self, reorderable: bool = False) -> QtWidgets.QTableWidget:
         table: QtWidgets.QTableWidget
@@ -1743,6 +1974,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.audio_target not in ("dfplayer_rp2040", "raspberry_pi"):
             self.audio_target = "dfplayer_rp2040"
         self.pi_convert_audio = self.db.get_setting("pi_convert_audio", "1") == "1"
+        self.devices_view_mode = self.db.get_setting("view_mode", "basic") or "basic"
+        if self.devices_view_mode not in ("basic", "advanced"):
+            self.devices_view_mode = "basic"
+        try:
+            self._ui_zoom_level = max(80, min(200, int(self.db.get_setting("ui_zoom_level", "100") or "100")))
+        except (ValueError, TypeError):
+            self._ui_zoom_level = 100
         try:
             retention = max(1, int(retention_raw))
         except ValueError:
@@ -2520,13 +2758,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if reply == QtWidgets.QMessageBox.StandardButton.No:
             force_clean = True
         
+        effective_audio_target = "dfplayer_rp2040" if self.devices_view_mode == "basic" else self.audio_target
         dlg = TaskProgressDialog(
             parent=self,
             title="SD Card Sync" + (" (clean install)" if force_clean else ""),
             func=self.sd_manager.sync_library,
             args=(sd_root,),
             kwargs={
-                "audio_target": self.audio_target,
+                "audio_target": effective_audio_target,
                 "pi_convert_audio": self.pi_convert_audio,
                 "force_clean": force_clean,
             },
@@ -2553,6 +2792,9 @@ class MainWindow(QtWidgets.QMainWindow):
                             self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
                     except Exception:
                         pass
+            # Auto-eject when option is on (for both "files copied" and "nothing copied" outcomes)
+            if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
+                QtCore.QTimer.singleShot(300, self.safely_remove_sd)
             if hasattr(self, 'test_mode_widget') and self.test_mode_widget:
                 self.test_mode_widget.refresh_from_db()
 
@@ -2832,6 +3074,79 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = InstallMicroPythonDialog(self)
         dlg.exec()
 
+    def _setup_pico_smart(self) -> None:
+        """One button: if MicroPython is installed, install app; else if RPI-RP2 present, flash firmware then prompt to run again."""
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        if not mpremote_cmd:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Setup Pico",
+                "mpremote is not available. Install it with: pip install mpremote\n\n"
+                "Then connect the Pico via USB and try again.",
+            )
+            return
+        root = self._project_root()
+        if not (root / "main.py").exists() or not (root / "radio_core.py").exists():
+            QtWidgets.QMessageBox.warning(self, "Setup Pico", "Project files not found.")
+            return
+        if not (root / "components" / "dfplayer_hardware.py").exists():
+            QtWidgets.QMessageBox.warning(self, "Setup Pico", "components/dfplayer_hardware.py not found.")
+            return
+
+        # Quick test: can we connect to Pico (MicroPython already installed)?
+        try:
+            r = _run_mpremote(
+                mpremote_cmd,
+                ["connect", "auto", "exec", "print(1)"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if r.returncode == 0:
+                self.install_to_pico()
+                return
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+
+        # No connection: check for Pico in BOOTSEL (RPI-RP2 drive)
+        if self._is_rpi_rp2_present():
+            dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
+            dlg.exec()
+            self.statusBar().showMessage("MicroPython installed. Installing app…", 8000)
+            QtCore.QTimer.singleShot(500, self._install_to_pico_after_firmware)
+        else:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Setup Pico",
+                "No Pico detected. Connect the Pico via USB.\n\n"
+                "If it's new, hold BOOTSEL while plugging in to install MicroPython first.",
+            )
+
+    def _is_rpi_rp2_present(self) -> bool:
+        """True if a drive with label RPI-RP2 (Pico in BOOTSEL) is present."""
+        for _path, label in self.sd_manager.detect_sd_roots():
+            if label and label.strip().upper() == "RPI-RP2":
+                return True
+        return False
+
+    def _check_basic_sd_pico_warning(self) -> None:
+        """Show warning in basic view only when both our SD card and RPI-RP2 (unflashed Pico) are present."""
+        if not hasattr(self, "_basic_sd_pico_warning"):
+            return
+        sd_present = self.sd_manager.is_sync_target_sd_present(
+            self.sd_root, self.db.get_setting("sd_volume_label")
+        )
+        rp2_present = self._is_rpi_rp2_present()
+        if sd_present and rp2_present:
+            self._basic_sd_pico_warning.setText(
+                "Your SD card and Pico (in setup mode) are both connected. "
+                "Install MicroPython on the Pico first (Setup Pico), then install the app."
+            )
+            self._basic_sd_pico_warning.setVisible(True)
+        else:
+            self._basic_sd_pico_warning.setVisible(False)
+
     def _resolve_mpremote_cmd(self) -> Optional[List[str]]:
         """Find the mpremote command (bundled in-process, standalone, or system-installed).
 
@@ -2981,37 +3296,34 @@ class MainWindow(QtWidgets.QMainWindow):
             print("AMradioSound.wav not found - PWM overlay won't be available")
 
         # ── Copy radio_metadata.json ──
+        # Always generate fresh metadata from the database so albums/playlists on the Pico
+        # match the current library. Never use SD card's metadata (can be stale). Overwrites
+        # whatever is on the Pico.
         _report("Copying metadata...")
-        metadata_src = None
-        if sd_root:
-            candidate = Path(sd_root) / "VintageRadio" / "radio_metadata.json"
-            if candidate.exists():
-                metadata_src = candidate
-
-        tmpdir_cleanup = None
-        if not metadata_src:
-            tmpdir = _tempfile.mkdtemp()
-            tmpdir_cleanup = tmpdir
+        tmpdir = _tempfile.mkdtemp()
+        try:
+            tmp_vintage = Path(tmpdir) / "VintageRadio"
+            tmp_vintage.mkdir(parents=True, exist_ok=True)
+            sd_manager._write_metadata(tmp_vintage)
+            metadata_src = tmp_vintage / "radio_metadata.json"
+            if metadata_src.exists():
+                r = run_mpremote(["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"])
+                if r.returncode != 0:
+                    print(f"Warning: metadata copy failed: {r.stderr or r.stdout}")
+        except Exception as e:
+            print(f"Warning: Could not generate or copy metadata: {e}")
+        finally:
             try:
-                tmp_vintage = Path(tmpdir) / "VintageRadio"
-                tmp_vintage.mkdir(parents=True, exist_ok=True)
-                sd_manager._write_metadata(tmp_vintage)
-                metadata_src = tmp_vintage / "radio_metadata.json"
-            except Exception as e:
-                print(f"Warning: Could not generate metadata: {e}")
-                metadata_src = None
-
-        if metadata_src and metadata_src.exists():
-            try:
-                run_mpremote(["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"])
-            except Exception as e:
-                print(f"Warning: metadata copy failed: {e}")
-
-        if tmpdir_cleanup:
-            try:
-                shutil.rmtree(tmpdir_cleanup)
+                shutil.rmtree(tmpdir)
             except Exception:
                 pass
+
+        # Remove stale album_state.txt on Pico so firmware starts with clean state
+        # (avoids invalid album/playlist index if metadata layout changed)
+        try:
+            run_mpremote(["exec", "import os; os.remove('VintageRadio/album_state.txt')"], timeout_sec=10)
+        except Exception:
+            pass  # File may not exist; ignore
 
         # Full reboot (as if pressing reset button) so new firmware runs from cold
         _report("Rebooting Pico...")
@@ -3024,7 +3336,11 @@ class MainWindow(QtWidgets.QMainWindow):
             progress_callback(total, total, "Done!")
         return "Installed to Pico successfully. Pico has been rebooted."
 
-    def install_to_pico(self) -> None:
+    def _install_to_pico_after_firmware(self) -> None:
+        """Called after firmware install; run app install and only prompt to retry if it failed."""
+        self.install_to_pico(after_firmware=True)
+
+    def install_to_pico(self, after_firmware: bool = False) -> None:
         """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote)."""
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
@@ -3058,7 +3374,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(str(msg), 5000)
 
         def on_error(msg):
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", f"Error:\n\n{msg}")
+            text = f"Error:\n\n{msg}"
+            if after_firmware:
+                text += "\n\nClick Setup Pico again to install the app once the Pico is connected."
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", text)
 
         dlg.on_success = on_success
         dlg.on_error = on_error

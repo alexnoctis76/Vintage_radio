@@ -646,19 +646,25 @@ class SDManager:
         if pending_tasks:
             if progress_callback:
                 progress_callback(0, total_work, f"Syncing {len(pending_tasks)} files to SD card...")
+            mappings_batch: List[tuple] = []
+            sd_paths_batch: List[tuple] = []
             with ThreadPoolExecutor(max_workers=4) as pool:
                 futures = {pool.submit(_process_one, t): t for t in pending_tasks}
                 for future in as_completed(futures):
                     status, sid, sd_path, folder_num, track_num, title = future.result()
                     if status == "ok":
-                        self.db.set_sd_mapping(sid, folder_num, track_num)
-                        self.db.update_song_sd_path(sid, sd_path)
+                        mappings_batch.append((sid, folder_num, track_num))
+                        sd_paths_batch.append((sid, sd_path if sd_path is not None else ""))
                         copied += 1
                     else:
                         skipped += 1
                     work_done += 1
                     if progress_callback:
                         progress_callback(work_done, total_work, f"Synced: {title}")
+            if mappings_batch:
+                self.db.set_sd_mappings_batch(mappings_batch)
+            if sd_paths_batch:
+                self.db.update_song_sd_paths_batch(sd_paths_batch)
         else:
             if progress_callback:
                 progress_callback(0, total_work, "All files already up to date")

@@ -230,6 +230,22 @@ class RadioCore:
             self.current_album_index = state.get('album_index', 0)
             self.current_track = state.get('track', 1)
             self.known_tracks = state.get('known_tracks', {})
+            # Clamp album/playlist index to valid range (metadata may have changed since state was saved)
+            if self.mode == MODE_PLAYLIST and self.playlists:
+                if self.current_album_index >= len(self.playlists):
+                    self.hw.log(f"Clamping playlist index {self.current_album_index} to {len(self.playlists) - 1}")
+                    self.current_album_index = max(0, len(self.playlists) - 1)
+            elif self.mode == MODE_ALBUM and self.albums:
+                if self.current_album_index >= len(self.albums):
+                    self.hw.log(f"Clamping album index {self.current_album_index} to {len(self.albums) - 1}")
+                    self.current_album_index = max(0, len(self.albums) - 1)
+            self.current_album_index = max(0, self.current_album_index)
+            # Clamp track to valid range for current album/playlist
+            tracks = self._get_current_tracks()
+            if tracks and self.current_track > len(tracks):
+                self.hw.log(f"Clamping track {self.current_track} to {len(tracks)}")
+                self.current_track = len(tracks)
+            self.current_track = max(1, self.current_track)
             self.hw.log(f"Loaded state: mode={self.mode}, album={self.current_album_index}, track={self.current_track}")
             
             # Initialize mode-specific state based on loaded mode
