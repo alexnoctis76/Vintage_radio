@@ -28,16 +28,50 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def app_data_dir() -> Path:
-    """Writable directory for db, backups.
+_DATA_DIR_NAME = "data"
 
-    When running from source: project root.
+
+def app_data_dir() -> Path:
+    """Writable directory for db, backups, libraries.
+
+    When running from source: project_root() / "data" so all DBs live in one
+    directory that can be gitignored. Migrates existing DBs from project root
+    into data/ once.
     When frozen (packaged): on macOS uses ~/Library/Application Support/Vintage Radio/
-    so the app bundle is not written to (avoids read-only or replacement issues).
-    On Windows/Linux frozen apps use the directory containing the executable.
+    so the app bundle is not written to. On Windows/Linux uses the directory
+    containing the executable.
     """
     if not getattr(sys, "frozen", False):
-        return project_root()
+        root = project_root()
+        data_dir = root / _DATA_DIR_NAME
+        # One-time migration: if DBs or libraries exist at project root, copy into data/
+        root_has_db = (root / "radio_manager.db").exists()
+        lib_src = root / "libraries"
+        root_has_libraries = lib_src.exists() and lib_src.is_dir() and any(lib_src.iterdir())
+        data_lib = data_dir / "libraries"
+        data_has_library_dbs = data_lib.exists() and any(data_lib.glob("*.db"))
+        data_needs_migration = (
+            (not (data_lib / "libraries.json").exists() and not (data_dir / "radio_manager.db").exists())
+            or (root_has_libraries and not data_has_library_dbs)
+        )
+        if data_needs_migration and (root_has_db or root_has_libraries):
+            data_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                import shutil
+                if (root / "radio_manager.db").exists():
+                    shutil.copy2(root / "radio_manager.db", data_dir / "radio_manager.db")
+                for walshm in ("radio_manager.db-wal", "radio_manager.db-shm"):
+                    p = root / walshm
+                    if p.exists():
+                        shutil.copy2(p, data_dir / walshm)
+                if lib_src.exists() and lib_src.is_dir():
+                    (data_dir / "libraries").mkdir(parents=True, exist_ok=True)
+                    for f in lib_src.iterdir():
+                        if f.is_file():
+                            shutil.copy2(f, data_dir / "libraries" / f.name)
+            except OSError:
+                pass
+        return data_dir
     try:
         import platform
         if platform.system() == "Darwin":

@@ -588,18 +588,25 @@ class TestModeWidget(QtWidgets.QWidget):
         self._check_sd_sync()
     
     def _check_sd_sync(self) -> None:
-        """Check if library is in sync with SD card and show warning if not."""
+        """Check if library is in sync with SD card and show warning if not.
+        Only show when our sync-target SD card is present (card unplugged = no warning).
+        """
+        sd_root = self.db.get_setting("sd_root")
+        stored_label = self.db.get_setting("sd_volume_label")
+        if not self.sd_manager.is_sync_target_sd_present(sd_root, stored_label):
+            self.sd_sync_warning.setVisible(False)
+            return
         results = self.sd_manager.validate_sd()
         
         # Filter out size mismatches that are due to format conversion
-        # (These are expected when files are converted to MP3)
         actual_size_mismatches = [
             item for item in results.get("size_mismatch", [])
             if item.get("reason") == "size_mismatch"
         ]
+        source_missing = results.get("source_file_missing", [])
         
-        # Count total issues (excluding format conversion size differences)
         total_issues = (
+            len(source_missing) +
             len(results.get("missing_sd_path", [])) +
             len(results.get("missing_file", [])) +
             len(actual_size_mismatches) +
@@ -607,26 +614,24 @@ class TestModeWidget(QtWidgets.QWidget):
         )
         
         if total_issues > 0:
-            # Show red warning
-            missing_sd = len(results.get("missing_sd_path", []))
-            missing_files = len(results.get("missing_file", []))
-            hash_mismatch = len(results.get("hash_mismatch", []))
-            
             warning_parts = []
-            if missing_sd > 0:
-                warning_parts.append(f"{missing_sd} missing SD paths")
-            if missing_files > 0:
-                warning_parts.append(f"{missing_files} missing files")
-            if len(actual_size_mismatches) > 0:
+            if source_missing:
+                warning_parts.append(
+                    f"{len(source_missing)} song(s) have missing source files (paths from another PC?) — re-import in Library or fix paths, then Sync to SD"
+                )
+            if results.get("missing_sd_path"):
+                warning_parts.append(f"{len(results['missing_sd_path'])} missing SD paths")
+            if results.get("missing_file"):
+                warning_parts.append(f"{len(results['missing_file'])} missing files on SD")
+            if actual_size_mismatches:
                 warning_parts.append(f"{len(actual_size_mismatches)} size mismatches")
-            if hash_mismatch > 0:
-                warning_parts.append(f"{hash_mismatch} hash mismatches")
+            if results.get("hash_mismatch"):
+                warning_parts.append(f"{len(results['hash_mismatch'])} hash mismatches")
             
-            warning_text = f"⚠️ Library out of sync with SD card: {', '.join(warning_parts)}. Sync to SD card to test with actual hardware files."
+            warning_text = "⚠️ Library out of sync with SD card: " + ". ".join(warning_parts)
             self.sd_sync_warning.setText(warning_text)
             self.sd_sync_warning.setVisible(True)
         else:
-            # All in sync
             self.sd_sync_warning.setVisible(False)
     
     def refresh_from_db(self) -> None:
@@ -1122,11 +1127,14 @@ class TestModeWidget(QtWidgets.QWidget):
         
         if not hasattr(self, '_core_initialized'):
             self._core_initialized = True
-            self.core.init()  # First boot: load state + start playback (will be delayed)
+            self.core.init()  # First boot: load state (playback requested below so it can be delayed)
         else:
-            self.core.power_on_handler()  # Resume from power off (will be delayed)
+            self.core.power_on_handler()  # Resume from power off (playback requested below so it can be delayed)
         
         self._sync_from_core()
+        
+        # Request first-track playback so it is queued in _pending_playback (delay_playback is True)
+        self.core.start_playback_for_current()
         
         # Play AM overlay first, then schedule track playback after it finishes
         if not self.audio_ready:

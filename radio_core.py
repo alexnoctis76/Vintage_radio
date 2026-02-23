@@ -1050,22 +1050,22 @@ class RadioCore:
         self.hw.stop()
         self.is_playing = False
         
-        # Enable playback delay so GUI can sequence AM overlay before track
+        # Enable playback delay so firmware can sequence AM overlay before track
         if hasattr(self.hw, 'set_delay_playback'):
             self.hw.set_delay_playback(True)
         
-        # Note: AM overlay is played by GUI layer to ensure proper sequencing
-        
-        # Resume from saved state
+        # Restore only mode and album from saved state (track/position ignored; we start from track 1)
         if self.resume_state:
             self.mode = self.resume_state.get('mode', MODE_ALBUM)
             self.current_album_index = self.resume_state.get('album_index', 0)
-            self.current_track = self.resume_state.get('track', 1)
-            start_ms = self.resume_state.get('position_ms', 0)
             self.resume_state = None
-            self._start_playback_for_current(start_ms=start_ms)
-        else:
-            self._start_playback_for_current()
+        
+        # Always start from track 1 on power-on
+        self.current_track = 1
+        if self.mode == MODE_SHUFFLE and self.shuffle_tracks:
+            self.shuffle_index = 0
+        elif self.mode == MODE_RADIO and self.radio_stations:
+            self.radio_station_index = 0
     
     # ===========================
     #   PLAYBACK HELPERS
@@ -1197,6 +1197,10 @@ class RadioCore:
         else:
             self.hw.log(f"Playback failed to start: '{title}' by {artist}")
             self.is_playing = False
+
+    def start_playback_for_current(self, start_ms=0):
+        """Request playback for the current track (public API for firmware/GUI to call after power-on or when sequencing AM overlay)."""
+        self._start_playback_for_current(start_ms=start_ms)
     
     def set_volume(self, level):
         """Set volume (0-100)."""

@@ -96,6 +96,12 @@ class VintageRadioFirmware:
         
         # Load state only; do not start playback yet (we start with AM overlay below)
         self.core.init(skip_initial_playback=True)
+        # Always start from first song of current playlist/album on power-on
+        self.core.current_track = 1
+        if self.core.mode == "shuffle" and self.core.shuffle_tracks:
+            self.core.shuffle_index = 0
+        elif self.core.mode == "radio" and self.core.radio_stations:
+            self.core.radio_station_index = 0
         
         # Report AM sound status
         if self.hw.wav_data is not None:
@@ -105,41 +111,7 @@ class VintageRadioFirmware:
             print(f"AM sound: For overlay, copy AMradioSound.wav to Pico via 'Install to Pico'")
         
         # Start with AM overlay (single start, same as baseline start_sequence_synced)
-        tr = self.core._get_current_track()
-        if tr:
-            folder = tr.get("folder", 1)
-            track = tr.get("track_number", 1)
-            title = tr.get("title", "Unknown")
-            artist = tr.get("artist", "Unknown")
-            print(f"Boot: Using track from metadata - '{title}' by {artist} (folder={folder:02d}, track={track:03d}, album_idx={self.core.current_album_index}, logical_track={self.core.current_track})")
-        else:
-            folder = self.core.current_album_index + 1
-            track = self.core.current_track
-            print(f"Boot: No track dict, using fallback - folder={folder:02d}, track={track:03d}, album_idx={self.core.current_album_index}")
-            print(f"Boot: WARNING - This means metadata wasn't loaded correctly!")
-        confirmed = self.hw.start_with_am(folder, track)
-        # Reset BUSY tracking — the overlay blocked the main loop so prev_busy
-        # may be stale (e.g. was 0 from a previous playing track). Without this,
-        # the code would see a false 0→1 edge and auto-advance immediately.
-        self.prev_busy = 1
-        self._busy_high_since = 0
-        
-        if confirmed:
-            print("Boot playback confirmed")
-        else:
-            # Match original baseline second-chance:
-            # df_reset() → df_set_vol(DFPLAYER_VOL) → df_stop() → guard → df_play → wait_busy(1500)
-            print("Boot playback not confirmed - attempting second chance")
-            self.hw._df_reset()
-            self.hw._df_set_vol(self.hw._df_volume)
-            self.hw._df_stop()
-            time.sleep_ms(POST_CMD_GUARD_MS)
-            self.hw._df_play_folder_track(folder, track)
-            if self.hw._wait_for_busy_low(1500):
-                print("Second-chance confirmed (BUSY LOW)")
-                self.hw._note_track_learned(folder, track)
-            else:
-                print("Second-chance still not confirmed (possible BUSY wiring issue)")
+        self._start_with_am_and_recovery("Boot")
     
     def handle_button(self):
         """Handle button press and release events (edge detection only).
@@ -165,22 +137,37 @@ class VintageRadioFirmware:
         
         self.last_button = curr
     
-    def _play_am_for_change(self):
-        """Play AM overlay for mode/album change. Called when delay_playback is set."""
+    def _start_with_am_and_recovery(self, context="Boot"):
+        """Start playback via AM overlay with second-chance recovery on failure."""
         tr = self.core._get_current_track()
         if tr:
             folder = tr.get('folder', 1)
             track = tr.get('track_number', 1)
             title = tr.get('title', 'Unknown')
-            print(f"AM overlay triggered: '{title}' (folder={folder}, track={track})")
+            print(f"{context}: '{title}' (folder={folder}, track={track})")
         else:
             folder = self.core.current_album_index + 1
             track = self.core.current_track
-            print(f"AM overlay triggered: folder={folder}, track={track} (no metadata)")
-        self.hw.start_with_am(folder, track)
-        # Reset BUSY tracking after blocking AM overlay (same reason as boot_sequence)
+            print(f"{context}: folder={folder}, track={track} (no metadata)")
+        confirmed = self.hw.start_with_am(folder, track)
         self.prev_busy = 1
         self._busy_high_since = 0
+        if not confirmed:
+            print(f"{context} playback not confirmed - second chance")
+            self.hw._df_reset()
+            self.hw._df_set_vol(self.hw._df_volume)
+            self.hw._df_stop()
+            time.sleep_ms(POST_CMD_GUARD_MS)
+            self.hw._df_play_folder_track(folder, track)
+            if self.hw._wait_for_busy_low(1500):
+                print(f"{context} second-chance confirmed (BUSY LOW)")
+                self.hw._note_track_learned(folder, track)
+            else:
+                print(f"{context} second-chance still not confirmed")
+    
+    def _play_am_for_change(self):
+        """Play AM overlay for mode/album change. Called when delay_playback is set."""
+        self._start_with_am_and_recovery("Mode change")
     
     def handle_track_finished(self):
         """Detect track finished via BUSY pin with debouncing.
@@ -245,22 +232,7 @@ class VintageRadioFirmware:
                 self.rail2_on = True
                 self.hw.reset_dfplayer()
                 self.core.power_on_handler()
-                
-                # Play AM overlay on power-on (use metadata for correct DFPlayer folder/track)
-                tr = self.core._get_current_track()
-                if tr:
-                    folder = tr.get('folder', 1)
-                    track = tr.get('track_number', 1)
-                    title = tr.get('title', 'Unknown')
-                    print(f"Power-on AM overlay: '{title}' (folder={folder}, track={track})")
-                else:
-                    folder = self.core.current_album_index + 1
-                    track = self.core.current_track
-                    print(f"Power-on AM overlay: folder={folder}, track={track} (no metadata)")
-                self.hw.start_with_am(folder, track)
-                # Reset BUSY tracking after blocking AM overlay
-                self.prev_busy = 1
-                self._busy_high_since = 0
+                self._start_with_am_and_recovery("Power-on")
             
             self.last_sense = sense
     

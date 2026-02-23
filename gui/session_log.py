@@ -93,6 +93,17 @@ def init_session_logging(app_version: str = "dev") -> Path:
     root_logger.addHandler(_file_handler)
     root_logger.setLevel(logging.DEBUG)
 
+    # ── Optional: verbose console logging ────────────────────
+    # Set VINTAGE_RADIO_VERBOSE=1 (or true/yes) to see DEBUG logs in the terminal as well as in the file.
+    if os.environ.get("VINTAGE_RADIO_VERBOSE", "").strip().lower() in ("1", "true", "yes"):
+        console_handler = logging.StreamHandler(_original_stdout)
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+        )
+        root_logger.addHandler(console_handler)
+        print("Verbose debug logging enabled (VINTAGE_RADIO_VERBOSE)")
+
     # ── Global exception hook ────────────────────────────────
     _original_excepthook = sys.excepthook
 

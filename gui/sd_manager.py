@@ -23,9 +23,96 @@ from .database import DatabaseManager
 from .resource_paths import resource_path
 
 
+# Volume label we set on the SD card after first sync so we can recognize it among multiple cards
+SYNC_TARGET_VOLUME_LABEL = "VINTAGERADIO"
+
+
 class SDManager:
     def __init__(self, db: DatabaseManager) -> None:
         self.db = db
+
+    @staticmethod
+    def set_sync_target_volume_label(sd_root: Path) -> bool:
+        """
+        Try to set the volume label of the given path to SYNC_TARGET_VOLUME_LABEL
+        so we can detect "our" SD card when multiple are present.
+        Returns True if we believe the label was set (or already matched).
+        """
+        try:
+            system = platform.system()
+            if system == "Windows":
+                root = str(sd_root.resolve())
+                if len(root) >= 2 and root[1] == ":":
+                    drive = root[:2]
+                    try:
+                        import ctypes
+                        from ctypes import wintypes
+                        if ctypes.windll.kernel32.SetVolumeLabelW(drive + "\\", SYNC_TARGET_VOLUME_LABEL):
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        r = subprocess.run(
+                            ["label", drive, SYNC_TARGET_VOLUME_LABEL],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        return r.returncode == 0
+                    except Exception:
+                        pass
+                return False
+            if system == "Darwin":
+                volumes = Path("/Volumes")
+                if not volumes.exists():
+                    return False
+                for item in volumes.iterdir():
+                    if not item.is_dir():
+                        continue
+                    try:
+                        if sd_root.resolve() == item.resolve():
+                            current = item.name
+                            if current == SYNC_TARGET_VOLUME_LABEL:
+                                return True
+                            r = subprocess.run(
+                                ["diskutil", "rename", current, SYNC_TARGET_VOLUME_LABEL],
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                            )
+                            return r.returncode == 0
+                    except (OSError, PermissionError):
+                        continue
+                return False
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def is_sync_target_sd_present(sd_root: Optional[str], stored_label: Optional[str]) -> bool:
+        """
+        Return True only when the SD card we sync to is actually connected and
+        visible as a removable drive. Uses detect_sd_roots() so we don't show
+        "out of sync" when the card is unplugged (path may still exist on some systems).
+        """
+        detected = SDManager.detect_sd_roots()
+        if not detected:
+            return False
+        try:
+            sd_path = Path(sd_root).resolve() if sd_root else None
+        except Exception:
+            sd_path = None
+        for path, label in detected:
+            if sd_path is not None:
+                try:
+                    pr = path.resolve()
+                    if sd_path == pr or pr in sd_path.parents or sd_path in path.parents:
+                        return True
+                except Exception:
+                    pass
+            if stored_label and label and label.strip().upper() == stored_label.strip().upper():
+                return True
+        return False
 
     @staticmethod
     def detect_sd_roots() -> List[Tuple[Path, str]]:
@@ -437,45 +524,22 @@ class SDManager:
             self._write_metadata(vintage_root)
             return 0, 0
 
-        # ── Assign each song a stable (folder, track_number) slot ──
+        # ── Assign each song a (folder, track_number) slot in library order ──
+        # Every resync (normal or clean) assigns slots in the same order as albums/playlists
+        # so that metadata and SD card layout always match.
         # DFPlayer supports track numbers 001-255 per folder.
         MAX_TRACKS_PER_FOLDER = 255
         RESERVED_FOLDER = 99  # AM WAV
 
-        # Check existing sd_mapping first so already-synced songs keep their slot
         song_slot: Dict[int, Tuple[int, int]] = {}  # song_id -> (folder, track)
-        occupied: set = set()  # (folder, track) pairs already assigned
-
-        if not force_clean:
-            for sid in used_song_ids:
-                mapping = self.db.get_sd_mapping(sid)
-                if mapping:
-                    f, t = mapping["folder_number"], mapping["track_number"]
-                    if f != RESERVED_FOLDER:
-                        song_slot[sid] = (f, t)
-                        occupied.add((f, t))
-
-        # Assign slots for any songs that don't have one yet
         next_folder = 1
         next_track = 1
-        # If there are existing slots, start after the highest used
-        if occupied:
-            max_folder = max(f for f, _ in occupied)
-            max_track_in_last = max(t for f, t in occupied if f == max_folder)
-            next_folder = max_folder
-            next_track = max_track_in_last + 1
-            if next_track > MAX_TRACKS_PER_FOLDER:
-                next_folder += 1
-                next_track = 1
 
         for sid in used_song_ids:
-            if sid in song_slot:
-                continue
             if next_folder == RESERVED_FOLDER:
                 next_folder += 1
                 next_track = 1
             song_slot[sid] = (next_folder, next_track)
-            occupied.add((next_folder, next_track))
             next_track += 1
             if next_track > MAX_TRACKS_PER_FOLDER:
                 next_folder += 1
@@ -497,6 +561,21 @@ class SDManager:
             file_path = Path(song["file_path"])
             if not file_path.exists():
                 print(f"Source file missing, skipping: {file_path}")
+                # On clean sync, clear this slot on SD so old files don't persist
+                if force_clean and sid in song_slot:
+                    folder_num, track_num = song_slot[sid]
+                    folder_path = sd_root / f"{folder_num:02d}"
+                    target_path = folder_path / f"{track_num:03d}.mp3"
+                    if target_path.exists():
+                        try:
+                            target_path.unlink(missing_ok=True)
+                            print(f"Removed stale slot (no source): {target_path}")
+                        except OSError:
+                            pass
+                    try:
+                        self.db.update_song_sd_path(sid, "")
+                    except Exception:
+                        pass
                 skipped += 1
                 continue
 
@@ -623,6 +702,8 @@ class SDManager:
             progress_callback(total_work, total_work, "Sync complete!")
 
         print(f"SD sync complete: {copied} copied, {skipped} skipped, {len(used_song_ids)} unique songs")
+        if copied == 0 and skipped > 0:
+            print("No files were copied (all sources missing?). Re-import in Library or fix file paths, then sync again.")
         return copied, skipped
 
     def _copy_am_wav_to_dfplayer_sd(self, sd_root: Path) -> bool:
@@ -882,6 +963,7 @@ class SDManager:
 
     def validate_sd(self) -> Dict[str, List[Dict[str, str]]]:
         results: Dict[str, List[Dict[str, str]]] = {
+            "source_file_missing": [],
             "missing_sd_path": [],
             "missing_file": [],
             "size_mismatch": [],
@@ -889,6 +971,13 @@ class SDManager:
         }
         songs = self.db.list_songs()
         for song in songs:
+            # Check source file first (library paths from another PC often break)
+            file_path = song["file_path"]
+            if file_path and not Path(file_path).exists():
+                results["source_file_missing"].append(
+                    {"id": str(song["id"]), "title": song["title"] or "", "path": file_path}
+                )
+                continue
             sd_path = song["sd_path"]
             if not sd_path:
                 results["missing_sd_path"].append(

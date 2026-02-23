@@ -20,7 +20,7 @@ from .database import DatabaseManager
 from .device_debug import DeviceDebugWidget
 from .library_manager import LibraryRegistry
 from .resource_paths import app_data_dir, project_root, resource_path
-from .sd_manager import SDManager
+from .sd_manager import SDManager, SYNC_TARGET_VOLUME_LABEL
 from .test_mode import TestModeWidget
 from . import sd_manager as sd_manager_module
 
@@ -1380,8 +1380,74 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_playlists_tab(), "Playlists")
         tabs.addTab(self._build_sd_tab(), "Devices")
         tabs.addTab(self.test_mode_widget, "Emulator")
-        tabs.addTab(self.device_debug_widget, "Device Debug")
+        device_tab_container = self._build_device_debug_tab()
+        self._device_debug_tab_index = tabs.count()
+        tabs.addTab(device_tab_container, "Device Debug")
+        tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(tabs)
+
+    def _build_device_debug_tab(self) -> QtWidgets.QWidget:
+        """Build Device Debug tab with optional SD/library out-of-sync warning."""
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(container)
+        self.device_sync_warning = QtWidgets.QLabel()
+        self.device_sync_warning.setWordWrap(True)
+        self.device_sync_warning.setStyleSheet("color: #c00; font-weight: bold;")
+        self.device_sync_warning.setVisible(False)
+        layout.addWidget(self.device_sync_warning)
+        layout.addWidget(self.device_debug_widget)
+        return container
+
+    def _on_tab_changed(self, index: int) -> None:
+        """When switching to Device Debug tab, check SD/library sync and show warning if needed."""
+        if index == self._device_debug_tab_index:
+            self._check_device_tab_sync()
+
+    def _check_device_tab_sync(self) -> None:
+        """If library and SD card are out of sync, show a warning on the Device Debug tab.
+        Only show when our sync-target SD card is present (so we don't warn when the card is unplugged).
+        """
+        if not self.sd_manager.is_sync_target_sd_present(
+            self.sd_root, self.db.get_setting("sd_volume_label")
+        ):
+            self.device_sync_warning.setVisible(False)
+            return
+        results = self.sd_manager.validate_sd()
+        actual_size_mismatches = [
+            item for item in results.get("size_mismatch", [])
+            if item.get("reason") == "size_mismatch"
+        ]
+        source_missing = results.get("source_file_missing", [])
+        total_issues = (
+            len(source_missing) +
+            len(results.get("missing_sd_path", [])) +
+            len(results.get("missing_file", [])) +
+            len(actual_size_mismatches) +
+            len(results.get("hash_mismatch", []))
+        )
+        if total_issues > 0:
+            parts = []
+            if source_missing:
+                parts.append(
+                    f"{len(source_missing)} song(s) have missing source files (paths from another PC?) — re-import in Library or fix paths, then Sync to SD"
+                )
+            n = len(results.get("missing_sd_path", []))
+            if n:
+                parts.append(f"{n} missing SD paths")
+            n = len(results.get("missing_file", []))
+            if n:
+                parts.append(f"{n} missing files on SD")
+            if actual_size_mismatches:
+                parts.append(f"{len(actual_size_mismatches)} size mismatches")
+            n = len(results.get("hash_mismatch", []))
+            if n:
+                parts.append(f"{n} hash mismatches")
+            self.device_sync_warning.setText(
+                "⚠️ Library and SD card may be out of sync: " + ". ".join(parts)
+            )
+            self.device_sync_warning.setVisible(True)
+        else:
+            self.device_sync_warning.setVisible(False)
 
     def _build_library_tab(self) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
@@ -1873,8 +1939,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 if existing is None:
                     existing = db.get_song_by_path(metadata["file_path"])
                 if existing is not None:
+                    # Fix stale path if the file now lives somewhere else (e.g. different PC)
+                    old_fp = existing["file_path"]
+                    new_fp = metadata["file_path"]
+                    if new_fp != old_fp and Path(new_fp).exists() and not Path(old_fp).exists():
+                        db.update_song(int(existing["id"]), {"file_path": new_fp})
                     skipped += 1
-                    # Still track the ID so callers can add it to collections
                     added_ids.append(int(existing["id"]))
                     continue
                 song_id = db.add_song(
@@ -1911,8 +1981,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if existing is None:
                     existing = self.db.get_song_by_path(metadata["file_path"])
                 if existing is not None:
+                    old_fp = existing["file_path"]
+                    new_fp = metadata["file_path"]
+                    if new_fp != old_fp and Path(new_fp).exists() and not Path(old_fp).exists():
+                        self.db.update_song(int(existing["id"]), {"file_path": new_fp})
                     skipped += 1
-                    # Still track the ID so callers can add it to collections
                     added_ids.append(int(existing["id"]))
                     continue
                 song_id = self.db.add_song(
@@ -2348,8 +2421,89 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_root = self._resolve_sd_root()
         if not sd_root:
             return
-        
-        # Ask user if they want a clean install (force re-sync all files)
+
+        # ── Pre-sync: check for missing source files ──
+        missing_source_songs = []
+        recoverable_from_sd = []
+        all_songs = self.db.list_songs()
+        for song in all_songs:
+            fp = song["file_path"]
+            if fp and not Path(fp).exists():
+                mapping = self.db.get_sd_mapping(song["id"])
+                if mapping:
+                    slot_path = sd_root / f"{mapping['folder_number']:02d}" / f"{mapping['track_number']:03d}.mp3"
+                    if slot_path.exists():
+                        recoverable_from_sd.append((song["id"], song["title"] or "Unknown", str(slot_path)))
+                        continue
+                missing_source_songs.append(song["title"] or song["original_filename"] or "Unknown")
+
+        # If there are files on SD we can adopt, offer to do that first
+        if recoverable_from_sd:
+            names = "\n".join(f"  - {title}" for _, title, _ in recoverable_from_sd[:10])
+            more = f"\n  ... and {len(recoverable_from_sd) - 10} more" if len(recoverable_from_sd) > 10 else ""
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Recover from SD card",
+                f"{len(recoverable_from_sd)} song(s) have missing source files on this PC, "
+                f"but copies already exist on the SD card:\n\n{names}{more}\n\n"
+                "Link library to the SD card copies so they can be synced in the future?\n"
+                "(This updates the library paths to point to the SD card.)",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.Yes,
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                for song_id, title, slot_path in recoverable_from_sd:
+                    self.db.update_song(song_id, {"file_path": slot_path})
+                    self.db.update_song_sd_path(song_id, slot_path)
+                self.statusBar().showMessage(
+                    f"Linked {len(recoverable_from_sd)} song(s) to SD card copies.", 5000
+                )
+                missing_source_songs = []  # Re-check after recovery
+                for song in all_songs:
+                    fp = song["file_path"]
+                    if fp and not Path(fp).exists():
+                        mapping = self.db.get_sd_mapping(song["id"])
+                        if mapping:
+                            slot_path = sd_root / f"{mapping['folder_number']:02d}" / f"{mapping['track_number']:03d}.mp3"
+                            if slot_path.exists():
+                                continue
+                        missing_source_songs.append(song["title"] or "Unknown")
+
+        # If there are still songs with no source anywhere, warn clearly
+        if missing_source_songs:
+            total = len(all_songs)
+            n_missing = len(missing_source_songs)
+            names = "\n".join(f"  - {t}" for t in missing_source_songs[:10])
+            more = f"\n  ... and {n_missing - 10} more" if n_missing > 10 else ""
+            if n_missing == total:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Cannot Sync — All Source Files Missing",
+                    f"None of the {total} song(s) in your library can be found on this computer.\n\n"
+                    f"Paths point to another machine:\n{names}{more}\n\n"
+                    "To fix this:\n"
+                    "1. Go to Library tab\n"
+                    "2. Remove the broken entries (select all → Remove Selected)\n"
+                    "3. Import your music files from this PC (Import Files / Import Folder)\n"
+                    "4. Re-add songs to your albums/playlists\n"
+                    "5. Then Sync to SD again",
+                )
+                return
+            else:
+                reply = QtWidgets.QMessageBox.warning(
+                    self,
+                    "Missing Source Files",
+                    f"{n_missing} of {total} song(s) have missing source files and will NOT be copied:\n\n"
+                    f"{names}{more}\n\n"
+                    "Continue syncing the remaining songs?\n\n"
+                    "(Fix missing songs: Library → Remove broken entries, then re-import from this PC.)",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+                    QtWidgets.QMessageBox.StandardButton.Yes,
+                )
+                if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
+                    return
+
+        # ── Ask for normal vs clean sync ──
         force_clean = False
         reply = QtWidgets.QMessageBox.question(
             self,
@@ -2359,7 +2513,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Click 'Yes' for normal sync (skips existing files).\n"
             "Click 'No' for clean install (re-syncs all files).",
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Yes
+            QtWidgets.QMessageBox.StandardButton.Yes,
         )
         if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
             return
@@ -2380,9 +2534,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def on_success(result):
             copied, skipped = result
-            self.statusBar().showMessage(
-                f"SD sync complete. Copied: {copied}, Skipped: {skipped}", 5000
-            )
+            if skipped > 0 and copied == 0:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Sync Complete — No Files Copied",
+                    f"No music files were copied to the SD card.\n"
+                    f"{skipped} file(s) were skipped (source missing or already up to date).\n\n"
+                    "If songs are missing, re-import them in the Library tab.",
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"SD sync complete. Copied: {copied}, Skipped: {skipped}", 5000
+                )
+                # Mark this SD as our sync target (set volume label so we recognize it when multiple cards are present)
+                if self.sd_root:
+                    try:
+                        if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
+                            self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                    except Exception:
+                        pass
             if hasattr(self, 'test_mode_widget') and self.test_mode_widget:
                 self.test_mode_widget.refresh_from_db()
 
@@ -2731,8 +2901,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("radio_core.py", "radio_core.py"),
             ("components/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         ]
-        # Total steps: mkdir×2 + files + AM WAV + metadata
-        total = 2 + len(files_to_copy) + 1 + 1
+        # Total steps: mkdir×2 + files + AM WAV + metadata + reboot
+        total = 2 + len(files_to_copy) + 1 + 1 + 1
         step = 0
 
         def _report(msg: str):
@@ -2758,11 +2928,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 timeout=timeout_sec, creationflags=creation_flags, env=env,
             )
 
+        def run_mpremote_with_retry(args: List[str], timeout_sec: int = 30):
+            """Run mpremote; if it fails with 'no device found', wait 3s and retry once (Pico may still be re-enumerating after flash/reboot)."""
+            r = run_mpremote(args, timeout_sec=timeout_sec)
+            if r.returncode != 0:
+                err = (r.stderr or "") + (r.stdout or "")
+                if "no device found" in err.lower():
+                    import time
+                    time.sleep(3)
+                    r = run_mpremote(args, timeout_sec=timeout_sec)
+            return r
+
         # ── Create directories ──
         _report("Creating directories on Pico...")
         for dirname in ("components", "VintageRadio"):
             try:
-                run_mpremote(["exec", f"import os; os.mkdir('{dirname}')"], timeout_sec=15)
+                run_mpremote_with_retry(["exec", f"import os; os.mkdir('{dirname}')"], timeout_sec=15)
             except Exception:
                 pass  # directory may already exist
         step = 2
@@ -2773,7 +2954,7 @@ class MainWindow(QtWidgets.QMainWindow):
             src = root / local
             if not src.exists():
                 continue
-            r = run_mpremote(["cp", str(src), f":{remote}"])
+            r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
             if r.returncode != 0:
                 raise RuntimeError(
                     f"Failed to copy {local}.\n\n"
@@ -2832,9 +3013,16 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        # Full reboot (as if pressing reset button) so new firmware runs from cold
+        _report("Rebooting Pico...")
+        try:
+            run_mpremote(["exec", "import machine; machine.reset()"], timeout_sec=5)
+        except Exception as e:
+            print(f"Note: Could not trigger reboot: {e}")
+
         if progress_callback:
             progress_callback(total, total, "Done!")
-        return "Installed to Pico successfully (including metadata files)."
+        return "Installed to Pico successfully. Pico has been rebooted."
 
     def install_to_pico(self) -> None:
         """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote)."""

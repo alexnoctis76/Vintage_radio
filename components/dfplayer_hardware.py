@@ -585,6 +585,15 @@ class DFPlayerHardware(HardwareInterface):
         # Ensure volume is at target after fade
         self._df_set_vol(self._df_volume)
         print(f"AM: PWM overlay complete, vol={self._df_volume}, confirmed={confirmed}")
+        # If BUSY never went LOW, retry play once (helps when nothing plays after AM on some hardware)
+        if not confirmed and folder is not None and track is not None:
+            print("AM: Playback not confirmed, retrying play command...")
+            self._df_stop()
+            time.sleep_ms(POST_CMD_GUARD_MS)
+            self._df_play_folder_track(folder, track)
+            if self._wait_for_busy_low(2000):
+                confirmed = True
+                print("AM: Retry confirmed (BUSY LOW)")
         return confirmed
     
     def _play_am_dfplayer_sequential(self, folder=None, track=None):
@@ -648,17 +657,18 @@ class DFPlayerHardware(HardwareInterface):
     def save_state(self, state_dict):
         """Persist state to SD card."""
         try:
-            # Format compatible with old album_state.txt
+            # Format compatible with old album_state.txt; optional ;mode= for shuffle/playlist/radio
             album_idx = state_dict.get('album_index', 0) + 1  # 1-based for DFPlayer folders
             track = state_dict.get('track', 1)
             known = state_dict.get('known_tracks', {})
+            mode = state_dict.get('mode', 'album')
             
             track_str = ",".join("%d:%d" % (a, c) for a, c in sorted(known.items()))
-            payload = f"{album_idx},{track};tracks={track_str}"
+            payload = f"{album_idx},{track};tracks={track_str};mode={mode}"
             
             with open(ALBUM_FILE, "w") as f:
                 f.write(payload)
-            print(f"Saved state: album={album_idx} (idx={album_idx-1}), track={track}, mode={state_dict.get('mode', 'album')}")
+            print(f"Saved state: album={album_idx} (idx={album_idx-1}), track={track}, mode={mode}")
         except Exception as e:
             print(f"State save error: {e}")
     
@@ -681,22 +691,28 @@ class DFPlayerHardware(HardwareInterface):
             track = int(t_str)
             
             known_tracks = {}
-            if len(parts) > 1 and parts[1].startswith("tracks="):
-                track_part = parts[1][7:]
-                if track_part:
-                    for pair in track_part.split(","):
-                        if not pair:
-                            continue
-                        a, c = pair.split(":")
-                        known_tracks[int(a)] = int(c)
+            mode = 'album'
+            for i in range(1, len(parts)):
+                if parts[i].startswith("tracks="):
+                    track_part = parts[i][7:]
+                    if track_part:
+                        for pair in track_part.split(","):
+                            if not pair:
+                                continue
+                            a, c = pair.split(":")
+                            known_tracks[int(a)] = int(c)
+                elif parts[i].startswith("mode="):
+                    mode = parts[i][5:].strip().lower()
+                    if mode not in ('album', 'playlist', 'shuffle', 'radio'):
+                        mode = 'album'
             
             state = {
-                'mode': 'album',
+                'mode': mode,
                 'album_index': album_idx,
                 'track': track,
                 'known_tracks': known_tracks,
             }
-            print(f"Loaded state: album_idx={album_idx} (folder={album_idx+1}), track={track}, known_tracks={len(known_tracks)}")
+            print(f"Loaded state: album_idx={album_idx} (folder={album_idx+1}), track={track}, mode={mode}, known_tracks={len(known_tracks)}")
             
         except Exception as e:
             print("No valid album_state.txt:", e)
