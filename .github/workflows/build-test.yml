@@ -104,6 +104,15 @@ jobs:
           test -f "dist/Vintage Radio.app/Contents/Info.plist" || (echo "Info.plist missing" && exit 1)
           echo "Vintage Radio.app bundle OK"
 
+      - name: Strip macOS app bundle (reduce size)
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/Vintage Radio.app"
+          strip -x "$APP/Contents/MacOS/Vintage Radio" 2>/dev/null || true
+          find "$APP" -name "*.dylib" -exec strip -x {} \; 2>/dev/null || true
+          find "$APP" -name "*.so" -exec strip -x {} \; 2>/dev/null || true
+          echo "Stripped macOS app bundle"
+
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
