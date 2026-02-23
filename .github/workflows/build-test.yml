@@ -48,70 +48,13 @@ jobs:
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
-      - name: Generate macOS .icns icon (macOS only)
-        if: runner.os == 'macOS'
-        run: |
-          ICONSET='gui/resources/vintage_radio.iconset'
-          ICNS='gui/resources/vintage_radio.icns'
-          rm -rf "$ICONSET"
-          if [ -f 'gui/resources/vintage_radio.svg' ]; then
-            echo "Generating .icns from SVG..."
-            python3 -c "
-          from PyQt6.QtSvg import QSvgRenderer
-          from PyQt6.QtGui import QImage, QPainter
-          from PyQt6.QtCore import QSize, Qt
-          import os
-          renderer = QSvgRenderer('gui/resources/vintage_radio.svg')
-          os.makedirs('$ICONSET', exist_ok=True)
-          for size in [16, 32, 64, 128, 256, 512, 1024]:
-              img = QImage(QSize(size, size), QImage.Format.Format_ARGB32)
-              img.fill(Qt.GlobalColor.transparent)
-              p = QPainter(img)
-              renderer.render(p)
-              p.end()
-              if size <= 512:
-                  img.save(f'$ICONSET/icon_{size}x{size}.png')
-              if size >= 32:
-                  half = size // 2
-                  img.save(f'$ICONSET/icon_{half}x{half}@2x.png')
-          " && iconutil -c icns "$ICONSET" -o "$ICNS" && rm -rf "$ICONSET" && echo "Icon from SVG OK"
-          elif [ -f 'gui/resources/vintage_radio.png' ]; then
-            echo "Generating .icns from PNG..."
-            mkdir -p "$ICONSET"
-            for size in 16 32 64 128 256 512; do
-              sips -z $size $size gui/resources/vintage_radio.png --out "$ICONSET/icon_${size}x${size}.png"
-              [ $size -ge 32 ] && half=$((size/2)) && sips -z $half $half gui/resources/vintage_radio.png --out "$ICONSET/icon_${half}x${half}@2x.png"
-            done
-            iconutil -c icns "$ICONSET" -o "$ICNS"
-            rm -rf "$ICONSET"
-            echo "Icon from PNG OK"
-          else
-            echo "No SVG or PNG icon found; build will use spec default"
-          fi
-
-      - name: Clean build directories (macOS only)
-        if: runner.os == 'macOS'
-        run: rm -rf dist build
-
-      - name: Build with PyInstaller
+      - name: Build Windows with PyInstaller
+        if: runner.os == 'Windows'
         run: pyinstaller vintage_radio.spec --noconfirm
 
-      - name: Verify macOS app bundle
+      - name: Build macOS app (same as local: build_macos.sh)
         if: runner.os == 'macOS'
-        run: |
-          test -d "dist/Vintage Radio.app" || (echo "Expected dist/Vintage Radio.app not found. dist contents:" && ls -la dist && exit 1)
-          test -f "dist/Vintage Radio.app/Contents/MacOS/Vintage Radio" || (echo "App executable missing" && exit 1)
-          test -f "dist/Vintage Radio.app/Contents/Info.plist" || (echo "Info.plist missing" && exit 1)
-          echo "Vintage Radio.app bundle OK"
-
-      - name: Strip macOS app bundle (reduce size)
-        if: runner.os == 'macOS'
-        run: |
-          APP="dist/Vintage Radio.app"
-          strip -x "$APP/Contents/MacOS/Vintage Radio" 2>/dev/null || true
-          find "$APP" -name "*.dylib" -exec strip -x {} \; 2>/dev/null || true
-          find "$APP" -name "*.so" -exec strip -x {} \; 2>/dev/null || true
-          echo "Stripped macOS app bundle"
+        run: bash build_macos.sh --no-dmg
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
