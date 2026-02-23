@@ -93,6 +93,10 @@ class HardwareInterface:
         """Return current playback position in milliseconds."""
         raise NotImplementedError
     
+    def check_track_finished_uart(self):
+        """Optional: True if track-finished was received via UART (e.g. DFPlayer 0x3D). Default: False."""
+        return False
+    
     def play_am_overlay(self):
         """Play the AM radio sound overlay."""
         raise NotImplementedError

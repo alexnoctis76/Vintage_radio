@@ -1240,6 +1240,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             import time
             try:
                 self._debug_log("Streaming started on persistent connection", "info")
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_stream_output",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, "[Tip: If no output appears, click 'Soft Reset' to restart the device and see boot messages.]")
+                )
                 self._serial_error_count = 0
                 buffer = ""
                 
@@ -1274,8 +1280,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                             waiting = ser.in_waiting
                         except (serial.SerialException, OSError) as e:
                             self._serial_error_count += 1
-                            if self._serial_error_count > 10:
-                                self._debug_log("Too many serial errors, stopping stream", "error")
+                            if self._serial_error_count > 25:
+                                self._debug_log(f"Too many serial errors ({self._serial_error_count}), stopping stream: {e}", "error")
                                 break
                             time.sleep(1.0)
                             continue
@@ -1304,7 +1310,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                                     buffer = ""
                             except (serial.SerialException, OSError) as e:
                                 self._serial_error_count += 1
-                                if self._serial_error_count > 10:
+                                if self._serial_error_count > 25:
+                                    self._debug_log(f"Too many serial read errors, stopping stream: {e}", "error")
                                     break
                                 time.sleep(0.5)
                                 continue
@@ -1317,7 +1324,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     
                     except Exception as e:
                         self._serial_error_count += 1
-                        if self._serial_error_count > 20:
+                        if self._serial_error_count > 40:
+                            self._debug_log(f"Too many stream errors ({self._serial_error_count}), stopping: {e}", "error")
                             break
                         time.sleep(0.5)
                         continue

@@ -57,6 +57,25 @@ BUSY_CONFIRM_MS = 1800
 POST_CMD_GUARD_MS = 120
 ALBUM_PROBE_MS  = 650
 
+# DFPlayer response (command) codes (from DFPlayer TX -> Pico RX)
+DF_RESP_ACK = 0x41           # Command acknowledgment (when feedback=0x01)
+DF_RESP_ERROR = 0x40         # Error occurred, param_lo = error code
+DF_RESP_TRACK_FINISHED = 0x3D  # Track finished on TF card, p1:p2 = track number
+DF_RESP_INIT = 0x3F         # Init/Reset complete, p2 = device bitmap
+DF_RESP_MEDIA_INSERTED = 0x3A
+DF_RESP_MEDIA_EJECTED = 0x3B
+DF_RESP_STATUS = 0x42       # Response to status query: p1=device, p2=0 stopped / 1 playing
+DF_RESP_VOLUME = 0x43       # Response to volume query: p2 = 0..30
+DF_RESP_TF_FILES = 0x48     # Response: total TF files (p1<<8|p2)
+DF_RESP_CURRENT_TRACK = 0x4C  # Response: current track on TF (p1<<8|p2)
+
+# DFPlayer 0x40 error codes (param_lo)
+DF_ERROR_MSGS = {
+    0x01: "Module busy", 0x02: "Sleep mode", 0x03: "Serial receiving error",
+    0x04: "Checksum error", 0x05: "File index out of bound", 0x06: "File not found",
+    0x07: "Insert TF card",
+}
+
 MID = 32768
 
 # ===========================
@@ -113,6 +132,16 @@ class DFPlayerHardware(HardwareInterface):
         
         self.uart = UART(0, baudrate=9600, tx=Pin(PIN_UART_TX), rx=Pin(PIN_UART_RX))
         
+        # Two-way UART state (must be initialized before any _df_send / _df_read_pending calls)
+        self._uart_rx_buf = bytearray()
+        self._track_finished_via_uart = False
+        self._track_finished_track_num = None
+        self._last_error_code = None
+        self._pending_ack = False
+        self._query_status_result = None
+        self._query_current_track_result = None
+        self._query_file_count_result = None
+        
         # GPIO 3 (PIN_AUDIO) is used for PWM AM overlay only.
         # Start it as high-impedance input so it doesn't inject noise
         # into the amplifier during normal DFPlayer playback.
@@ -120,8 +149,9 @@ class DFPlayerHardware(HardwareInterface):
         self.pwm = None
         self.tim = None
         
-        # Reset DFPlayer first to ensure it's in a known state
-        # This is critical for the LED to light up and for proper initialization
+        # Give DFPlayer time to power up before first UART (avoids missed ACKs / no play)
+        time.sleep_ms(400)
+        # Reset DFPlayer to ensure it's in a known state
         self._df_reset()
         
         # Volume — matches original baseline: fixed at DFPLAYER_VOL (28)
@@ -134,8 +164,6 @@ class DFPlayerHardware(HardwareInterface):
         self.ignore_busy_until = 0
         
         # Load WAV data for PWM-based AM overlay (plays through GPIO 3)
-        # If loaded, this enables simultaneous overlay: PWM static + DFPlayer music fade-in
-        # If not loaded, falls back to DFPlayer-only sequential AM playback (folder 99)
         self.wav_data = None
         self.wav_sr = 8000
         self.lut = None
@@ -148,9 +176,9 @@ class DFPlayerHardware(HardwareInterface):
         self._known_tracks = {}
         
         # AM sound DFPlayer folder/track (loaded from metadata)
-        self._am_folder = 99   # Default: folder 99
-        self._am_track = 1     # Default: track 1 (001.wav)
-        self._am_duration_ms = 3000  # How long to play AM sound before switching to music
+        self._am_folder = 99
+        self._am_track = 1
+        self._am_duration_ms = 3000
         
         # Flag to prevent duplicate playback when AM overlay is playing
         self._am_overlay_active = False
@@ -239,21 +267,26 @@ class DFPlayerHardware(HardwareInterface):
     #   DFPLAYER COMMANDS
     # ===========================
     
-    def _df_send(self, cmd, p1=0, p2=0):
-        """Send a command to DFPlayer."""
-        pkt = bytearray([0x7E, 0xFF, 0x06, cmd, 0x00, p1 & 0xFF, p2 & 0xFF])
+    def _df_send(self, cmd, p1=0, p2=0, feedback=False):
+        """Send a command to DFPlayer.
+        
+        feedback=False (default): byte 4 = 0x00, fire-and-forget. Matches original
+            working firmware. DFPlayer still sends unsolicited events (0x3D track
+            finished, 0x40 error, 0x3F init) regardless.
+        feedback=True: byte 4 = 0x01. Use ONLY for query commands (0x42, 0x4C, 0x48)
+            that need a specific response. Many DFPlayer clones misbehave with 0x01.
+        """
+        fb = 0x01 if feedback else 0x00
+        pkt = bytearray([0x7E, 0xFF, 0x06, cmd, fb, p1 & 0xFF, p2 & 0xFF])
         csum = -sum(pkt[1:7]) & 0xFFFF
         pkt.append((csum >> 8) & 0xFF)
         pkt.append(csum & 0xFF)
         pkt.append(0xEF)
-        bytes_written = self.uart.write(pkt)
-        
-        # Debug: log command details
-        cmd_name = {0x0F: "PLAY_FOLDER_TRACK", 0x06: "SET_VOLUME", 0x3F: "RESET", 0x16: "STOP", 0x03: "SET_TIME"}.get(cmd, f"CMD_0x{cmd:02X}")
-        print(f"DF: Sending {cmd_name} - cmd=0x{cmd:02X}, p1={p1}, p2={p2}, packet_len={len(pkt)}, bytes_written={bytes_written}")
-        
-        if bytes_written != len(pkt):
-            print(f"WARNING: UART write mismatch - wrote {bytes_written}, expected {len(pkt)}")
+        n = self.uart.write(pkt)
+        if n != len(pkt):
+            print(f"UART WRITE ERROR: wrote {n}/{len(pkt)} bytes for cmd 0x{cmd:02X}")
+        # DFPlayer needs ~20-30ms to process each command before the next one.
+        # Without this, back-to-back commands get dropped silently.
         time.sleep_ms(30)
     
     def _df_reset(self):
@@ -261,11 +294,13 @@ class DFPlayerHardware(HardwareInterface):
         print("DF: RESET")
         self._df_send(0x3F, 0x00, 0x00)
         time.sleep_ms(800)
+        self._df_read_pending()
     
     def _df_set_vol(self, v):
         """Set DFPlayer volume (0-30)."""
         v = max(0, min(30, v))
-        print("DF: set volume", v)
+        if not getattr(self, '_am_overlay_active', False):
+            print("DF: set volume", v)
         self._df_send(0x06, 0x00, v)
     
     def _df_play_folder_track(self, folder, track):
@@ -331,8 +366,141 @@ class DFPlayerHardware(HardwareInterface):
         self._df_send(0x16, 0, 0)
     
     # ===========================
+    #   DFPLAYER RESPONSE PARSING (two-way UART)
+    # ===========================
+    
+    def _df_read_response(self):
+        """Read one 10-byte DFPlayer response packet from UART if available.
+        
+        Handles partial reads and resync (scan for 0x7E). Returns (cmd, param_hi, param_lo)
+        or None if no complete packet. Updates _uart_rx_buf with any leftover bytes.
+        """
+        n = self.uart.any()
+        if n > 0:
+            data = self.uart.read(n)
+            if data:
+                self._uart_rx_buf.extend(data)
+        # Need at least 10 bytes for a packet
+        while len(self._uart_rx_buf) >= 10:
+            # Find start byte
+            start = -1
+            for i in range(len(self._uart_rx_buf)):
+                if self._uart_rx_buf[i] == 0x7E:
+                    start = i
+                    break
+            if start < 0:
+                self._uart_rx_buf.clear()
+                return None
+            if start > 0:
+                # Discard bytes before start
+                del self._uart_rx_buf[:start]
+            if len(self._uart_rx_buf) < 10:
+                return None
+            pkt = self._uart_rx_buf[:10]
+            # Validate: byte 1 = 0xFF, byte 2 = 0x06, byte 9 = 0xEF
+            if pkt[1] != 0xFF or pkt[2] != 0x06 or pkt[9] != 0xEF:
+                del self._uart_rx_buf[:1]
+                continue
+            csum = -sum(pkt[1:7]) & 0xFFFF
+            if (pkt[7] != ((csum >> 8) & 0xFF)) or (pkt[8] != (csum & 0xFF)):
+                del self._uart_rx_buf[:1]
+                continue
+            cmd, p1, p2 = pkt[3], pkt[5], pkt[6]
+            del self._uart_rx_buf[:10]
+            return (cmd, p1, p2)
+        return None
+    
+    def _df_read_pending(self):
+        """Drain all available DFPlayer responses and dispatch unsolicited events.
+        
+        Sets _track_finished_via_uart / _track_finished_track_num on 0x3D,
+        _last_error_code and logs on 0x40, _pending_ack on 0x41, and stores
+        query results for 0x42/0x4C/0x48. Call this every main loop iteration.
+        """
+        while True:
+            r = self._df_read_response()
+            if r is None:
+                break
+            cmd, p1, p2 = r
+            if cmd == DF_RESP_TRACK_FINISHED:
+                track_num = (p1 << 8) | p2
+                self._track_finished_via_uart = True
+                self._track_finished_track_num = track_num
+                print("DF: UART track finished, track=", track_num)
+            elif cmd == DF_RESP_ERROR:
+                self._last_error_code = p2
+                err_msg = DF_ERROR_MSGS.get(p2, "Unknown error 0x%02X" % p2)
+                print("DF: Error:", err_msg)
+            elif cmd == DF_RESP_ACK:
+                self._pending_ack = True
+            elif cmd == DF_RESP_INIT:
+                print("DF: Init complete, device bitmap=", p2)
+            elif cmd == DF_RESP_STATUS:
+                self._query_status_result = p2  # 0=no play, 1=play
+            elif cmd == DF_RESP_CURRENT_TRACK:
+                self._query_current_track_result = (p1 << 8) | p2
+            elif cmd == DF_RESP_TF_FILES:
+                self._query_file_count_result = (p1 << 8) | p2
+    
+    def check_track_finished_uart(self):
+        """Return True if a track-finished event was received via UART (0x3D).
+        Caller should clear the event by consuming it (see consume_track_finished_uart)."""
+        return self._track_finished_via_uart
+    
+    def consume_track_finished_uart(self):
+        """Clear the UART track-finished flag and return the track number that finished (or None)."""
+        track_num = self._track_finished_track_num
+        self._track_finished_via_uart = False
+        self._track_finished_track_num = None
+        return track_num
+    
+    def query_status(self):
+        """Query playback status (0x42). Returns 0=stopped, 1=playing, or None on timeout."""
+        self._query_status_result = None
+        self._df_send(0x42, 0, 0, feedback=True)
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < 200:
+            self._df_read_pending()
+            if self._query_status_result is not None:
+                return self._query_status_result
+            time.sleep_ms(10)
+        return None
+    
+    def query_current_track(self):
+        """Query current track on TF card (0x4C). Returns track number or None."""
+        self._query_current_track_result = None
+        self._df_send(0x4C, 0, 0, feedback=True)
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < 200:
+            self._df_read_pending()
+            if self._query_current_track_result is not None:
+                return self._query_current_track_result
+            time.sleep_ms(10)
+        return None
+    
+    def query_file_count(self):
+        """Query total file count on TF card (0x48). Returns count or None."""
+        self._query_file_count_result = None
+        self._df_send(0x48, 0, 0, feedback=True)
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < 200:
+            self._df_read_pending()
+            if self._query_file_count_result is not None:
+                return self._query_file_count_result
+            time.sleep_ms(10)
+        return None
+    
+    def get_last_error_code(self):
+        """Return last DFPlayer error code (0x40) or None. Cleared when next error arrives."""
+        return self._last_error_code
+    
+    # ===========================
     #   BUSY DETECTION
     # ===========================
+    # We still need BUSY even with 2-way UART because play commands use feedback=False
+    # (fire-and-forget). DFPlayer does not send ACK (0x41) for play. It may send 0x40
+    # on error, but many clones do not send it reliably or send it late. BUSY is the
+    # only definitive hardware signal that playback has actually started.
     
     def _wait_for_busy_low(self, timeout_ms=BUSY_CONFIRM_MS):
         """Wait for BUSY pin to go LOW (indicating playback started)."""
@@ -369,32 +537,51 @@ class DFPlayerHardware(HardwareInterface):
         print(f"play_track: Starting folder={folder}, track={track}, start_ms={start_ms}")
         self._df_stop()
         time.sleep_ms(POST_CMD_GUARD_MS)
-        # Ensure volume is at DFPLAYER_VOL before playing
         self._df_set_vol(self._df_volume)
-        # Guard between set_vol and play — DFPlayer needs time to process
         time.sleep_ms(POST_CMD_GUARD_MS)
         self._df_play_folder_track(folder, track)
         
-        # Wait for playback to start
-        if self._wait_for_busy_low():
-            print("BUSY went LOW -> playback started")
+        # Poll UART and BUSY in parallel: catch 0x40 errors (which may arrive late)
+        # and wait for BUSY LOW (definitive playback confirmation)
+        self._last_error_code = None
+        confirmed = False
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < BUSY_CONFIRM_MS:
+            self._df_read_pending()
+            if self._last_error_code is not None:
+                err_msg = DF_ERROR_MSGS.get(self._last_error_code, f"Unknown 0x{self._last_error_code:02X}")
+                print(f"DF: play rejected (0x{self._last_error_code:02X}): {err_msg}")
+                self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
+                return False
+            if self.pin_busy.value() == 0:
+                confirmed = True
+                break
+            time.sleep_ms(25)
+        
+        if confirmed:
+            print("DF: BUSY went LOW -> playback started")
+        elif self.query_status() == 1:
+            confirmed = True
+            print("DF: query_status -> playing")
+        
+        if confirmed:
             self._note_track_learned(folder, track)
-            # Ignore BUSY for 4s after play — DFPlayer clones can glitch BUSY
-            # HIGH briefly during the first few seconds of playback.
             self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
-            
-            # If start_ms > 0, seek to that position
             if start_ms > 0:
                 start_seconds = start_ms // 1000
-                time.sleep_ms(100)  # Small delay to ensure playback has started
+                time.sleep_ms(80)
                 self._df_set_time(start_seconds)
                 print(f"DF: seeking to {start_seconds}s ({start_ms}ms)")
-            
             return True
         
-        print("No BUSY LOW -> not confirmed")
-        # Still set ignore window to prevent false track-finished triggers
-        # (DFPlayer may start playing after the confirmation timeout)
+        print(f"DF: playback not confirmed (folder={folder}, track={track})")
+        print(f"DF: Expected SD path: {folder:02d}/{track:03d}.mp3")
+        if self._last_error_code is not None:
+            err_msg = DF_ERROR_MSGS.get(self._last_error_code, f"Unknown 0x{self._last_error_code:02X}")
+            print(f"DF: UART error received: 0x{self._last_error_code:02X} ({err_msg})")
+        else:
+            print("DF: No UART error received; BUSY stayed HIGH (DFPlayer may not have responded)")
+            print("DF: Tip: If UART errors never appear, ensure DFPlayer TX is wired to Pico GP1 (UART RX)")
         self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
         return False
     
@@ -475,10 +662,17 @@ class DFPlayerHardware(HardwareInterface):
             # from SD card BEFORE starting the 8kHz Timer ISR. Without this,
             # the ISR can starve the CPU and interfere with DFPlayer startup.
             time.sleep_ms(300)
+            # Check for DFPlayer errors (e.g. file not found)
+            self._last_error_code = None
+            self._df_read_pending()
+            if self._last_error_code is not None:
+                print(f"AM: DFPlayer error after play cmd: code={self._last_error_code}")
             # Check if BUSY already went LOW during that wait
             if self.pin_busy.value() == 0:
                 confirmed = True
                 print("AM: BUSY LOW -> music playing (confirmed before overlay)")
+            else:
+                print(f"AM: BUSY still HIGH after play cmd (pin={self.pin_busy.value()})")
         
         # Start PWM AM static sound simultaneously
         print("AM: Starting PWM static on GPIO", PIN_AUDIO)
@@ -1049,7 +1243,7 @@ class DFPlayerHardware(HardwareInterface):
         # Test 7: Try to play a track to see if DFPlayer responds
         try:
             print("Attempting to play folder 1, track 1...")
-            self._df_send(0x0F, 0x01, 0x01)  # Play folder 1, track 1
+            self._df_send(0x0F, 0x01, 0x01)
             time.sleep_ms(500)
             busy_after_play = self.pin_busy.value()
             results['play_attempted'] = True
@@ -1060,6 +1254,28 @@ class DFPlayerHardware(HardwareInterface):
             results['play_attempted'] = False
             results['play_error'] = str(e)
             print(f"✗ Play error: {e}")
+        
+        # Test 8: Two-way UART queries (status, current track, file count, last error)
+        try:
+            print("Querying status (0x42)...")
+            st = self.query_status()
+            results['query_status'] = st
+            print("✓ query_status:", "playing" if st == 1 else "stopped" if st == 0 else "timeout")
+            print("Querying current track (0x4C)...")
+            ct = self.query_current_track()
+            results['query_current_track'] = ct
+            print("✓ query_current_track:", ct if ct is not None else "timeout")
+            print("Querying TF file count (0x48)...")
+            fc = self.query_file_count()
+            results['query_file_count'] = fc
+            print("✓ query_file_count:", fc if fc is not None else "timeout")
+            err = self.get_last_error_code()
+            results['last_error_code'] = err
+            if err is not None:
+                print("✓ Last DF error code:", err)
+        except Exception as e:
+            results['query_error'] = str(e)
+            print(f"✗ Query error: {e}")
         
         print("\n=== Diagnostic Summary ===")
         print(f"UART initialized: {results.get('uart_initialized', False)}")

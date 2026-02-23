@@ -527,8 +527,11 @@ class SDManager:
         # ── Assign each song a (folder, track_number) slot in library order ──
         # Every resync (normal or clean) assigns slots in the same order as albums/playlists
         # so that metadata and SD card layout always match.
-        # DFPlayer supports track numbers 001-255 per folder.
-        MAX_TRACKS_PER_FOLDER = 255
+        # Many DFPlayer clones struggle with large directories (>15-20 files per
+        # folder), causing playback failures for higher-numbered tracks.  Spreading
+        # songs across folders avoids this.  15 tracks/folder × 98 folders = 1,470
+        # max tracks — more than the 255 per single folder the datasheet allows.
+        MAX_TRACKS_PER_FOLDER = 100
         RESERVED_FOLDER = 99  # AM WAV
 
         song_slot: Dict[int, Tuple[int, int]] = {}  # song_id -> (folder, track)
