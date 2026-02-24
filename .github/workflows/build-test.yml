@@ -52,7 +52,7 @@ jobs:
         if: runner.os == 'Windows'
         run: pyinstaller vintage_radio.spec --noconfirm
 
-      - name: Build macOS app (same as local: build_macos.sh)
+      - name: "Build macOS app (same as local - build_macos.sh)"
         if: runner.os == 'macOS'
         run: bash build_macos.sh --no-dmg
 
