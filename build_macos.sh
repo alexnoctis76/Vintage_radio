@@ -13,9 +13,21 @@
 #   - For signing: Apple Developer ID and codesign utility
 #   - For notarization: altool configured with developer credentials
 
+
 set -e  # Exit on error
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$SCRIPT_DIR"
+
+# Use project venv if it exists (ensures same Python/packages as when running from terminal)
+if [ -d "$SCRIPT_DIR/venv" ]; then
+    source "$SCRIPT_DIR/venv/bin/activate"
+    echo "Using venv Python: $(which python3)"
+elif [ -d "$SCRIPT_DIR/.venv" ]; then
+    source "$SCRIPT_DIR/.venv/bin/activate"
+    echo "Using .venv Python: $(which python3)"
+fi
+
 APP_NAME="Vintage Radio"
 BUILD_DIR="$SCRIPT_DIR/dist"
 APP_BUNDLE="$BUILD_DIR/Vintage Radio.app"
@@ -60,11 +72,24 @@ echo "Notarize: $NOTARIZE"
 echo "Create DMG: $BUILD_DMG"
 echo "=========================================="
 
-# Check for PyInstaller
-if ! command -v pyinstaller &> /dev/null; then
+# Check for PyInstaller (use same Python as venv for consistent build)
+if ! python3 -c "import PyInstaller" 2>/dev/null; then
     echo "Error: PyInstaller not found. Install with: pip install pyinstaller"
     exit 1
 fi
+
+# Check for mpremote (required for bundled Pico flashing; must be in same env as pyinstaller)
+echo "Python: $(which python3) ($(python3 --version 2>&1))"
+if ! python3 -c "from mpremote.main import main" 2>/dev/null; then
+    echo "Error: mpremote not found. The packaged app needs it for 'Setup Pico' / 'Install to Pico'."
+    echo "  With venv activated, run: pip install mpremote"
+    echo "  Then run this build script again."
+    echo ""
+    echo "If you don't see 'Using venv Python' above, create a venv first:"
+    echo "  python3 -m venv venv && source venv/bin/activate && pip install mpremote"
+    exit 1
+fi
+echo "mpremote: OK (will be bundled)"
 
 # --- Generate .icns icon from SVG ---
 SVG_ICON="$SCRIPT_DIR/gui/resources/vintage_radio.svg"
@@ -122,7 +147,7 @@ mkdir -p "$BUILD_DIR"
 
 # Run PyInstaller (spec now produces a .app bundle on macOS via BUNDLE step)
 echo "Building application with PyInstaller..."
-pyinstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$SCRIPT_DIR/build"
+python3 -m PyInstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$SCRIPT_DIR/build"
 
 # Verify the .app bundle was created
 if [ ! -d "$APP_BUNDLE" ]; then
@@ -140,7 +165,42 @@ fi
 echo "Build successful: $APP_BUNDLE"
 echo "  Executable: $APP_EXE"
 
-# Code sign if requested
+# Build mpremote helper (standalone exe, no Qt) for macOS - avoids pyserial+Qt crash in main app
+echo ""
+echo "Building mpremote helper (for Setup Pico on packaged macOS)..."
+HELPER_SPEC="$SCRIPT_DIR/mpremote_helper.spec"
+HELPER_DIR="$BUILD_DIR/mpremote_helper"
+HELPER_EXE="$HELPER_DIR/mpremote_helper"
+mkdir -p "$SCRIPT_DIR/build/mpremote_helper"
+if python3 -m PyInstaller "$HELPER_SPEC" --noconfirm --distpath "$BUILD_DIR" --workpath "$SCRIPT_DIR/build/mpremote_helper"; then
+    if [ -d "$HELPER_DIR" ] && [ -f "$HELPER_EXE" ]; then
+        cp -R "$HELPER_DIR" "$APP_BUNDLE/Contents/MacOS/"
+        chmod +x "$APP_BUNDLE/Contents/MacOS/mpremote_helper/mpremote_helper"
+        # Remove .dist-info (metadata) - codesign rejects it; not needed at runtime
+        find "$APP_BUNDLE/Contents/MacOS/mpremote_helper" -type d -name "*.dist-info" -print0 | xargs -0 rm -rf 2>/dev/null || true
+        echo "  mpremote_helper installed in app bundle (one-folder, no extraction delay)"
+    fi
+else
+    echo "  Warning: mpremote_helper build failed; Setup Pico will require system Python (python3 -m pip install mpremote)"
+fi
+
+# Remove PyInstaller's ad-hoc signatures so shared DMG gets "unidentified developer" + Open Anyway, not "damaged"
+if [ "$SIGN" = false ]; then
+    echo ""
+    echo "Removing ad-hoc signatures (for Open Anyway when shared)..."
+    _strip_count=0
+    while IFS= read -r -d '' f; do
+        if codesign --remove --all-architectures "$f" 2>/dev/null; then
+            _strip_count=$((_strip_count + 1))
+        fi
+    done < <(find "$APP_BUNDLE" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
+    rm -rf "$APP_BUNDLE/Contents/_CodeSignature" 2>/dev/null || true
+    [ "$_strip_count" -gt 0 ] && echo "  Removed signature from $_strip_count binary(ies)"
+fi
+
+# Code sign only with Developer ID. Ad-hoc signing (-) causes "damaged" when the app
+# is shared/downloaded; unsigned apps get "unidentified developer" which allows Open Anyway in Settings.
+IDENTITY=""
 if [ "$SIGN" = true ]; then
     echo ""
     echo "Code signing application..."
@@ -148,29 +208,30 @@ if [ "$SIGN" = true ]; then
     IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | awk '{print $2}')
 
     if [ -z "$IDENTITY" ]; then
-        echo "Warning: No Developer ID found in keychain"
-        echo "Attempting ad-hoc signing (good for local use)..."
-        IDENTITY="-"
-    fi
-
-    echo "Using identity: $IDENTITY"
-
-    if [ -f "$ENTITLEMENTS_FILE" ] && [ "$IDENTITY" != "-" ]; then
-        codesign --deep --force --sign "$IDENTITY" --entitlements "$ENTITLEMENTS_FILE" "$APP_BUNDLE"
+        echo "Skipping signing: No Developer ID found."
+        echo "  (Ad-hoc signing would cause 'damaged' when shared. Unsigned app allows Open Anyway in Settings.)"
+        SIGN=false
     else
-        codesign --deep --force --sign "$IDENTITY" "$APP_BUNDLE"
-    fi
-
-    echo "Application signed"
-
-    if codesign --verify --verbose "$APP_BUNDLE" 2>/dev/null; then
-        echo "Signature verified"
-    else
-        echo "Warning: Signature verification returned non-zero (may be fine for ad-hoc)"
+        echo "Using identity: $IDENTITY"
+        if [ -f "$ENTITLEMENTS_FILE" ]; then
+            if codesign --deep --force --sign "$IDENTITY" --entitlements "$ENTITLEMENTS_FILE" "$APP_BUNDLE"; then
+                echo "Application signed"
+            else
+                echo "Warning: App signing failed. DMG will contain unsigned app."
+                SIGN=false
+            fi
+        else
+            if codesign --deep --force --sign "$IDENTITY" "$APP_BUNDLE"; then
+                echo "Application signed"
+            else
+                echo "Warning: App signing failed. DMG will contain unsigned app."
+                SIGN=false
+            fi
+        fi
     fi
 fi
 
-# Create DMG if requested
+# Create DMG (signed app if signing succeeded)
 if [ "$BUILD_DMG" = true ]; then
     echo ""
     echo "Creating DMG installer..."
@@ -181,23 +242,46 @@ if [ "$BUILD_DMG" = true ]; then
     rm -rf "$DMG_STAGING"
     mkdir -p "$DMG_STAGING"
     cp -R "$APP_BUNDLE" "$DMG_STAGING/"
+    ln -s /Applications "$DMG_STAGING/Applications"
+
+    # Clear quarantine/extended attributes so app runs without xattr workaround when DMG is used locally
+    xattr -cr "$DMG_STAGING/$APP_NAME.app" 2>/dev/null || true
+
+    # README with Open Anyway instructions (works for unsigned/unidentified apps; no Terminal needed)
+    cat > "$DMG_STAGING/README - START HERE.txt" << 'README_EOF'
+FIRST TIME: Allow the app in System Settings
+
+1. Double-click "Vintage Radio" (you'll see a security message - that's expected)
+2. Open System Settings (Apple menu > System Settings)
+3. Go to Privacy & Security
+4. Scroll to Security
+5. Click "Open Anyway" next to the Vintage Radio message
+6. Enter your password if asked
+
+After that, double-click Vintage Radio anytime - or drag it to Applications first.
+
+The "Open Anyway" button is available for about an hour after step 1.
+README_EOF
 
     hdiutil create -volname "$APP_NAME" \
         -srcfolder "$DMG_STAGING" \
-        -ov -format UDZO "$DMG_OUTPUT"
+        -ov -format UDZO \
+        -imagekey zlib-level=9 \
+        "$DMG_OUTPUT"
 
     rm -rf "$DMG_STAGING"
 
     if [ -f "$DMG_OUTPUT" ]; then
         echo "DMG created at $DMG_OUTPUT"
-
-        if [ "$SIGN" = true ] && [ "$IDENTITY" != "-" ]; then
-            echo "Signing DMG..."
-            codesign --force --sign "$IDENTITY" "$DMG_OUTPUT"
-            echo "DMG signed"
-        fi
     else
         echo "Warning: Failed to create DMG"
+    fi
+
+    if [ "$SIGN" = true ] && [ -n "$IDENTITY" ] && [ "$IDENTITY" != "-" ]; then
+        echo "Signing DMG..."
+        if codesign --force --sign "$IDENTITY" "$DMG_OUTPUT"; then
+            echo "DMG signed"
+        fi
     fi
 fi
 
@@ -248,6 +332,16 @@ echo ""
 echo "=========================================="
 echo "Build Complete!"
 echo "=========================================="
+if [ "$SIGN" = false ] && [ -f "$ENTITLEMENTS_FILE" ]; then
+    echo ""
+    echo "Note: For serial/USB (Setup Pico) to work, sign the app so entitlements apply:"
+    echo "  ./build_macos.sh --sign"
+fi
+if [ "$SIGN" = true ] && [ "$NOTARIZE" = false ]; then
+    echo ""
+    echo "Note: For distribution (avoid 'damaged' when downloaded), notarize the DMG:"
+    echo "  ./build_macos.sh --sign --notarize"
+fi
 echo "Output: $APP_BUNDLE"
 echo "Run:    open \"$APP_BUNDLE\""
 if [ "$BUILD_DMG" = true ] && [ -f "$DMG_OUTPUT" ]; then

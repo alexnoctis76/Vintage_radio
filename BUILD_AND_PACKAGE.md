@@ -81,22 +81,31 @@ python -m gui.radio_manager
 
 Packaging creates a standalone executable or app bundle that doesn't require Python to be installed.
 
-### macOS
+### macOS – Create distribution locally
 
-#### Build as App Bundle (Unsigned)
+From the project root (with venv activated and dependencies installed):
 
-For personal use on your own Mac:
+| Goal | Command | Output |
+|------|---------|--------|
+| **App + DMG (default)** | `bash build_macos.sh` | `dist/Vintage Radio.app` and `dist/Vintage Radio.dmg` |
+| App only (no DMG) | `bash build_macos.sh --no-dmg` | `dist/Vintage Radio.app` only |
+| Signed app + DMG | `bash build_macos.sh --sign` | Same, with code signing (needs Developer ID) |
+| Signed + notarized DMG | `bash build_macos.sh --notarize` | Same, DMG notarized for distribution (needs Apple ID) |
+
+**Typical local distribution (no Apple Developer account):**
 
 ```bash
+cd /path/to/Vintage_radio
+source venv/bin/activate   # if you use a venv
 bash build_macos.sh
 ```
 
-Output: `dist/Vintage Radio.app`
+You get:
+- **`dist/Vintage Radio.app`** – double-click to run
+- **`dist/Vintage Radio.dmg`** – share this; recipients open it and drag the app to Applications (or run from the DMG). Requires macOS 13+.
 
-To run:
-```bash
-open dist/"Vintage Radio.app"
-```
+Recipients who get "damaged" or Library Validation errors should run once:  
+`xattr -cr "/path/to/Vintage Radio.app"` (see [App won't launch](#app-wont-launch-on-macos--damaged-after-downloading)).
 
 #### Build as App Bundle (Signed)
 

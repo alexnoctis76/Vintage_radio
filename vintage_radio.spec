@@ -14,14 +14,14 @@ import sys
 import platform
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_all
 
 block_cipher = None
 
 # Project root (directory containing this spec)
 project_dir = Path(SPECPATH)
 
-# Data files: gui/resources, and firmware files for Export (main.py, radio_core.py, components)
+# Data files: gui/resources, firmware files, and mpremote (for bundled Pico flashing)
 gui_resources = project_dir / 'gui' / 'resources'
 datas = [
     (str(gui_resources), 'gui/resources'),
@@ -29,6 +29,27 @@ datas = [
     (str(project_dir / 'radio_core.py'), '.'),
     (str(project_dir / 'components'), 'components'),
 ]
+# Bundle mpremote fully (modules + any data files)
+try:
+    mpremote_datas, mpremote_binaries, mpremote_hidden = collect_all('mpremote')
+    datas += mpremote_datas
+except Exception:
+    mpremote_datas = []
+    mpremote_binaries = []
+    mpremote_hidden = []
+
+# Force-include stdlib packages needed by mpremote.mip (urllib -> email, http)
+def _collect_stdlib(pkg):
+    try:
+        d, b, h = collect_all(pkg)
+        return d, b, h
+    except Exception:
+        return [], [], []
+_email_d, _email_b, _email_h = _collect_stdlib('email')
+_http_d, _http_b, _http_h = _collect_stdlib('http')
+datas += _email_d + _http_d
+mpremote_binaries += _email_b + _http_b
+mpremote_hidden += _email_h + _http_h
 
 # Application icon
 # Windows: .ico    macOS: .icns (fall back to .png)    Linux: .png
@@ -53,7 +74,7 @@ entitlements_file = str(project_dir / 'macos_entitlements.plist') if (project_di
 a = Analysis(
     ['run_vintage_radio.py'],
     pathex=[str(project_dir)],
-    binaries=[],
+    binaries=mpremote_binaries,
     datas=datas,
     hiddenimports=[
         'PyQt6.QtCore',
@@ -69,16 +90,32 @@ a = Analysis(
         'mpremote',
         'mpremote.commands',
         'mpremote.main',
+        'mpremote.mip',
+        'serial',
+        'serial.tools.list_ports',
+        'serial.tools.list_ports_osx',
         'platformdirs',
-    ] + collect_submodules('mpremote'),
+        'importlib_metadata',
+        'certifi',
+        # urllib.request and its full dependency chain (required by mpremote.mip)
+        'urllib',
+        'urllib.request',
+        'urllib.error',
+        'urllib.parse',
+        'email',
+        'email.utils',
+        'email.header',
+        'email.parser',
+        'email.errors',
+        'http',
+        'http.client',
+        'http.server',
+        'ssl',
+    ] + mpremote_hidden + collect_submodules('mpremote'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        'tkinter', '_tkinter', 'unittest', 'test', 'distutils',
-        'email', 'html', 'http', 'xml', 'pydoc', 'doctest',
-        'lib2to3', 'pydoc_data', 'pytest', 'setuptools', 'pip', 'wheel',
-    ],
+    excludes=[],  # Do not exclude stdlib - mpremote/urllib need email, http, etc.
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

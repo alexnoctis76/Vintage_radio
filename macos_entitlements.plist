@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Not a Mac App Store app: disable sandbox so serial/USB access works -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+
 	<!-- Allow reading external storage devices (USB drives, SD cards) -->
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>

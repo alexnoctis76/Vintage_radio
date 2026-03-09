@@ -8,8 +8,9 @@ Creates a timestamped log file in the system temp directory that captures:
 - GUI debug events
 
 Log files are stored in:
-  %TEMP%/VintageRadio/  (Windows)
-  /tmp/VintageRadio/    (Linux/Mac)
+  %TEMP%/VintageRadio/       (Windows)
+  $TMPDIR/VintageRadio/      (macOS: often /var/folders/.../T/VintageRadio/)
+  /tmp/VintageRadio/        (Linux)
 
 Old log files are automatically cleaned up (keeps last 10 sessions).
 """

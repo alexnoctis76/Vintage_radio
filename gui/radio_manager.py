@@ -352,6 +352,80 @@ class MetadataDialog(QtWidgets.QDialog):
         return fields
 
 
+def _show_install_error(parent: QtWidgets.QWidget, msg: str, after_firmware: bool) -> None:
+    text = f"Error:\n\n{msg}"
+    if after_firmware:
+        text += "\n\nClick Setup Pico again to install the app once the Pico is connected."
+    QtWidgets.QMessageBox.warning(parent, "Install to Pico", text)
+
+
+def _run_install_main_thread(
+    parent: QtWidgets.QWidget,
+    mpremote_cmd: List[str],
+    root: Path,
+    sd_root: Optional[str],
+    sd_manager: "SDManager",
+    after_firmware: bool,
+    on_success: Callable[[str], None],
+    on_error: Callable[[str], None],
+) -> None:
+    """Run install on main thread with progress dialog. Status bar updates via processEvents()."""
+    dlg = QtWidgets.QDialog(parent)
+    dlg.setWindowTitle("Install to Pico")
+    dlg.setModal(True)
+    dlg.setMinimumWidth(400)
+    layout = QtWidgets.QVBoxLayout(dlg)
+    status = QtWidgets.QLabel("Starting...")
+    status.setWordWrap(True)
+    layout.addWidget(status)
+    progress = QtWidgets.QProgressBar()
+    progress.setRange(0, 0)
+    layout.addWidget(progress)
+    dlg.show()
+    QtWidgets.QApplication.processEvents()
+
+    def report(step: int, total: int, msg: str):
+        progress.setRange(0, max(1, total))
+        progress.setValue(step)
+        status.setText(msg)
+        QtWidgets.QApplication.processEvents()
+
+    try:
+        worker_class = type(parent)
+        result = worker_class._install_to_pico_worker(
+            mpremote_cmd, root, sd_root, sd_manager, progress_callback=report,
+        )
+        dlg.close()
+        on_success(result)
+    except Exception as e:
+        dlg.close()
+        on_error(f"{e}\n\n{traceback.format_exc()}")
+
+
+def _resolve_system_mpremote_for_worker() -> Optional[List[str]]:
+    """Return [python3, -m, mpremote] for use in worker threads (avoids in-process sys.stdout hijacking)."""
+    for py in (shutil.which("python3"), shutil.which("python"),
+               "/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python3"):
+        if not py or (py.startswith("/") and not Path(py).exists()):
+            continue
+        try:
+            from gui.resource_paths import subprocess_env
+            _cwd = os.path.expanduser("~") if getattr(sys, "frozen", False) else None
+            r = subprocess.run(
+                [py, "-m", "mpremote", "--version"],
+                capture_output=True,
+                timeout=5,
+                cwd=_cwd,
+                env=subprocess_env() if getattr(sys, "frozen", False) else None,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            if r.returncode == 0:
+                return [py, "-m", "mpremote"]
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            continue
+    return None
+
+
 def _run_mpremote(
     mpremote_cmd: List[str],
     args: List[str],
@@ -365,14 +439,23 @@ def _run_mpremote(
     """Run mpremote via subprocess or in-process (when bundled). Returns result with .returncode, .stdout, .stderr."""
     if mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__":
         from io import StringIO
+
+        class _EncodedStringIO(StringIO):
+            """StringIO with encoding='utf-8' so mpremote's b.decode(sys.stdout.encoding) works."""
+
+            encoding = "utf-8"
+
         mpremote_main = mpremote_cmd[1]
-        argv = ["mpremote", "connect", "auto"] + args
+        argv = ["mpremote"] + args  # args already include full command (e.g. connect auto exec ...)
         old_argv = sys.argv
         old_stdout = sys.stdout
         old_stderr = sys.stderr
-        out = StringIO()
-        err = StringIO()
+        old_cwd = os.getcwd() if cwd else None
+        out = _EncodedStringIO()
+        err = _EncodedStringIO()
         try:
+            if cwd:
+                os.chdir(cwd)
             sys.argv = argv
             sys.stdout = out
             sys.stderr = err
@@ -382,9 +465,24 @@ def _run_mpremote(
             sys.argv = old_argv
             sys.stdout = old_stdout
             sys.stderr = old_stderr
+            if old_cwd is not None:
+                try:
+                    os.chdir(old_cwd)
+                except OSError:
+                    pass
+    # When using system Python (py -m mpremote), avoid cwd inside app bundle so it doesn't load app's mpremote
+    run_cwd = cwd
+    if (
+        run_cwd
+        and len(mpremote_cmd) >= 3
+        and mpremote_cmd[1] == "-m"
+        and mpremote_cmd[2] == "mpremote"
+        and getattr(sys, "frozen", False)
+    ):
+        run_cwd = os.path.expanduser("~")
     return subprocess.run(
         mpremote_cmd + args,
-        cwd=cwd,
+        cwd=run_cwd,
         capture_output=capture_output,
         text=text,
         timeout=timeout,
@@ -1170,7 +1268,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_album_combo = QtWidgets.QComboBox()
         self.sd_playlist_combo = QtWidgets.QComboBox()
         self.test_mode_widget = TestModeWidget(self.db)
-        self.device_debug_widget = DeviceDebugWidget()
+        self._device_debug_widget = None  # Lazy-load to avoid crash during init (macOS/pyserial)
 
         self._apply_saved_settings()
 
@@ -1540,12 +1638,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_sync_warning.setStyleSheet("color: #c00; font-weight: bold;")
         self.device_sync_warning.setVisible(False)
         layout.addWidget(self.device_sync_warning)
-        layout.addWidget(self.device_debug_widget)
+        self._device_debug_placeholder = QtWidgets.QLabel("Loading Device Debug...")
+        layout.addWidget(self._device_debug_placeholder)
+        self._device_debug_tab_container = container
+        self._device_debug_tab_layout = layout
         return container
 
     def _on_tab_changed(self, index: int) -> None:
-        """When switching to Device Debug tab, check SD/library sync and show warning if needed."""
+        """When switching to Device Debug tab, lazy-load widget and check SD/library sync."""
         if index == self._device_debug_tab_index:
+            if self._device_debug_widget is None:
+                self._device_debug_tab_layout.removeWidget(self._device_debug_placeholder)
+                self._device_debug_placeholder.deleteLater()
+                self._device_debug_widget = DeviceDebugWidget()
+                self._device_debug_tab_layout.addWidget(self._device_debug_widget)
             self._check_device_tab_sync()
         # When switching to Devices tab (index 3), update basic-view SD+Pico warning if in basic mode
         if index == 3 and self.devices_view_mode == "basic" and hasattr(self, "_check_basic_sd_pico_warning"):
@@ -1805,7 +1911,9 @@ class MainWindow(QtWidgets.QMainWindow):
         rp2040_layout = QtWidgets.QHBoxLayout(rp2040_group)
         setup_pico_btn = QtWidgets.QPushButton("Setup Pico")
         setup_pico_btn.setToolTip("Install firmware (if needed) and copy the app to your Pico. Connect the Pico via USB.")
-        setup_pico_btn.clicked.connect(self._setup_pico_smart)
+        setup_pico_btn.clicked.connect(
+            lambda: QtCore.QTimer.singleShot(0, self._setup_pico_smart)
+        )
         rp2040_layout.addWidget(setup_pico_btn)
         rp2040_layout.addStretch()
         layout.addWidget(rp2040_group)
@@ -3078,12 +3186,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """One button: if MicroPython is installed, install app; else if RPI-RP2 present, flash firmware then prompt to run again."""
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Setup Pico",
-                "mpremote is not available. Install it with: pip install mpremote\n\n"
-                "Then connect the Pico via USB and try again.",
-            )
+            bundle_err = getattr(self, "_mpremote_bundle_error", None)
+            if bundle_err:
+                print(f"[Setup Pico] mpremote import failed:\n{bundle_err}")
+            msg = "mpremote is not available. Install it with: pip install mpremote\n\nThen connect the Pico via USB and try again."
+            if bundle_err:
+                msg += "\n\n(Bundled mpremote failed to load:\n" + str(bundle_err) + ")"
+            QtWidgets.QMessageBox.information(self, "Setup Pico", msg)
             return
         root = self._project_root()
         if not (root / "main.py").exists() or not (root / "radio_core.py").exists():
@@ -3094,6 +3203,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Quick test: can we connect to Pico (MicroPython already installed)?
+        conn_err = ""
         try:
             r = _run_mpremote(
                 mpremote_cmd,
@@ -3101,27 +3211,113 @@ class MainWindow(QtWidgets.QMainWindow):
                 cwd=str(root),
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
             )
             if r.returncode == 0:
                 self.install_to_pico()
                 return
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+            conn_err = (r.stderr or "") + (r.stdout or "")
+
+            # Fallback 1: "connect auto" can fail on macOS bundled app; try each port explicitly
+            try:
+                import serial.tools.list_ports as list_ports
+                for port_info in list_ports.comports():
+                    port_dev = getattr(port_info, "device", None) or str(port_info)
+                    hwid = getattr(port_info, "hwid", "") or ""
+                    if "2E8A" in hwid or "2E8A" in str(port_info):  # Raspberry Pi Pico VID
+                        r2 = _run_mpremote(
+                            mpremote_cmd,
+                            ["connect", port_dev, "exec", "print(1)"],
+                            cwd=str(root),
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        if r2.returncode == 0:
+                            self.install_to_pico()
+                            return
+                        conn_err += f"\n[Port {port_dev}]: {(r2.stderr or '') + (r2.stdout or '')}"
+            except Exception as fallback_e:
+                conn_err += f"\n[Fallback scan]: {fallback_e}"
+
+            # Fallback 2: in-process mpremote can fail on macOS; try system Python via subprocess
+            if getattr(sys, "frozen", False):
+                from gui.resource_paths import subprocess_env
+                sp_env = subprocess_env()
+                # Use home as cwd so system Python doesn't load app's mpremote from bundle
+                _safe_cwd = os.path.expanduser("~")
+                seen = set()
+                py_candidates = []
+                for p in (shutil.which("python3"), shutil.which("python"),
+                          "/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python3"):
+                    if not p or p in seen:
+                        continue
+                    if not p.startswith("/") or Path(p).exists():
+                        seen.add(p)
+                        py_candidates.append(p)
+                for py_exe in py_candidates:
+                    if not py_exe:
+                        continue
+                    try:
+                        r3 = subprocess.run(
+                            [py_exe, "-m", "mpremote", "connect", "auto", "exec", "print(1)"],
+                            cwd=_safe_cwd,
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            env=sp_env,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                        )
+                        if r3.returncode == 0:
+                            self._mpremote_system_cmd = [py_exe, "-m", "mpremote"]
+                            self.install_to_pico()
+                            return
+                        conn_err += f"\n[System {py_exe}]: {(r3.stderr or '') + (r3.stdout or '')}"
+                        # Try each Pico port with system Python too
+                        try:
+                            import serial.tools.list_ports as list_ports
+                            for port_info in list_ports.comports():
+                                port_dev = getattr(port_info, "device", None) or str(port_info)
+                                hwid = getattr(port_info, "hwid", "") or ""
+                                if "2E8A" in hwid or "2E8A" in str(port_info):
+                                    r4 = subprocess.run(
+                                        [py_exe, "-m", "mpremote", "connect", port_dev, "exec", "print(1)"],
+                                        cwd=_safe_cwd,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=10,
+                                        env=sp_env,
+                                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                                    )
+                                    if r4.returncode == 0:
+                                        self._mpremote_system_cmd = [py_exe, "-m", "mpremote"]
+                                        self.install_to_pico()
+                                        return
+                                    conn_err += f"\n[System {py_exe} {port_dev}]: {(r4.stderr or '') + (r4.stdout or '')}"
+                        except Exception:
+                            pass
+                    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                        continue
+        except (subprocess.TimeoutExpired, Exception) as e:
+            conn_err = str(e)
 
         # No connection: check for Pico in BOOTSEL (RPI-RP2 drive)
+        print(f"[Setup Pico] All connection attempts failed. Output:\n{conn_err}")
         if self._is_rpi_rp2_present():
             dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
             dlg.exec()
             self.statusBar().showMessage("MicroPython installed. Installing app…", 8000)
             QtCore.QTimer.singleShot(500, self._install_to_pico_after_firmware)
         else:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Setup Pico",
+            msg = (
                 "No Pico detected. Connect the Pico via USB.\n\n"
-                "If it's new, hold BOOTSEL while plugging in to install MicroPython first.",
+                "If it's new, hold BOOTSEL while plugging in to install MicroPython first."
             )
+            if conn_err and len(conn_err) < 500:
+                msg += f"\n\nConnection attempt output:\n{conn_err.strip()}"
+            elif conn_err:
+                msg += f"\n\nConnection attempt output:\n{conn_err[:500].strip()}..."
+            QtWidgets.QMessageBox.information(self, "Setup Pico", msg)
 
     def _is_rpi_rp2_present(self) -> bool:
         """True if a drive with label RPI-RP2 (Pico in BOOTSEL) is present."""
@@ -3150,18 +3346,57 @@ class MainWindow(QtWidgets.QMainWindow):
     def _resolve_mpremote_cmd(self) -> Optional[List[str]]:
         """Find the mpremote command (bundled in-process, standalone, or system-installed).
 
-        Priority order (frozen app):
-        1. Standalone mpremote executable (if available)
-        2. System Python with mpremote
-        3. Bundled mpremote (in-process; no subprocess needed)
+        When frozen (packaged app): try bundled mpremote first so the app works without system mpremote.
+        When not frozen: try current interpreter, then PATH, then system Python.
         """
-        # First, try standalone mpremote executable (works everywhere)
+        if hasattr(self, "_mpremote_bundle_error"):
+            delattr(self, "_mpremote_bundle_error")
+        # Use system Python cmd if setup already proved it works (fallback path)
+        if getattr(self, "_mpremote_system_cmd", None):
+            return list(self._mpremote_system_cmd)
+        # Packaged macOS: in-process mpremote crashes (pyserial/IOKit + Qt main-thread conflict).
+        # Use bundled mpremote_helper (subprocess, no Qt) or system Python fallback.
+        if getattr(sys, "frozen", False) and sys.platform == "darwin":
+            macos_dir = Path(sys.executable).parent
+            helper = macos_dir / "mpremote_helper" / "mpremote_helper"
+            if not helper.exists():
+                helper = macos_dir / "mpremote_helper"
+            if helper.exists():
+                return [str(helper)]
+            fallback = _resolve_system_mpremote_for_worker()
+            if fallback:
+                return list(fallback)
+            setattr(
+                self, "_mpremote_bundle_error",
+                "On packaged macOS, Setup Pico requires system Python with mpremote.\n"
+                "Run in Terminal: python3 -m pip install mpremote"
+            )
+            return None
+        # Packaged Windows/Linux: use bundled mpremote
+        if getattr(sys, "frozen", False):
+            try:
+                from mpremote.main import main as mpremote_main
+                return ["__INPROCESS__", mpremote_main]
+            except ImportError as e:
+                import traceback
+                setattr(self, "_mpremote_bundle_error", f"{e}\n{traceback.format_exc()}")
+
+        # Standalone mpremote on PATH (e.g. pipx install mpremote)
         cmd = shutil.which("mpremote")
         if cmd:
             return [cmd]
 
-        # Try system Python (user may have: pip install mpremote)
-        system_python = shutil.which("pythonw") or shutil.which("python")
+        # Current interpreter (from source): pip install mpremote
+        if not getattr(sys, "frozen", False):
+            try:
+                import mpremote  # noqa: F401
+                python_cmd = shutil.which("python") or sys.executable
+                return [python_cmd, "-m", "mpremote"]
+            except ImportError:
+                pass
+
+        # System Python (user may have: pip install mpremote globally)
+        system_python = shutil.which("python3") or shutil.which("pythonw") or shutil.which("python")
         if system_python:
             try:
                 result = subprocess.run(
@@ -3173,23 +3408,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if result.returncode == 0:
                     return [system_python, "-m", "mpremote"]
             except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                pass
-
-        # Frozen: use bundled mpremote in-process (no separate Python needed)
-        if getattr(sys, "frozen", False):
-            try:
-                from mpremote.main import main as mpremote_main
-                return ["__INPROCESS__", mpremote_main]
-            except ImportError:
-                pass
-
-        # Not frozen: try current interpreter with -m mpremote
-        if not getattr(sys, "frozen", False):
-            try:
-                import mpremote  # noqa: F401
-                python_cmd = shutil.which("python") or sys.executable
-                return [python_cmd, "-m", "mpremote"]
-            except ImportError:
                 pass
 
         return None
@@ -3207,17 +3425,32 @@ class MainWindow(QtWidgets.QMainWindow):
         Uses mpremote command-line interface (bundled in-process when frozen, or subprocess).
         All subprocess calls use CREATE_NO_WINDOW on Windows to prevent new windows.
 
+        In-process mpremote must NOT run in a worker thread (macOS NSWindow main-thread requirement).
+        Caller must pass subprocess form when using TaskProgressDialog.
         Returns a status message string. Raises on fatal error.
         """
         import tempfile as _tempfile
+
+        # In-process mpremote hijacks sys.stdout and must run on main thread (macOS NSWindow requirement).
+        import threading
+        if mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__":
+            if threading.current_thread() is not threading.main_thread():
+                fallback = _resolve_system_mpremote_for_worker()
+                if fallback:
+                    mpremote_cmd = list(fallback)
+                else:
+                    raise RuntimeError(
+                        "Install runs in a background thread; in-process mpremote is not safe here.\n"
+                        "Install mpremote for system Python: python3 -m pip install mpremote"
+                    )
 
         files_to_copy = [
             ("main.py", "main.py"),
             ("radio_core.py", "radio_core.py"),
             ("components/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         ]
-        # Total steps: mkdir×2 + files + AM WAV + metadata + reboot
-        total = 2 + len(files_to_copy) + 1 + 1 + 1
+        # Total steps: mkdir + firmware batch + AM WAV + metadata + reboot
+        total = 5
         step = 0
 
         def _report(msg: str):
@@ -3236,10 +3469,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 if internal_dir.exists():
                     env = os.environ.copy()
                     env["PATH"] = str(internal_dir) + os.pathsep + env.get("PATH", "")
+            else:
+                from gui.resource_paths import subprocess_env
+                env = subprocess_env()
+
+        # System Python subprocess must not use app bundle as cwd (would load app's broken mpremote)
+        _mpremote_cwd = str(root)
+        if getattr(sys, "frozen", False) and mpremote_cmd and mpremote_cmd[0] != "__INPROCESS__":
+            exe = mpremote_cmd[0].lower()
+            if "python" in exe or (exe.startswith("/usr") and "mpremote" not in exe):
+                _mpremote_cwd = os.path.expanduser("~")
 
         def run_mpremote(args: List[str], timeout_sec: int = 30):
             return _run_mpremote(
-                mpremote_cmd, args, cwd=str(root), capture_output=True, text=True,
+                mpremote_cmd, args, cwd=_mpremote_cwd, capture_output=True, text=True,
                 timeout=timeout_sec, creationflags=creation_flags, env=env,
             )
 
@@ -3254,28 +3497,28 @@ class MainWindow(QtWidgets.QMainWindow):
                     r = run_mpremote(args, timeout_sec=timeout_sec)
             return r
 
-        # ── Create directories ──
+        # ── Create directories (batched: one mpremote call) ──
         _report("Creating directories on Pico...")
-        for dirname in ("components", "VintageRadio"):
-            try:
-                run_mpremote_with_retry(["exec", f"import os; os.mkdir('{dirname}')"], timeout_sec=15)
-            except Exception:
-                pass  # directory may already exist
-        step = 2
+        try:
+            run_mpremote_with_retry(
+                ["exec", "import os; os.mkdir('components'); os.mkdir('VintageRadio')"],
+                timeout_sec=15,
+            )
+        except Exception:
+            pass  # directories may already exist
 
-        # ── Copy firmware files ──
+        # ── Copy firmware files (one mpremote cp per file; batched cp requires dest to be a dir) ──
+        _report("Copying main.py, radio_core.py, dfplayer_hardware.py...")
         for local, remote in files_to_copy:
-            _report(f"Copying {local}...")
             src = root / local
-            if not src.exists():
-                continue
-            r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
-            if r.returncode != 0:
-                raise RuntimeError(
-                    f"Failed to copy {local}.\n\n"
-                    f"Ensure the Pico is connected via USB and running MicroPython.\n\n"
-                    f"{r.stderr or r.stdout or ''}"
-                )
+            if src.exists():
+                r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        "Failed to copy firmware files.\n\n"
+                        "Ensure the Pico is connected via USB and running MicroPython.\n\n"
+                        f"{r.stderr or r.stdout or ''}"
+                    )
 
         # ── Copy AMradioSound.wav ──
         _report("Copying AM radio sound...")
@@ -3318,19 +3561,22 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        # Remove stale album_state.txt on Pico so firmware starts with clean state
-        # (avoids invalid album/playlist index if metadata layout changed)
-        try:
-            run_mpremote(["exec", "import os; os.remove('VintageRadio/album_state.txt')"], timeout_sec=10)
-        except Exception:
-            pass  # File may not exist; ignore
-
-        # Full reboot (as if pressing reset button) so new firmware runs from cold
+        # Remove stale album_state.txt and reboot. machine.reset() drops connection - timeout expected.
         _report("Rebooting Pico...")
         try:
-            run_mpremote(["exec", "import machine; machine.reset()"], timeout_sec=5)
-        except Exception as e:
-            print(f"Note: Could not trigger reboot: {e}")
+            run_mpremote([
+                "exec",
+                "import os\n"
+                "try: os.remove('VintageRadio/album_state.txt')\n"
+                "except: pass\n"
+                "import machine\n"
+                "machine.reset()",
+            ], timeout_sec=5)
+        except (subprocess.TimeoutExpired, Exception) as e:
+            if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                print("Reboot initiated (connection closed as expected)")
+            else:
+                print(f"Note: Could not trigger reboot: {e}")
 
         if progress_callback:
             progress_callback(total, total, "Done!")
@@ -3344,14 +3590,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote)."""
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Install to Pico",
-                "mpremote is not available. In a packaged executable, mpremote should be bundled.\n\n"
-                "If running from source, install it with:\n\n  pip install mpremote\n\n"
-                "Then connect the Pico via USB (with MicroPython already installed) and try again.\n"
-                "See README_RP2040.md for how to install MicroPython on the Pico (one-time).",
-            )
+            msg = ("mpremote is not available. In a packaged executable, mpremote should be bundled.\n\n"
+                   "If running from source, install it with:\n\n  pip install mpremote\n\n"
+                   "Then connect the Pico via USB (with MicroPython already installed) and try again.\n"
+                   "See README_RP2040.md for how to install MicroPython on the Pico (one-time).")
+            if getattr(self, "_mpremote_bundle_error", None):
+                msg += "\n\n(Bundled mpremote failed to load:\n" + str(self._mpremote_bundle_error) + ")"
+            QtWidgets.QMessageBox.information(self, "Install to Pico", msg)
             return
 
         root = self._project_root()
@@ -3362,26 +3607,32 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "components/dfplayer_hardware.py not found.")
             return
 
-        dlg = TaskProgressDialog(
-            parent=self,
-            title="Install to Pico",
-            func=self._install_to_pico_worker,
-            args=(mpremote_cmd, root, self.sd_root, self.sd_manager),
-            kwargs={},
-        )
+        use_inprocess = mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__"
 
-        def on_success(msg):
-            self.statusBar().showMessage(str(msg), 5000)
+        if use_inprocess:
+            _run_install_main_thread(
+                self, mpremote_cmd, root, self.sd_root, self.sd_manager,
+                after_firmware, on_success=lambda m: self.statusBar().showMessage(str(m), 5000),
+                on_error=lambda m: _show_install_error(self, m, after_firmware),
+            )
+        else:
+            dlg = TaskProgressDialog(
+                parent=self,
+                title="Install to Pico",
+                func=self._install_to_pico_worker,
+                args=(mpremote_cmd, root, self.sd_root, self.sd_manager),
+                kwargs={},
+            )
 
-        def on_error(msg):
-            text = f"Error:\n\n{msg}"
-            if after_firmware:
-                text += "\n\nClick Setup Pico again to install the app once the Pico is connected."
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", text)
+            def on_success(msg):
+                self.statusBar().showMessage(str(msg), 5000)
 
-        dlg.on_success = on_success
-        dlg.on_error = on_error
-        dlg.exec()
+            def on_error(msg):
+                _show_install_error(self, msg, after_firmware)
+
+            dlg.on_success = on_success
+            dlg.on_error = on_error
+            dlg.exec()
 
     def deploy_to_pi(self) -> None:
         """Copy application files to Raspberry Pi via SCP (requires SSH access)."""
