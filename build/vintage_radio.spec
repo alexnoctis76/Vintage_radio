@@ -18,16 +18,16 @@ from PyInstaller.utils.hooks import collect_submodules, collect_all
 
 block_cipher = None
 
-# Project root (directory containing this spec)
-project_dir = Path(SPECPATH)
+# Project root (parent of build/ which contains this spec)
+project_dir = Path(SPECPATH).parent
 
 # Data files: gui/resources, firmware files, and mpremote (for bundled Pico flashing)
 gui_resources = project_dir / 'gui' / 'resources'
 datas = [
     (str(gui_resources), 'gui/resources'),
-    (str(project_dir / 'main.py'), '.'),
-    (str(project_dir / 'radio_core.py'), '.'),
-    (str(project_dir / 'components'), 'components'),
+    (str(project_dir / 'firmware' / 'pico' / 'main.py'), '.'),
+    (str(project_dir / 'firmware' / 'radio_core.py'), '.'),
+    (str(project_dir / 'firmware' / 'pico' / 'dfplayer_hardware.py'), 'components'),
 ]
 # Bundle mpremote fully (modules + any data files)
 try:
@@ -69,7 +69,7 @@ else:
     icon_path = str(icon_png) if icon_png.exists() else None
 
 # macOS entitlements (for code signing)
-entitlements_file = str(project_dir / 'macos_entitlements.plist') if (project_dir / 'macos_entitlements.plist').exists() else None
+entitlements_file = str(project_dir / 'build' / 'macos_entitlements.plist') if (project_dir / 'build' / 'macos_entitlements.plist').exists() else None
 
 a = Analysis(
     ['run_vintage_radio.py'],

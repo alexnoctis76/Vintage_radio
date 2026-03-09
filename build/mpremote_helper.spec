@@ -8,7 +8,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
-project_dir = Path(SPECPATH)
+project_dir = Path(SPECPATH).parent
 
 # Collect mpremote and deps (no Qt)
 try:
@@ -26,7 +26,7 @@ _email_d, _email_b, _email_h = _collect_stdlib('email')
 _http_d, _http_b, _http_h = _collect_stdlib('http')
 
 a = Analysis(
-    ['mpremote_helper.py'],
+    [str(project_dir / 'build' / 'mpremote_helper.py')],
     pathex=[str(project_dir)],
     binaries=mpremote_binaries + _email_b + _http_b,
     datas=mpremote_datas + _email_d + _http_d,

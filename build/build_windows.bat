@@ -11,8 +11,9 @@ REM Output: dist\Vintage Radio\ (app folder with vintage_radio.exe)
 setlocal enabledelayedexpansion
 
 set SCRIPT_DIR=%~dp0
+for %%i in ("%SCRIPT_DIR%..") do set PROJECT_ROOT=%%~fi
 set APP_NAME=Vintage Radio
-set BUILD_DIR=%SCRIPT_DIR%dist
+set BUILD_DIR=%PROJECT_ROOT%\dist
 set SPEC_FILE=%SCRIPT_DIR%vintage_radio.spec
 set EXE_PATH=%BUILD_DIR%\Vintage Radio\Vintage Radio.exe
 
@@ -57,7 +58,7 @@ if "%CLEAN%"=="true" (
 
 REM Run PyInstaller
 echo Building application with PyInstaller...
-pyinstaller "%SPEC_FILE%" --noconfirm --distpath "%BUILD_DIR%" --workpath "%SCRIPT_DIR%build"
+pyinstaller "%SPEC_FILE%" --noconfirm --distpath "%BUILD_DIR%" --workpath "%PROJECT_ROOT%\build\pyinstaller_temp"
 
 if not exist "%EXE_PATH%" (
     echo Error: Failed to build executable at %EXE_PATH%

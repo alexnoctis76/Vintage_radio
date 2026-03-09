@@ -12,8 +12,9 @@
 set -e  # Exit on error
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 APP_NAME="Vintage Radio"
-BUILD_DIR="$SCRIPT_DIR/dist"
+BUILD_DIR="$PROJECT_ROOT/dist"
 APP_DIR="$BUILD_DIR/Vintage Radio"
 SPEC_FILE="$SCRIPT_DIR/vintage_radio.spec"
 
@@ -57,7 +58,7 @@ fi
 
 # Run PyInstaller
 echo "Building application with PyInstaller..."
-pyinstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --buildpath "$SCRIPT_DIR/build" --specpath "$SCRIPT_DIR"
+pyinstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$PROJECT_ROOT/build/pyinstaller_temp" --specpath "$SCRIPT_DIR"
 
 if [ ! -d "$APP_DIR" ]; then
     echo "Error: Failed to build app directory at $APP_DIR"

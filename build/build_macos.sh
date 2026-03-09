@@ -17,19 +17,20 @@
 set -e  # Exit on error
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+cd "$PROJECT_ROOT"
 
 # Use project venv if it exists (ensures same Python/packages as when running from terminal)
-if [ -d "$SCRIPT_DIR/venv" ]; then
-    source "$SCRIPT_DIR/venv/bin/activate"
+if [ -d "$PROJECT_ROOT/venv" ]; then
+    source "$PROJECT_ROOT/venv/bin/activate"
     echo "Using venv Python: $(which python3)"
-elif [ -d "$SCRIPT_DIR/.venv" ]; then
-    source "$SCRIPT_DIR/.venv/bin/activate"
+elif [ -d "$PROJECT_ROOT/.venv" ]; then
+    source "$PROJECT_ROOT/.venv/bin/activate"
     echo "Using .venv Python: $(which python3)"
 fi
 
 APP_NAME="Vintage Radio"
-BUILD_DIR="$SCRIPT_DIR/dist"
+BUILD_DIR="$PROJECT_ROOT/dist"
 APP_BUNDLE="$BUILD_DIR/Vintage Radio.app"
 DMG_OUTPUT="$BUILD_DIR/Vintage Radio.dmg"
 SPEC_FILE="$SCRIPT_DIR/vintage_radio.spec"
@@ -92,14 +93,14 @@ fi
 echo "mpremote: OK (will be bundled)"
 
 # --- Generate .icns icon from SVG ---
-SVG_ICON="$SCRIPT_DIR/gui/resources/vintage_radio.svg"
-ICNS_ICON="$SCRIPT_DIR/gui/resources/vintage_radio.icns"
-PNG_ICON="$SCRIPT_DIR/gui/resources/vintage_radio.png"
+SVG_ICON="$PROJECT_ROOT/gui/resources/vintage_radio.svg"
+ICNS_ICON="$PROJECT_ROOT/gui/resources/vintage_radio.icns"
+PNG_ICON="$PROJECT_ROOT/gui/resources/vintage_radio.png"
 
 if [ -f "$SVG_ICON" ]; then
     echo "Generating .icns icon from SVG..."
 
-    ICONSET_DIR="$SCRIPT_DIR/gui/resources/vintage_radio.iconset"
+    ICONSET_DIR="$PROJECT_ROOT/gui/resources/vintage_radio.iconset"
     rm -rf "$ICONSET_DIR"
     mkdir -p "$ICONSET_DIR"
 
@@ -142,12 +143,12 @@ fi
 # Clean previous build
 echo "Cleaning previous build..."
 rm -rf "$BUILD_DIR"
-rm -rf "$SCRIPT_DIR/build"
+rm -rf "$PROJECT_ROOT/build/pyinstaller_temp"
 mkdir -p "$BUILD_DIR"
 
 # Run PyInstaller (spec now produces a .app bundle on macOS via BUNDLE step)
 echo "Building application with PyInstaller..."
-python3 -m PyInstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$SCRIPT_DIR/build"
+python3 -m PyInstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$PROJECT_ROOT/build/pyinstaller_temp"
 
 # Verify the .app bundle was created
 if [ ! -d "$APP_BUNDLE" ]; then
@@ -171,8 +172,8 @@ echo "Building mpremote helper (for Setup Pico on packaged macOS)..."
 HELPER_SPEC="$SCRIPT_DIR/mpremote_helper.spec"
 HELPER_DIR="$BUILD_DIR/mpremote_helper"
 HELPER_EXE="$HELPER_DIR/mpremote_helper"
-mkdir -p "$SCRIPT_DIR/build/mpremote_helper"
-if python3 -m PyInstaller "$HELPER_SPEC" --noconfirm --distpath "$BUILD_DIR" --workpath "$SCRIPT_DIR/build/mpremote_helper"; then
+mkdir -p "$PROJECT_ROOT/build/pyinstaller_temp/mpremote_helper"
+if python3 -m PyInstaller "$HELPER_SPEC" --noconfirm --distpath "$BUILD_DIR" --workpath "$PROJECT_ROOT/build/pyinstaller_temp/mpremote_helper"; then
     if [ -d "$HELPER_DIR" ] && [ -f "$HELPER_EXE" ]; then
         cp -R "$HELPER_DIR" "$APP_BUNDLE/Contents/MacOS/"
         chmod +x "$APP_BUNDLE/Contents/MacOS/mpremote_helper/mpremote_helper"
@@ -238,7 +239,7 @@ if [ "$BUILD_DMG" = true ]; then
 
     rm -f "$DMG_OUTPUT"
 
-    DMG_STAGING="$SCRIPT_DIR/build/dmg_staging"
+    DMG_STAGING="$PROJECT_ROOT/build/pyinstaller_temp/dmg_staging"
     rm -rf "$DMG_STAGING"
     mkdir -p "$DMG_STAGING"
     cp -R "$APP_BUNDLE" "$DMG_STAGING/"
@@ -335,12 +336,12 @@ echo "=========================================="
 if [ "$SIGN" = false ] && [ -f "$ENTITLEMENTS_FILE" ]; then
     echo ""
     echo "Note: For serial/USB (Setup Pico) to work, sign the app so entitlements apply:"
-    echo "  ./build_macos.sh --sign"
+    echo "  bash build/build_macos.sh --sign"
 fi
 if [ "$SIGN" = true ] && [ "$NOTARIZE" = false ]; then
     echo ""
     echo "Note: For distribution (avoid 'damaged' when downloaded), notarize the DMG:"
-    echo "  ./build_macos.sh --sign --notarize"
+    echo "  bash build/build_macos.sh --sign --notarize"
 fi
 echo "Output: $APP_BUNDLE"
 echo "Run:    open \"$APP_BUNDLE\""

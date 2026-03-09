@@ -150,7 +150,7 @@ To build a standalone folder (no install; user runs the exe or .app directly):
 
 2. From the project root, run:
    ```bash
-   pyinstaller vintage_radio.spec
+   pyinstaller build/vintage_radio.spec
    ```
    Close any running Vintage Radio app (or process using `dist/Vintage Radio`) before rebuilding, or PyInstaller may fail with "Access is denied". Use `--noconfirm` to skip the "Continue? (y/N)" prompt. SyntaxWarnings from the `pydub` dependency during build are harmless; to hide them use `$env:PYTHONWARNINGS='ignore::SyntaxWarning'` (PowerShell) before running PyInstaller.
 
@@ -166,50 +166,58 @@ Then rebuild. The spec will use `vintage_radio.ico` if present.
 Vintage_radio/
 ├── .github/
 │   └── workflows/
-│       └── build-release.yml   # CI: build Windows/macOS executables
-├── components/                 # Hardware interfaces
+│       ├── build-release.yml   # CI: build Windows/macOS executables
+│       └── build-test.yml      # CI: test build on any branch
+├── firmware/                    # Pico/Pi firmware
+│   ├── radio_core.py           # Shared state machine (GUI + firmware)
+│   ├── pico/
+│   │   ├── main.py             # MicroPython entry for Pico
+│   │   └── dfplayer_hardware.py # DFPlayer driver
+│   └── pi/
+│       ├── main_pi.py          # Raspberry Pi entry
+│       └── pi_hardware.py      # VLC/GPIO driver
+├── gui/                         # Desktop GUI application
 │   ├── __init__.py
-│   ├── dfplayer_hardware.py   # DFPlayer (Pico/RP2040)
-│   └── pi_hardware.py         # Raspberry Pi (VLC)
-├── docs/
-│   ├── README_Pi.md           # Raspberry Pi setup
-│   └── README_RP2040.md       # RP2040 firmware notes
-├── gui/                        # GUI application code
-│   ├── __init__.py
-│   ├── radio_manager.py       # Main window
-│   ├── test_mode.py           # Emulator widget
-│   ├── database.py            # Database operations
-│   ├── sd_manager.py          # SD card sync
-│   ├── hardware_emulator.py   # Hardware emulation
-│   ├── audio_metadata.py      # Metadata extraction
-│   ├── resource_paths.py      # Paths for dev vs frozen exe
-│   ├── resources/             # Icons, images, sounds
-│   │   ├── vintage_radio.ico, .png, .svg
-│   │   ├── volDial.png, powerInd.png, AMradioSound.wav, etc.
-│   └── ...
-├── radio_core.py              # Shared core logic (GUI + firmware)
-├── main.py                    # Firmware entry (reference)
-├── main_pi.py                 # Raspberry Pi entry
-├── run_vintage_radio.py       # Launcher for GUI (used by PyInstaller)
-├── vintage_radio.spec         # PyInstaller spec for standalone build
+│   ├── radio_manager.py        # Main window
+│   ├── test_mode.py            # Emulator widget
+│   ├── database.py             # Database operations
+│   ├── sd_manager.py           # SD card sync
+│   ├── hardware_emulator.py    # Hardware emulation
+│   ├── audio_metadata.py       # Metadata extraction
+│   ├── resource_paths.py       # Paths for dev vs frozen exe
+│   └── resources/              # Icons, images, sounds
+├── build/                       # Build/packaging config
+│   ├── vintage_radio.spec      # PyInstaller spec
+│   ├── mpremote_helper.spec    # mpremote helper spec
+│   ├── build_macos.sh          # macOS build script
+│   ├── build_windows.bat       # Windows build script
+│   └── build_linux.sh          # Linux build script
+├── docs/                        # Documentation
+│   ├── README_Pi.md            # Raspberry Pi setup
+│   ├── README_RP2040.md        # RP2040 firmware notes
+│   ├── CHANGELOG.md
+│   ├── FIRST_WALKTHROUGH.md
+│   └── images/                 # Screenshots
+├── tests/                       # Test suite
+├── run_vintage_radio.py         # GUI entry point (PyInstaller)
 ├── requirements.txt
-├── README.md
-└── RELEASE_NOTES.md           # Template for release notes
+└── README.md
 ```
 
 ## Architecture
 
 ### Shared Core Logic
-The `radio_core.py` module contains the core state machine logic used by both:
-- The GUI emulator
-- The actual firmware (hardware)
+`firmware/radio_core.py` contains the core state machine logic used by both:
+- The GUI emulator (`gui/hardware_emulator.py`)
+- The actual firmware (`firmware/pico/main.py`, `firmware/pi/main_pi.py`)
 
 This ensures that the emulator accurately represents device behavior.
 
 ### Hardware Abstraction
 The system uses a `HardwareInterface` abstraction layer:
 - **GUI**: `PygameHardwareEmulator` - Uses pygame for audio playback
-- **Firmware**: `DFPlayerHardware` - Uses DFPlayer Mini via UART
+- **Pico Firmware**: `DFPlayerHardware` (`firmware/pico/dfplayer_hardware.py`) - Uses DFPlayer Mini via UART
+- **Pi Firmware**: `PiHardware` (`firmware/pi/pi_hardware.py`) - Uses VLC and GPIO
 
 ### Database Schema
 - `songs`: Music file metadata
@@ -230,7 +238,7 @@ The emulator provides a complete emulation of the device:
 - Detailed logging
 
 ### Firmware Integration
-The firmware uses `components/dfplayer_hardware.py` (and `components/pi_hardware.py` for Pi), implementing the same `HardwareInterface` as the GUI, ensuring compatibility.
+The firmware uses `firmware/pico/dfplayer_hardware.py` (and `firmware/pi/pi_hardware.py` for Pi), implementing the same `HardwareInterface` as the GUI, ensuring compatibility.
 
 ## Known Limitations
 

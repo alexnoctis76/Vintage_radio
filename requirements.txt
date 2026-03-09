@@ -7,3 +7,4 @@ python-vlc>=3.0.20123
 mpremote>=1.0.0
 pyserial>=3.5
 certifi>=2023.7.22
+pytest>=8.0.0

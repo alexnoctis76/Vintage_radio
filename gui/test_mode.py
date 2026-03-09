@@ -27,7 +27,7 @@ from .resource_paths import app_data_dir, resource_path
 from .sd_manager import SDManager
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "firmware"))
 from radio_core import (
     RadioCore, HardwareInterface,
     DF_BOOT_MS, LONG_PRESS_MS, TAP_WINDOW_MS,

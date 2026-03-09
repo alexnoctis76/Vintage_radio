@@ -3154,11 +3154,13 @@ class MainWindow(QtWidgets.QMainWindow):
         root = self._project_root()
         dest = Path(folder)
         dest.mkdir(parents=True, exist_ok=True)
-        for name in ("main.py", "radio_core.py"):
-            src = root / name
-            if src.exists():
-                shutil.copy2(src, dest / name)
-        fw_src = root / "components" / "dfplayer_hardware.py"
+        pico_main = root / "firmware" / "pico" / "main.py"
+        if pico_main.exists():
+            shutil.copy2(pico_main, dest / "main.py")
+        rc_src = root / "firmware" / "radio_core.py"
+        if rc_src.exists():
+            shutil.copy2(rc_src, dest / "radio_core.py")
+        fw_src = root / "firmware" / "pico" / "dfplayer_hardware.py"
         if fw_src.exists():
             (dest / "components").mkdir(parents=True, exist_ok=True)
             shutil.copy2(fw_src, dest / "components" / "dfplayer_hardware.py")
@@ -3195,11 +3197,11 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Setup Pico", msg)
             return
         root = self._project_root()
-        if not (root / "main.py").exists() or not (root / "radio_core.py").exists():
+        if not (root / "firmware" / "pico" / "main.py").exists() or not (root / "firmware" / "radio_core.py").exists():
             QtWidgets.QMessageBox.warning(self, "Setup Pico", "Project files not found.")
             return
-        if not (root / "components" / "dfplayer_hardware.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Setup Pico", "components/dfplayer_hardware.py not found.")
+        if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
+            QtWidgets.QMessageBox.warning(self, "Setup Pico", "firmware/pico/dfplayer_hardware.py not found.")
             return
 
         # Quick test: can we connect to Pico (MicroPython already installed)?
@@ -3445,9 +3447,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
 
         files_to_copy = [
-            ("main.py", "main.py"),
-            ("radio_core.py", "radio_core.py"),
-            ("components/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
+            ("firmware/pico/main.py", "main.py"),
+            ("firmware/radio_core.py", "radio_core.py"),
+            ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         ]
         # Total steps: mkdir + firmware batch + AM WAV + metadata + reboot
         total = 5
@@ -3600,11 +3602,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         root = self._project_root()
-        if not (root / "main.py").exists() or not (root / "radio_core.py").exists():
+        if not (root / "firmware" / "pico" / "main.py").exists() or not (root / "firmware" / "radio_core.py").exists():
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "Project files not found.")
             return
-        if not (root / "components" / "dfplayer_hardware.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", "components/dfplayer_hardware.py not found.")
+        if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", "firmware/pico/dfplayer_hardware.py not found.")
             return
 
         use_inprocess = mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__"
@@ -3651,11 +3653,13 @@ class MainWindow(QtWidgets.QMainWindow):
         deploy_dir = app_data_dir() / "agent_workshop" / "deploy_pi" / "vintage_radio"
         deploy_dir.mkdir(parents=True, exist_ok=True)
         (deploy_dir / "components").mkdir(parents=True, exist_ok=True)
-        for name in ("main_pi.py", "radio_core.py"):
-            src = root / name
-            if src.exists():
-                shutil.copy2(src, deploy_dir / name)
-        pi_hw = root / "components" / "pi_hardware.py"
+        pi_main = root / "firmware" / "pi" / "main_pi.py"
+        if pi_main.exists():
+            shutil.copy2(pi_main, deploy_dir / "main_pi.py")
+        rc_src = root / "firmware" / "radio_core.py"
+        if rc_src.exists():
+            shutil.copy2(rc_src, deploy_dir / "radio_core.py")
+        pi_hw = root / "firmware" / "pi" / "pi_hardware.py"
         if pi_hw.exists():
             shutil.copy2(pi_hw, deploy_dir / "components" / "pi_hardware.py")
         (deploy_dir / "requirements_pi.txt").write_text("python-vlc\nRPi.GPIO\n", encoding="utf-8")
@@ -3724,11 +3728,13 @@ class MainWindow(QtWidgets.QMainWindow):
         root = self._project_root()
         dest = Path(folder)
         dest.mkdir(parents=True, exist_ok=True)
-        for name in ("main_pi.py", "radio_core.py"):
-            src = root / name
-            if src.exists():
-                shutil.copy2(src, dest / name)
-        pi_hw = root / "components" / "pi_hardware.py"
+        pi_main = root / "firmware" / "pi" / "main_pi.py"
+        if pi_main.exists():
+            shutil.copy2(pi_main, dest / "main_pi.py")
+        rc_src = root / "firmware" / "radio_core.py"
+        if rc_src.exists():
+            shutil.copy2(rc_src, dest / "radio_core.py")
+        pi_hw = root / "firmware" / "pi" / "pi_hardware.py"
         if pi_hw.exists():
             (dest / "components").mkdir(parents=True, exist_ok=True)
             shutil.copy2(pi_hw, dest / "components" / "pi_hardware.py")

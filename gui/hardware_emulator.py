@@ -36,7 +36,7 @@ except (ImportError, OSError):
 from .database import DatabaseManager
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "firmware"))
 from radio_core import HardwareInterface
 
 
