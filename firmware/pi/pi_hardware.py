@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from radio_core import HardwareInterface, FADE_IN_S
+from pin_config_loader import load_pin_config
 
 # Configurable paths (set before instantiating or via env)
 MEDIA_ROOT = os.environ.get("VINTAGE_RADIO_MEDIA_ROOT", "/media/vintage")
@@ -23,10 +24,12 @@ ALBUM_FILE = str(VINTAGE_DIR / "album_state.txt")
 METADATA_FILE = str(VINTAGE_DIR / "radio_metadata.json")
 WAV_FILE = str(VINTAGE_DIR / "AMradioSound.wav")
 
-# GPIO pin numbers (BCM); match Pico layout where possible
-PIN_BUTTON = 2
-PIN_SENSE = 14   # power sense
-PIN_BUSY = 15    # optional: can derive from VLC playing
+# GPIO pin numbers from config (BCM); falls back to defaults matching Pico layout
+_cfg = load_pin_config()
+_pins = _cfg.get("pins", {})
+PIN_BUTTON = _pins.get("button", 2)
+PIN_SENSE = _pins.get("power_sense", 14)
+PIN_BUSY = _pins.get("busy", 15)
 
 try:
     import vlc

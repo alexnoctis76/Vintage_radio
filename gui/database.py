@@ -5,14 +5,14 @@ from __future__ import annotations
 import sqlite3
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .resource_paths import app_data_dir
 from typing import Any, Dict, Iterable, List, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -77,9 +77,29 @@ class DatabaseManager:
             self._set_schema_version(3)
             current = 3
             print("[DB] Migration to v3 complete")
+        if current < 4:
+            print("[DB] Running migration to v4...")
+            self._migrate_to_v4()
+            self._set_schema_version(4)
+            current = 4
+            print("[DB] Migration to v4 complete")
+        if current < 5:
+            print("[DB] Running migration to v5...")
+            self._migrate_to_v5()
+            self._set_schema_version(5)
+            current = 5
+            print("[DB] Migration to v5 complete")
+        if current < 6:
+            print("[DB] Running migration to v6...")
+            self._migrate_to_v6()
+            self._set_schema_version(6)
+            current = 6
+            print("[DB] Migration to v6 complete")
         # Safety: ensure sort_order column exists even if version was already 3
         # (handles cases where version was bumped but ALTER TABLE didn't succeed)
         self._ensure_sort_order_columns()
+        self._ensure_device_profiles_table()
+        self._ensure_basic_stations_tables()
         print(f"[DB] Schema version after migrations: {current}")
 
     def _ensure_settings_table(self) -> None:
@@ -237,6 +257,380 @@ class DatabaseManager:
                     )
                 self.conn.commit()
                 print(f"[DB] sort_order column added and initialized for {table}")
+
+    def _migrate_to_v4(self) -> None:
+        """Add device_profiles table for configurable pin layouts and board selection."""
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS device_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                notes TEXT DEFAULT '',
+                board_id TEXT NOT NULL DEFAULT 'raspberry_pi_pico',
+                pin_config_json TEXT NOT NULL DEFAULT '{}',
+                custom_hw_driver_path TEXT DEFAULT '',
+                is_default INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                modified_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        self.conn.commit()
+        self._ensure_default_device_profile()
+
+    def _ensure_device_profiles_table(self) -> None:
+        """Safety: create device_profiles table and default profile if missing."""
+        tables = [
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        ]
+        if "device_profiles" not in tables:
+            self._migrate_to_v4()
+        else:
+            self._ensure_default_device_profile()
+
+    def _migrate_to_v5(self) -> None:
+        """Add basic_stations and basic_station_tracks tables for basic-mode station management."""
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS basic_stations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                folder_number INTEGER NOT NULL UNIQUE,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                modified_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS basic_station_tracks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                station_id INTEGER NOT NULL,
+                song_id INTEGER NOT NULL,
+                track_order INTEGER NOT NULL,
+                UNIQUE (station_id, track_order),
+                FOREIGN KEY (station_id) REFERENCES basic_stations(id) ON DELETE CASCADE,
+                FOREIGN KEY (song_id) REFERENCES songs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_basic_station_tracks_order
+                ON basic_station_tracks (station_id, track_order);
+            """
+        )
+        self.conn.commit()
+
+    def _migrate_to_v6(self) -> None:
+        """Recreate basic_station_tracks with auto-increment PK (allows duplicate songs per station)."""
+        tables = {
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        if "basic_station_tracks" not in tables:
+            return
+        # Check if old schema has (station_id, song_id) as PK by inspecting columns
+        cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(basic_station_tracks);").fetchall()]
+        if "id" in cols:
+            return  # Already migrated
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS basic_station_tracks_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                station_id INTEGER NOT NULL,
+                song_id INTEGER NOT NULL,
+                track_order INTEGER NOT NULL,
+                UNIQUE (station_id, track_order),
+                FOREIGN KEY (station_id) REFERENCES basic_stations(id) ON DELETE CASCADE,
+                FOREIGN KEY (song_id) REFERENCES songs(id) ON DELETE CASCADE
+            );
+            INSERT INTO basic_station_tracks_new (station_id, song_id, track_order)
+                SELECT station_id, song_id, track_order FROM basic_station_tracks;
+            DROP TABLE basic_station_tracks;
+            ALTER TABLE basic_station_tracks_new RENAME TO basic_station_tracks;
+            CREATE INDEX IF NOT EXISTS idx_basic_station_tracks_order
+                ON basic_station_tracks (station_id, track_order);
+            """
+        )
+        self.conn.commit()
+
+    def _ensure_basic_stations_tables(self) -> None:
+        """Safety: create basic_stations tables if missing."""
+        tables = {
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        if "basic_stations" not in tables or "basic_station_tracks" not in tables:
+            self._migrate_to_v5()
+
+    def _ensure_default_device_profile(self) -> None:
+        """Ensure at least one default profile exists."""
+        row = self.conn.execute(
+            "SELECT id FROM device_profiles WHERE is_default = 1;"
+        ).fetchone()
+        if row is None:
+            count = self.conn.execute("SELECT COUNT(*) as c FROM device_profiles;").fetchone()["c"]
+            if count == 0:
+                from .board_profiles import get_default_board_profile
+                bp = get_default_board_profile()
+                now = datetime.now(timezone.utc).isoformat()
+                self.conn.execute(
+                    """INSERT INTO device_profiles
+                       (name, notes, board_id, pin_config_json, custom_hw_driver_path, is_default, created_at, modified_at)
+                       VALUES (?, ?, ?, ?, ?, 1, ?, ?);""",
+                    ("Default (Pico)", "", bp.id, bp.default_config_json(), "", now, now),
+                )
+                self.conn.commit()
+                new_id = self.conn.execute("SELECT last_insert_rowid();").fetchone()[0]
+                self.set_setting("active_profile_id", str(new_id))
+
+    # ---- Device Profile CRUD ----
+
+    def create_device_profile(
+        self,
+        name: str,
+        board_id: str,
+        pin_config_json: str,
+        notes: str = "",
+        custom_hw_driver_path: str = "",
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self.conn.execute(
+            """INSERT INTO device_profiles
+               (name, notes, board_id, pin_config_json, custom_hw_driver_path, is_default, created_at, modified_at)
+               VALUES (?, ?, ?, ?, ?, 0, ?, ?);""",
+            (name, notes, board_id, pin_config_json, custom_hw_driver_path, now, now),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_device_profile(self, profile_id: int, **fields) -> None:
+        allowed = {"name", "notes", "board_id", "pin_config_json", "custom_hw_driver_path"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        updates["modified_at"] = datetime.now(timezone.utc).isoformat()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [profile_id]
+        self.conn.execute(
+            f"UPDATE device_profiles SET {set_clause} WHERE id = ?;",
+            values,
+        )
+        self.conn.commit()
+
+    def delete_device_profile(self, profile_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT is_default FROM device_profiles WHERE id = ?;", (profile_id,)
+        ).fetchone()
+        if row is None or row["is_default"] == 1:
+            return False
+        count = self.conn.execute("SELECT COUNT(*) as c FROM device_profiles;").fetchone()["c"]
+        if count <= 1:
+            return False
+        self.conn.execute("DELETE FROM device_profiles WHERE id = ?;", (profile_id,))
+        self.conn.commit()
+        active = self.get_setting("active_profile_id")
+        if active == str(profile_id):
+            first = self.conn.execute("SELECT id FROM device_profiles ORDER BY id LIMIT 1;").fetchone()
+            if first:
+                self.set_setting("active_profile_id", str(first["id"]))
+        return True
+
+    def duplicate_device_profile(self, profile_id: int, new_name: str) -> int:
+        row = self.get_device_profile(profile_id)
+        if row is None:
+            raise ValueError(f"Profile {profile_id} not found")
+        return self.create_device_profile(
+            name=new_name,
+            board_id=row["board_id"],
+            pin_config_json=row["pin_config_json"],
+            notes=row["notes"],
+            custom_hw_driver_path=row["custom_hw_driver_path"],
+        )
+
+    def get_device_profile(self, profile_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM device_profiles WHERE id = ?;", (profile_id,)
+        ).fetchone()
+
+    def list_device_profiles(self) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM device_profiles ORDER BY is_default DESC, name COLLATE NOCASE;"
+        ).fetchall()
+
+    def get_active_profile(self) -> Optional[sqlite3.Row]:
+        pid = self.get_setting("active_profile_id")
+        if pid is not None:
+            row = self.get_device_profile(int(pid))
+            if row is not None:
+                return row
+        first = self.conn.execute(
+            "SELECT * FROM device_profiles ORDER BY is_default DESC, id LIMIT 1;"
+        ).fetchone()
+        if first:
+            self.set_setting("active_profile_id", str(first["id"]))
+        return first
+
+    def set_active_profile(self, profile_id: int) -> None:
+        self.set_setting("active_profile_id", str(profile_id))
+
+    # ---- Basic Station CRUD ----
+
+    def create_basic_station(self, name: str, folder_number: int) -> int:
+        max_order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM basic_stations;"
+        ).fetchone()[0]
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO basic_stations (name, folder_number, sort_order, created_at, modified_at)
+               VALUES (?, ?, ?, ?, ?);""",
+            (name, folder_number, max_order + 1, now, now),
+        )
+        self.conn.commit()
+        station_id = self.conn.execute("SELECT last_insert_rowid();").fetchone()[0]
+        self._maybe_backup()
+        return int(station_id)
+
+    def update_basic_station(self, station_id: int, **fields) -> None:
+        allowed = {"name", "folder_number"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        updates["modified_at"] = datetime.now(timezone.utc).isoformat()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [station_id]
+        self.conn.execute(
+            f"UPDATE basic_stations SET {set_clause} WHERE id = ?;", values
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def delete_basic_station(self, station_id: int) -> None:
+        self.conn.execute("DELETE FROM basic_stations WHERE id = ?;", (station_id,))
+        self.conn.commit()
+        self._maybe_backup()
+
+    def get_basic_station(self, station_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM basic_stations WHERE id = ?;", (station_id,)
+        ).fetchone()
+
+    def list_basic_stations(self) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM basic_stations ORDER BY sort_order, folder_number;"
+        ).fetchall()
+
+    def next_basic_station_folder(self) -> int:
+        """Return the next unused DFPlayer folder number (1-98)."""
+        used = {
+            r["folder_number"]
+            for r in self.conn.execute("SELECT folder_number FROM basic_stations;").fetchall()
+        }
+        for n in range(1, 99):
+            if n not in used:
+                return n
+        raise ValueError("All 98 DFPlayer folders are in use")
+
+    def update_basic_station_order(self, station_ids: List[int]) -> None:
+        """Reorder stations and reassign folder numbers so position matches folder (1-indexed)."""
+        with self.conn:
+            # Temporarily set folder_number to negative to avoid UNIQUE conflicts during swap
+            for idx, sid in enumerate(station_ids):
+                self.conn.execute(
+                    "UPDATE basic_stations SET sort_order = ?, folder_number = ? WHERE id = ?;",
+                    (idx, -(idx + 1), sid),
+                )
+            for idx, sid in enumerate(station_ids):
+                self.conn.execute(
+                    "UPDATE basic_stations SET folder_number = ? WHERE id = ?;",
+                    (idx + 1, sid),
+                )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def add_song_to_basic_station(self, station_id: int, song_id: int, track_order: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM basic_station_tracks WHERE station_id = ? AND track_order = ?;",
+                (station_id, track_order),
+            )
+            self.conn.execute(
+                """INSERT INTO basic_station_tracks (station_id, song_id, track_order)
+                   VALUES (?, ?, ?);""",
+                (station_id, song_id, track_order),
+            )
+        self._maybe_backup()
+
+    def remove_basic_station_track(self, track_row_id: int) -> None:
+        """Remove a single track entry by its row id (allows removing one instance of a duplicate)."""
+        self.conn.execute(
+            "DELETE FROM basic_station_tracks WHERE id = ?;", (track_row_id,)
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def remove_song_from_basic_station(self, station_id: int, song_id: int) -> None:
+        """Remove all instances of a song from a station."""
+        self.conn.execute(
+            "DELETE FROM basic_station_tracks WHERE station_id = ? AND song_id = ?;",
+            (station_id, song_id),
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def list_basic_station_songs(self, station_id: int) -> List[sqlite3.Row]:
+        """Return all tracks for a station, including duplicates. Each row has a
+        ``bst_id`` column (the basic_station_tracks row id) for individual removal."""
+        return self.conn.execute(
+            """SELECT basic_station_tracks.id AS bst_id, songs.*
+               FROM basic_station_tracks
+               JOIN songs ON songs.id = basic_station_tracks.song_id
+               WHERE basic_station_tracks.station_id = ?
+               ORDER BY basic_station_tracks.track_order ASC;""",
+            (station_id,),
+        ).fetchall()
+
+    def list_basic_station_tracks(self, station_id: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT id, song_id, track_order
+               FROM basic_station_tracks
+               WHERE station_id = ?
+               ORDER BY track_order ASC;""",
+            (station_id,),
+        ).fetchall()
+
+    def replace_basic_station_tracks(self, station_id: int, song_ids: Iterable[int]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM basic_station_tracks WHERE station_id = ?;", (station_id,)
+            )
+            for index, song_id in enumerate(song_ids, start=1):
+                self.conn.execute(
+                    """INSERT INTO basic_station_tracks (station_id, song_id, track_order)
+                       VALUES (?, ?, ?);""",
+                    (station_id, song_id, index),
+                )
+        self._maybe_backup()
+
+    def next_basic_station_track_order(self, station_id: int) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(track_order), 0) AS max_order FROM basic_station_tracks WHERE station_id = ?;",
+            (station_id,),
+        ).fetchone()
+        return int(row["max_order"]) + 1
+
+    def clear_all_basic_stations(self) -> None:
+        """Remove all basic stations and their track associations."""
+        with self.conn:
+            self.conn.execute("DELETE FROM basic_station_tracks;")
+            self.conn.execute("DELETE FROM basic_stations;")
+        self.conn.commit()
+        self._maybe_backup()
+
+    # ---- Settings ----
 
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         row = self.conn.execute(
@@ -406,7 +800,7 @@ class DatabaseManager:
     def update_song(self, song_id: int, fields: Dict[str, Any]) -> None:
         if not fields:
             return
-        fields["modified_at"] = datetime.utcnow().isoformat()
+        fields["modified_at"] = datetime.now(timezone.utc).isoformat()
         columns = ", ".join(f"{key} = ?" for key in fields.keys())
         values = list(fields.values()) + [song_id]
         self.conn.execute(f"UPDATE songs SET {columns} WHERE id = ?;", values)
@@ -421,7 +815,7 @@ class DatabaseManager:
         """Update sd_path and modified_at for many songs in one transaction. items: [(song_id, sd_path), ...]."""
         if not updates:
             return
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         rows = [(path_str if path_str is not None else "", now, song_id) for song_id, path_str in updates]
         self.conn.executemany(
             "UPDATE songs SET sd_path = ?, modified_at = ? WHERE id = ?;",
@@ -462,7 +856,7 @@ class DatabaseManager:
     def update_album(self, album_id: int, fields: Dict[str, Any]) -> None:
         if not fields:
             return
-        fields["modified_at"] = datetime.utcnow().isoformat()
+        fields["modified_at"] = datetime.now(timezone.utc).isoformat()
         columns = ", ".join(f"{key} = ?" for key in fields.keys())
         values = list(fields.values()) + [album_id]
         self.conn.execute(f"UPDATE albums SET {columns} WHERE id = ?;", values)
@@ -490,7 +884,7 @@ class DatabaseManager:
     def update_playlist(self, playlist_id: int, fields: Dict[str, Any]) -> None:
         if not fields:
             return
-        fields["modified_at"] = datetime.utcnow().isoformat()
+        fields["modified_at"] = datetime.now(timezone.utc).isoformat()
         columns = ", ".join(f"{key} = ?" for key in fields.keys())
         values = list(fields.values()) + [playlist_id]
         self.conn.execute(f"UPDATE playlists SET {columns} WHERE id = ?;", values)
@@ -704,7 +1098,7 @@ class DatabaseManager:
 
     def backup_now(self) -> Optional[Path]:
         self.backups_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_path = self.backups_dir / f"radio_manager_{timestamp}.db"
         shutil.copy2(self.db_path, backup_path)
         self._enforce_backup_retention()

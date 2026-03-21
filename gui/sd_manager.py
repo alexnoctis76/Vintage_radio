@@ -442,6 +442,132 @@ class SDManager:
                     print(f"Alternative FLAC conversion also failed for {source_path.name}: {e2}")
             return False
 
+    def sync_library_basic(
+        self,
+        sd_root: Path,
+        force_clean: bool = False,
+        progress_callback: Optional[callable] = None,
+    ) -> Tuple[int, int]:
+        """Sync basic-mode stations to SD card.
+
+        Each station maps to a DFPlayer folder (01-98). Tracks are duplicated
+        across folders if they appear in multiple stations. Folder 99 is
+        reserved for the AM WAV overlay. No metadata file is written -- the
+        firmware discovers stations by querying the DFPlayer directly.
+        """
+        RESERVED_FOLDER = 99
+        stations = self.db.list_basic_stations()
+        if not stations:
+            if progress_callback:
+                progress_callback(1, 1, "No stations to sync")
+            self._copy_am_wav_to_dfplayer_sd(sd_root)
+            return 0, 0
+
+        vlc_available = self._check_vlc()
+        ffmpeg_available = self._check_ffmpeg()
+        can_convert = vlc_available or (ffmpeg_available and PYDUB_AVAILABLE)
+
+        # Count total tracks for progress
+        station_tracks: List[Tuple[int, List]] = []
+        total_tracks = 0
+        for station in stations:
+            tracks = self.db.list_basic_station_songs(station["id"])
+            station_tracks.append((station["folder_number"], tracks))
+            total_tracks += len(tracks)
+
+        total_work = total_tracks + 2  # tracks + cleanup + AM WAV
+        work_done = 0
+        copied = 0
+        skipped = 0
+
+        used_folders: set = set()
+        for folder_num, tracks in station_tracks:
+            used_folders.add(folder_num)
+            folder_path = sd_root / f"{folder_num:02d}"
+            folder_path.mkdir(parents=True, exist_ok=True)
+            valid_track_nums: set = set()
+
+            for track_order, song in enumerate(tracks, start=1):
+                valid_track_nums.add(track_order)
+                file_path = Path(song["file_path"])
+                title = song["title"] or song["original_filename"]
+                if progress_callback:
+                    progress_callback(work_done, total_work, f"Syncing: {title}")
+
+                if not file_path.exists():
+                    print(f"Source file missing, skipping: {file_path}")
+                    skipped += 1
+                    work_done += 1
+                    continue
+
+                target_path = folder_path / f"{track_order:03d}.mp3"
+                source_ext = file_path.suffix.lower()
+
+                if not force_clean and target_path.exists():
+                    try:
+                        target_size = target_path.stat().st_size
+                        if source_ext == ".mp3":
+                            if target_size == file_path.stat().st_size:
+                                skipped += 1
+                                work_done += 1
+                                continue
+                        elif target_size > 1024:
+                            skipped += 1
+                            work_done += 1
+                            continue
+                    except OSError:
+                        pass
+
+                try:
+                    if source_ext == ".mp3":
+                        shutil.copy2(file_path, target_path)
+                        copied += 1
+                    elif can_convert:
+                        if self._convert_to_mp3(file_path, target_path):
+                            copied += 1
+                        else:
+                            print(f"Failed to convert {file_path.name}")
+                            skipped += 1
+                    else:
+                        print(f"Cannot convert {file_path.name} (no converter)")
+                        skipped += 1
+                except OSError as e:
+                    print(f"Error syncing {file_path.name}: {e}")
+                    skipped += 1
+                work_done += 1
+
+            # Remove stale tracks within this folder
+            for item in folder_path.iterdir():
+                if item.suffix.lower() == ".mp3" and item.stem.isdigit():
+                    if int(item.stem) not in valid_track_nums:
+                        print(f"Removing stale track: {item}")
+                        item.unlink(missing_ok=True)
+
+        # Clean up folders not assigned to any station
+        work_done += 1
+        if progress_callback:
+            progress_callback(work_done, total_work, "Cleaning up...")
+        for item in sd_root.iterdir():
+            if item.is_dir() and item.name.isdigit():
+                folder_num = int(item.name)
+                if folder_num != RESERVED_FOLDER and folder_num not in used_folders:
+                    print(f"Removing stale folder: {item}")
+                    shutil.rmtree(item, ignore_errors=True)
+
+        work_done += 1
+        if progress_callback:
+            progress_callback(work_done, total_work, "Copying AM radio sound...")
+        self._copy_am_wav_to_dfplayer_sd(sd_root)
+
+        # Write feature flags to folder 99
+        loop_enabled = self.db.get_setting("basic_loop_stations", "1") == "1"
+        self._write_basic_feature_flags(sd_root, loop_stations=loop_enabled)
+
+        if progress_callback:
+            progress_callback(total_work, total_work, "Basic sync complete!")
+        print(f"Basic SD sync complete: {copied} copied, {skipped} skipped across {len(stations)} stations")
+        return copied, skipped
+
     def sync_library(
         self,
         sd_root: Path,
@@ -714,6 +840,30 @@ class SDManager:
         if copied == 0 and skipped > 0:
             print("No files were copied (all sources missing?). Re-import in Library or fix file paths, then sync again.")
         return copied, skipped
+
+    def _write_basic_feature_flags(self, sd_root: Path, loop_stations: bool = True) -> None:
+        """Write/remove feature flag files in folder 99.
+
+        Folder 99 layout:
+          001.wav - AM radio sound (always present)
+          002.mp3 - Loop stations flag (present = loop enabled)
+
+        The firmware queries folder 99 file count (0x4E) to detect flags.
+        """
+        flag_path = sd_root / "99" / "002.mp3"
+        if loop_stations:
+            if not flag_path.exists():
+                flag_path.parent.mkdir(parents=True, exist_ok=True)
+                # Write a minimal valid MP3 frame (silent, ~0.1s)
+                # MPEG1 Layer3, 128kbps, 44100Hz, stereo, padding
+                flag_path.write_bytes(
+                    b'\xff\xfb\x90\x00' + b'\x00' * 413
+                )
+                print(f"Feature flag written: {flag_path} (loop_stations=True)")
+        else:
+            if flag_path.exists():
+                flag_path.unlink()
+                print(f"Feature flag removed: {flag_path} (loop_stations=False)")
 
     def _copy_am_wav_to_dfplayer_sd(self, sd_root: Path) -> bool:
         """Copy AMradioSound.wav to folder 99/001.wav on the DFPlayer SD card.

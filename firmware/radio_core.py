@@ -34,7 +34,7 @@ except ImportError:
 FADE_IN_S = 2.4
 DF_BOOT_MS = 2000
 LONG_PRESS_MS = 500   # Hold >= 500ms = long press
-TAP_WINDOW_MS = 500   # 500ms of no input after last release = resolve accumulated input
+TAP_WINDOW_MS = 350   # ms after last release to resolve taps (single-tap next/prev feels snappier; double-tap still detectable)
 BUSY_CONFIRM_MS = 1800
 POST_CMD_GUARD_MS = 120
 MAX_ALBUM_NUM = 99
@@ -70,60 +70,165 @@ class RadioStation:
 class HardwareInterface:
     """
     Abstract interface for hardware operations.
-    Implement this for real hardware (DFPlayer) or emulation (pygame).
+
+    Implement this for real hardware (DFPlayer, I2S, etc.) or
+    emulation (pygame).  The firmware entry point (main.py) and
+    RadioCore both call these methods.
+
+    See docs/CUSTOM_DRIVER.md for a full guide on building a
+    custom driver and firmware/custom_driver_template.py for a
+    ready-to-fill-in starting point.
     """
-    
+
+    # ---- Playback ----
+
     def play_track(self, folder, track, start_ms=0):
-        """Play a track. folder/track for DFPlayer, or use metadata mapping."""
+        """Play a track.
+
+        Args:
+            folder: DFPlayer folder number (1-99).
+            track:  Track number within that folder (1-999).
+            start_ms: Seek to this position after starting (0 = beginning).
+
+        Returns:
+            True if playback started, False on failure.
+        """
         raise NotImplementedError
-    
+
     def stop(self):
-        """Stop playback."""
+        """Stop playback immediately."""
         raise NotImplementedError
-    
+
     def set_volume(self, level):
-        """Set volume (0-100)."""
+        """Set volume.
+
+        Args:
+            level: 0-100 (the driver maps this to its hardware range).
+        """
         raise NotImplementedError
-    
+
     def is_playing(self):
-        """Return True if currently playing."""
+        """Return True if audio is currently playing."""
         raise NotImplementedError
-    
+
     def get_playback_position_ms(self):
-        """Return current playback position in milliseconds."""
+        """Return current playback position in milliseconds.
+
+        Return 0 if the hardware cannot report position.
+        """
         raise NotImplementedError
-    
+
     def check_track_finished_uart(self):
-        """Optional: True if track-finished was received via UART (e.g. DFPlayer 0x3D). Default: False."""
+        """Return True if a track-finished event was received.
+
+        For DFPlayer this is the 0x3D UART message.  If your hardware
+        does not send such events, leave the default (returns False)
+        and RadioCore will fall back to polling is_playing().
+        """
         return False
-    
+
     def play_am_overlay(self):
-        """Play the AM radio sound overlay."""
+        """Play the AM radio 'tuning' static effect.
+
+        Can be a no-op if the hardware does not support an AM overlay.
+        """
         raise NotImplementedError
-    
+
+    # ---- State persistence ----
+
     def save_state(self, state_dict):
-        """Persist state to storage."""
+        """Persist state to non-volatile storage.
+
+        state_dict contains at least:
+            mode (str), album_index (int), track (int), known_tracks (dict).
+        """
         raise NotImplementedError
-    
+
     def load_state(self):
-        """Load state from storage. Returns dict or None."""
+        """Load previously saved state.
+
+        Returns:
+            A dict with the same keys as save_state(), or None if
+            no state was saved.
+        """
         raise NotImplementedError
-    
+
+    # ---- Logging ----
+
     def log(self, message):
-        """Log a message."""
+        """Output a log/debug message (e.g. print to serial)."""
         raise NotImplementedError
-    
+
+    # ---- Metadata ----
+
     def get_albums(self):
-        """Return list of album dicts: [{'id': int, 'name': str, 'tracks': [...]}]"""
+        """Return albums from radio_metadata.json.
+
+        Each album is a dict:
+            {'id': int, 'name': str, 'tracks': [<track_dict>, ...]}
+
+        Each track_dict contains at least:
+            id, title, artist, duration (seconds), folder, track_number.
+        """
         raise NotImplementedError
-    
+
     def get_playlists(self):
-        """Return list of playlist dicts: [{'id': int, 'name': str, 'tracks': [...]}]"""
+        """Return playlists from radio_metadata.json.
+
+        Same format as get_albums().
+        """
         raise NotImplementedError
-    
+
     def get_all_tracks(self):
-        """Return list of all track dicts."""
+        """Return a flat list of every unique track dict."""
         raise NotImplementedError
+
+    # ---- Hardware / GPIO ----
+
+    def is_power_on(self):
+        """Return True when the power-sense input is active.
+
+        The firmware main loop polls this to detect power on/off.
+        If your hardware has no power sense, return True.
+        """
+        raise NotImplementedError
+
+    def is_button_pressed(self):
+        """Return True when the user button is currently held down.
+
+        Active-low buttons should invert the pin value here.
+        """
+        raise NotImplementedError
+
+    # ---- Optional (override if needed) ----
+
+    def set_delay_playback(self, delay):
+        """When True, play_track() should no-op.
+
+        The firmware sets this before running the AM overlay
+        sequence so the core's auto-play doesn't race with it.
+        Override if your driver needs to honour this flag.
+        """
+        pass
+
+    def set_current_track_hint(self, track):
+        """Hint for emulators / GUIs -- the track dict about to play.
+
+        Firmware drivers can ignore this.
+        """
+        pass
+
+    def discover_stations(self):
+        """Discover stations from hardware (e.g. DFPlayer folder queries).
+
+        Used by basic_mode to build station/playlist data directly from
+        the SD card folder structure without metadata files.
+
+        Returns:
+            List of station dicts (same format as get_albums/get_playlists),
+            or empty list if not supported.
+        """
+        return []
 
 
 # ===========================
@@ -143,17 +248,21 @@ class RadioCore:
     - Radio mode with virtual station timing
     """
     
-    def __init__(self, hardware):
+    def __init__(self, hardware, basic_mode=False):
         """
         Initialize the radio core.
         
         Args:
             hardware: An object implementing HardwareInterface
+            basic_mode: When True, stations are discovered from DFPlayer
+                        folder structure (no metadata). No album mode --
+                        only station (playlist), shuffle, and radio.
         """
         self.hw = hardware
+        self.basic_mode = basic_mode
         
         # Current state
-        self.mode = MODE_ALBUM
+        self.mode = MODE_PLAYLIST if basic_mode else MODE_ALBUM
         self.power_on = True
         self.is_playing = False
         
@@ -192,6 +301,9 @@ class RadioCore:
         
         # Known tracks per album (for firmware compatibility)
         self.known_tracks = {}
+        
+        # Basic mode feature flags (read from folder 99 on SD card via DFPlayer)
+        self.loop_stations = True  # Default: loop enabled
     
     def init(self, skip_initial_playback=False):
         """Initialize the radio - load state and optionally start playback.
@@ -199,12 +311,17 @@ class RadioCore:
         Used by firmware to match baseline: one start inside AM overlay, no double-start.
         """
         self._load_data()
+        if self.basic_mode:
+            self._check_feature_flags()
         self._load_state()
         if self.power_on and not skip_initial_playback:
             self._start_playback_for_current()
     
     def _load_data(self):
         """Load albums, playlists, and tracks from hardware."""
+        if self.basic_mode:
+            self._load_data_basic()
+            return
         self.albums = self.hw.get_albums() or []
         self.playlists = self.hw.get_playlists() or []
         
@@ -212,24 +329,73 @@ class RadioCore:
         if not self.albums:
             all_tracks = self.hw.get_all_tracks() or []
             self.albums = [{'id': 0, 'name': 'Library', 'tracks': all_tracks}]
+
+    def _load_data_basic(self):
+        """Load station data by querying DFPlayer folder structure.
         
-        # Ensure we have at least one playlist (full library)
+        In basic mode, stations are discovered via UART queries (0x4F, 0x4E)
+        and mapped to playlists. Albums stay empty (no album mode).
+        The hardware's internal _playlists/_albums are also set so that
+        _load_metadata() (called from load_state) won't overwrite them
+        with advanced-mode radio_metadata.json.
+        """
+        self.albums = []
+        stations = self.hw.discover_stations()
+        if stations:
+            self.playlists = stations
+        else:
+            self.playlists = [{"id": 0, "name": "Empty", "tracks": []}]
+        self.hw.log(f"BASIC: Loaded {len(self.playlists)} stations")
+        
         if not self.playlists:
             all_tracks = self.hw.get_all_tracks() or []
             self.playlists = [{'id': 0, 'name': 'Library', 'tracks': all_tracks}]
         
+        # Populate hw-level caches so _load_metadata() sees them and skips
+        # the radio_metadata.json load (which would overwrite station data).
+        if hasattr(self.hw, '_playlists'):
+            self.hw._playlists = list(self.playlists)
+        if hasattr(self.hw, '_albums'):
+            self.hw._albums = list(self.albums)
+        
         self.hw.log(f"Loaded {len(self.albums)} albums, {len(self.playlists)} playlists")
         for i, playlist in enumerate(self.playlists):
             self.hw.log(f"[PLAYLIST DEBUG] Playlist {i}: name='{playlist.get('name', 'Unknown')}', tracks={len(playlist.get('tracks', []))}")
-    
+
+    def _check_feature_flags(self):
+        """Read feature flags from folder 99 on the DFPlayer SD card.
+
+        Folder 99 already holds the AM WAV (track 001). Additional tracks
+        act as boolean feature flags:
+          002 present -> loop_stations enabled (default: enabled)
+
+        Uses the 0x4E query (file count in folder) which is non-intrusive.
+        """
+        if not hasattr(self.hw, 'query_files_in_folder'):
+            return
+        count = self.hw.query_files_in_folder(99, suppress_errors=True)
+        if count is None:
+            self.hw.log("BASIC: Could not query folder 99 for feature flags, using defaults")
+            return
+        self.loop_stations = count >= 2
+        self.hw.log(f"BASIC: Feature flags from folder 99: {count} file(s), loop_stations={self.loop_stations}")
+
     def _load_state(self):
         """Load persisted state."""
         state = self.hw.load_state()
         if state:
-            self.mode = state.get('mode', MODE_ALBUM)
+            loaded_mode = state.get('mode', MODE_PLAYLIST if self.basic_mode else MODE_ALBUM)
+            if self.basic_mode and loaded_mode == MODE_ALBUM:
+                loaded_mode = MODE_PLAYLIST
+            self.mode = loaded_mode
             self.current_album_index = state.get('album_index', 0)
             self.current_track = state.get('track', 1)
-            self.known_tracks = state.get('known_tracks', {})
+            if self.basic_mode:
+                # In basic mode, use hardware's _known_tracks (set by discover_stations)
+                # rather than potentially stale values from persisted state.
+                self.known_tracks = dict(getattr(self.hw, '_known_tracks', {}))
+            else:
+                self.known_tracks = state.get('known_tracks', {})
             # Clamp album/playlist index to valid range (metadata may have changed since state was saved)
             if self.mode == MODE_PLAYLIST and self.playlists:
                 if self.current_album_index >= len(self.playlists):
@@ -445,60 +611,76 @@ class RadioCore:
         elif tap_count == 2:
             self._init_current_shuffle()
         elif tap_count == 1:
-            self._cycle_mode_basic()
+            if not self.basic_mode:
+                self._cycle_mode_basic()
+            elif self.mode == MODE_SHUFFLE:
+                # Exit shuffle and return to normal station mode
+                self.switch_mode(MODE_PLAYLIST)
+            # else: already in station mode, 1-tap + hold does nothing
+            # (0-tap + hold already advances the station)
         else:
             self._next_album()
     
     def _cycle_mode_basic(self):
-        """Cycle between album and playlist modes.
-        
-        If in shuffle or radio mode, switch back to album mode.
+        """Cycle between modes. In basic_mode, album mode is not available --
+        cycle between station (playlist) and shuffle only.
         """
-        if self.mode == MODE_ALBUM:
-            self.switch_mode(MODE_PLAYLIST)
-        elif self.mode == MODE_PLAYLIST:
-            self.switch_mode(MODE_ALBUM)
+        if self.basic_mode:
+            if self.mode == MODE_PLAYLIST:
+                self.switch_mode(MODE_SHUFFLE)
+            else:
+                self.switch_mode(MODE_PLAYLIST)
         else:
-            # From shuffle or radio, go back to album mode
-            self.switch_mode(MODE_ALBUM)
+            if self.mode == MODE_ALBUM:
+                self.switch_mode(MODE_PLAYLIST)
+            elif self.mode == MODE_PLAYLIST:
+                self.switch_mode(MODE_ALBUM)
+            else:
+                self.switch_mode(MODE_ALBUM)
     
     def _init_current_shuffle(self):
-        """Initialize shuffle mode for current album/playlist."""
+        """Initialize shuffle mode for current album/playlist/station."""
         tracks = []
         source_name = 'Unknown'
         
-        # Determine source based on current mode (before switching to shuffle)
-        # If already in shuffle mode, use the stored source type
-        if self.mode == MODE_SHUFFLE and self._shuffle_source_type:
-            # We're already in shuffle, use the stored source type
-            if self._shuffle_source_type == 'playlist':
+        if self.basic_mode:
+            # In basic mode, always shuffle the current station (playlist) regardless of
+            # the current mode.  This prevents the fallback-to-library behaviour when
+            # calling shuffle-station from inside library-shuffle mode (where
+            # self.mode == MODE_SHUFFLE and _shuffle_source_type is None).
+            if self.playlists and self.current_album_index < len(self.playlists):
+                tracks = self.playlists[self.current_album_index].get('tracks', [])
+                source_name = self.playlists[self.current_album_index].get('name', 'Station')
+                self._shuffle_source_type = 'station'
+        elif self.mode == MODE_SHUFFLE and self._shuffle_source_type:
+            if self._shuffle_source_type in ('playlist', 'station'):
                 if self.playlists and self.current_album_index < len(self.playlists):
                     tracks = self.playlists[self.current_album_index].get('tracks', [])
-                    source_name = self.playlists[self.current_album_index].get('name', 'Playlist')
+                    source_name = self.playlists[self.current_album_index].get('name', 'Station' if self.basic_mode else 'Playlist')
             else:  # 'album'
                 if self.albums and self.current_album_index < len(self.albums):
                     tracks = self.albums[self.current_album_index].get('tracks', [])
                     source_name = self.albums[self.current_album_index].get('name', 'Album')
         elif self.mode == MODE_PLAYLIST:
-            # Currently in playlist mode - shuffle current playlist
             if self.playlists and self.current_album_index < len(self.playlists):
                 tracks = self.playlists[self.current_album_index].get('tracks', [])
-                source_name = self.playlists[self.current_album_index].get('name', 'Playlist')
-                self._shuffle_source_type = 'playlist'
+                source_name = self.playlists[self.current_album_index].get('name', 'Station' if self.basic_mode else 'Playlist')
+                self._shuffle_source_type = 'station' if self.basic_mode else 'playlist'
         else:
-            # Currently in album mode (or other mode) - shuffle current album
             if self.albums and self.current_album_index < len(self.albums):
                 tracks = self.albums[self.current_album_index].get('tracks', [])
                 source_name = self.albums[self.current_album_index].get('name', 'Album')
                 self._shuffle_source_type = 'album'
         
-        # Fallback: if no tracks found, use library
         if not tracks:
-            all_tracks = self.hw.get_all_tracks() or []
-            tracks = list(all_tracks)
+            if self.basic_mode:
+                for pl in self.playlists:
+                    tracks.extend(pl.get('tracks', []))
+            else:
+                tracks = list(self.hw.get_all_tracks() or [])
             source_name = 'Library'
             self._shuffle_source_type = None
-            self.hw.log("Warning: No current album/playlist found, shuffling library instead")
+            self.hw.log("Warning: No current source found, shuffling library instead")
         
         if not tracks:
             self.hw.log("Error: No tracks available to shuffle")
@@ -523,7 +705,14 @@ class RadioCore:
         
         # Save shuffle configuration before calling switch_mode (which will overwrite it)
         saved_shuffle_tracks = list(self.shuffle_tracks) if self.shuffle_tracks else list(tracks)
-        saved_shuffle_source = self._shuffle_source_type if self._shuffle_source_type else ('playlist' if self.mode == MODE_PLAYLIST else 'album')
+        if self._shuffle_source_type:
+            saved_shuffle_source = self._shuffle_source_type
+        elif self.basic_mode:
+            saved_shuffle_source = 'station'
+        elif self.mode == MODE_PLAYLIST:
+            saved_shuffle_source = 'playlist'
+        else:
+            saved_shuffle_source = 'album'
         
         # Use switch_mode to properly initialize shuffle mode
         self.switch_mode(MODE_SHUFFLE)
@@ -539,9 +728,16 @@ class RadioCore:
         self._start_playback_for_current()
     
     def _init_library_shuffle(self):
-        """Initialize shuffle mode for entire library."""
-        all_tracks = self.hw.get_all_tracks() or []
-        # Create a fresh copy and shuffle
+        """Initialize shuffle mode for entire library.
+        In basic mode, gathers all tracks from discovered stations (playlists)
+        rather than calling hw.get_all_tracks() which may hit metadata.
+        """
+        if self.basic_mode:
+            all_tracks = []
+            for pl in self.playlists:
+                all_tracks.extend(pl.get('tracks', []))
+        else:
+            all_tracks = self.hw.get_all_tracks() or []
         self.shuffle_tracks = list(all_tracks)
         
         # Fisher-Yates shuffle - always create a new random order
@@ -705,13 +901,36 @@ class RadioCore:
         if not self.power_on:
             return
         
-        self.hw.log("Track finished, auto-advancing")
-        
         if self.mode == MODE_RADIO:
-            # Radio mode: advance based on virtual time
+            self.hw.log("Track finished, auto-advancing (radio)")
             self._advance_radio_track()
             return
         
+        # In basic mode, check for an asynchronous "file not found" error (0x06).
+        # Cheap DFPlayer clones lower BUSY immediately (so play_track returns True),
+        # then send error 0x06 after the fact when they can't find the file.
+        # By the time on_track_finished fires (BUSY-fallback ~3s later), the error
+        # is sitting in hw._last_error_code.  Trim the station now so the device
+        # doesn't keep trying phantom tracks.
+        if self.basic_mode and getattr(self.hw, '_last_error_code', None) == 6:
+            tracks = self._get_current_tracks()
+            if tracks and 0 < self.current_track <= len(tracks):
+                folder = tracks[self.current_track - 1].get('folder')
+                if folder is not None:
+                    self.hw.log(f"BASIC: Async file-not-found for folder {folder} track {self.current_track}, correcting station")
+                    self._handle_basic_track_not_found(folder, self.current_track)
+                    return
+
+        # In basic mode with loop disabled, stop at end of station
+        if self.basic_mode and not self.loop_stations and self.mode == MODE_PLAYLIST:
+            total = self._get_track_count()
+            if total > 0 and self.current_track >= total:
+                self.hw.log("Track finished: end of station (loop disabled), stopping")
+                self.hw.stop()
+                self.is_playing = False
+                return
+        
+        self.hw.log("Track finished, auto-advancing")
         self._next_track()
     
     def _advance_radio_track(self):
@@ -791,6 +1010,9 @@ class RadioCore:
         self.hw.log(f"[MODE] {old_mode} -> {new_mode}")
         
         # Validate mode switch
+        if self.basic_mode and new_mode == MODE_ALBUM:
+            self.hw.log("[MODE] Album mode not available in basic mode")
+            return
         if new_mode == MODE_PLAYLIST and not self.playlists:
             self.hw.log("[MODE] No playlists, cannot switch")
             return
@@ -865,22 +1087,23 @@ class RadioCore:
         self.radio_stations = []
         self.radio_mode_start_ms = ticks_ms()
         
-        # Station 0: Full library
-        all_tracks = self.hw.get_all_tracks() or []
-        if all_tracks:
-            total_ms = sum((t.get('duration', 0) or 0) * 1000 for t in all_tracks)
-            total_ms = max(total_ms, 1)
-            # Generate random start offset (0 to total_ms-1)
-            random_offset = randint(0, max(int(total_ms) - 1, 0))
-            self.radio_stations.append(RadioStation(
-                name="Full Library",
-                tracks=all_tracks,
-                total_duration_ms=int(total_ms),
-                start_offset_ms=random_offset
-            ))
-            self.hw.log(f"Station 'Full Library': total={total_ms}ms, start_offset={random_offset}ms")
+        # In basic mode, skip the full-library mega-station and albums
+        if not self.basic_mode:
+            # Station 0: Full library
+            all_tracks = self.hw.get_all_tracks() or []
+            if all_tracks:
+                total_ms = sum((t.get('duration', 0) or 0) * 1000 for t in all_tracks)
+                total_ms = max(total_ms, 1)
+                random_offset = randint(0, max(int(total_ms) - 1, 0))
+                self.radio_stations.append(RadioStation(
+                    name="Full Library",
+                    tracks=all_tracks,
+                    total_duration_ms=int(total_ms),
+                    start_offset_ms=random_offset
+                ))
+                self.hw.log(f"Station 'Full Library': total={total_ms}ms, start_offset={random_offset}ms")
         
-        # Albums as stations
+        # Albums as stations (skipped in basic mode -- albums is empty)
         for album in self.albums:
             if album.get('id') == 0 and album.get('name') == 'Library':
                 continue
@@ -1185,8 +1408,11 @@ class RadioCore:
             track_num = track.get('track_number')
             title = track.get('title', 'Unknown')
             artist = track.get('artist', 'Unknown')
+            # In basic mode, report "station" instead of "playlist" so the GUI
+            # displays "Station" not "Playlist".
+            mode_label = "station" if (self.basic_mode and self.mode == MODE_PLAYLIST) else self.mode
             # Single combined log line so GUI parser can extract everything at once
-            self.hw.log(f"_start_playback_for_current: mode={self.mode}, source={source_name}, shuffle_type={shuffle_type}, album_idx={self.current_album_index}, track_idx={self.current_track}, folder={folder}, track={track_num}")
+            self.hw.log(f"_start_playback_for_current: mode={mode_label}, source={source_name}, shuffle_type={shuffle_type}, album_idx={self.current_album_index}, track_idx={self.current_track}, folder={folder}, track={track_num}")
             self.hw.log(f"_start_playback_for_current: Playing '{title}' by {artist}")
             self._start_playback_for_track(track, start_ms=start_ms)
         else:
@@ -1217,6 +1443,31 @@ class RadioCore:
         else:
             self.hw.log(f"Playback failed to start: '{title}' by {artist}")
             self.is_playing = False
+            if self.basic_mode:
+                self._handle_basic_track_not_found(folder, track_num)
+
+    def _handle_basic_track_not_found(self, folder, failed_track_num):
+        """Called when a play attempt returns 'file not found' in basic mode.
+
+        Trims the station's track list to the last known-good count so future
+        _get_track_count() calls return the correct value, then wraps to track 1
+        and restarts playback.  Guards against track 1 itself being missing.
+        """
+        if failed_track_num <= 1:
+            self.hw.log(f"BASIC: Station folder {folder} has no playable tracks - cannot recover")
+            return
+        actual_count = failed_track_num - 1
+        for pl in self.playlists:
+            if pl.get('id') == folder:
+                tracks = pl.get('tracks', [])
+                if actual_count < len(tracks):
+                    pl['tracks'] = tracks[:actual_count]
+                    if hasattr(self.hw, '_known_tracks'):
+                        self.hw._known_tracks[folder] = actual_count
+                    self.hw.log(f"BASIC: Station folder {folder} corrected to {actual_count} tracks")
+                break
+        self.current_track = 1
+        self._start_playback_for_current()
 
     def start_playback_for_current(self, start_ms=0):
         """Request playback for the current track (public API for firmware/GUI to call after power-on or when sequencing AM overlay)."""

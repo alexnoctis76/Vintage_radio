@@ -8,9 +8,9 @@ from gui.database import DatabaseManager
 
 
 class TestSchemaInit:
-    def test_fresh_db_reaches_schema_v3(self, tmp_db):
+    def test_fresh_db_reaches_schema_v6(self, tmp_db):
         version = tmp_db.get_setting("schema_version")
-        assert version == "3"
+        assert version == "6"
 
     def test_tables_exist(self, tmp_db):
         tables = {
@@ -20,7 +20,8 @@ class TestSchemaInit:
             ).fetchall()
         }
         for expected in ("songs", "albums", "playlists", "album_songs",
-                         "playlist_songs", "sd_mapping", "settings"):
+                         "playlist_songs", "sd_mapping", "settings",
+                         "basic_stations", "basic_station_tracks"):
             assert expected in tables
 
     def test_sort_order_columns_exist(self, tmp_db):
@@ -328,3 +329,150 @@ class TestSdPathBatch:
         tmp_db.update_song_sd_paths_batch([(s1, "/sd/01/001.mp3"), (s2, "/sd/01/002.mp3")])
         assert tmp_db.get_song_by_id(s1)["sd_path"] == "/sd/01/001.mp3"
         assert tmp_db.get_song_by_id(s2)["sd_path"] == "/sd/01/002.mp3"
+
+
+class TestBasicStationsCRUD:
+    def test_create_and_get(self, tmp_db):
+        sid = tmp_db.create_basic_station("Station 1", 1)
+        assert sid > 0
+        station = tmp_db.get_basic_station(sid)
+        assert station is not None
+        assert station["name"] == "Station 1"
+        assert station["folder_number"] == 1
+
+    def test_list_stations(self, tmp_db):
+        tmp_db.create_basic_station("Station A", 1)
+        tmp_db.create_basic_station("Station B", 2)
+        stations = tmp_db.list_basic_stations()
+        assert len(stations) == 2
+
+    def test_update_station(self, tmp_db):
+        sid = tmp_db.create_basic_station("Old Name", 1)
+        tmp_db.update_basic_station(sid, name="New Name")
+        assert tmp_db.get_basic_station(sid)["name"] == "New Name"
+
+    def test_delete_station(self, tmp_db):
+        sid = tmp_db.create_basic_station("To Delete", 1)
+        tmp_db.delete_basic_station(sid)
+        assert tmp_db.get_basic_station(sid) is None
+
+    def test_next_folder_number(self, tmp_db):
+        assert tmp_db.next_basic_station_folder() == 1
+        tmp_db.create_basic_station("S1", 1)
+        assert tmp_db.next_basic_station_folder() == 2
+        tmp_db.create_basic_station("S3", 3)
+        assert tmp_db.next_basic_station_folder() == 2
+
+    def test_update_station_order(self, tmp_db):
+        s1 = tmp_db.create_basic_station("First", 1)
+        s2 = tmp_db.create_basic_station("Second", 2)
+        tmp_db.update_basic_station_order([s2, s1])
+        stations = tmp_db.list_basic_stations()
+        assert stations[0]["name"] == "Second"
+        assert stations[1]["name"] == "First"
+
+    def test_update_station_order_reassigns_folders(self, tmp_db):
+        s1 = tmp_db.create_basic_station("A", 1)
+        s2 = tmp_db.create_basic_station("B", 2)
+        s3 = tmp_db.create_basic_station("C", 3)
+        tmp_db.update_basic_station_order([s3, s1, s2])
+        stations = tmp_db.list_basic_stations()
+        assert stations[0]["folder_number"] == 1
+        assert stations[0]["name"] == "C"
+        assert stations[1]["folder_number"] == 2
+        assert stations[1]["name"] == "A"
+        assert stations[2]["folder_number"] == 3
+        assert stations[2]["name"] == "B"
+
+    def test_clear_all(self, tmp_db):
+        s1 = tmp_db.create_basic_station("S1", 1)
+        song = tmp_db.add_song(original_filename="x.mp3", file_path="/x.mp3")
+        tmp_db.add_song_to_basic_station(s1, song, 1)
+        tmp_db.clear_all_basic_stations()
+        assert len(tmp_db.list_basic_stations()) == 0
+
+
+class TestBasicStationTracks:
+    def test_add_and_list(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        s1 = tmp_db.add_song(original_filename="a.mp3", file_path="/a.mp3")
+        s2 = tmp_db.add_song(original_filename="b.mp3", file_path="/b.mp3")
+        tmp_db.add_song_to_basic_station(sid, s1, 1)
+        tmp_db.add_song_to_basic_station(sid, s2, 2)
+        songs = tmp_db.list_basic_station_songs(sid)
+        assert len(songs) == 2
+        assert songs[0]["id"] == s1
+        assert "bst_id" in songs[0].keys()
+
+    def test_remove_song(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        song = tmp_db.add_song(original_filename="r.mp3", file_path="/r.mp3")
+        tmp_db.add_song_to_basic_station(sid, song, 1)
+        tmp_db.remove_song_from_basic_station(sid, song)
+        assert len(tmp_db.list_basic_station_songs(sid)) == 0
+
+    def test_remove_single_track_by_id(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        song = tmp_db.add_song(original_filename="dup.mp3", file_path="/dup.mp3")
+        tmp_db.add_song_to_basic_station(sid, song, 1)
+        tmp_db.add_song_to_basic_station(sid, song, 2)
+        songs = tmp_db.list_basic_station_songs(sid)
+        assert len(songs) == 2
+        tmp_db.remove_basic_station_track(songs[0]["bst_id"])
+        songs_after = tmp_db.list_basic_station_songs(sid)
+        assert len(songs_after) == 1
+
+    def test_duplicate_songs_in_station(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        song = tmp_db.add_song(original_filename="song.mp3", file_path="/song.mp3")
+        tmp_db.add_song_to_basic_station(sid, song, 1)
+        tmp_db.add_song_to_basic_station(sid, song, 2)
+        tmp_db.add_song_to_basic_station(sid, song, 3)
+        songs = tmp_db.list_basic_station_songs(sid)
+        assert len(songs) == 3
+        assert all(s["id"] == song for s in songs)
+        assert songs[0]["bst_id"] != songs[1]["bst_id"]
+
+    def test_replace_tracks(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        s1 = tmp_db.add_song(original_filename="t1.mp3", file_path="/t1.mp3")
+        s2 = tmp_db.add_song(original_filename="t2.mp3", file_path="/t2.mp3")
+        s3 = tmp_db.add_song(original_filename="t3.mp3", file_path="/t3.mp3")
+        tmp_db.add_song_to_basic_station(sid, s1, 1)
+        tmp_db.replace_basic_station_tracks(sid, [s3, s2])
+        songs = tmp_db.list_basic_station_songs(sid)
+        assert len(songs) == 2
+        assert songs[0]["id"] == s3
+
+    def test_replace_tracks_with_duplicates(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        song = tmp_db.add_song(original_filename="x.mp3", file_path="/x.mp3")
+        tmp_db.replace_basic_station_tracks(sid, [song, song, song])
+        songs = tmp_db.list_basic_station_songs(sid)
+        assert len(songs) == 3
+
+    def test_next_track_order(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        assert tmp_db.next_basic_station_track_order(sid) == 1
+        song = tmp_db.add_song(original_filename="n.mp3", file_path="/n.mp3")
+        tmp_db.add_song_to_basic_station(sid, song, 3)
+        assert tmp_db.next_basic_station_track_order(sid) == 4
+
+    def test_song_in_multiple_stations(self, tmp_db):
+        s1 = tmp_db.create_basic_station("S1", 1)
+        s2 = tmp_db.create_basic_station("S2", 2)
+        song = tmp_db.add_song(original_filename="shared.mp3", file_path="/shared.mp3")
+        tmp_db.add_song_to_basic_station(s1, song, 1)
+        tmp_db.add_song_to_basic_station(s2, song, 1)
+        assert len(tmp_db.list_basic_station_songs(s1)) == 1
+        assert len(tmp_db.list_basic_station_songs(s2)) == 1
+
+    def test_cascade_delete_station(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        song = tmp_db.add_song(original_filename="c.mp3", file_path="/c.mp3")
+        tmp_db.add_song_to_basic_station(sid, song, 1)
+        tmp_db.delete_basic_station(sid)
+        tracks = tmp_db.conn.execute(
+            "SELECT * FROM basic_station_tracks WHERE station_id = ?;", (sid,)
+        ).fetchall()
+        assert len(tracks) == 0

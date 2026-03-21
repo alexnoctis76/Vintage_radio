@@ -28,6 +28,9 @@ datas = [
     (str(project_dir / 'firmware' / 'pico' / 'main.py'), '.'),
     (str(project_dir / 'firmware' / 'radio_core.py'), '.'),
     (str(project_dir / 'firmware' / 'pico' / 'dfplayer_hardware.py'), 'components'),
+    (str(project_dir / 'firmware' / 'custom_driver_template.py'), 'firmware'),
+    (str(project_dir / 'firmware' / 'pin_config_loader.py'), 'firmware'),
+    (str(project_dir / 'docs' / 'CUSTOM_DRIVER.md'), 'docs'),
 ]
 # Bundle mpremote fully (modules + any data files)
 try:

@@ -30,23 +30,30 @@ except ImportError:
 # Import shared constants and interface from radio_core
 from radio_core import HardwareInterface, FADE_IN_S, DF_BOOT_MS
 
+# Import pin configuration (reads pin_config.json, falls back to defaults)
+from pin_config_loader import load_pin_config, get_spi_config, get_dfplayer_config
+
 # ===========================
 #      PIN CONFIGURATION
 # ===========================
 
-PIN_AUDIO       = 3        # PWM audio output for AM overlay
-PIN_BUTTON      = 2
-PIN_NEOPIX      = 16
-PIN_UART_TX     = 0
-PIN_UART_RX     = 1
-PIN_SENSE       = 14      # power sense from Rail 2
-PIN_BUSY        = 15      # DFPlayer BUSY (0 = playing, 1 = idle)
+_cfg = load_pin_config()
+_pins = _cfg.get("pins", {})
+
+PIN_AUDIO       = _pins.get("audio_pwm", 3)
+PIN_BUTTON      = _pins.get("button", 2)
+PIN_NEOPIX      = _pins.get("neopixel", 16)
+PIN_UART_TX     = _pins.get("uart_tx", 0)
+PIN_UART_RX     = _pins.get("uart_rx", 1)
+PIN_SENSE       = _pins.get("power_sense", 14)
+PIN_BUSY        = _pins.get("busy", 15)
 
 # ===========================
 #      CONSTANTS
 # ===========================
 
-DFPLAYER_VOL    = 28  # Max volume (0-30 scale) - matches original baseline 5.9.1
+_df_cfg = get_dfplayer_config()
+DFPLAYER_VOL    = _df_cfg.get("max_volume", 28)  # Max volume (0-30 scale)
 VOLUME_SCALE    = 1.0
 WAV_FILE        = "VintageRadio/AMradioSound.wav"
 PWM_CARRIER     = 125_000
@@ -68,6 +75,8 @@ DF_RESP_STATUS = 0x42       # Response to status query: p1=device, p2=0 stopped 
 DF_RESP_VOLUME = 0x43       # Response to volume query: p2 = 0..30
 DF_RESP_TF_FILES = 0x48     # Response: total TF files (p1<<8|p2)
 DF_RESP_CURRENT_TRACK = 0x4C  # Response: current track on TF (p1<<8|p2)
+DF_RESP_FOLDER_FILES = 0x4E   # Response: file count in queried folder (p1<<8|p2)
+DF_RESP_FOLDER_COUNT = 0x4F   # Response: total folder count on TF (p1<<8|p2)
 
 # DFPlayer 0x40 error codes (param_lo)
 DF_ERROR_MSGS = {
@@ -141,6 +150,8 @@ class DFPlayerHardware(HardwareInterface):
         self._query_status_result = None
         self._query_current_track_result = None
         self._query_file_count_result = None
+        self._query_folder_count_result = None
+        self._query_folder_files_result = None
         
         # GPIO 3 (PIN_AUDIO) is used for PWM AM overlay only.
         # Start it as high-impedance input so it doesn't inject noise
@@ -205,26 +216,48 @@ class DFPlayerHardware(HardwareInterface):
             # Note: These pins may need to be adjusted based on your hardware
             # Common SD card module connections:
             # CS = GP5, SCK = GP2, MOSI = GP3, MISO = GP4
+            spi_cfg = get_spi_config(alt=False)
+            spi_bus = spi_cfg.get("bus", 1)
+            spi_sck = spi_cfg.get("sck", 10)
+            spi_mosi = spi_cfg.get("mosi", 11)
+            spi_miso = spi_cfg.get("miso", 12)
+            spi_cs = spi_cfg.get("cs", 13)
             try:
-                spi = SPI(1, baudrate=1000000, polarity=0, phase=0, sck=Pin(10), mosi=Pin(11), miso=Pin(12))
-                cs = Pin(13, Pin.OUT)
+                spi = SPI(spi_bus, baudrate=1000000, polarity=0, phase=0, sck=Pin(spi_sck), mosi=Pin(spi_mosi), miso=Pin(spi_miso))
+                cs = Pin(spi_cs, Pin.OUT)
                 sd = SDCard(spi, cs)
                 os.mount(sd, "/sd")
                 print("SD card mounted at /sd")
                 return True
             except Exception as e:
                 print(f"SD card mount failed (SPI method): {e}")
-                # Try alternative pin configuration
+                spi_alt = get_spi_config(alt=True)
+                if spi_alt:
+                    alt_bus = spi_alt.get("bus", 0)
+                    alt_sck = spi_alt.get("sck", 18)
+                    alt_mosi = spi_alt.get("mosi", 19)
+                    alt_miso = spi_alt.get("miso", 16)
+                    alt_cs = spi_alt.get("cs", 17)
+                    try:
+                        spi = SPI(alt_bus, baudrate=1000000, polarity=0, phase=0, sck=Pin(alt_sck), mosi=Pin(alt_mosi), miso=Pin(alt_miso))
+                        cs = Pin(alt_cs, Pin.OUT)
+                        sd = SDCard(spi, cs)
+                        os.mount(sd, "/sd")
+                        print("SD card mounted at /sd (alt pins)")
+                        return True
+                    except Exception as e2:
+                        print(f"SD card mount failed (alt pins): {e2}")
+                # Fallback: RP2040 default SPI pins (no custom pins - avoids "bad SCK pin" from config)
                 try:
-                    spi = SPI(0, baudrate=1000000, polarity=0, phase=0, sck=Pin(18), mosi=Pin(19), miso=Pin(16))
-                    cs = Pin(17, Pin.OUT)
+                    spi = SPI(1, baudrate=1000000, polarity=0, phase=0)  # default sck=10, mosi=11, miso=8
+                    cs = Pin(13, Pin.OUT)
                     sd = SDCard(spi, cs)
                     os.mount(sd, "/sd")
-                    print("SD card mounted at /sd (alt pins)")
+                    print("SD card mounted at /sd (default SPI1 pins)")
                     return True
-                except Exception as e2:
-                    print(f"SD card mount failed (alt pins): {e2}")
-                    return False
+                except Exception as e3:
+                    print(f"SD card mount failed (default pins): {e3}")
+                return False
         except Exception as e:
             print(f"SD card mount error: {e}")
             return False
@@ -393,20 +426,22 @@ class DFPlayerHardware(HardwareInterface):
                 return None
             if start > 0:
                 # Discard bytes before start
-                del self._uart_rx_buf[:start]
+                # MicroPython: slice deletion (del buf[:n]) is not supported;
+                # use slice assignment instead.
+                self._uart_rx_buf[:] = self._uart_rx_buf[start:]
             if len(self._uart_rx_buf) < 10:
                 return None
             pkt = self._uart_rx_buf[:10]
             # Validate: byte 1 = 0xFF, byte 2 = 0x06, byte 9 = 0xEF
             if pkt[1] != 0xFF or pkt[2] != 0x06 or pkt[9] != 0xEF:
-                del self._uart_rx_buf[:1]
+                self._uart_rx_buf[:] = self._uart_rx_buf[1:]
                 continue
             csum = -sum(pkt[1:7]) & 0xFFFF
             if (pkt[7] != ((csum >> 8) & 0xFF)) or (pkt[8] != (csum & 0xFF)):
-                del self._uart_rx_buf[:1]
+                self._uart_rx_buf[:] = self._uart_rx_buf[1:]
                 continue
             cmd, p1, p2 = pkt[3], pkt[5], pkt[6]
-            del self._uart_rx_buf[:10]
+            self._uart_rx_buf[:] = self._uart_rx_buf[10:]
             return (cmd, p1, p2)
         return None
     
@@ -441,6 +476,10 @@ class DFPlayerHardware(HardwareInterface):
                 self._query_current_track_result = (p1 << 8) | p2
             elif cmd == DF_RESP_TF_FILES:
                 self._query_file_count_result = (p1 << 8) | p2
+            elif cmd == DF_RESP_FOLDER_FILES:
+                self._query_folder_files_result = (p1 << 8) | p2
+            elif cmd == DF_RESP_FOLDER_COUNT:
+                self._query_folder_count_result = (p1 << 8) | p2
     
     def check_track_finished_uart(self):
         """Return True if a track-finished event was received via UART (0x3D).
@@ -490,6 +529,127 @@ class DFPlayerHardware(HardwareInterface):
             time.sleep_ms(10)
         return None
     
+    def query_folder_count(self):
+        """Query total folder count on TF card (0x4F). Returns count or None."""
+        self._query_folder_count_result = None
+        self._df_send(0x4F, 0, 0, feedback=True)
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < 300:
+            self._df_read_pending()
+            if self._query_folder_count_result is not None:
+                return self._query_folder_count_result
+            time.sleep_ms(10)
+        return None
+
+    def query_files_in_folder(self, folder_num, suppress_errors=False):
+        """Query file count in a specific folder (0x4E). Returns count or None.
+
+        If the DFPlayer returns an error (e.g. 0x06 = file not found for a
+        non-existent folder), returns 0 immediately rather than waiting for timeout.
+
+        suppress_errors: if True, do not print the error message (used during
+            station discovery to avoid spamming the console).
+        """
+        self._query_folder_files_result = None
+        self._last_error_code = None
+        self._df_send(0x4E, 0, folder_num & 0xFF, feedback=True)
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < 300:
+            # Drain UART manually so we can intercept error responses
+            while True:
+                r = self._df_read_response()
+                if r is None:
+                    break
+                cmd, p1, p2 = r
+                if cmd == DF_RESP_FOLDER_FILES:
+                    self._query_folder_files_result = (p1 << 8) | p2
+                elif cmd == DF_RESP_ERROR:
+                    self._last_error_code = p2
+                    if not suppress_errors:
+                        err_msg = DF_ERROR_MSGS.get(p2, "Unknown error 0x%02X" % p2)
+                        print("DF: Error:", err_msg)
+                    # Any error means folder doesn't exist or is empty
+                    return 0
+                else:
+                    # Pass other responses to normal dispatch
+                    if cmd == DF_RESP_TRACK_FINISHED:
+                        self._track_finished_via_uart = True
+                        self._track_finished_track_num = (p1 << 8) | p2
+                    elif cmd == DF_RESP_STATUS:
+                        self._query_status_result = p2
+                    elif cmd == DF_RESP_CURRENT_TRACK:
+                        self._query_current_track_result = (p1 << 8) | p2
+                    elif cmd == DF_RESP_TF_FILES:
+                        self._query_file_count_result = (p1 << 8) | p2
+                    elif cmd == DF_RESP_FOLDER_COUNT:
+                        self._query_folder_count_result = (p1 << 8) | p2
+            if self._query_folder_files_result is not None:
+                return self._query_folder_files_result
+            time.sleep_ms(10)
+        return None
+
+    def discover_stations(self):
+        """Discover stations from DFPlayer SD card folder structure via UART queries.
+
+        Queries the DFPlayer for total folder count (0x4F), then for each folder
+        01..98 (skipping folder 99 reserved for AM WAV), queries the file count
+        (0x4E). Stops early after 3 consecutive empty/missing folders since valid
+        station folders are always numbered consecutively from 01.
+
+        Error responses (0x40) from the DFPlayer for non-existent folders are
+        treated as empty and suppressed from the console.
+
+        Returns:
+            List of dicts: [{"name": "Station 1", "folder": 1, "tracks": [...]}, ...]
+        """
+        print("BASIC: Discovering stations from DFPlayer SD card...")
+
+        folder_count = self.query_folder_count()
+        if folder_count is None:
+            print("BASIC: Failed to query folder count (0x4F returned None)")
+            return []
+        print(f"BASIC: DFPlayer reports {folder_count} total folders (including root)")
+
+        stations = []
+        station_num = 0
+        consecutive_empty = 0
+        MAX_CONSECUTIVE_EMPTY = 3
+
+        for folder in range(1, 99):
+            file_count = self.query_files_in_folder(folder, suppress_errors=True)
+
+            if file_count is None or file_count == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                    print(f"BASIC: {MAX_CONSECUTIVE_EMPTY} consecutive empty folders, stopping scan at folder {folder:02d}")
+                    break
+                continue
+
+            consecutive_empty = 0
+            station_num += 1
+            tracks = []
+            for track_idx in range(1, file_count + 1):
+                tracks.append({
+                    "id": folder * 1000 + track_idx,
+                    "title": f"Track {track_idx}",
+                    "artist": "",
+                    "duration": 0,
+                    "folder": folder,
+                    "track_number": track_idx,
+                })
+
+            station = {
+                "id": folder,
+                "name": f"Station {station_num}",
+                "tracks": tracks,
+            }
+            stations.append(station)
+            self._known_tracks[folder] = file_count
+            print(f"BASIC: Station {station_num} -> folder {folder:02d}, {file_count} tracks")
+
+        print(f"BASIC: Discovered {len(stations)} stations")
+        return stations
+
     def get_last_error_code(self):
         """Return last DFPlayer error code (0x40) or None. Cleared when next error arrives."""
         return self._last_error_code
@@ -925,6 +1085,9 @@ class DFPlayerHardware(HardwareInterface):
         if self._albums or self._playlists:
             print("Metadata already loaded, skipping")
             return
+        
+        # Mount SD if available (so /sd paths can be used)
+        self._try_mount_sd()
         
         # Try multiple paths: SD card first (where it should be), then Pico flash
         metadata_paths = [

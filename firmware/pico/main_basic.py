@@ -1,5 +1,6 @@
-# Vintage Radio Firmware - Using Shared RadioCore
-# This firmware uses the same logic as the GUI emulator via radio_core.py
+# Vintage Radio Firmware - BASIC MODE
+# Uses DFPlayer folder structure as the source of truth for stations.
+# No metadata files required -- stations are discovered via UART queries.
 #
 # Hardware: Raspberry Pi Pico + DFPlayer Mini
 # Compatible with MicroPython
@@ -7,63 +8,42 @@
 from machine import Pin
 import time
 
-# Import shared core logic
 from radio_core import (
-    RadioCore, 
+    RadioCore,
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
     FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
     ticks_ms, ticks_diff,
 )
 
-# Import hardware implementation
 from components.dfplayer_hardware import DFPlayerHardware
 
-# ===========================
-#      MAIN FIRMWARE CLASS
-# ===========================
 
 class VintageRadioFirmware:
-    """
-    Main firmware class that runs the Vintage Radio.
-    
-    Uses RadioCore for state machine logic and DFPlayerHardware for hardware access.
-    This ensures the firmware runs the exact same logic as the GUI emulator.
-    """
-    
+    """Basic-mode firmware. Stations are discovered from DFPlayer SD card
+    folder structure (0x4F/0x4E queries). No album mode, no metadata files."""
+
     def __init__(self):
-        print("Booting Vintage Radio (RadioCore-based)")
-        
-        # Initialize hardware interface
+        print("Booting Vintage Radio (BASIC MODE)")
         self.hw = DFPlayerHardware()
-        
-        # Initialize core state machine
-        self.core = RadioCore(self.hw)
-        
-        # Button state tracking (for edge detection)
-        self.last_button = 1  # Not pressed (pull-up)
+        self.core = RadioCore(self.hw, basic_mode=True)
+
+        self.last_button = 1
         self.press_start = 0
-        
-        # Power state
         self.rail2_on = False
         self.last_sense = 0
-        
-        # BUSY pin state for track-finished detection
         self.prev_busy = 1
-        self._busy_high_since = 0  # Timestamp when BUSY first went HIGH (for debounce)
-        self._was_playing = False  # For drivers without BUSY (e.g. VS1053) track-finished
-    
+        self._busy_high_since = 0
+        self._was_playing = False
+
     def wait_for_power(self):
-        """Wait for power sense pin to go HIGH, or skip if configured."""
-        # Check if power sense check is disabled
         skip_power_check = self._check_skip_power_sense()
-        
         if skip_power_check:
             print("Power sense check DISABLED (configured via debug mode)")
             self.rail2_on = True
             self.last_sense = 1
             return
-        
+
         print("Waiting for power sense HIGH...")
         print("(Turn pot on, or create skip_power_sense.txt with 'true' to skip)")
         last_hint = ticks_ms()
@@ -72,35 +52,23 @@ class VintageRadioFirmware:
                 print("...waiting for power sense HIGH")
                 last_hint = ticks_ms()
             time.sleep_ms(20)
-        
+
         print("Power sense HIGH detected.")
         self.rail2_on = True
         self.last_sense = 1
-    
+
     def _check_skip_power_sense(self):
-        """Check if power sense check should be skipped (from config file)."""
         try:
             with open("skip_power_sense.txt", "r") as f:
                 content = f.read().strip().lower()
-                result = content == "true" or content == "1"
-                return result
+                return content == "true" or content == "1"
         except OSError:
-            # File doesn't exist - default to requiring power sense (safe)
             return False
-    
+
     def _check_hw_comms(self):
-        """Diagnostic: verify audio hardware is responsive after boot.
-
-        For DFPlayer drivers runs full UART/SD check; for other drivers
-        just does a test play and checks is_playing().
-        """
-        known_tracks = getattr(self.hw, "_known_tracks", {})
-        total_expected = sum(known_tracks.values())
-        num_folders = len(known_tracks)
-        print(f"  Metadata: {total_expected} songs across {num_folders} folders")
-
+        """Verify DFPlayer communication after boot."""
+        print("--- DFPlayer comms check (basic mode) ---")
         if hasattr(self.hw, "_df_read_pending") and hasattr(self.hw, "query_file_count"):
-            print("--- DFPlayer comms check ---")
             self.hw._df_read_pending()
             busy = self.hw.pin_busy.value()
             print(f"  BUSY pin = {busy} (expect 1=idle)")
@@ -109,42 +77,25 @@ class VintageRadioFirmware:
                 print(f"  TF file count = {fc}")
             else:
                 print("  TF file count = TIMEOUT (GP1 not wired to DFPlayer TX?)")
-            if fc is not None and total_expected > 0:
-                if fc < total_expected:
-                    print(f"  *** SD CARD INCOMPLETE: {fc} files < {total_expected} expected ***")
-                else:
-                    print(f"  SD card OK: {fc} files >= {total_expected} expected")
-            print("  Test play: folder=1, track=1")
-            self.hw._df_play_folder_track(1, 1)
-            time.sleep_ms(500)
-            busy_after = self.hw.pin_busy.value()
-            self.hw._df_read_pending()
-            err = getattr(self.hw, "_last_error_code", None)
-            print(f"  Result: BUSY={busy_after}, error={err}")
-            self.hw._df_stop()
-            time.sleep_ms(100)
-            if hasattr(self.hw, "_last_error_code"):
-                self.hw._last_error_code = None
-            print("--- End DFPlayer check ---")
-        else:
-            # VS1053 etc: skip test play to avoid start/stop before real track (can confuse decoder)
-            if getattr(self.hw, "tick_stream", None) is None:
-                print("--- Audio hardware check (test play) ---")
-                self.hw.play_track(1, 1)
-                time.sleep_ms(800)
-                playing = self.hw.is_playing()
-                print(f"  Test play folder=1 track=1: is_playing={playing}")
-                if not playing:
-                    print("  Warning: playback may not have started. Check wiring and storage.")
-                self.hw.stop()
-                print("--- End check ---")
-            else:
-                print("--- Audio hardware: VS1053 (streaming), no test play ---")
-    
+
+            num_stations = len(self.core.playlists)
+            if num_stations > 0:
+                first = self.core.playlists[0]
+                folder = first.get("folder", first.get("id", 1))
+                print(f"  Test play: folder={folder}, track=1")
+                self.hw._df_play_folder_track(folder, 1)
+                time.sleep_ms(500)
+                busy_after = self.hw.pin_busy.value()
+                self.hw._df_read_pending()
+                err = getattr(self.hw, "_last_error_code", None)
+                print(f"  Result: BUSY={busy_after}, error={err}")
+                self.hw._df_stop()
+                time.sleep_ms(100)
+                if hasattr(self.hw, "_last_error_code"):
+                    self.hw._last_error_code = None
+        print("--- End DFPlayer check ---")
+
     def boot_sequence(self):
-        """Perform boot sequence: optional hardware reset, load state, start playback with AM overlay.
-        Works with any HardwareInterface; DFPlayer-specific steps are optional.
-        """
         try:
             reset = getattr(self.hw, "reset_dfplayer", None)
             if reset is not None:
@@ -174,37 +125,22 @@ class VintageRadioFirmware:
             self.core.current_album_index = 0
             self.core.current_track = 1
         self._start_with_am_and_recovery("Boot")
-    
+
     def handle_button(self):
-        """Handle button press and release events (edge detection only).
-        
-        With deferred timing, all actions happen in tick() via _resolve_input(),
-        not here. This method only detects edges and delegates to RadioCore.
-        """
         curr = 0 if self.hw.is_button_pressed() else 1
         now = ticks_ms()
-        
-        # Button press edge (1 -> 0)
         if self.last_button == 1 and curr == 0:
             self.press_start = now
             print(f"Button PRESSED at {now}")
             self.core.on_button_press()
-        
-        # Button release edge (0 -> 1)
         elif self.last_button == 0 and curr == 1:
             press_dur = ticks_diff(now, self.press_start)
             print(f"Button RELEASED at {now}, duration: {press_dur}ms")
             self.core.on_button_release()
-            time.sleep_ms(40)  # Debounce
-        
+            time.sleep_ms(40)
         self.last_button = curr
-    
-    def _start_with_am_and_recovery(self, context="Boot"):
-        """Start playback via AM overlay with optional second-chance recovery.
 
-        Uses start_with_am() when the driver provides it (e.g. DFPlayer);
-        otherwise calls play_am_overlay() then play_track() and confirms via is_playing().
-        """
+    def _start_with_am_and_recovery(self, context="Boot"):
         try:
             if self.hw.np is not None:
                 self.hw.np[0] = (0, 10, 0)
@@ -260,13 +196,11 @@ class VintageRadioFirmware:
                     print(f"{context} second-chance confirmed (is_playing)")
                 else:
                     print(f"{context} second-chance still not confirmed")
-    
+
     def _play_am_for_change(self):
-        """Play AM overlay for mode/album change. Called when delay_playback is set."""
         self._start_with_am_and_recovery("Mode change")
-    
+
     def _fire_track_finished(self):
-        """Advance to next track and log (shared by UART and BUSY paths)."""
         old_tr = self.core._get_current_track()
         old_title = old_tr.get('title', 'Unknown') if old_tr else 'Unknown'
         old_album = self.core.current_album_index
@@ -276,10 +210,9 @@ class VintageRadioFirmware:
         new_title = new_tr.get('title', 'Unknown') if new_tr else 'Unknown'
         new_album = self.core.current_album_index
         new_track = self.core.current_track
-        print(f"Track finished: '{old_title}' -> '{new_title}' (album {old_album+1} track {old_track} -> album {new_album+1} track {new_track})")
-    
+        print(f"Track finished: '{old_title}' -> '{new_title}' (station {old_album+1} track {old_track} -> station {new_album+1} track {new_track})")
+
     def handle_track_finished(self):
-        """Detect track finished: prefer UART when available, else BUSY pin or is_playing() (VS1053)."""
         if not self.rail2_on:
             return
 
@@ -293,7 +226,6 @@ class VintageRadioFirmware:
 
         pin_busy = getattr(self.hw, "pin_busy", None)
         if pin_busy is None:
-            # No BUSY pin (e.g. VS1053): use is_playing() transition
             if self._was_playing and not self.hw.is_playing():
                 self._was_playing = False
                 print("Track finished (stream end)")
@@ -316,31 +248,9 @@ class VintageRadioFirmware:
                     self._busy_high_since = 0
                     self._fire_track_finished()
         self.prev_busy = b
-    
-    def _quick_sd_check(self, target_folder=None, target_track=None):
-        """Optional SD/file count check after power-on (DFPlayer and similar)."""
-        query_file_count = getattr(self.hw, "query_file_count", None)
-        known_tracks = getattr(self.hw, "_known_tracks", {})
-        total_expected = sum(known_tracks.values())
-        num_folders = len(known_tracks)
-        if query_file_count is None:
-            if total_expected > 0:
-                print(f"SD check: metadata expects {total_expected} songs across {num_folders} folders")
-            return
-        fc = query_file_count()
-        if fc is not None:
-            print(f"SD check: device sees {fc} files, metadata expects {total_expected} songs")
-            if total_expected > 0 and fc < total_expected:
-                print(f"  WARNING: fewer files ({fc}) than metadata expects ({total_expected})")
-        else:
-            print(f"SD check: file count query timed out")
-            if total_expected > 0:
-                print(f"  Metadata expects {total_expected} songs across {num_folders} folders")
 
     def handle_power_change(self):
-        """Handle power on/off via power sense pin."""
         sense = 1 if self.hw.is_power_on() else 0
-        
         if sense != self.last_sense:
             if sense == 0:
                 print("Power sense LOW - Rail 2 power OFF (pot turned OFF)")
@@ -352,78 +262,58 @@ class VintageRadioFirmware:
                 reset = getattr(self.hw, "reset_dfplayer", None)
                 if reset is not None:
                     reset()
-                self._quick_sd_check()
                 self.core.power_on_handler()
                 self._start_with_am_and_recovery("Power-on")
-            
             self.last_sense = sense
-    
+
     def run(self):
-        """Main loop."""
-        print("Button active. Patterns:")
+        print("BASIC MODE active. Button patterns:")
         print("  tap = next track")
         print("  double-tap = previous track")
-        print("  triple-tap = restart album")
-        print("  hold = next album")
-        print("  tap + hold = toggle album/playlist")
-        print("  double-tap + hold = shuffle current")
+        print("  triple-tap = restart station")
+        print("  hold = next station")
+        print("  tap + hold = toggle station/shuffle")
+        print("  double-tap + hold = shuffle current station")
         print("  triple-tap + hold = shuffle library")
-        
+
         while True:
             try:
-                # VS1053: multiple feeds per loop iteration to avoid buffer underrun (slow-mo sound)
                 ts = getattr(self.hw, "tick_stream", None)
                 if ts:
                     n = 4 if getattr(self.hw, "_stream_file", None) is not None else 1
                     for _ in range(n):
                         ts()
-                # Drain DFPlayer UART responses (track-finished 0x3D, errors 0x40, ACKs, etc.)
                 if getattr(self.hw, '_df_read_pending', None):
                     self.hw._df_read_pending()
-                
-                # Handle button events (edge detection only)
+
                 self.handle_button()
-                
-                # Process deferred input (tap window timeout)
+
                 old_track_idx = self.core.current_track
                 self.core.tick()
-                
-                # If tick() changed the track (button-driven skip), reset debounce
+
                 if self.core.current_track != old_track_idx:
                     self._busy_high_since = 0
-                
-                # After tick(), check if a mode/album change set delay_playback
+
                 if self.hw._delay_playback:
                     self._play_am_for_change()
                     self._busy_high_since = 0
-                
-                # Detect track finished
+
                 self.handle_track_finished()
-                
-                # Watch power sense line
                 self.handle_power_change()
-                
-                # Poll volume potentiometer ADC (self-throttled to ~50ms intervals)
+
                 if getattr(self.hw, 'poll_volume_adc', None):
                     self.hw.poll_volume_adc()
             except OSError as e:
                 print("Main loop recoverable error:", e)
-            
-            # Short sleep; tick_stream feeds data as fast as DREQ allows
+
             time.sleep_ms(1)
 
 
-# ===========================
-#      ENTRY POINT
-# ===========================
-
-# Global firmware instance (for debug access)
 firmware = None
 
 def main():
-    """Main entry point for the firmware."""
     global firmware
-    print("===== Vintage Radio main() =====")
+    print("===== Vintage Radio main() [BASIC MODE] =====")
     try:
         firmware = VintageRadioFirmware()
         firmware.wait_for_power()
@@ -438,7 +328,6 @@ def main():
             sys.print_exception(e)
         except Exception:
             pass
-        # Red LED to signal crash (visible without serial)
         try:
             import neopixel
             from pin_config_loader import get_pin
@@ -448,12 +337,10 @@ def main():
             np.write()
         except Exception:
             pass
-        # Keep repeating the error so Device Debug can pick it up after connecting
         while True:
             time.sleep_ms(2000)
             print(err_msg)
 
 
-# Run if executed directly
 if __name__ == "__main__":
     main()

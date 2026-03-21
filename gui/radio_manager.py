@@ -1,4 +1,5 @@
 """Main GUI application for Vintage Radio Music Manager."""
+# pyright: reportOptionalMemberAccess=none, reportOptionalCall=none, reportAttributeAccessIssue=none, reportIncompatibleMethodOverride=none
 
 from __future__ import annotations
 
@@ -9,20 +10,25 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QUrl
 from PyQt6.QtGui import QDesktopServices, QFont, QIcon
 
 from .audio_metadata import compute_file_hash, extract_metadata
+from .board_profiles import get_board_profile, get_default_board_profile, BOARD_PROFILES_BY_ID
 from .database import DatabaseManager
 from .device_debug import DeviceDebugWidget
 from .library_manager import LibraryRegistry
+from .pin_config_editor import BoardSelectorWidget, PinConfigDialog
+from .profile_manager import ProfileSelectorBar
 from .resource_paths import app_data_dir, project_root, resource_path
 from .sd_manager import SDManager, SYNC_TARGET_VOLUME_LABEL
 from .test_mode import TestModeWidget
 from . import sd_manager as sd_manager_module
+
+BASIC_MAX_TRACKS_PER_STATION = 255
 
 
 # ───────────────────────────────────────────────────────────
@@ -368,10 +374,14 @@ def _run_install_main_thread(
     after_firmware: bool,
     on_success: Callable[[str], None],
     on_error: Callable[[str], None],
+    pin_config_json: str = "",
+    custom_hw_driver_path: str = "",
+    basic_mode: bool = False,
 ) -> None:
     """Run install on main thread with progress dialog. Status bar updates via processEvents()."""
     dlg = QtWidgets.QDialog(parent)
-    dlg.setWindowTitle("Install to Pico")
+    title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
+    dlg.setWindowTitle(title)
     dlg.setModal(True)
     dlg.setMinimumWidth(400)
     layout = QtWidgets.QVBoxLayout(dlg)
@@ -394,6 +404,9 @@ def _run_install_main_thread(
         worker_class = type(parent)
         result = worker_class._install_to_pico_worker(
             mpremote_cmd, root, sd_root, sd_manager, progress_callback=report,
+            pin_config_json=pin_config_json,
+            custom_hw_driver_path=custom_hw_driver_path,
+            basic_mode=basic_mode,
         )
         dlg.close()
         on_success(result)
@@ -459,7 +472,7 @@ def _run_mpremote(
             sys.argv = argv
             sys.stdout = out
             sys.stderr = err
-            rc = mpremote_main()
+            rc = cast(Callable[[], int], mpremote_cmd[1])()
             return type("Result", (), {"returncode": rc, "stdout": out.getvalue(), "stderr": err.getvalue()})()
         finally:
             sys.argv = old_argv
@@ -497,6 +510,9 @@ _TABLE_REORDER_MIME = "application/x-vintage-radio-table-reorder"
 class ReorderTable(QtWidgets.QTableWidget):
     """QTableWidget with drag-to-reorder. Uses fully custom drag/drop so Qt
     never performs InternalMove (which nukes rows on macOS).
+
+    Reorder is tracked by *row index* (not song id) so duplicate song ids
+    are handled correctly.
     """
     order_changed = QtCore.pyqtSignal()
 
@@ -504,7 +520,7 @@ class ReorderTable(QtWidgets.QTableWidget):
         super().__init__(parent)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
+        self.setDropIndicatorShown(False)
         self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(QtCore.Qt.DropAction.CopyAction)
         self.setSelectionBehavior(
@@ -516,11 +532,13 @@ class ReorderTable(QtWidgets.QTableWidget):
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSortingEnabled(False)
         self._pending_order: Optional[List[int]] = None
+        self._drop_indicator_row: int = -1
 
     # -- snapshot helpers --------------------------------------------------
 
     def _snapshot_all(self) -> List[tuple]:
-        """Return [(row, song_id, [col_texts]), ...] for every row."""
+        """Return [(row, song_id, [col_texts], extra_data), ...] for every row.
+        extra_data preserves any UserRole+1 data stored on the first column item."""
         result: List[tuple] = []
         for row in range(self.rowCount()):
             item = self.item(row, 0)
@@ -529,31 +547,64 @@ class ReorderTable(QtWidgets.QTableWidget):
             song_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
             if song_id is None:
                 continue
+            extra = item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
             cols = []
             for c in range(self.columnCount()):
                 it = self.item(row, c)
                 cols.append(it.text() if it is not None else "")
-            result.append((row, int(song_id), cols))
+            result.append((row, int(song_id), cols, extra))
         return result
 
-    def _rebuild_table(self, new_order: List[int],
-                       id_to_cols: Dict[int, List[str]]) -> None:
-        """Replace table contents with rows in *new_order*."""
+    def _rebuild_from_snapshot(self, ordered_snap: List[tuple]) -> None:
+        """Replace table contents from an ordered list of snapshot tuples."""
         self.setSortingEnabled(False)
         self.blockSignals(True)
         try:
-            self.setRowCount(len(new_order))
-            for new_row, sid in enumerate(new_order):
-                cols = id_to_cols.get(sid, [""] * self.columnCount())
+            self.setRowCount(len(ordered_snap))
+            for new_row, (_, sid, cols, extra) in enumerate(ordered_snap):
                 for c, text in enumerate(cols):
                     item = QtWidgets.QTableWidgetItem(text)
                     if c == 0:
                         item.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
+                        if extra is not None:
+                            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, extra)
                     item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                     self.setItem(new_row, c, item)
         finally:
             self.blockSignals(False)
             self.setSortingEnabled(True)
+
+    # -- drop indicator painting -------------------------------------------
+
+    def _row_at_pos(self, pos: QtCore.QPoint) -> int:
+        """Return the row index for the drop indicator, clamped to [0, rowCount]."""
+        idx = self.indexAt(self.viewport().mapFrom(self, pos))
+        if idx.isValid():
+            rect = self.visualRect(idx)
+            if pos.y() > rect.center().y():
+                return idx.row() + 1
+            return idx.row()
+        return self.rowCount()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._drop_indicator_row < 0:
+            return
+        painter = QtGui.QPainter(self.viewport())
+        pen = QtGui.QPen(QtGui.QColor("#4CAF50"), 2)
+        painter.setPen(pen)
+        row = self._drop_indicator_row
+        if row < self.rowCount():
+            rect = self.visualRect(self.model().index(row, 0))
+            y = rect.top()
+        else:
+            if self.rowCount() > 0:
+                rect = self.visualRect(self.model().index(self.rowCount() - 1, 0))
+                y = rect.bottom()
+            else:
+                y = 0
+        painter.drawLine(0, y, self.viewport().width(), y)
+        painter.end()
 
     # -- accept our custom mime during drag-over ----------------------------
 
@@ -566,63 +617,68 @@ class ReorderTable(QtWidgets.QTableWidget):
     def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
         if event.mimeData().hasFormat(_TABLE_REORDER_MIME):
             event.acceptProposedAction()
+            new_row = self._row_at_pos(event.position().toPoint())
+            if new_row != self._drop_indicator_row:
+                self._drop_indicator_row = new_row
+                self.viewport().update()
         else:
             super().dragMoveEvent(event)
 
-    # -- drag (our own QDrag, no super) ------------------------------------
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self._drop_indicator_row = -1
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
+    # -- drag (encode row indices, not song ids) ---------------------------
 
     def startDrag(self, supportedActions: QtCore.Qt.DropActions) -> None:
         rows = sorted(set(idx.row() for idx in self.selectedIndexes()))
-        sids: List[int] = []
-        for r in rows:
-            item = self.item(r, 0)
-            if item is None:
-                continue
-            sid = item.data(QtCore.Qt.ItemDataRole.UserRole)
-            if sid is not None:
-                sids.append(int(sid))
-        if not sids:
+        if not rows:
             return
         mime = QtCore.QMimeData()
         mime.setData(_TABLE_REORDER_MIME,
-                     ",".join(str(s) for s in sids).encode("utf-8"))
+                     ",".join(str(r) for r in rows).encode("utf-8"))
         drag = QtGui.QDrag(self)
         drag.setMimeData(mime)
         drag.exec(QtCore.Qt.DropAction.CopyAction)
 
-    # -- drop --------------------------------------------------------------
+    # -- drop (use row indices) --------------------------------------------
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        self._drop_indicator_row = -1
+        self.viewport().update()
+
         if event.source() is not self or not event.mimeData().hasFormat(_TABLE_REORDER_MIME):
             super().dropEvent(event)
             return
 
-        raw = bytes(event.mimeData().data(_TABLE_REORDER_MIME)).decode("utf-8")
+        data = event.mimeData().data(_TABLE_REORDER_MIME)
+        raw = bytes(cast(Any, data)).decode("utf-8")
         try:
-            moving = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            moving_rows = sorted(int(x.strip()) for x in raw.split(",") if x.strip())
         except ValueError:
             event.ignore()
             return
-        if not moving:
+        if not moving_rows:
             event.ignore()
             return
 
         snap = self._snapshot_all()
-        current_sids = [sid for (_, sid, _) in snap]
-        id_to_cols: Dict[int, List[str]] = {sid: cols for (_, sid, cols) in snap}
-        moving_set = set(moving)
-        staying = [s for s in current_sids if s not in moving_set]
+        total = len(snap)
+        moving_set = set(moving_rows)
 
-        drop_pos = event.position().toPoint()
-        viewport_pos = self.viewport().mapFrom(self, drop_pos)
-        target_row = self.indexAt(viewport_pos).row()
-        if target_row < 0:
-            target_row = len(staying)
-        insert_at = max(0, min(target_row, len(staying)))
+        target_row = self._row_at_pos(event.position().toPoint())
 
-        new_order = staying[:insert_at] + moving + staying[insert_at:]
-        self._pending_order = new_order
-        self._rebuild_table(new_order, id_to_cols)
+        moving_items = [snap[r] for r in moving_rows if r < total]
+        staying_items = [snap[r] for r in range(total) if r not in moving_set]
+
+        # Adjust insertion index: count how many staying rows are above the drop
+        above = sum(1 for r in range(total) if r < target_row and r not in moving_set)
+        insert_at = max(0, min(above, len(staying_items)))
+
+        ordered = staying_items[:insert_at] + moving_items + staying_items[insert_at:]
+        self._pending_order = [entry[1] for entry in ordered]
+        self._rebuild_from_snapshot(ordered)
 
         event.setDropAction(QtCore.Qt.DropAction.CopyAction)
         event.accept()
@@ -678,12 +734,42 @@ class ReorderListWidget(QtWidgets.QListWidget):
         super().__init__(parent)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
+        self.setDropIndicatorShown(False)
         self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(QtCore.Qt.DropAction.CopyAction)
         self.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
+        self._drop_indicator_row: int = -1
+
+    def _row_at_pos(self, pos: QtCore.QPoint) -> int:
+        idx = self.indexAt(self.viewport().mapFrom(self, pos))
+        if idx.isValid():
+            rect = self.visualRect(idx)
+            if pos.y() > rect.center().y():
+                return idx.row() + 1
+            return idx.row()
+        return self.count()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._drop_indicator_row < 0:
+            return
+        painter = QtGui.QPainter(self.viewport())
+        pen = QtGui.QPen(QtGui.QColor("#4CAF50"), 2)
+        painter.setPen(pen)
+        row = self._drop_indicator_row
+        if row < self.count():
+            rect = self.visualRect(self.model().index(row, 0))
+            y = rect.top()
+        else:
+            if self.count() > 0:
+                rect = self.visualRect(self.model().index(self.count() - 1, 0))
+                y = rect.bottom()
+            else:
+                y = 0
+        painter.drawLine(0, y, self.viewport().width(), y)
+        painter.end()
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasFormat(_REORDER_MIME):
@@ -694,8 +780,17 @@ class ReorderListWidget(QtWidgets.QListWidget):
     def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
         if event.mimeData().hasFormat(_REORDER_MIME):
             event.acceptProposedAction()
+            new_row = self._row_at_pos(event.position().toPoint())
+            if new_row != self._drop_indicator_row:
+                self._drop_indicator_row = new_row
+                self.viewport().update()
         else:
             super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self._drop_indicator_row = -1
+        self.viewport().update()
+        super().dragLeaveEvent(event)
 
     def startDrag(self, supportedActions: QtCore.Qt.DropActions) -> None:
         """Start drag with our mime data (UIDs only). We do not call super() so Qt
@@ -719,6 +814,9 @@ class ReorderListWidget(QtWidgets.QListWidget):
         drag.exec(QtCore.Qt.DropAction.CopyAction)
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        self._drop_indicator_row = -1
+        self.viewport().update()
+
         if event.source() is not self:
             super().dropEvent(event)
             return
@@ -726,7 +824,8 @@ class ReorderListWidget(QtWidgets.QListWidget):
             event.ignore()
             return
 
-        raw = bytes(event.mimeData().data(_REORDER_MIME)).decode("utf-8")
+        data = event.mimeData().data(_REORDER_MIME)
+        raw = bytes(cast(Any, data)).decode("utf-8")
         try:
             moving = [int(x.strip()) for x in raw.split(",") if x.strip()]
         except ValueError:
@@ -736,7 +835,6 @@ class ReorderListWidget(QtWidgets.QListWidget):
             event.ignore()
             return
 
-        # Current list order (row -> uid, and uid -> item for text/icon)
         all_ids: List[tuple] = []
         for row in range(self.count()):
             item = self.item(row)
@@ -752,11 +850,7 @@ class ReorderListWidget(QtWidgets.QListWidget):
             event.ignore()
             return
 
-        drop_pos = event.position().toPoint()
-        viewport_pos = self.viewport().mapFrom(self, drop_pos)
-        target_row = self.indexAt(viewport_pos).row()
-        if target_row < 0:
-            target_row = len(staying)
+        target_row = self._row_at_pos(event.position().toPoint())
         insert_at = max(0, min(target_row, len(staying)))
         new_order = staying[:insert_at] + moving + staying[insert_at:]
 
@@ -1298,37 +1392,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setGeometry(x, y, w, h)
 
     def _build_status_bar_zoom(self) -> None:
-        """Add zoom +/- buttons at bottom left of the status bar (pill style with label)."""
-        pill = QtWidgets.QFrame()
-        pill.setObjectName("ZoomPill")
-        pill.setStyleSheet(
-            "#ZoomPill { background-color: #e8e8e8; border-radius: 999px; padding: 2px 8px 2px 10px; }"
-        )
-        zoom_layout = QtWidgets.QHBoxLayout(pill)
-        zoom_layout.setContentsMargins(4, 2, 6, 2)
-        zoom_layout.setSpacing(4)
+        """Add zoom +/- buttons at bottom left of the status bar."""
+        container = QtWidgets.QWidget()
+        zoom_layout = QtWidgets.QHBoxLayout(container)
+        zoom_layout.setContentsMargins(4, 0, 4, 0)
+        zoom_layout.setSpacing(2)
         zoom_label = QtWidgets.QLabel("Zoom")
-        zoom_label.setStyleSheet("font-weight: bold; color: #333;")
+        zoom_label.setStyleSheet("font-weight: bold;")
         zoom_layout.addWidget(zoom_label)
-        zoom_out_btn = QtWidgets.QPushButton("−")
-        zoom_out_btn.setToolTip("Zoom out")
-        zoom_out_btn.setFixedWidth(26)
+        zoom_out_btn = QtWidgets.QPushButton("\u2212")
+        zoom_out_btn.setToolTip("Zoom out (min 80%)")
+        zoom_out_btn.setFixedSize(26, 22)
         zoom_out_btn.clicked.connect(self._on_zoom_out)
         zoom_in_btn = QtWidgets.QPushButton("+")
-        zoom_in_btn.setToolTip("Zoom in")
-        zoom_in_btn.setFixedWidth(26)
+        zoom_in_btn.setToolTip("Zoom in (max 200%)")
+        zoom_in_btn.setFixedSize(26, 22)
         zoom_in_btn.clicked.connect(self._on_zoom_in)
         zoom_layout.addWidget(zoom_out_btn)
         zoom_layout.addWidget(zoom_in_btn)
-        zoom_layout.addSpacing(2)
-        self.statusBar().addWidget(pill)
+        self.statusBar().addWidget(container)
 
     def _apply_ui_zoom(self) -> None:
         """Apply UI zoom level via application font scale. Uses a fixed base point size so direction stays correct."""
         app = QtWidgets.QApplication.instance()
         if not app:
             return
-        # Store the true base point size only once (before we've ever scaled), so zoom in/out always scale from the same base
         if not getattr(self, "_ui_zoom_base_pt", None):
             base_pt = app.font().pointSize()
             self._ui_zoom_base_pt = base_pt if base_pt and base_pt > 0 else 10
@@ -1338,16 +1426,30 @@ class MainWindow(QtWidgets.QMainWindow):
         new_font = QFont(base_font)
         new_font.setPointSize(new_pt)
         app.setFont(new_font)
+
+        # Propagate the new font to all child widgets so zoom takes effect everywhere.
+        # Skip the debug console (QPlainTextEdit) which uses its own Ctrl+scroll zoom.
+        from gui.device_debug import DeviceDebugWidget
+        for widget in self.findChildren(QtWidgets.QWidget):
+            if isinstance(widget, QtWidgets.QPlainTextEdit):
+                if isinstance(widget.parent(), DeviceDebugWidget) or (
+                    hasattr(widget, "objectName") and widget.objectName() == "console_output"
+                ):
+                    continue
+            wf = widget.font()
+            scaled = QFont(wf)
+            scaled.setPointSize(new_pt)
+            if wf.bold():
+                scaled.setBold(True)
+            widget.setFont(scaled)
+
         fm = QtGui.QFontMetrics(app.font())
-        # Keep "Library:" heading in sync with zoom (toolbar labels can miss font inheritance)
         if hasattr(self, "_library_heading_label") and self._library_heading_label is not None:
             label_font = QFont(app.font())
             label_font.setBold(True)
             self._library_heading_label.setFont(label_font)
-        # Keep library combo wide enough for names at current zoom
         if hasattr(self, "_lib_combo") and self._lib_combo is not None:
             self._lib_combo.setMinimumWidth(max(180, fm.averageCharWidth() * 22))
-        # Prevent clipping when zoomed: scale minimum sizes with font/zoom
         min_w = min(1200, max(700, int(650 * self._ui_zoom_level // 100)))
         min_h = min(900, max(500, int(450 * self._ui_zoom_level // 100)))
         self.setMinimumSize(min_w, min_h)
@@ -1360,7 +1462,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.library_table.horizontalHeader().setMinimumSectionSize(
                 max(40, fm.averageCharWidth() * 8)
             )
-        # Keep library-tab button row wide enough so "Sync to SD" etc. don't clip
         if hasattr(self, "_library_controls_widget") and self._library_controls_widget is not None:
             self._library_controls_widget.setMinimumWidth(max(400, fm.averageCharWidth() * 55))
 
@@ -1453,16 +1554,31 @@ class MainWindow(QtWidgets.QMainWindow):
             self._view_advanced_action.setChecked(self.devices_view_mode == "advanced")
 
     def _set_devices_view_mode(self, mode: str) -> None:
-        """Set Devices tab view mode (basic or advanced) and persist."""
+        """Set Devices tab view mode (basic or advanced), persist, and rebuild tabs."""
         if mode not in ("basic", "advanced"):
             return
+        old_mode = getattr(self, "devices_view_mode", None)
         self.devices_view_mode = mode
         self.db.set_setting("view_mode", mode)
         self._update_view_menu_checked()
+
+        if old_mode != mode:
+            self._rebuild_tabs()
+
         if hasattr(self, "_devices_stack") and self._devices_stack is not None:
             self._devices_stack.setCurrentIndex(0 if mode == "basic" else 1)
         if mode == "basic" and hasattr(self, "_check_basic_sd_pico_warning"):
             self._check_basic_sd_pico_warning()
+
+    def _rebuild_tabs(self) -> None:
+        """Tear down the current tab widget and rebuild for the active view mode."""
+        old_central = self.centralWidget()
+        self._device_debug_widget = None
+        self._build_tabs()
+        if old_central is not None:
+            old_central.deleteLater()
+        if self.devices_view_mode == "advanced":
+            self._refresh_all()
 
     # ── Library switcher toolbar ──────────────────────────────
 
@@ -1618,14 +1734,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_tabs(self) -> None:
         tabs = QtWidgets.QTabWidget()
-        tabs.addTab(self._build_library_tab(), "Library")
-        tabs.addTab(self._build_albums_tab(), "Albums")
-        tabs.addTab(self._build_playlists_tab(), "Playlists")
-        tabs.addTab(self._build_sd_tab(), "Devices")
-        tabs.addTab(self.test_mode_widget, "Emulator")
-        device_tab_container = self._build_device_debug_tab()
-        self._device_debug_tab_index = tabs.count()
-        tabs.addTab(device_tab_container, "Device Debug")
+        self._tabs_widget = tabs
+
+        if self.devices_view_mode == "basic":
+            tabs.addTab(self._build_basic_mcu_tab(), "Microprocessor")
+            tabs.addTab(self._build_basic_sd_card_tab(), "SD Card")
+            self._device_debug_tab_index = -1
+        else:
+            tabs.addTab(self._build_library_tab(), "Library")
+            tabs.addTab(self._build_albums_tab(), "Albums")
+            tabs.addTab(self._build_playlists_tab(), "Playlists")
+            tabs.addTab(self._build_sd_tab(), "Devices")
+            tabs.addTab(self.test_mode_widget, "Emulator")
+            device_tab_container = self._build_device_debug_tab()
+            self._device_debug_tab_index = tabs.count()
+            tabs.addTab(device_tab_container, "Device Debug")
+
         tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(tabs)
 
@@ -1644,17 +1768,648 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_debug_tab_layout = layout
         return container
 
+    def _build_basic_mcu_tab(self) -> QtWidgets.QWidget:
+        """Basic mode: Microprocessor tab with single setup button (left) and debug console (right)."""
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(widget)
+
+        # ── Left panel: single setup button ──
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 8, 0)
+
+        fw_group = QtWidgets.QGroupBox("Device Setup")
+        fw_layout = QtWidgets.QVBoxLayout(fw_group)
+
+        info_label = QtWidgets.QLabel(
+            "Connect your RP2040 Pico via USB, then click the button below.\n"
+            "MicroPython will be installed automatically if needed."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #555; padding: 4px;")
+        fw_layout.addWidget(info_label)
+
+        fw_layout.addSpacing(8)
+
+        setup_btn = QtWidgets.QPushButton("Setup Device")
+        setup_btn.setToolTip(
+            "One-click setup: installs MicroPython (if needed) and flashes basic-mode firmware to the Pico."
+        )
+        setup_btn.setStyleSheet("font-weight: bold; padding: 10px; font-size: 14px;")
+        setup_btn.clicked.connect(self._setup_basic_device)
+        fw_layout.addWidget(setup_btn)
+
+        fw_layout.addStretch()
+        left_layout.addWidget(fw_group)
+
+        # ── Right panel: streamlined debug console ──
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 0, 0, 0)
+
+        debug_group = QtWidgets.QGroupBox("Device Console")
+        debug_layout = QtWidgets.QVBoxLayout(debug_group)
+        self._basic_debug_container = debug_group
+        self._basic_debug_layout = debug_layout
+        self._basic_debug_widget = DeviceDebugWidget(basic_mode=True, db=self.db)
+        debug_layout.addWidget(self._basic_debug_widget)
+        right_layout.addWidget(debug_group)
+
+        layout.addWidget(left, 1)
+        layout.addWidget(right, 2)
+        return widget
+
+    def _setup_basic_device(self) -> None:
+        """One-click: install MicroPython if needed, then flash basic-mode firmware."""
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        if not mpremote_cmd:
+            bundle_err = getattr(self, "_mpremote_bundle_error", None)
+            msg = "mpremote is not available. Install it with: pip install mpremote"
+            if bundle_err:
+                msg += "\n\n(Bundled mpremote failed:\n" + str(bundle_err) + ")"
+            QtWidgets.QMessageBox.information(self, "Setup Device", msg)
+            return
+
+        root = self._project_root()
+        if not (root / "firmware" / "pico" / "main_basic.py").exists():
+            QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
+            return
+
+        # Test: can we reach a running MicroPython?
+        try:
+            r = _run_mpremote(
+                mpremote_cmd,
+                ["connect", "auto", "exec", "print(1)"],
+                cwd=str(root), capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                self.install_to_pico(basic_mode=True)
+                return
+        except Exception:
+            pass
+
+        # No MicroPython found -- check for Pico in BOOTSEL mode
+        if self._is_rpi_rp2_present():
+            dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
+            dlg.exec()
+            self.statusBar().showMessage("MicroPython installed. Installing basic firmware...", 8000)
+            QtCore.QTimer.singleShot(500, lambda: self.install_to_pico(basic_mode=True))
+        else:
+            QtWidgets.QMessageBox.information(
+                self, "Setup Device",
+                "No Pico detected.\n\n"
+                "1. Connect the Pico via USB.\n"
+                "2. If it's new, hold BOOTSEL while plugging in.\n"
+                "3. Then click 'Setup Device' again.",
+            )
+
+    def _build_basic_sd_card_tab(self) -> QtWidgets.QWidget:
+        """Basic mode: SD Card tab with station manager, track list, capacity, and sync."""
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+
+        # ── Storage selector row ──
+        storage_group = QtWidgets.QGroupBox("Storage")
+        storage_layout = QtWidgets.QHBoxLayout(storage_group)
+        storage_layout.addWidget(QtWidgets.QLabel("SD card root:"))
+        self._basic_sd_root_label = QtWidgets.QLabel(self.sd_root or "(not set)")
+        self._basic_sd_root_label.setStyleSheet("color: #555;")
+        storage_layout.addWidget(self._basic_sd_root_label, 1)
+        detect_btn = QtWidgets.QPushButton("Detect")
+        detect_btn.clicked.connect(self._select_sd_root_basic)
+        browse_btn = QtWidgets.QPushButton("Browse")
+        browse_btn.clicked.connect(self._browse_sd_root_basic)
+        storage_layout.addWidget(detect_btn)
+        storage_layout.addWidget(browse_btn)
+        layout.addWidget(storage_group)
+
+        # ── SD capacity bar ──
+        cap_layout = QtWidgets.QHBoxLayout()
+        cap_layout.addWidget(QtWidgets.QLabel("SD Capacity:"))
+        self._basic_sd_capacity_bar = QtWidgets.QProgressBar()
+        self._basic_sd_capacity_bar.setFormat("%p% used")
+        self._basic_sd_capacity_bar.setValue(0)
+        cap_layout.addWidget(self._basic_sd_capacity_bar, 1)
+        self._basic_sd_capacity_label = QtWidgets.QLabel("")
+        cap_layout.addWidget(self._basic_sd_capacity_label)
+        layout.addLayout(cap_layout)
+
+        # ── Station manager (left) + track list (right) ──
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+
+        # Left: station list
+        station_panel = QtWidgets.QWidget()
+        station_layout = QtWidgets.QVBoxLayout(station_panel)
+        station_layout.setContentsMargins(0, 0, 0, 0)
+
+        station_heading = QtWidgets.QHBoxLayout()
+        stations_label = QtWidgets.QLabel("Stations")
+        stations_label.setStyleSheet("font-weight: bold;")
+        stations_label.setToolTip("Drag stations to reorder. Each station maps to a numbered folder on the SD card.")
+        station_heading.addWidget(stations_label)
+        self._basic_stations_size_label = QtWidgets.QLabel("")
+        self._basic_stations_size_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._basic_stations_size_label.setToolTip("Estimated total size of all station tracks on the SD card")
+        station_heading.addWidget(self._basic_stations_size_label)
+        station_heading.addStretch()
+        station_layout.addLayout(station_heading)
+
+        self._basic_station_list = ReorderListWidget()
+        self._basic_station_list.order_changed.connect(self._on_basic_station_reordered)
+        self._basic_station_list.currentItemChanged.connect(self._on_basic_station_selected)
+        self._basic_station_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._basic_station_list.customContextMenuRequested.connect(self._show_station_context_menu)
+        station_layout.addWidget(self._basic_station_list)
+
+        station_btns = QtWidgets.QHBoxLayout()
+        add_station_btn = QtWidgets.QPushButton("New Station")
+        add_station_btn.clicked.connect(self._create_basic_station)
+        rename_station_btn = QtWidgets.QPushButton("Rename")
+        rename_station_btn.clicked.connect(self._rename_basic_station)
+        del_station_btn = QtWidgets.QPushButton("Delete")
+        del_station_btn.clicked.connect(self._delete_basic_station)
+        station_btns.addWidget(add_station_btn)
+        station_btns.addWidget(rename_station_btn)
+        station_btns.addWidget(del_station_btn)
+        station_layout.addLayout(station_btns)
+        splitter.addWidget(station_panel)
+
+        # Right: tracks in selected station (reorderable + file drop)
+        track_panel = QtWidgets.QWidget()
+        track_layout = QtWidgets.QVBoxLayout(track_panel)
+        track_layout.setContentsMargins(0, 0, 0, 0)
+        self._basic_station_detail = QtWidgets.QLabel("Select a station to view tracks.")
+        self._basic_station_detail.setWordWrap(True)
+        track_layout.addWidget(self._basic_station_detail)
+
+        self._basic_station_tracks_table = CollectionDropTable()
+        self._basic_station_tracks_table.setColumnCount(4)
+        self._basic_station_tracks_table.setHorizontalHeaderLabels(["Title", "Artist", "Duration", "Format"])
+        self._basic_station_tracks_table.horizontalHeader().setStretchLastSection(True)
+        self._basic_station_tracks_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._basic_station_tracks_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self._basic_station_tracks_table.files_dropped.connect(self._import_files_to_basic_station)
+        self._basic_station_tracks_table.order_changed.connect(self._persist_basic_station_track_order)
+        self._basic_station_tracks_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._basic_station_tracks_table.customContextMenuRequested.connect(self._show_station_track_context_menu)
+        track_layout.addWidget(self._basic_station_tracks_table, 1)
+
+        track_btns = QtWidgets.QHBoxLayout()
+        add_tracks_btn = QtWidgets.QPushButton("Add Tracks")
+        add_tracks_btn.setToolTip("Browse for audio files to add to this station (also imports them to the library)")
+        add_tracks_btn.clicked.connect(self._add_tracks_to_basic_station)
+        remove_tracks_btn = QtWidgets.QPushButton("Remove Selected")
+        remove_tracks_btn.clicked.connect(self._remove_songs_from_basic_station)
+        track_btns.addWidget(add_tracks_btn)
+        track_btns.addWidget(remove_tracks_btn)
+        track_btns.addStretch()
+        track_layout.addLayout(track_btns)
+        splitter.addWidget(track_panel)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+
+        # ── Sync buttons ──
+        sync_group = QtWidgets.QGroupBox("Sync")
+        sync_layout = QtWidgets.QHBoxLayout(sync_group)
+        sync_btn = QtWidgets.QPushButton("Sync Stations to SD")
+        sync_btn.setToolTip("Copy all stations to the SD card in DFPlayer folder format.")
+        sync_btn.setStyleSheet("font-weight: bold; padding: 6px;")
+        sync_btn.clicked.connect(self._sync_basic_to_sd)
+        eject_btn = QtWidgets.QPushButton("Safely Remove SD")
+        eject_btn.clicked.connect(self.safely_remove_sd)
+        self._basic_auto_eject_cb = QtWidgets.QCheckBox("Automatically safely remove SD card after syncing")
+        self._basic_auto_eject_cb.setChecked(self.db.get_setting("auto_eject_after_sync", "0") == "1")
+        self._basic_auto_eject_cb.stateChanged.connect(self._on_auto_eject_after_sync_changed)
+        self._basic_loop_stations_cb = QtWidgets.QCheckBox("Loop stations (restart from track 1 when station ends)")
+        self._basic_loop_stations_cb.setToolTip(
+            "When enabled, a station will automatically restart from the beginning after the last track. "
+            "This setting is synced to the SD card as a feature flag (no firmware reflash needed)."
+        )
+        self._basic_loop_stations_cb.setChecked(self.db.get_setting("basic_loop_stations", "1") == "1")
+        self._basic_loop_stations_cb.stateChanged.connect(self._on_basic_loop_stations_changed)
+        sync_layout.addWidget(sync_btn)
+        sync_layout.addWidget(eject_btn)
+        sync_layout.addWidget(self._basic_auto_eject_cb)
+        sync_layout.addWidget(self._basic_loop_stations_cb)
+        sync_layout.addStretch()
+        layout.addWidget(sync_group)
+
+        self._refresh_basic_station_list()
+        self._update_basic_stations_size()
+        return widget
+
+    # ── Basic-mode SD capacity ──
+
+    def _refresh_basic_sd_capacity(self) -> None:
+        """Update the SD capacity bar and label from the current sd_root."""
+        sd_root = self._resolve_sd_root()
+        if not sd_root:
+            self._basic_sd_capacity_bar.setValue(0)
+            self._basic_sd_capacity_label.setText("No SD card selected")
+            return
+        try:
+            usage = shutil.disk_usage(str(sd_root))
+            pct = int(usage.used * 100 / usage.total) if usage.total else 0
+            self._basic_sd_capacity_bar.setValue(pct)
+            used_mb = usage.used / (1024 * 1024)
+            total_mb = usage.total / (1024 * 1024)
+            free_mb = usage.free / (1024 * 1024)
+            if total_mb >= 1024:
+                self._basic_sd_capacity_label.setText(
+                    f"{used_mb / 1024:.1f} / {total_mb / 1024:.1f} GB  ({free_mb / 1024:.1f} GB free)"
+                )
+            else:
+                self._basic_sd_capacity_label.setText(
+                    f"{used_mb:.0f} / {total_mb:.0f} MB  ({free_mb:.0f} MB free)"
+                )
+        except OSError:
+            self._basic_sd_capacity_bar.setValue(0)
+            self._basic_sd_capacity_label.setText("Cannot read SD card")
+
+    # ── Basic-mode station list management ──
+
+    def _refresh_basic_station_list(self) -> None:
+        """Reload station list from DB into the QListWidget, preserving the current selection."""
+        if not hasattr(self, "_basic_station_list"):
+            return
+        prev_item = self._basic_station_list.currentItem()
+        prev_station_id = prev_item.data(QtCore.Qt.ItemDataRole.UserRole) if prev_item else None
+        self._basic_station_list.blockSignals(True)
+        self._basic_station_list.clear()
+        stations = self.db.list_basic_stations()
+        restore_row = -1
+        for idx, station in enumerate(stations):
+            track_count = len(self.db.list_basic_station_tracks(station["id"]))
+            item = QtWidgets.QListWidgetItem(
+                f'{station["name"]}  (Folder {station["folder_number"]:02d}, {track_count} tracks)'
+            )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, station["id"])
+            self._basic_station_list.addItem(item)
+            if station["id"] == prev_station_id:
+                restore_row = idx
+        self._basic_station_list.blockSignals(False)
+        if restore_row >= 0:
+            self._basic_station_list.setCurrentRow(restore_row)
+
+    def _on_basic_station_selected(self, current, _previous) -> None:
+        if current is None:
+            self._basic_station_detail.setText("Select a station to view tracks.")
+            self._basic_station_tracks_table.setRowCount(0)
+            return
+        station_id = current.data(QtCore.Qt.ItemDataRole.UserRole)
+        station = self.db.get_basic_station(station_id)
+        if station is None:
+            return
+        track_count = len(self.db.list_basic_station_tracks(station_id))
+        self._basic_station_detail.setText(
+            f'Station: {station["name"]}  |  Folder: {station["folder_number"]:02d}'
+            f'  |  Tracks: {track_count}/{BASIC_MAX_TRACKS_PER_STATION}'
+        )
+        self._refresh_basic_station_tracks(station_id)
+
+    def _refresh_basic_station_tracks(self, station_id: int) -> None:
+        """Reload the tracks table for a given station (including duplicates)."""
+        songs = self.db.list_basic_station_songs(station_id)
+        table = self._basic_station_tracks_table
+        table.setRowCount(len(songs))
+        for row_idx, song in enumerate(songs):
+            title_item = QtWidgets.QTableWidgetItem(song["title"] or song["original_filename"])
+            # Store song id for reorder; store bst_id (track row id) in UserRole+1 for removal
+            title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song["id"])
+            title_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, song["bst_id"])
+            table.setItem(row_idx, 0, title_item)
+            table.setItem(row_idx, 1, QtWidgets.QTableWidgetItem(song["artist"] or ""))
+            dur = song["duration"]
+            dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur else ""
+            table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(dur_str))
+            table.setItem(row_idx, 3, QtWidgets.QTableWidgetItem(song["format"] or ""))
+        table.resizeColumnsToContents()
+
+    def _create_basic_station(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "New Station", "Station name:")
+        if not ok or not name.strip():
+            return
+        try:
+            folder = self.db.next_basic_station_folder()
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Limit Reached", "All 98 DFPlayer folders are in use.")
+            return
+        self.db.create_basic_station(name.strip(), folder)
+        self._refresh_basic_station_list()
+
+    def _rename_basic_station(self) -> None:
+        item = self._basic_station_list.currentItem()
+        if item is None:
+            return
+        station_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        station = self.db.get_basic_station(station_id)
+        if station is None:
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename Station", "New name:", text=station["name"]
+        )
+        if ok and name.strip():
+            self.db.update_basic_station(station_id, name=name.strip())
+            self._refresh_basic_station_list()
+
+    def _delete_basic_station(self) -> None:
+        item = self._basic_station_list.currentItem()
+        if item is None:
+            return
+        station_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        reply = QtWidgets.QMessageBox.question(
+            self, "Delete Station",
+            f"Delete station '{item.text().split('  (')[0]}'?\nThis will remove the station and its track list.",
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.db.delete_basic_station(station_id)
+            self._refresh_basic_station_list()
+            self._basic_station_tracks_table.setRowCount(0)
+            self._basic_station_detail.setText("Select a station to view tracks.")
+            self._update_basic_stations_size()
+
+    def _on_basic_station_reordered(self) -> None:
+        ids = []
+        for i in range(self._basic_station_list.count()):
+            item = self._basic_station_list.item(i)
+            if item:
+                sid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if sid is not None:
+                    ids.append(sid)
+        if ids:
+            self.db.update_basic_station_order(ids)
+            self._refresh_basic_station_list()
+
+    def _get_selected_basic_station_id(self) -> Optional[int]:
+        """Return the selected station id, or None."""
+        item = self._basic_station_list.currentItem()
+        if item is None:
+            return None
+        return item.data(QtCore.Qt.ItemDataRole.UserRole)
+
+    def _add_tracks_to_basic_station(self) -> None:
+        """Browse for audio files from file explorer, import to library, and add to selected station."""
+        station_id = self._get_selected_basic_station_id()
+        if station_id is None:
+            QtWidgets.QMessageBox.information(self, "No Station", "Select a station first.")
+            return
+
+        current_count = len(self.db.list_basic_station_tracks(station_id))
+        if current_count >= BASIC_MAX_TRACKS_PER_STATION:
+            QtWidgets.QMessageBox.warning(
+                self, "Track Limit",
+                f"This station already has {current_count} tracks (max {BASIC_MAX_TRACKS_PER_STATION} per DFPlayer folder).",
+            )
+            return
+
+        last_dir = self.db.get_setting("basic_last_import_dir", str(Path.home()))
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add Tracks to Station", last_dir, "Audio Files (*.*)",
+        )
+        if not files:
+            return
+
+        self.db.set_setting("basic_last_import_dir", str(Path(files[0]).parent))
+
+        remaining = BASIC_MAX_TRACKS_PER_STATION - current_count
+        if len(files) > remaining:
+            QtWidgets.QMessageBox.warning(
+                self, "Track Limit",
+                f"Only {remaining} more track(s) can be added (max {BASIC_MAX_TRACKS_PER_STATION} per station). "
+                f"Adding the first {remaining}.",
+            )
+            files = files[:remaining]
+
+        song_ids = self.import_files([Path(f) for f in files])
+        if song_ids:
+            next_order = self.db.next_basic_station_track_order(station_id)
+            for sid in song_ids:
+                self.db.add_song_to_basic_station(station_id, sid, next_order)
+                next_order += 1
+            self._refresh_basic_station_tracks(station_id)
+            self._refresh_basic_station_list()
+            self._update_basic_stations_size()
+
+    def _import_files_to_basic_station(self, paths: list) -> None:
+        """Handle file drop onto the station tracks table: import and add to current station."""
+        station_id = self._get_selected_basic_station_id()
+        if station_id is None:
+            QtWidgets.QMessageBox.information(self, "No Station", "Select a station first, then drop files.")
+            return
+
+        current_count = len(self.db.list_basic_station_tracks(station_id))
+        remaining = BASIC_MAX_TRACKS_PER_STATION - current_count
+        if remaining <= 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Track Limit",
+                f"This station already has {current_count} tracks (max {BASIC_MAX_TRACKS_PER_STATION} per DFPlayer folder).",
+            )
+            return
+
+        song_ids = self.import_files(paths)
+        if song_ids:
+            if len(song_ids) > remaining:
+                QtWidgets.QMessageBox.warning(
+                    self, "Track Limit",
+                    f"Only {remaining} more track(s) can be added. Adding the first {remaining}.",
+                )
+                song_ids = song_ids[:remaining]
+            next_order = self.db.next_basic_station_track_order(station_id)
+            for sid in song_ids:
+                self.db.add_song_to_basic_station(station_id, sid, next_order)
+                next_order += 1
+            self._refresh_basic_station_tracks(station_id)
+            self._refresh_basic_station_list()
+            self._update_basic_stations_size()
+
+    def _persist_basic_station_track_order(self) -> None:
+        """Persist track order after drag-reorder in the station tracks table.
+        Rebuilds the track list from the current table order, preserving duplicates."""
+        item = self._basic_station_list.currentItem()
+        if item is None:
+            return
+        station_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        table = self._basic_station_tracks_table
+        song_ids = []
+        for row in range(table.rowCount()):
+            title_item = table.item(row, 0)
+            if title_item:
+                sid = title_item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if sid is not None:
+                    song_ids.append(sid)
+        if song_ids:
+            self.db.replace_basic_station_tracks(station_id, song_ids)
+            self._refresh_basic_station_tracks(station_id)
+
+    def _remove_songs_from_basic_station(self) -> None:
+        station_item = self._basic_station_list.currentItem()
+        if station_item is None:
+            return
+        station_id = station_item.data(QtCore.Qt.ItemDataRole.UserRole)
+        selected = self._basic_station_tracks_table.selectedItems()
+        bst_ids = set()
+        for sel in selected:
+            row = sel.row()
+            title_item = self._basic_station_tracks_table.item(row, 0)
+            if title_item:
+                bst_id = title_item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+                if bst_id is not None:
+                    bst_ids.add(bst_id)
+        for bst_id in bst_ids:
+            self.db.remove_basic_station_track(bst_id)
+        self._refresh_basic_station_tracks(station_id)
+        self._refresh_basic_station_list()
+        self._update_basic_stations_size()
+
+    # ── Basic-mode SD root wrappers (auto-refresh capacity) ──
+
+    def _select_sd_root_basic(self) -> None:
+        """Detect SD root and auto-refresh capacity."""
+        self.select_sd_root()
+        if hasattr(self, "_basic_sd_root_label"):
+            self._basic_sd_root_label.setText(self.sd_root or "(not set)")
+        self._refresh_basic_sd_capacity()
+
+    def _browse_sd_root_basic(self) -> None:
+        """Browse SD root and auto-refresh capacity."""
+        self.browse_sd_root()
+        if hasattr(self, "_basic_sd_root_label"):
+            self._basic_sd_root_label.setText(self.sd_root or "(not set)")
+        self._refresh_basic_sd_capacity()
+
+    # ── Basic-mode context menus ──
+
+    def _show_station_context_menu(self, pos) -> None:
+        item = self._basic_station_list.itemAt(pos)
+        menu = QtWidgets.QMenu(self)
+        if item:
+            station_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            rename_act = menu.addAction("Rename Station")
+            rename_act.triggered.connect(self._rename_basic_station)
+            del_act = menu.addAction("Delete Station")
+            del_act.triggered.connect(self._delete_basic_station)
+            menu.addSeparator()
+            add_act = menu.addAction("Add Tracks...")
+            add_act.triggered.connect(self._add_tracks_to_basic_station)
+        new_act = menu.addAction("New Station")
+        new_act.triggered.connect(self._create_basic_station)
+        menu.exec(self._basic_station_list.viewport().mapToGlobal(pos))
+
+    def _show_station_track_context_menu(self, pos) -> None:
+        table = self._basic_station_tracks_table
+        item = table.itemAt(pos)
+        menu = QtWidgets.QMenu(self)
+        add_act = menu.addAction("Add Tracks...")
+        add_act.triggered.connect(self._add_tracks_to_basic_station)
+        if item:
+            menu.addSeparator()
+            remove_act = menu.addAction("Remove Selected")
+            remove_act.triggered.connect(self._remove_songs_from_basic_station)
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    # ── Basic-mode estimated size ──
+
+    def _update_basic_stations_size(self) -> None:
+        """Calculate and display estimated total size of all station tracks."""
+        if not hasattr(self, "_basic_stations_size_label"):
+            return
+        stations = self.db.list_basic_stations()
+        total_bytes = 0
+        for station in stations:
+            songs = self.db.list_basic_station_songs(station["id"])
+            for song in songs:
+                size = song["file_size"]
+                if size:
+                    total_bytes += size
+        if total_bytes == 0:
+            self._basic_stations_size_label.setText("")
+        elif total_bytes < 1024 * 1024:
+            self._basic_stations_size_label.setText(f"~{total_bytes / 1024:.0f} KB")
+        elif total_bytes < 1024 * 1024 * 1024:
+            self._basic_stations_size_label.setText(f"~{total_bytes / (1024 * 1024):.1f} MB")
+        else:
+            self._basic_stations_size_label.setText(f"~{total_bytes / (1024 * 1024 * 1024):.2f} GB")
+
+    # ── Basic-mode SD sync ──
+
+    def _sync_basic_to_sd(self) -> None:
+        """Sync basic-mode stations to SD card."""
+        sd_root = self._resolve_sd_root()
+        if not sd_root:
+            QtWidgets.QMessageBox.warning(self, "No SD Card", "Select an SD card first.")
+            return
+
+        stations = self.db.list_basic_stations()
+        if not stations:
+            QtWidgets.QMessageBox.information(self, "No Stations", "Create at least one station with tracks first.")
+            return
+
+        force_clean = False
+        reply = QtWidgets.QMessageBox.question(
+            self, "Sync Stations to SD",
+            "Sync all stations to SD card?\n\n"
+            "Each station will be written to its own DFPlayer folder.\n\n"
+            "'Yes' = normal sync (skip existing files)\n"
+            "'No' = clean install (re-write all files)",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
+            return
+        if reply == QtWidgets.QMessageBox.StandardButton.No:
+            force_clean = True
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Sync Stations to SD" + (" (clean)" if force_clean else ""),
+            func=self.sd_manager.sync_library_basic,
+            args=(sd_root,),
+            kwargs={"force_clean": force_clean},
+        )
+
+        def on_success(result):
+            copied, skipped = result
+            self.statusBar().showMessage(
+                f"Basic sync complete. Copied: {copied}, Skipped: {skipped}", 5000
+            )
+            if self.sd_root:
+                try:
+                    if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
+                        self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                except Exception:
+                    pass
+            self._refresh_basic_sd_capacity()
+            if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
+                QtCore.QTimer.singleShot(300, self.safely_remove_sd)
+
+        def on_error(msg):
+            QtWidgets.QMessageBox.critical(self, "Sync Error", f"Error during basic sync:\n\n{msg}")
+
+        dlg.on_success = on_success
+        dlg.on_error = on_error
+        dlg.exec()
+
     def _on_tab_changed(self, index: int) -> None:
-        """When switching to Device Debug tab, lazy-load widget and check SD/library sync."""
-        if index == self._device_debug_tab_index:
+        """Handle tab switches: lazy-load debug widgets, check sync status."""
+        # Advanced mode: Device Debug tab lazy-load
+        if self._device_debug_tab_index >= 0 and index == self._device_debug_tab_index:
             if self._device_debug_widget is None:
                 self._device_debug_tab_layout.removeWidget(self._device_debug_placeholder)
                 self._device_debug_placeholder.deleteLater()
                 self._device_debug_widget = DeviceDebugWidget()
                 self._device_debug_tab_layout.addWidget(self._device_debug_widget)
             self._check_device_tab_sync()
-        # When switching to Devices tab (index 3), update basic-view SD+Pico warning if in basic mode
-        if index == 3 and self.devices_view_mode == "basic" and hasattr(self, "_check_basic_sd_pico_warning"):
+
+        # Basic mode: SD Card tab (index 1) - refresh capacity
+        if self.devices_view_mode == "basic" and index == 1:
+            if hasattr(self, "_basic_sd_root_label"):
+                self._basic_sd_root_label.setText(self.sd_root or "(not set)")
+            self._refresh_basic_sd_capacity()
+
+        # Advanced mode: Devices tab warning
+        if self.devices_view_mode == "advanced" and index == 3 and hasattr(self, "_check_basic_sd_pico_warning"):
             self._check_basic_sd_pico_warning()
 
     def _check_device_tab_sync(self) -> None:
@@ -1847,6 +2602,11 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
+        # ---- Device Profile selector bar ----
+        self._profile_bar = ProfileSelectorBar(self.db, self)
+        self._profile_bar.profile_changed.connect(self._on_profile_changed)
+        layout.addWidget(self._profile_bar)
+
         # ---- Storage (shared: root + Detect + Browse) ----
         storage_group = QtWidgets.QGroupBox("Storage & target")
         storage_layout = QtWidgets.QVBoxLayout(storage_group)
@@ -1875,12 +2635,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(QtWidgets.QLabel("Validation / import status:"))
         layout.addWidget(self.sd_status, 1)
+
+        self._load_active_profile()
         return widget
 
     def _build_sd_tab_basic_content(self) -> QtWidgets.QWidget:
-        """Basic Devices view: Sync, Eject, auto-eject option, single Setup Pico button."""
+        """Basic Devices view: board selector, notes, pin config, Sync, Eject, Setup."""
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
+
+        # Board selector (shared widget reference stored for profile loading)
+        self._basic_board_selector = BoardSelectorWidget()
+        self._basic_board_selector.board_changed.connect(self._on_board_changed)
+        layout.addWidget(self._basic_board_selector)
+
+        # Profile notes
+        notes_row = QtWidgets.QHBoxLayout()
+        notes_row.addWidget(QtWidgets.QLabel("Profile Notes:"))
+        self._basic_notes_edit = QtWidgets.QPlainTextEdit()
+        self._basic_notes_edit.setMaximumHeight(50)
+        self._basic_notes_edit.setPlaceholderText("Describe your wiring, audio module, use case...")
+        self._basic_notes_edit.textChanged.connect(self._on_basic_notes_changed)
+        notes_row.addWidget(self._basic_notes_edit, 1)
+        layout.addLayout(notes_row)
+
+        # Configure Pins button
+        pin_row = QtWidgets.QHBoxLayout()
+        self._basic_pin_summary = QtWidgets.QLabel()
+        self._basic_pin_summary.setStyleSheet("color: gray; font-size: 11px;")
+        pin_row.addWidget(self._basic_pin_summary, 1)
+        config_pins_btn = QtWidgets.QPushButton("Configure Pins...")
+        config_pins_btn.setToolTip("Open pin configuration editor")
+        config_pins_btn.clicked.connect(self._open_pin_config_dialog)
+        pin_row.addWidget(config_pins_btn)
+        layout.addLayout(pin_row)
 
         self._basic_sd_pico_warning = QtWidgets.QLabel()
         self._basic_sd_pico_warning.setWordWrap(True)
@@ -1907,39 +2695,61 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_ops_layout.addLayout(row)
         layout.addWidget(sd_ops_group)
 
-        rp2040_group = QtWidgets.QGroupBox("RP2040 (Pico)")
-        rp2040_layout = QtWidgets.QHBoxLayout(rp2040_group)
-        setup_pico_btn = QtWidgets.QPushButton("Setup Pico")
-        setup_pico_btn.setToolTip("Install firmware (if needed) and copy the app to your Pico. Connect the Pico via USB.")
-        setup_pico_btn.clicked.connect(
+        self._basic_device_group = QtWidgets.QGroupBox("Device")
+        device_layout = QtWidgets.QHBoxLayout(self._basic_device_group)
+        self._basic_setup_btn = QtWidgets.QPushButton("Install Firmware")
+        self._basic_setup_btn.setToolTip("Install firmware and copy the app to your device. Connect the device via USB.")
+        self._basic_setup_btn.clicked.connect(
             lambda: QtCore.QTimer.singleShot(0, self._setup_pico_smart)
         )
-        rp2040_layout.addWidget(setup_pico_btn)
-        rp2040_layout.addStretch()
-        layout.addWidget(rp2040_group)
+        device_layout.addWidget(self._basic_setup_btn)
+        device_layout.addStretch()
+        layout.addWidget(self._basic_device_group)
 
         layout.addStretch()
         return page
 
     def _build_sd_tab_advanced_content(self) -> QtWidgets.QWidget:
-        """Advanced Devices view: audio target, full SD ops, RP2040 options, Raspberry Pi."""
+        """Advanced Devices view: board selector, pin config, full SD ops, firmware install."""
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
 
-        target_layout = QtWidgets.QHBoxLayout()
-        target_layout.addWidget(QtWidgets.QLabel("Audio target:"))
+        # Board selector
+        self._adv_board_selector = BoardSelectorWidget()
+        self._adv_board_selector.board_changed.connect(self._on_board_changed)
+        layout.addWidget(self._adv_board_selector)
+
+        # Profile notes
+        notes_layout = QtWidgets.QHBoxLayout()
+        notes_layout.addWidget(QtWidgets.QLabel("Profile Notes:"))
+        self._adv_notes_edit = QtWidgets.QPlainTextEdit()
+        self._adv_notes_edit.setMaximumHeight(55)
+        self._adv_notes_edit.setPlaceholderText("Describe your wiring, audio module, use case...")
+        self._adv_notes_edit.textChanged.connect(self._on_notes_changed)
+        notes_layout.addWidget(self._adv_notes_edit, 1)
+        layout.addLayout(notes_layout)
+
+        # Pin configuration button + summary
+        pin_row = QtWidgets.QHBoxLayout()
+        self._adv_pin_summary = QtWidgets.QLabel()
+        self._adv_pin_summary.setStyleSheet("color: gray; font-size: 11px;")
+        pin_row.addWidget(self._adv_pin_summary, 1)
+        adv_config_pins_btn = QtWidgets.QPushButton("Configure Pins...")
+        adv_config_pins_btn.setToolTip("Open pin configuration editor")
+        adv_config_pins_btn.clicked.connect(self._open_pin_config_dialog)
+        pin_row.addWidget(adv_config_pins_btn)
+        layout.addLayout(pin_row)
+
+        # Legacy audio target combo (hidden, kept for backward compat with sync logic)
         self.audio_target_combo = QtWidgets.QComboBox()
         self.audio_target_combo.addItem("DFPlayer + RP2040", "dfplayer_rp2040")
         self.audio_target_combo.addItem("Raspberry Pi 2W/3", "raspberry_pi")
-        self.audio_target_combo.setToolTip("Choose which device the library will be synced for. DFPlayer uses numbered folders (01/, 002.mp3); Pi uses a flat library folder.")
+        self.audio_target_combo.setVisible(False)
         idx = self.audio_target_combo.findData(self.audio_target)
         if idx >= 0:
             self.audio_target_combo.setCurrentIndex(idx)
         self.audio_target_combo.currentIndexChanged.connect(self._on_audio_target_changed)
-        target_layout.addWidget(self.audio_target_combo)
-        target_layout.addWidget(QtWidgets.QLabel("Used for sync layout and export options."))
-        target_layout.addStretch()
-        layout.addLayout(target_layout)
+        layout.addWidget(self.audio_target_combo)
 
         self.pi_convert_checkbox = QtWidgets.QCheckBox("Convert non-MP3 to MP3 when syncing for Pi")
         self.pi_convert_checkbox.setToolTip("When Raspberry Pi is the audio target: if checked, non-MP3 files are converted to MP3 during sync; if unchecked, files are copied as-is (e.g. FLAC, WAV).")
@@ -2038,6 +2848,160 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "pi_convert_checkbox"):
             self.pi_convert_checkbox.setVisible(self.audio_target == "raspberry_pi")
 
+    # ---- Device profile / pin config handlers ----
+
+    def _load_active_profile(self) -> None:
+        """Load the active device profile into all UI widgets."""
+        import json as _json
+        profile = self.db.get_active_profile()
+        if profile is None:
+            return
+
+        board_id = profile["board_id"]
+        bp = get_board_profile(board_id)
+        board_name = bp.name if bp else board_id
+        notes = profile["notes"] or ""
+
+        try:
+            pin_cfg = _json.loads(profile["pin_config_json"]) if profile["pin_config_json"] else {}
+        except (_json.JSONDecodeError, TypeError):
+            pin_cfg = bp.default_pin_config if bp else {}
+
+        # Dynamic button label
+        if hasattr(self, "_basic_setup_btn"):
+            if bp and bp.platform == "cpython":
+                self._basic_setup_btn.setText("Deploy to Pi")
+            elif bp and "pico" in bp.id:
+                self._basic_setup_btn.setText("Setup Pico")
+            else:
+                self._basic_setup_btn.setText("Install Firmware")
+
+        if hasattr(self, "_basic_device_group"):
+            self._basic_device_group.setTitle(board_name)
+
+        # Board selectors (both views)
+        for selector in ("_basic_board_selector", "_adv_board_selector"):
+            w = getattr(self, selector, None)
+            if w is not None:
+                w.set_board_id(board_id)
+
+        # Notes fields (both views)
+        for notes_edit in ("_basic_notes_edit", "_adv_notes_edit"):
+            w = getattr(self, notes_edit, None)
+            if w is not None:
+                w.blockSignals(True)
+                w.setPlainText(notes)
+                w.blockSignals(False)
+
+        # Pin summary labels (both views)
+        summary = self._build_pin_summary(pin_cfg)
+        for label_attr in ("_basic_pin_summary", "_adv_pin_summary"):
+            lbl = getattr(self, label_attr, None)
+            if lbl is not None:
+                lbl.setText(summary)
+
+        # Audio target (derived from board platform)
+        if bp and bp.platform == "cpython":
+            target = "raspberry_pi"
+        else:
+            target = "dfplayer_rp2040"
+        if hasattr(self, "audio_target_combo"):
+            idx = self.audio_target_combo.findData(target)
+            if idx >= 0:
+                self.audio_target_combo.setCurrentIndex(idx)
+        self.audio_target = target
+        self.db.set_setting("audio_target", target)
+        self._update_pi_convert_visibility()
+
+    @staticmethod
+    def _build_pin_summary(pin_cfg: dict) -> str:
+        pins = pin_cfg.get("pins", {})
+        if not pins:
+            return "(no pins configured)"
+        parts = [f"{k}={v}" for k, v in sorted(pins.items())]
+        text = ", ".join(parts)
+        if len(text) > 80:
+            text = text[:77] + "..."
+        driver = pin_cfg.get("_custom_driver", "")
+        prefix = f"Pins: {text}"
+        return prefix
+
+    def _on_profile_changed(self, profile_id: int) -> None:
+        self._load_active_profile()
+
+    def _on_board_changed(self, board_id: str) -> None:
+        import json as _json
+        profile = self.db.get_active_profile()
+        if profile is None:
+            return
+        bp = get_board_profile(board_id)
+        if bp is None:
+            return
+
+        import copy
+        new_cfg = copy.deepcopy(bp.default_pin_config)
+        self.db.update_device_profile(
+            profile["id"],
+            board_id=board_id,
+            pin_config_json=_json.dumps(new_cfg),
+        )
+        self._load_active_profile()
+
+    def _on_notes_changed(self) -> None:
+        """Handler for advanced view notes changes."""
+        profile = self.db.get_active_profile()
+        if profile is None:
+            return
+        self.db.update_device_profile(
+            profile["id"],
+            notes=self._adv_notes_edit.toPlainText(),
+        )
+
+    def _on_basic_notes_changed(self) -> None:
+        """Handler for basic view notes changes."""
+        profile = self.db.get_active_profile()
+        if profile is None:
+            return
+        self.db.update_device_profile(
+            profile["id"],
+            notes=self._basic_notes_edit.toPlainText(),
+        )
+        if hasattr(self, "_adv_notes_edit"):
+            self._adv_notes_edit.blockSignals(True)
+            self._adv_notes_edit.setPlainText(self._basic_notes_edit.toPlainText())
+            self._adv_notes_edit.blockSignals(False)
+
+    def _open_pin_config_dialog(self) -> None:
+        """Open the pin configuration popup dialog."""
+        import json as _json
+        profile = self.db.get_active_profile()
+        if profile is None:
+            return
+
+        bp = get_board_profile(profile["board_id"])
+        try:
+            pin_cfg = _json.loads(profile["pin_config_json"]) if profile["pin_config_json"] else {}
+        except (_json.JSONDecodeError, TypeError):
+            pin_cfg = bp.default_pin_config if bp else {}
+
+        dlg = PinConfigDialog(
+            config=pin_cfg,
+            board_profile=bp,
+            custom_driver_path=profile["custom_hw_driver_path"] or "",
+            parent=self,
+        )
+        dlg.exec()
+        if dlg.was_accepted():
+            new_cfg = dlg.get_config()
+            new_driver = dlg.get_custom_driver_path()
+            if new_cfg is not None:
+                self.db.update_device_profile(
+                    profile["id"],
+                    pin_config_json=_json.dumps(new_cfg),
+                    custom_hw_driver_path=new_driver,
+                )
+                self._load_active_profile()
+
     def _on_auto_eject_after_sync_changed(self) -> None:
         sender = self.sender()
         if isinstance(sender, QtWidgets.QCheckBox):
@@ -2056,6 +3020,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._auto_eject_after_sync_cb_advanced.blockSignals(True)
             self._auto_eject_after_sync_cb_advanced.setChecked(checked)
             self._auto_eject_after_sync_cb_advanced.blockSignals(False)
+
+    def _on_basic_loop_stations_changed(self, state: int) -> None:
+        self.db.set_setting("basic_loop_stations", "1" if state else "0")
 
     def _create_song_table(self, reorderable: bool = False) -> QtWidgets.QTableWidget:
         table: QtWidgets.QTableWidget
@@ -2267,7 +3234,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _import_files_worker(
         file_list: List[Path],
         db: DatabaseManager,
-        progress_callback: Optional[callable] = None,
+        progress_callback: Optional[Callable[..., Any]] = None,
     ) -> Tuple[int, int, List[int]]:
         """Background worker: import files into the database."""
         added = 0
@@ -3160,16 +4127,37 @@ class MainWindow(QtWidgets.QMainWindow):
         rc_src = root / "firmware" / "radio_core.py"
         if rc_src.exists():
             shutil.copy2(rc_src, dest / "radio_core.py")
-        fw_src = root / "firmware" / "pico" / "dfplayer_hardware.py"
-        if fw_src.exists():
+
+        profile_params = self._get_active_profile_install_params()
+        custom_driver = profile_params.get("custom_hw_driver_path", "")
+        if custom_driver and Path(custom_driver).is_file():
             (dest / "components").mkdir(parents=True, exist_ok=True)
-            shutil.copy2(fw_src, dest / "components" / "dfplayer_hardware.py")
+            shutil.copy2(custom_driver, dest / "components" / "dfplayer_hardware.py")
+        else:
+            fw_src = root / "firmware" / "pico" / "dfplayer_hardware.py"
+            if fw_src.exists():
+                (dest / "components").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(fw_src, dest / "components" / "dfplayer_hardware.py")
+
+        loader_src = root / "firmware" / "pin_config_loader.py"
+        if loader_src.exists():
+            shutil.copy2(loader_src, dest / "pin_config_loader.py")
+
+        sdcard_src = root / "firmware" / "pico" / "sdcard.py"
+        if sdcard_src.exists():
+            shutil.copy2(sdcard_src, dest / "sdcard.py")
+
+        pin_json = profile_params.get("pin_config_json", "")
+        if pin_json:
+            (dest / "pin_config.json").write_text(pin_json, encoding="utf-8")
+
         vintage_dest = dest / "VintageRadio"
         vintage_dest.mkdir(parents=True, exist_ok=True)
         readme_txt = dest / "README_RP2040.txt"
         readme_txt.write_text(
-            "RP2040 + DFPlayer. Copy main.py, radio_core.py, and components/\n"
-            "to the Pico. AM sound is on SD card in folder 99/001.wav.\n"
+            "RP2040 + DFPlayer. Copy main.py, radio_core.py, pin_config_loader.py,\n"
+            "sdcard.py, pin_config.json, and components/ to the Pico.\n"
+            "AM sound is on SD card in folder 99/001.wav.\n"
             "SD layout: folders 01/, 02/, ... at SD root with 001.mp3, 002.mp3 inside;\n"
             "folder 99/001.wav for AM static sound; VintageRadio/ for metadata.\n"
             "See README_RP2040.md in this folder for full setup.\n",
@@ -3185,23 +4173,38 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def _setup_pico_smart(self) -> None:
-        """One button: if MicroPython is installed, install app; else if RPI-RP2 present, flash firmware then prompt to run again."""
+        """One button: if MicroPython is installed, install app; else if RPI-RP2 present, flash firmware then prompt to run again.
+
+        Board-aware: for non-Pico MicroPython boards (ESP32 etc.), skips BOOTSEL/UF2 logic
+        but still uses mpremote for firmware install over USB serial.
+        For Raspberry Pi (cpython), redirects to deploy_to_pi.
+        """
+        profile = self.db.get_active_profile()
+        board_id = profile["board_id"] if profile else "raspberry_pi_pico"
+        bp = get_board_profile(board_id)
+
+        if bp and bp.platform == "cpython":
+            self.deploy_to_pi()
+            return
+
+        is_pico = bp is not None and "pico" in bp.id
+
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
             bundle_err = getattr(self, "_mpremote_bundle_error", None)
             if bundle_err:
-                print(f"[Setup Pico] mpremote import failed:\n{bundle_err}")
-            msg = "mpremote is not available. Install it with: pip install mpremote\n\nThen connect the Pico via USB and try again."
+                print(f"[Setup Device] mpremote import failed:\n{bundle_err}")
+            msg = "mpremote is not available. Install it with: pip install mpremote\n\nThen connect the device via USB and try again."
             if bundle_err:
                 msg += "\n\n(Bundled mpremote failed to load:\n" + str(bundle_err) + ")"
-            QtWidgets.QMessageBox.information(self, "Setup Pico", msg)
+            QtWidgets.QMessageBox.information(self, "Install Firmware", msg)
             return
         root = self._project_root()
         if not (root / "firmware" / "pico" / "main.py").exists() or not (root / "firmware" / "radio_core.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Setup Pico", "Project files not found.")
+            QtWidgets.QMessageBox.warning(self, "Install Firmware", "Project files not found.")
             return
         if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Setup Pico", "firmware/pico/dfplayer_hardware.py not found.")
+            QtWidgets.QMessageBox.warning(self, "Install Firmware", "firmware/pico/dfplayer_hardware.py not found.")
             return
 
         # Quick test: can we connect to Pico (MicroPython already installed)?
@@ -3303,23 +4306,26 @@ class MainWindow(QtWidgets.QMainWindow):
         except (subprocess.TimeoutExpired, Exception) as e:
             conn_err = str(e)
 
-        # No connection: check for Pico in BOOTSEL (RPI-RP2 drive)
-        print(f"[Setup Pico] All connection attempts failed. Output:\n{conn_err}")
-        if self._is_rpi_rp2_present():
+        # No connection: check for Pico in BOOTSEL (RPI-RP2 drive) -- Pico-only
+        print(f"[Setup Device] All connection attempts failed. Output:\n{conn_err}")
+        if is_pico and self._is_rpi_rp2_present():
             dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
             dlg.exec()
-            self.statusBar().showMessage("MicroPython installed. Installing app…", 8000)
+            self.statusBar().showMessage("MicroPython installed. Installing app...", 8000)
             QtCore.QTimer.singleShot(500, self._install_to_pico_after_firmware)
         else:
+            board_name = bp.name if bp else "device"
             msg = (
-                "No Pico detected. Connect the Pico via USB.\n\n"
-                "If it's new, hold BOOTSEL while plugging in to install MicroPython first."
+                f"No {board_name} detected. Connect the device via USB.\n\n"
+                "Ensure MicroPython is installed on the device."
             )
+            if is_pico:
+                msg += "\nIf it's new, hold BOOTSEL while plugging in to install MicroPython first."
             if conn_err and len(conn_err) < 500:
                 msg += f"\n\nConnection attempt output:\n{conn_err.strip()}"
             elif conn_err:
                 msg += f"\n\nConnection attempt output:\n{conn_err[:500].strip()}..."
-            QtWidgets.QMessageBox.information(self, "Setup Pico", msg)
+            QtWidgets.QMessageBox.information(self, "Install Firmware", msg)
 
     def _is_rpi_rp2_present(self) -> bool:
         """True if a drive with label RPI-RP2 (Pico in BOOTSEL) is present."""
@@ -3345,7 +4351,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._basic_sd_pico_warning.setVisible(False)
 
-    def _resolve_mpremote_cmd(self) -> Optional[List[str]]:
+    def _resolve_mpremote_cmd(self) -> Optional[List[Any]]:
         """Find the mpremote command (bundled in-process, standalone, or system-installed).
 
         When frozen (packaged app): try bundled mpremote first so the app works without system mpremote.
@@ -3420,7 +4426,10 @@ class MainWindow(QtWidgets.QMainWindow):
         root: Path,
         sd_root: Optional[str],
         sd_manager: SDManager,
-        progress_callback: Optional[callable] = None,
+        progress_callback: Optional[Callable[..., Any]] = None,
+        pin_config_json: str = "",
+        custom_hw_driver_path: str = "",
+        basic_mode: bool = False,
     ) -> str:
         """Background worker: copy firmware files to Pico via mpremote CLI.
 
@@ -3446,13 +4455,25 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Install mpremote for system Python: python3 -m pip install mpremote"
                     )
 
+        main_source = "firmware/pico/main_basic.py" if basic_mode else "firmware/pico/main.py"
         files_to_copy = [
-            ("firmware/pico/main.py", "main.py"),
+            (main_source, "main.py"),
             ("firmware/radio_core.py", "radio_core.py"),
             ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
+            ("firmware/pin_config_loader.py", "pin_config_loader.py"),
+            ("firmware/pico/sdcard.py", "sdcard.py"),
         ]
-        # Total steps: mkdir + firmware batch + AM WAV + metadata + reboot
-        total = 5
+
+        # If a custom driver is specified in the active profile, use it instead
+        if custom_hw_driver_path and Path(custom_hw_driver_path).is_file():
+            files_to_copy = [
+                (src, dst) for src, dst in files_to_copy
+                if dst != "components/dfplayer_hardware.py"
+            ]
+            files_to_copy.append((custom_hw_driver_path, "components/dfplayer_hardware.py"))
+
+        # Total steps: mkdir + firmware batch + pin_config + AM WAV + metadata + reboot
+        total = 6
         step = 0
 
         def _report(msg: str):
@@ -3522,6 +4543,24 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"{r.stderr or r.stdout or ''}"
                     )
 
+        # ── Write pin_config.json from active profile ──
+        _report("Writing pin configuration...")
+        if pin_config_json:
+            tmpdir_cfg = _tempfile.mkdtemp()
+            try:
+                cfg_file = Path(tmpdir_cfg) / "pin_config.json"
+                cfg_file.write_text(pin_config_json, encoding="utf-8")
+                r = run_mpremote_with_retry(["cp", str(cfg_file), ":pin_config.json"])
+                if r.returncode != 0:
+                    print(f"Warning: pin_config.json copy failed: {r.stderr or r.stdout}")
+            except Exception as e:
+                print(f"Warning: Could not copy pin_config.json: {e}")
+            finally:
+                try:
+                    shutil.rmtree(tmpdir_cfg)
+                except Exception:
+                    pass
+
         # ── Copy AMradioSound.wav ──
         _report("Copying AM radio sound...")
         from gui.resource_paths import resource_path
@@ -3588,8 +4627,23 @@ class MainWindow(QtWidgets.QMainWindow):
         """Called after firmware install; run app install and only prompt to retry if it failed."""
         self.install_to_pico(after_firmware=True)
 
-    def install_to_pico(self, after_firmware: bool = False) -> None:
-        """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote)."""
+    def _get_active_profile_install_params(self) -> dict:
+        """Read pin config and custom driver from the active profile for install/export."""
+        profile = self.db.get_active_profile()
+        if profile is None:
+            return {"pin_config_json": "", "custom_hw_driver_path": ""}
+        return {
+            "pin_config_json": profile["pin_config_json"] or "",
+            "custom_hw_driver_path": profile["custom_hw_driver_path"] or "",
+        }
+
+    def install_to_pico(self, after_firmware: bool = False, basic_mode: bool = False) -> None:
+        """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote).
+
+        Args:
+            after_firmware: If True, this was triggered right after flashing MicroPython.
+            basic_mode: If True, flash main_basic.py as main.py instead of the standard main.py.
+        """
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
             msg = ("mpremote is not available. In a packaged executable, mpremote should be bundled.\n\n"
@@ -3602,28 +4656,37 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         root = self._project_root()
-        if not (root / "firmware" / "pico" / "main.py").exists() or not (root / "firmware" / "radio_core.py").exists():
+        main_source = "firmware/pico/main_basic.py" if basic_mode else "firmware/pico/main.py"
+        if not (root / main_source).exists():
+            QtWidgets.QMessageBox.warning(self, "Install to Pico", f"{main_source} not found.")
+            return
+        if not (root / "firmware" / "radio_core.py").exists():
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "Project files not found.")
             return
         if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
             QtWidgets.QMessageBox.warning(self, "Install to Pico", "firmware/pico/dfplayer_hardware.py not found.")
             return
 
+        profile_params = self._get_active_profile_install_params()
+        profile_params["basic_mode"] = basic_mode
         use_inprocess = mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__"
+
+        title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
 
         if use_inprocess:
             _run_install_main_thread(
                 self, mpremote_cmd, root, self.sd_root, self.sd_manager,
                 after_firmware, on_success=lambda m: self.statusBar().showMessage(str(m), 5000),
                 on_error=lambda m: _show_install_error(self, m, after_firmware),
+                **profile_params,
             )
         else:
             dlg = TaskProgressDialog(
                 parent=self,
-                title="Install to Pico",
+                title=title,
                 func=self._install_to_pico_worker,
                 args=(mpremote_cmd, root, self.sd_root, self.sd_manager),
-                kwargs={},
+                kwargs=profile_params,
             )
 
             def on_success(msg):
@@ -3738,6 +4801,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if pi_hw.exists():
             (dest / "components").mkdir(parents=True, exist_ok=True)
             shutil.copy2(pi_hw, dest / "components" / "pi_hardware.py")
+
+        loader_src = root / "firmware" / "pin_config_loader.py"
+        if loader_src.exists():
+            shutil.copy2(loader_src, dest / "pin_config_loader.py")
+
+        profile_params = self._get_active_profile_install_params()
+        pin_json = profile_params.get("pin_config_json", "")
+        if pin_json:
+            (dest / "pin_config.json").write_text(pin_json, encoding="utf-8")
+
         req = dest / "requirements_pi.txt"
         req.write_text(
             "python-vlc\nRPi.GPIO\n",
@@ -4245,7 +5318,7 @@ def run_app() -> None:
     # Startup diagnostic: check whether VLC or ffmpeg+pydub are available for audio conversion.
     try:
         from .sd_manager import SDManager, PYDUB_AVAILABLE
-        sd_check = SDManager(None)
+        sd_check = SDManager(None)  # type: ignore[arg-type]
         vlc_ok = sd_check._check_vlc()
         ffmpeg_ok = sd_check._check_ffmpeg()
         if not vlc_ok and not ffmpeg_ok:

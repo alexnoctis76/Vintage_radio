@@ -23,8 +23,10 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 class DeviceDebugWidget(QtWidgets.QWidget):
     """Widget for debugging the physical Pico device via mpremote."""
     
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, basic_mode: bool = False, db=None) -> None:
         super().__init__(parent)
+        self._basic_mode = basic_mode
+        self._db = db
         self._mpremote_cmd = None
         self._connected = False
         self._output_thread = None
@@ -53,10 +55,10 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         """Set up the user interface."""
         layout = QtWidgets.QVBoxLayout(self)
         
-        # Title
-        title = QtWidgets.QLabel("Device Debug Console")
-        title.setStyleSheet("font-size: 18px; font-weight: bold;")
-        layout.addWidget(title)
+        if not self._basic_mode:
+            title = QtWidgets.QLabel("Device Debug Console")
+            title.setStyleSheet("font-size: 18px; font-weight: bold;")
+            layout.addWidget(title)
         
         # Connection section
         conn_group = QtWidgets.QGroupBox("Connection")
@@ -152,6 +154,17 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self.debug_logging_checkbox.setToolTip("Enable detailed debug logs in console and Python console")
         self.debug_logging_checkbox.stateChanged.connect(self._toggle_debug_logging)
         
+        # Start/Stop button (Thonny-style, shown in basic mode)
+        self.run_stop_btn = QtWidgets.QPushButton("Start")
+        self.run_stop_btn.setToolTip("Start or stop the firmware on the device")
+        self.run_stop_btn.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
+            "QPushButton:hover { background-color: #45a049; }"
+        )
+        self.run_stop_btn.clicked.connect(self._toggle_run_stop)
+        self.run_stop_btn.setEnabled(False)
+        self._firmware_running = False
+
         actions_layout.addWidget(self.restart_firmware_btn)
         actions_layout.addWidget(self.soft_reset_btn)
         actions_layout.addWidget(self.get_status_btn)
@@ -160,9 +173,19 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         actions_layout.addWidget(self.check_firmware_btn)
         actions_layout.addWidget(self.clear_console_btn)
         actions_layout.addWidget(self.stream_output_btn)
+        actions_layout.addWidget(self.run_stop_btn)
         actions_layout.addWidget(self.debug_logging_checkbox)
         actions_layout.addStretch()
         
+        # Basic mode firmware test button
+        self.test_basic_fw_btn = QtWidgets.QPushButton("Flash Basic Mode Firmware")
+        self.test_basic_fw_btn.setToolTip(
+            "Flash basic-mode firmware (discovers stations from DFPlayer folders via UART queries). "
+            "Use this to test DFPlayer 0x4F/0x4E query support on your hardware."
+        )
+        self.test_basic_fw_btn.clicked.connect(self._flash_basic_firmware)
+        actions_layout.addWidget(self.test_basic_fw_btn)
+
         # Power sense toggle
         power_layout = QtWidgets.QHBoxLayout()
         self.power_sense_checkbox = QtWidgets.QCheckBox("Skip Power Sense Check (No Potentiometer)")
@@ -176,6 +199,19 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         actions_layout.addLayout(power_layout)
         
         layout.addWidget(actions_group)
+
+        if self._basic_mode:
+            self.list_files_btn.setVisible(False)
+            self.check_firmware_btn.setVisible(False)
+            self.test_basic_fw_btn.setVisible(False)
+            self.power_sense_checkbox.setVisible(False)
+            self.debug_logging_checkbox.setVisible(False)
+            self.get_status_btn.setVisible(False)
+            self.stream_output_btn.setVisible(False)
+            self._debug_logging = True
+            self.run_stop_btn.setVisible(True)
+        else:
+            self.run_stop_btn.setVisible(False)
         
         # Now Playing display
         now_playing_group = QtWidgets.QGroupBox("Now Playing")
@@ -653,6 +689,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 self.send_btn.setEnabled(True)
                 self.stream_output_btn.setEnabled(True)
                 self.reset_connection_btn.setEnabled(True)
+                self.run_stop_btn.setEnabled(True)
                 
                 # Set "now playing" to waiting state (parsed from stream, not from Ctrl+C)
                 self.now_playing_label.setText(
@@ -1192,6 +1229,46 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         self._stop_output = False  # Reset for next start
     
+    def _toggle_run_stop(self) -> None:
+        """Start or stop the firmware (basic mode Thonny-style button).
+        Also auto-starts streaming when firmware starts, and stops it when firmware stops."""
+        if not self._connected:
+            self._log("Not connected. Please connect first.", "error")
+            return
+        if self._firmware_running:
+            self._log("Stopping firmware...", "info")
+            self._stop_streaming_forcefully()
+            port = self.port_combo.currentData()
+            try:
+                self._send_serial_command(port, "\x03", timeout=2)
+            except Exception:
+                pass
+            self._firmware_running = False
+            self.run_stop_btn.setText("Start")
+            self.run_stop_btn.setStyleSheet(
+                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
+                "QPushButton:hover { background-color: #45a049; }"
+            )
+        else:
+            self._log("Starting firmware...", "info")
+            self._restart_firmware()
+            self._firmware_running = True
+            self.run_stop_btn.setText("Stop")
+            self.run_stop_btn.setStyleSheet(
+                "QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 6px 16px; }"
+                "QPushButton:hover { background-color: #d32f2f; }"
+            )
+            # Auto-start streaming so output appears in the console
+            is_streaming = self._streaming_thread and self._streaming_thread.is_alive()
+            if not is_streaming:
+                QtCore.QTimer.singleShot(1500, self._auto_start_streaming_after_run)
+
+    def _auto_start_streaming_after_run(self) -> None:
+        """Start streaming after a short delay to let firmware boot."""
+        is_streaming = self._streaming_thread and self._streaming_thread.is_alive()
+        if self._firmware_running and self._connected and not is_streaming:
+            self._toggle_streaming()
+
     def _toggle_streaming(self) -> None:
         """Toggle real-time output streaming from the Pico."""
         if not self._connected:
@@ -1214,6 +1291,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self.stream_output_btn.setText("Stop Streaming")
             self._log("Starting output stream (capturing print statements from firmware)...", "info")
             self._start_streaming()
+            # Try to detect current track from existing console output
+            QtCore.QTimer.singleShot(500, self._scan_console_for_now_playing)
     
     def _start_streaming(self) -> None:
         """Start streaming output from the Pico using the persistent serial connection."""
@@ -1378,7 +1457,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             if "_start_playback_for_current: mode=" in line:
                 mode_match = re.search(r"mode=(\w+)", line)
                 if mode_match:
-                    self._current_device_mode = mode_match.group(1)
+                    detected_mode = mode_match.group(1)
+                    # Firmware logs "station" in basic mode, but guard against old firmware
+                    # sending "playlist" — treat both as "station" when in basic mode.
+                    if self._basic_mode and detected_mode == "playlist":
+                        detected_mode = "station"
+                    self._current_device_mode = detected_mode
                 
                 # Extract source name (everything between "source=" and the next ", shuffle_type=" or ", album_idx=")
                 source_match = re.search(r"source=([^,]*?)(?:,\s*shuffle_type=|,\s*album_idx=|$)", line)
@@ -1401,18 +1485,36 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     # Use album_idx as fallback ONLY if source is empty
                     if not self._current_device_source:
                         mode = self._current_device_mode or ""
-                        if mode == "playlist":
+                        if mode == "station":
+                            self._current_device_source = f"Station #{self._current_album_idx + 1}"
+                        elif mode == "playlist":
                             self._current_device_source = f"Playlist #{self._current_album_idx + 1}"
                         elif mode == "album":
                             self._current_device_source = f"Album #{self._current_album_idx + 1}"
                 
+                # In basic mode, the combined line also carries folder/track — resolve
+                # the actual song name immediately so Now Playing updates in one step.
+                if self._basic_mode and self._db:
+                    folder_match = re.search(r"folder=(\d+),?\s*track=(\d+)", line)
+                    if folder_match:
+                        self._current_basic_folder = int(folder_match.group(1))
+                        self._current_basic_track = int(folder_match.group(2))
+                        resolved = self._resolve_basic_track_name(
+                            self._current_basic_folder, self._current_basic_track
+                        )
+                        if resolved:
+                            self._current_track_title, self._current_track_artist = resolved
+
                 self._update_now_playing_display()
             
             # Detect mode changes: "[MODE] album -> playlist" or "[MODE] album -> playlist, album_idx=0"
             if "[MODE]" in line:
                 match = re.search(r"(\w+)\s*->\s*(\w+)", line)
                 if match:
-                    self._current_device_mode = match.group(2)
+                    new_mode = match.group(2)
+                    if self._basic_mode and new_mode == "playlist":
+                        new_mode = "station"
+                    self._current_device_mode = new_mode
                     # Clear source on mode change (will be re-detected from next playback log)
                     self._current_device_source = ""
                     if match.group(2) != "shuffle":
@@ -1421,8 +1523,10 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     idx_match = re.search(r"album_idx=(\d+)", line)
                     if idx_match:
                         self._current_album_idx = int(idx_match.group(1))
-                        mode = match.group(2)
-                        if mode == "playlist":
+                        mode = new_mode
+                        if mode == "station":
+                            self._current_device_source = f"Station #{self._current_album_idx + 1}"
+                        elif mode == "playlist":
                             self._current_device_source = f"Playlist #{self._current_album_idx + 1}"
                         elif mode == "album":
                             self._current_device_source = f"Album #{self._current_album_idx + 1}"
@@ -1462,12 +1566,29 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             
             # Detect playback start: "Starting playback: 'title' by artist (folder=X, track=Y, start_ms=Z)"
             #   or "Playback started successfully: 'title' by artist"
+            #   Artist may be empty (basic mode generates empty artist strings).
             if "Starting playback:" in line or "_start_playback_for_current: Playing" in line or "Playback started successfully:" in line:
-                # Match: 'title' by artist
-                match = re.search(r"'([^']+)'\s+by\s+(.+?)(?:\s*\(|$)", line)
+                match = re.search(r"'([^']+)'\s+by\s*(.*?)(?:\s*\(folder=|\s*$)", line)
                 if match:
                     title = match.group(1)
                     artist = match.group(2).strip()
+                    # In basic mode, resolve generic "Track N" to real song name
+                    if self._basic_mode and self._db and re.match(r"^Track \d+$", title):
+                        folder_match = re.search(r"folder=(\d+),?\s*track=(\d+)", line)
+                        if folder_match:
+                            self._current_basic_folder = int(folder_match.group(1))
+                            self._current_basic_track = int(folder_match.group(2))
+                            resolved = self._resolve_basic_track_name(
+                                self._current_basic_folder, self._current_basic_track
+                            )
+                            if resolved:
+                                title, artist = resolved
+                        elif not re.match(r"^Track \d+$", getattr(self, '_current_track_title', '')):
+                            # No folder info on this line but we already have a real resolved
+                            # title from the combined _start_playback_for_current: mode= line.
+                            # Don't overwrite it with the generic "Track N" placeholder.
+                            self._update_now_playing_display()
+                            return
                     self._current_track_title = title
                     self._current_track_artist = artist
                     self._update_now_playing_display()
@@ -1477,12 +1598,90 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             if "Track finished:" in line:
                 match = re.search(r"'([^']+)'\s*->\s*'([^']+)'", line)
                 if match:
-                    self._current_track_title = match.group(2)
-                    self._current_track_artist = "(auto-advanced)"
+                    new_title = match.group(2)
+                    new_artist = "(auto-advanced)"
+                    if self._basic_mode and self._db and re.match(r"^Track \d+$", new_title):
+                        folder_match = re.search(r"station (\d+) track (\d+) -> station (\d+) track (\d+)", line)
+                        if folder_match:
+                            resolved = self._resolve_basic_track_name(
+                                int(folder_match.group(3)), int(folder_match.group(4))
+                            )
+                            if resolved:
+                                new_title, new_artist = resolved
+                    self._current_track_title = new_title
+                    self._current_track_artist = new_artist
                     self._update_now_playing_display()
         except Exception:
             pass  # Non-critical - don't let parsing errors affect streaming
     
+    def _scan_console_for_now_playing(self) -> None:
+        """Scan existing console output for the most recent playback line
+        to detect what's currently playing (useful when streaming starts mid-playback)."""
+        try:
+            text = self.console_output.toPlainText()
+            if not text:
+                return
+            lines = text.split('\n')
+            for line in reversed(lines):
+                if "_start_playback_for_current: mode=" in line or "Starting playback:" in line:
+                    self._parse_stream_for_now_playing(line)
+                    return
+            # Fallback: in basic mode look for the most recent DFPlayer play command,
+            # which is always present in the boot log even when _start_playback_for_current
+            # is not (e.g. initial boot goes through start_with_am).
+            if self._basic_mode:
+                import re as _re
+                for line in reversed(lines):
+                    if "DF: Playing folder=" in line:
+                        m = _re.search(r"folder=(\d+),\s*track=(\d+)", line)
+                        if m:
+                            folder_num = int(m.group(1))
+                            track_num = int(m.group(2))
+                            self._current_basic_folder = folder_num
+                            self._current_basic_track = track_num
+                            if self._db:
+                                resolved = self._resolve_basic_track_name(folder_num, track_num)
+                                if resolved:
+                                    self._current_track_title, self._current_track_artist = resolved
+                                else:
+                                    self._current_track_title = f"Track {track_num}"
+                                    self._current_track_artist = ""
+                            else:
+                                self._current_track_title = f"Track {track_num}"
+                                self._current_track_artist = ""
+                            self._update_now_playing_display()
+                        return
+        except Exception:
+            pass
+
+    def _resolve_basic_track_name(self, folder_num: int, track_num: int):
+        """Look up the actual song name from the station database given a DFPlayer folder/track.
+        Returns (title, artist) or None if not found.
+        Also updates _current_device_source to the station name so the display
+        shows which station the track belongs to (useful for library shuffle)."""
+        try:
+            stations = self._db.list_basic_stations()
+            for station in stations:
+                if station["folder_number"] == folder_num:
+                    station_name = station["name"] or f"Station {folder_num}"
+                    songs = self._db.list_basic_station_songs(station["id"])
+                    if 0 < track_num <= len(songs):
+                        song = songs[track_num - 1]
+                        try:
+                            title = song["title"] or song["original_filename"] or f"Track {track_num}"
+                        except (KeyError, TypeError):
+                            title = f"Track {track_num}"
+                        try:
+                            artist = song["artist"] or ""
+                        except (KeyError, TypeError):
+                            artist = ""
+                        self._current_device_source = station_name
+                        return (title, artist)
+                    break
+        except Exception:
+            pass
+        return None
+
     def _update_now_playing_display(self):
         """Update the now playing label with current mode, source, track, and artist."""
         try:
@@ -1491,6 +1690,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             artist = getattr(self, '_current_track_artist', '')
             source = getattr(self, '_current_device_source', '')
             shuffle_type = getattr(self, '_current_shuffle_type', '')
+            folder = getattr(self, '_current_basic_folder', None)
+            track_num = getattr(self, '_current_basic_track', None)
             
             parts = []
             
@@ -1508,6 +1709,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     mode_display = f"Shuffle ({source})"
                 else:
                     mode_display = "Shuffle"
+            elif mode.lower() in ("station", "playlist") and self._basic_mode:
+                mode_display = "Station"
             else:
                 mode_display = mode.title()
             
@@ -1521,6 +1724,10 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 parts.append(f"<b style='color: #4ec9b0;'>&#9835; {title}</b>")
             if artist:
                 parts.append(f"<span style='color: #9cdcfe;'>{artist}</span>")
+            
+            # Show folder/track location for basic mode
+            if self._basic_mode and folder is not None and track_num is not None:
+                parts.append(f"<span style='color: #808080; font-size: smaller;'>Folder {folder:02d} / Track {track_num:03d}</span>")
             
             self.now_playing_label.setText("<br>".join(parts))
         except Exception:
@@ -1780,6 +1987,34 @@ GUI Commands (not sent to device):
         
         threading.Thread(target=toggle, daemon=True).start()
     
+    def _flash_basic_firmware(self) -> None:
+        """Flash basic-mode firmware to test DFPlayer query commands.
+
+        Uses the parent MainWindow's install_to_pico flow but swaps
+        main.py for main_basic.py.
+        """
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Flash Basic Mode Firmware",
+            "This will install basic-mode firmware on the connected Pico.\n\n"
+            "Basic mode discovers stations from DFPlayer SD card folders "
+            "using UART query commands (0x4F, 0x4E).\n"
+            "No metadata files are needed -- folder structure is the source of truth.\n\n"
+            "Make sure your SD card has numbered folders (01/, 02/, etc.) with MP3 files.\n\n"
+            "Proceed?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        main_window = self.window()
+        if not hasattr(main_window, "install_to_pico"):
+            self._log("Cannot find install_to_pico on MainWindow.", "error")
+            return
+
+        main_window.install_to_pico(after_firmware=False, basic_mode=True)
+
     def _log(self, message: str, level: str = "info") -> None:
         """Add a message to the console output. Thread-safe - can be called from any thread."""
         # Check if we're on the main thread
