@@ -615,19 +615,43 @@ class RadioCore:
             self.hw.log(f"_resolve_input: no actionable input")
     
     def _single_tap(self):
-        """Single tap - next track."""
+        """Single tap - next track (next in shuffle order when in shuffle mode)."""
         self.hw.log("Single tap: next track")
         self._next_track()
     
     def _double_tap(self):
-        """Double tap - previous track."""
+        """Double tap - previous track (previous in shuffle order when in shuffle mode)."""
         self.hw.log("Double tap: previous track")
         self._prev_track()
     
     def _triple_tap(self):
-        """Triple tap - restart current album/playlist."""
+        """Triple tap - restart from the beginning of the current source.
+
+        In ordered station/playlist/album mode: track 1 of that list.
+        In shuffle (station, album, playlist, or library): first entry in the
+        current ``shuffle_tracks`` order (same random order as when shuffle
+        started; does not re-shuffle). Single/double tap already move within
+        that list via ``shuffle_index``.
+        """
         self.hw.log("Triple tap: restart")
-        self.current_track = 1
+        if self.mode == MODE_SHUFFLE:
+            if not self.shuffle_tracks:
+                self.hw.log("Triple tap: no shuffle tracks to restart")
+                return
+            self.shuffle_index = 0
+            self.current_track = 1
+            st = self._shuffle_source_type
+            if st in ("album", "playlist", "station"):
+                self.hw.log(
+                    "Triple tap: restart at first track in current source shuffle order"
+                )
+            else:
+                self.hw.log(
+                    "Triple tap: restart at first track in library shuffle order"
+                )
+        else:
+            # Ordered playlist/station/album, or radio: first track index
+            self.current_track = 1
         self._save_state("triple tap restart")
         self._start_playback_for_current()
     
@@ -1578,25 +1602,103 @@ class RadioCore:
         """Called when a play attempt returns 'file not found' in basic mode.
 
         Trims the station's track list to the last known-good count so future
-        _get_track_count() calls return the correct value, then wraps to track 1
-        and restarts playback.  Guards against track 1 itself being missing.
+        _get_track_count() calls return the correct value, then restarts playback.
+        Library shuffle uses ``shuffle_tracks`` / ``shuffle_index`` (not
+        ``current_track`` alone); stale entries must be pruned or recovery loops
+        forever and can hit maximum recursion depth.
         """
-        if failed_track_num <= 1:
-            self.hw.log(f"BASIC: Station folder {folder} has no playable tracks - cannot recover")
+        self._basic_not_found_recovery_depth = (
+            getattr(self, "_basic_not_found_recovery_depth", 0) + 1
+        )
+        if self._basic_not_found_recovery_depth > 8:
+            self._basic_not_found_recovery_depth -= 1
+            self.hw.log("BASIC: file-not-found recovery stopped (too many retries)")
             return
-        actual_count = failed_track_num - 1
-        for pl in self.playlists:
-            if pl.get('id') == folder:
-                tracks = pl.get('tracks', [])
+        try:
+            if failed_track_num <= 1:
+                self.hw.log(
+                    f"BASIC: Station folder {folder} has no playable tracks - cannot recover"
+                )
+                return
+            try:
+                folder_id = int(folder)
+            except (TypeError, ValueError):
+                folder_id = folder
+
+            actual_count = failed_track_num - 1
+            matched = False
+            for pl in self.playlists:
+                pid = pl.get("id")
+                try:
+                    pid_int = int(pid)
+                except (TypeError, ValueError):
+                    pid_int = None
+                if pid_int is not None:
+                    if pid_int != folder_id:
+                        continue
+                elif pid != folder and pid != folder_id:
+                    continue
+                matched = True
+                tracks = pl.get("tracks", [])
                 if actual_count < len(tracks):
-                    pl['tracks'] = tracks[:actual_count]
-                    if hasattr(self.hw, '_known_tracks'):
+                    pl["tracks"] = tracks[:actual_count]
+                    if hasattr(self.hw, "_known_tracks"):
                         self.hw._known_tracks[folder] = actual_count
                     self.known_tracks[folder] = actual_count
-                    self.hw.log(f"BASIC: Station folder {folder} corrected to {actual_count} tracks")
+                    self.hw.log(
+                        f"BASIC: Station folder {folder} corrected to {actual_count} tracks"
+                    )
                 break
-        self.current_track = 1
-        self._start_playback_for_current()
+
+            # Shuffle mode keeps a separate list of track dicts; trimming ``playlists``
+            # does not remove references to missing files from ``shuffle_tracks``.
+            if self.mode == MODE_SHUFFLE and self.shuffle_tracks:
+
+                def _shuffle_entry_valid(t: dict) -> bool:
+                    f = t.get("folder")
+                    try:
+                        fi = int(f) if f is not None else None
+                    except (TypeError, ValueError):
+                        fi = None
+                    if fi != folder_id:
+                        return True
+                    tn = t.get("track_number", 0)
+                    try:
+                        tn = int(tn)
+                    except (TypeError, ValueError):
+                        return True
+                    return tn <= actual_count
+
+                before = len(self.shuffle_tracks)
+                self.shuffle_tracks = [t for t in self.shuffle_tracks if _shuffle_entry_valid(t)]
+                dropped = before - len(self.shuffle_tracks)
+                if dropped:
+                    self.hw.log(
+                        f"BASIC: Removed {dropped} shuffle entr(y/ies) not on SD "
+                        f"(folder {folder_id}, max track {actual_count})"
+                    )
+
+            if self.mode == MODE_SHUFFLE:
+                if not self.shuffle_tracks:
+                    self.hw.log("BASIC: No shuffle tracks left after not-found recovery")
+                    return
+                self.shuffle_index = min(self.shuffle_index, len(self.shuffle_tracks) - 1)
+                self.shuffle_index = max(0, self.shuffle_index)
+                self.current_track = self.shuffle_index + 1
+            else:
+                self.current_track = 1
+
+            if not matched:
+                self.hw.log(
+                    f"BASIC: No playlist matched folder {folder_id} for trim; "
+                    "retrying playback after shuffle prune"
+                )
+
+            self._start_playback_for_current()
+        finally:
+            self._basic_not_found_recovery_depth = max(
+                0, getattr(self, "_basic_not_found_recovery_depth", 1) - 1
+            )
 
     def start_playback_for_current(self, start_ms=0):
         """Request playback for the current track (public API for firmware/GUI to call after power-on or when sequencing AM overlay)."""

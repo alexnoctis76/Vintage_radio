@@ -1998,7 +1998,11 @@ class MainWindow(QtWidgets.QMainWindow):
         _cs_header_row("Taps")
         _cs_data_row("Single", "Next track")
         _cs_data_row("Double", "Previous track")
-        _cs_data_row("Triple", "Restart station from track 1")
+        _cs_data_row(
+            "Triple",
+            "Restart from the beginning: track 1 in station order, or first track "
+            "in the current shuffle pass (station / library shuffle)",
+        )
 
         _cs_header_row("Hold (long press, no taps)")
         _cs_data_row_html(
@@ -2682,7 +2686,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cap_label = getattr(self, "_basic_sd_capacity_label", None)
         if not _qt_widget_alive(bar) or not _qt_widget_alive(cap_label):
             return
-        sd_root = self._resolve_sd_root()
+        sd_root = self._resolve_sd_root(interactive=False)
         if not sd_root:
             bar.setValue(0)
             cap_label.setText("No SD card selected")
@@ -3035,6 +3039,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not self._basic_confirm_different_card(str(sd_root), for_sync=True):
             return
+
+        # Ensure folder 99 flags match what the user sees (combo), not a stale settings row.
+        self._persist_basic_station_end_mode_from_combo()
 
         force_clean = False
         reply = QtWidgets.QMessageBox.question(
@@ -3729,17 +3736,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _get_basic_station_end_mode(self) -> str:
         """Return 'loop', 'advance', or 'none' (mutually exclusive basic-mode end behavior)."""
-        m = self.db.get_setting("basic_station_end_mode", "")
+        m = (self.db.get_setting("basic_station_end_mode", "") or "").strip()
         if m in ("loop", "advance", "none"):
             return m
         # Legacy single flag before end-mode combo
-        legacy = self.db.get_setting("basic_loop_stations", "")
+        legacy = (self.db.get_setting("basic_loop_stations", "") or "").strip()
         if legacy == "1":
             return "loop"
         if legacy == "0":
             return "none"
         # Fresh install / unset: default to advance
         return "advance"
+
+    def _persist_basic_station_end_mode_from_combo(self) -> None:
+        """Write the SD tab combo box to settings (source of truth right before sync)."""
+        combo = getattr(self, "_basic_end_mode_combo", None)
+        if not _qt_widget_alive(combo):
+            return
+        idx = combo.currentIndex()
+        if idx < 0:
+            return
+        data = combo.itemData(idx)
+        if data is not None:
+            self._set_basic_station_end_mode(str(data))
 
     def _set_basic_station_end_mode(self, mode: str) -> None:
         if mode not in ("loop", "advance", "none"):
@@ -5790,7 +5809,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"An error occurred:\n{str(e)}",
             )
 
-    def _resolve_sd_root(self) -> Optional[Path]:
+    def _resolve_sd_root(self, *, interactive: bool = True) -> Optional[Path]:
+        """Resolve SD card path. When *interactive* is False, never open a volume-picker
+        dialog or browse folder — used for passive UI refresh (e.g. SD tab, after eject).
+        """
         if self.sd_root:
             path = Path(self.sd_root)
             if path.exists():
@@ -5835,6 +5857,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._update_sd_root_label()
                 return candidates[0][0]
             if len(candidates) > 1:
+                if not interactive:
+                    return None
                 choices = []
                 mapping = {}
                 for path, label in candidates:
@@ -5860,6 +5884,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._update_sd_root_label()
                     return Path(self.sd_root)
         if not self.sd_auto_detect:
+            if not interactive:
+                return None
             self.browse_sd_root()
             if self.sd_root:
                 return Path(self.sd_root)

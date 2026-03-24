@@ -44,7 +44,7 @@ pip install -r requirements.txt
 **Core Dependencies:**
 - `PyQt6>=6.6.0` - GUI framework
 - `mutagen>=1.47.0` - Audio metadata extraction
-- `pygame>=2.5.2` - Audio playback (emulator)
+- `pygame-ce>=2.5.2` - Audio playback (emulator; same API as pygame, `import pygame`)
 - `psutil>=5.9.0` - System utilities (SD card detection)
 - `pydub>=0.25.1` - Audio processing
 - `python-vlc>=3.0.20123` - Advanced audio playback (optional, for better seeking support)
@@ -249,7 +249,7 @@ The firmware uses `firmware/pico/dfplayer_hardware.py` (and `firmware/pi/pi_hard
 ## Troubleshooting
 
 ### Audio Playback Issues
-- Ensure pygame is properly installed: `pip install pygame`
+- Ensure pygame is available: `pip install -r requirements.txt` (uses **pygame-ce**, still `import pygame`)
 - For better format support, install VLC Media Player
 - Check that audio files are not corrupted
 

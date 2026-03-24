@@ -631,10 +631,11 @@ class SDManager:
             return False
 
     def _resolved_basic_station_end_mode(self) -> str:
-        end_mode = self.db.get_setting("basic_station_end_mode", "")
+        raw = self.db.get_setting("basic_station_end_mode", "") or ""
+        end_mode = raw.strip()
         if end_mode in ("loop", "advance", "none"):
             return end_mode
-        legacy = self.db.get_setting("basic_loop_stations", "")
+        legacy = (self.db.get_setting("basic_loop_stations", "") or "").strip()
         if legacy == "1":
             return "loop"
         if legacy == "0":
@@ -660,9 +661,9 @@ class SDManager:
             if progress_callback:
                 progress_callback(1, 1, "No stations to sync")
             self._copy_am_wav_to_dfplayer_sd(sd_root)
-            self._write_basic_feature_flags(
-                sd_root, end_mode=self._resolved_basic_station_end_mode()
-            )
+            _end = self._resolved_basic_station_end_mode()
+            print(f"Basic SD sync: station end mode = {_end!r} (folder 99 / DFPlayer 0x4E count)")
+            self._write_basic_feature_flags(sd_root, end_mode=_end)
             n = self.remove_hidden_junk_from_sd(sd_root)
             if n:
                 print(
@@ -767,9 +768,9 @@ class SDManager:
             progress_callback(work_done, total_work, "Copying AM radio sound...")
         self._copy_am_wav_to_dfplayer_sd(sd_root)
 
-        self._write_basic_feature_flags(
-            sd_root, end_mode=self._resolved_basic_station_end_mode()
-        )
+        _end = self._resolved_basic_station_end_mode()
+        print(f"Basic SD sync: station end mode = {_end!r} (folder 99 / DFPlayer 0x4E count)")
+        self._write_basic_feature_flags(sd_root, end_mode=_end)
 
         if progress_callback:
             progress_callback(total_work, total_work, "Basic sync complete!")
