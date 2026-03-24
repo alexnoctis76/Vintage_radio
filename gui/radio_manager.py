@@ -2485,68 +2485,114 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _setup_basic_device(self) -> None:
         """One-click: install MicroPython if needed, then flash basic-mode firmware."""
-        mpremote_cmd = self._resolve_mpremote_cmd()
-        if not mpremote_cmd:
-            bundle_err = getattr(self, "_mpremote_bundle_error", None)
-            msg = "mpremote is not available. Install it with: pip install mpremote"
-            if bundle_err:
-                msg += "\n\n(Bundled mpremote failed:\n" + str(bundle_err) + ")"
-            QtWidgets.QMessageBox.information(self, "Setup Device", msg)
-            return
-
-        root = self._project_root()
-        if not (root / "firmware" / "pico" / "main_basic.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
-            return
-
-        # Prefer explicit RP2040 ports first to avoid grabbing unrelated serial devices (e.g. Bluetooth COM).
         try:
-            import serial.tools.list_ports as list_ports
+            print("[Setup Basic Device] Starting one-click setup flow")
+            mpremote_cmd = self._resolve_mpremote_cmd()
+            if not mpremote_cmd:
+                bundle_err = getattr(self, "_mpremote_bundle_error", None)
+                print(f"[Setup Basic Device] mpremote unavailable. bundle_err={bundle_err!r}")
+                msg = "mpremote is not available. Install it with: pip install mpremote"
+                if bundle_err:
+                    msg += "\n\n(Bundled mpremote failed:\n" + str(bundle_err) + ")"
+                QtWidgets.QMessageBox.information(self, "Setup Device", msg)
+                return
 
-            for port_info in list_ports.comports():
-                port_dev = getattr(port_info, "device", None) or str(port_info)
-                if not DeviceDebugWidget._is_rp2040_port(port_info):
-                    continue
+            print(f"[Setup Basic Device] Resolved mpremote command: {mpremote_cmd!r}")
+            root = self._project_root()
+            main_basic_path = root / "firmware" / "pico" / "main_basic.py"
+            if not main_basic_path.exists():
+                print(f"[Setup Basic Device] Missing firmware file: {main_basic_path}")
+                QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
+                return
+
+            # Prefer explicit RP2040 ports first to avoid grabbing unrelated serial devices (e.g. Bluetooth COM).
+            try:
+                import serial.tools.list_ports as list_ports
+
+                ports = list(list_ports.comports())
+                print(f"[Setup Basic Device] Serial ports discovered: {len(ports)}")
+                rp_ports = []
+                for port_info in ports:
+                    port_dev = getattr(port_info, "device", None) or str(port_info)
+                    hwid = getattr(port_info, "hwid", "") or ""
+                    is_rp = DeviceDebugWidget._is_rp2040_port(port_info)
+                    print(
+                        f"[Setup Basic Device] Port candidate: device={port_dev!r} hwid={hwid!r} rp2040={is_rp}"
+                    )
+                    if is_rp:
+                        rp_ports.append(port_info)
+
+                print(f"[Setup Basic Device] RP2040 candidate ports: {len(rp_ports)}")
+                for port_info in rp_ports:
+                    port_dev = getattr(port_info, "device", None) or str(port_info)
+                    print(f"[Setup Basic Device] Trying mpremote explicit connect: {port_dev}")
+                    r = _run_mpremote(
+                        mpremote_cmd,
+                        ["connect", port_dev, "exec", "print(1)"],
+                        cwd=str(root),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    out = ((r.stdout or "") + (r.stderr or "")).strip()
+                    if out:
+                        print(f"[Setup Basic Device] explicit connect output ({port_dev}): {out[:600]}")
+                    print(f"[Setup Basic Device] explicit connect rc ({port_dev}) = {r.returncode}")
+                    if r.returncode == 0:
+                        print(f"[Setup Basic Device] explicit connect succeeded on {port_dev}, installing firmware")
+                        self.install_to_pico(basic_mode=True)
+                        return
+            except Exception:
+                print("[Setup Basic Device] RP2040 explicit scan/connect exception:")
+                print(traceback.format_exc())
+
+            # Fallback: can we reach a running MicroPython via auto-detected port?
+            print("[Setup Basic Device] Trying mpremote auto connect fallback")
+            try:
                 r = _run_mpremote(
                     mpremote_cmd,
-                    ["connect", port_dev, "exec", "print(1)"],
-                    cwd=str(root),
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
+                    ["connect", "auto", "exec", "print(1)"],
+                    cwd=str(root), capture_output=True, text=True, timeout=10,
                 )
+                out = ((r.stdout or "") + (r.stderr or "")).strip()
+                if out:
+                    print(f"[Setup Basic Device] auto connect output: {out[:600]}")
+                print(f"[Setup Basic Device] auto connect rc = {r.returncode}")
                 if r.returncode == 0:
+                    print("[Setup Basic Device] auto connect succeeded, installing firmware")
                     self.install_to_pico(basic_mode=True)
                     return
-        except Exception:
-            pass
+            except Exception:
+                print("[Setup Basic Device] auto connect exception:")
+                print(traceback.format_exc())
 
-        # Fallback: can we reach a running MicroPython via auto-detected port?
-        try:
-            r = _run_mpremote(
-                mpremote_cmd,
-                ["connect", "auto", "exec", "print(1)"],
-                cwd=str(root), capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0:
-                self.install_to_pico(basic_mode=True)
+            # No MicroPython found -- check for Pico in BOOTSEL mode
+            bootsel_present = self._is_rpi_rp2_present()
+            print(f"[Setup Basic Device] BOOTSEL (RPI-RP2) present: {bootsel_present}")
+            if bootsel_present:
+                print("[Setup Basic Device] Opening InstallMicroPythonDialog")
+                dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
+                dlg.exec()
+                self.statusBar().showMessage("MicroPython installed. Installing basic firmware...", 8000)
+                QtCore.QTimer.singleShot(500, lambda: self.install_to_pico(basic_mode=True))
                 return
-        except Exception:
-            pass
 
-        # No MicroPython found -- check for Pico in BOOTSEL mode
-        if self._is_rpi_rp2_present():
-            dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
-            dlg.exec()
-            self.statusBar().showMessage("MicroPython installed. Installing basic firmware...", 8000)
-            QtCore.QTimer.singleShot(500, lambda: self.install_to_pico(basic_mode=True))
-        else:
+            print("[Setup Basic Device] No compatible Pico detected")
             QtWidgets.QMessageBox.information(
                 self, "Setup Device",
                 "No Pico detected.\n\n"
                 "1. Connect the Pico via USB.\n"
                 "2. If it's new, hold BOOTSEL while plugging in.\n"
                 "3. Then click 'Setup Device' again.",
+            )
+        except Exception:
+            print("[Setup Basic Device] FATAL exception in setup flow:")
+            print(traceback.format_exc())
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Setup Device Error",
+                "An unexpected error occurred during Setup Device.\n\n"
+                "Please open Help > View Session Log and send the latest log.",
             )
 
     def _build_basic_sd_card_tab(self) -> QtWidgets.QWidget:
