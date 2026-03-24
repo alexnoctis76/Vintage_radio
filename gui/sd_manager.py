@@ -279,7 +279,11 @@ class SDManager:
                 fstype = part.fstype.lower()
                 if "removable" in opts or fstype in {"fat", "fat32", "exfat"}:
                     path = Path(mount)
-                    if path.exists():
+                    try:
+                        accessible = path.exists()
+                    except OSError:
+                        accessible = False
+                    if accessible:
                         label = _get_volume_label(path)
                         roots.append((path, label))
 

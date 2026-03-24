@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import traceback
 from io import StringIO
 from pathlib import Path
@@ -46,6 +47,29 @@ def get_log_dir() -> Path:
 def get_session_log_path() -> Optional[Path]:
     """Return the path of the current session's log file (None if not initialized)."""
     return _session_log_path
+
+
+def write_session_line(message: str, *, prefix: str = "SETUP") -> None:
+    """Append one line directly to the session log file and flush + fsync.
+
+    Use this for crash-prone paths (e.g. Setup Device / mpremote). Unlike ``print()``,
+    this does not depend on ``sys.stdout`` (PyInstaller windowed builds, torn TeeWriter).
+    Survives until the OS buffers are lost (hard kill / native crash may still omit lines).
+    """
+    if not _session_log_path:
+        return
+    try:
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"{ts} [{prefix}] {message}\n"
+        with open(_session_log_path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(line)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def init_session_logging(app_version: str = "dev") -> Path:
@@ -123,6 +147,31 @@ def init_session_logging(app_version: str = "dev") -> Path:
 
     sys.excepthook = _exception_hook
 
+    # ── Thread exceptions (Python 3.8+) — otherwise silent in GUI threads ──
+    if hasattr(threading, "excepthook"):
+        _orig_thread_excepthook = threading.excepthook
+
+        def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
+            try:
+                msg = "".join(
+                    traceback.format_exception(
+                        args.exc_type, args.exc_value, args.exc_traceback
+                    )
+                )
+                log_file.write(f"\n{'!'*72}\n")
+                log_file.write(
+                    f"THREAD EXCEPTION (thread={args.thread!r}) at "
+                    f"{datetime.datetime.now().isoformat()}\n"
+                )
+                log_file.write(msg)
+                log_file.write(f"{'!'*72}\n\n")
+                log_file.flush()
+            except Exception:
+                pass
+            _orig_thread_excepthook(args)
+
+        threading.excepthook = _thread_excepthook
+
     # ── Cleanup on exit ──────────────────────────────────────
     def _on_exit():
         try:
@@ -139,6 +188,24 @@ def init_session_logging(app_version: str = "dev") -> Path:
     _cleanup_old_logs(log_dir, keep=10)
 
     print(f"Session log: {_session_log_path}")
+
+    # Dump Python stack on fault (helps when a C extension or embedded code aborts).
+    try:
+        import faulthandler
+
+        faulthandler.enable(file=log_file, all_threads=True)
+    except Exception:
+        pass
+
+    # Windows: optional minidump on native fatal exceptions (see gui/windows_crash_dump.py).
+    try:
+        if sys.platform == "win32":
+            from .windows_crash_dump import install_windows_minidump_handler
+
+            install_windows_minidump_handler(crash_dir=log_dir / "crash_dumps")
+    except Exception:
+        pass
+
     return _session_log_path
 
 

@@ -4,8 +4,8 @@ __pycache__/
 *$py.class
 *.so
 .Python
-# PyInstaller temp output (inside build/)
-build/pyinstaller_temp/
+# PyInstaller build output
+build/
 develop-eggs/
 dist/
 downloads/

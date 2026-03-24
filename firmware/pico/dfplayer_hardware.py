@@ -466,7 +466,7 @@ class DFPlayerHardware(HardwareInterface):
                     start = i
                     break
             if start < 0:
-                self._uart_rx_buf.clear()
+                self._uart_rx_buf[:] = b''
                 return None
             if start > 0:
                 # Discard bytes before start

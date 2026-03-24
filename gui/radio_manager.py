@@ -26,6 +26,7 @@ from .pin_config_editor import BoardSelectorWidget, PinConfigDialog
 from .profile_manager import ProfileSelectorBar
 from .resource_paths import app_data_dir, project_root, resource_path
 from .sd_manager import SDManager, SYNC_TARGET_VOLUME_LABEL
+from .session_log import write_session_line
 from .test_mode import TestModeWidget
 from . import sd_manager as sd_manager_module
 
@@ -424,6 +425,10 @@ def _run_install_main_thread(
         QtWidgets.QApplication.processEvents()
 
     try:
+        write_session_line(
+            f"_run_install_main_thread: basic_mode={basic_mode} after_firmware={after_firmware}",
+            prefix="INSTALL",
+        )
         worker_class = type(parent)
         result = worker_class._install_to_pico_worker(
             mpremote_cmd, root, sd_root, sd_manager, progress_callback=report,
@@ -435,6 +440,10 @@ def _run_install_main_thread(
         on_success(result)
     except Exception as e:
         dlg.close()
+        write_session_line(
+            f"_run_install_main_thread FAILED: {e}\n{traceback.format_exc()}",
+            prefix="INSTALL",
+        )
         on_error(f"{e}\n\n{traceback.format_exc()}")
 
 
@@ -474,6 +483,10 @@ def _run_mpremote(
 ):
     """Run mpremote via subprocess or in-process (when bundled). Returns result with .returncode, .stdout, .stderr."""
     if mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__":
+        write_session_line(
+            f"mpremote in-process: args={args!r} cwd={cwd!r}",
+            prefix="MPREMOTE",
+        )
         from io import StringIO
 
         class _EncodedStringIO(StringIO):
@@ -496,7 +509,25 @@ def _run_mpremote(
             sys.stdout = out
             sys.stderr = err
             rc = cast(Callable[[], int], mpremote_cmd[1])()
+            write_session_line(
+                f"mpremote in-process finished rc={rc} stdout_len={len(out.getvalue())} stderr_len={len(err.getvalue())}",
+                prefix="MPREMOTE",
+            )
             return type("Result", (), {"returncode": rc, "stdout": out.getvalue(), "stderr": err.getvalue()})()
+        except SystemExit as se:
+            rc = se.code if isinstance(se.code, int) else (1 if se.code else 0)
+            write_session_line(
+                f"mpremote in-process raised SystemExit (code={se.code!r}), "
+                f"captured as rc={rc} stdout={out.getvalue()[:400]!r} stderr={err.getvalue()[:400]!r}",
+                prefix="MPREMOTE",
+            )
+            return type("Result", (), {"returncode": rc, "stdout": out.getvalue(), "stderr": err.getvalue()})()
+        except Exception as e:
+            write_session_line(
+                f"mpremote in-process exception: {e}\n{traceback.format_exc()}",
+                prefix="MPREMOTE",
+            )
+            raise
         finally:
             sys.argv = old_argv
             sys.stdout = old_stdout
@@ -516,6 +547,11 @@ def _run_mpremote(
         and getattr(sys, "frozen", False)
     ):
         run_cwd = os.path.expanduser("~")
+    if args and args[0] == "connect":
+        write_session_line(
+            f"mpremote subprocess: cmd={mpremote_cmd!r} args={args!r} cwd={run_cwd!r}",
+            prefix="MPREMOTE",
+        )
     return subprocess.run(
         mpremote_cmd + args,
         cwd=run_cwd,
@@ -1849,7 +1885,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "One-click setup: installs MicroPython (if needed) and flashes basic-mode firmware to the Pico."
         )
         setup_btn.setStyleSheet("font-weight: bold; padding: 10px; font-size: 14px;")
-        setup_btn.clicked.connect(self._setup_basic_device)
+        setup_btn.clicked.connect(self._on_setup_basic_device_clicked)
         fw_layout.addWidget(setup_btn)
 
         # Collapsible reference: low-saturation grays (section / gesture / action differ by value).
@@ -2483,13 +2519,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         warn.setVisible(True)
 
+    def _on_setup_basic_device_clicked(self) -> None:
+        """Qt slot: log first (durable) then run setup — isolates signal vs handler crashes."""
+        write_session_line("Setup Device: Qt clicked (before _setup_basic_device)", prefix="SETUP")
+        self._setup_basic_device()
+
     def _setup_basic_device(self) -> None:
         """One-click: install MicroPython if needed, then flash basic-mode firmware."""
         try:
+            write_session_line("Starting one-click setup flow", prefix="SETUP")
             print("[Setup Basic Device] Starting one-click setup flow")
             mpremote_cmd = self._resolve_mpremote_cmd()
             if not mpremote_cmd:
                 bundle_err = getattr(self, "_mpremote_bundle_error", None)
+                write_session_line(f"mpremote unavailable bundle_err={bundle_err!r}", prefix="SETUP")
                 print(f"[Setup Basic Device] mpremote unavailable. bundle_err={bundle_err!r}")
                 msg = "mpremote is not available. Install it with: pip install mpremote"
                 if bundle_err:
@@ -2497,10 +2540,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(self, "Setup Device", msg)
                 return
 
+            write_session_line(f"Resolved mpremote command: {mpremote_cmd!r}", prefix="SETUP")
             print(f"[Setup Basic Device] Resolved mpremote command: {mpremote_cmd!r}")
             root = self._project_root()
             main_basic_path = root / "firmware" / "pico" / "main_basic.py"
             if not main_basic_path.exists():
+                write_session_line(f"Missing firmware file: {main_basic_path}", prefix="SETUP")
                 print(f"[Setup Basic Device] Missing firmware file: {main_basic_path}")
                 QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
                 return
@@ -2510,21 +2555,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 import serial.tools.list_ports as list_ports
 
                 ports = list(list_ports.comports())
+                write_session_line(f"Serial ports discovered: {len(ports)}", prefix="SETUP")
                 print(f"[Setup Basic Device] Serial ports discovered: {len(ports)}")
                 rp_ports = []
                 for port_info in ports:
                     port_dev = getattr(port_info, "device", None) or str(port_info)
                     hwid = getattr(port_info, "hwid", "") or ""
                     is_rp = DeviceDebugWidget._is_rp2040_port(port_info)
+                    write_session_line(
+                        f"Port candidate device={port_dev!r} rp2040={is_rp}",
+                        prefix="SETUP",
+                    )
                     print(
                         f"[Setup Basic Device] Port candidate: device={port_dev!r} hwid={hwid!r} rp2040={is_rp}"
                     )
                     if is_rp:
                         rp_ports.append(port_info)
 
+                write_session_line(f"RP2040 candidate ports: {len(rp_ports)}", prefix="SETUP")
                 print(f"[Setup Basic Device] RP2040 candidate ports: {len(rp_ports)}")
                 for port_info in rp_ports:
                     port_dev = getattr(port_info, "device", None) or str(port_info)
+                    write_session_line(f"Trying mpremote explicit connect: {port_dev}", prefix="SETUP")
                     print(f"[Setup Basic Device] Trying mpremote explicit connect: {port_dev}")
                     r = _run_mpremote(
                         mpremote_cmd,
@@ -2536,17 +2588,34 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     out = ((r.stdout or "") + (r.stderr or "")).strip()
                     if out:
+                        write_session_line(
+                            f"explicit connect output ({port_dev}): {out[:800]}",
+                            prefix="SETUP",
+                        )
                         print(f"[Setup Basic Device] explicit connect output ({port_dev}): {out[:600]}")
+                    write_session_line(
+                        f"explicit connect rc ({port_dev}) = {r.returncode}",
+                        prefix="SETUP",
+                    )
                     print(f"[Setup Basic Device] explicit connect rc ({port_dev}) = {r.returncode}")
                     if r.returncode == 0:
+                        write_session_line(
+                            f"explicit connect OK on {port_dev}, calling install_to_pico(basic_mode=True)",
+                            prefix="SETUP",
+                        )
                         print(f"[Setup Basic Device] explicit connect succeeded on {port_dev}, installing firmware")
                         self.install_to_pico(basic_mode=True)
                         return
             except Exception:
+                write_session_line(
+                    f"RP2040 explicit scan/connect exception:\n{traceback.format_exc()}",
+                    prefix="SETUP",
+                )
                 print("[Setup Basic Device] RP2040 explicit scan/connect exception:")
                 print(traceback.format_exc())
 
             # Fallback: can we reach a running MicroPython via auto-detected port?
+            write_session_line("Trying mpremote auto connect fallback", prefix="SETUP")
             print("[Setup Basic Device] Trying mpremote auto connect fallback")
             try:
                 r = _run_mpremote(
@@ -2556,20 +2625,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 out = ((r.stdout or "") + (r.stderr or "")).strip()
                 if out:
+                    write_session_line(f"auto connect output: {out[:800]}", prefix="SETUP")
                     print(f"[Setup Basic Device] auto connect output: {out[:600]}")
+                write_session_line(f"auto connect rc = {r.returncode}", prefix="SETUP")
                 print(f"[Setup Basic Device] auto connect rc = {r.returncode}")
                 if r.returncode == 0:
+                    write_session_line("auto connect OK, calling install_to_pico(basic_mode=True)", prefix="SETUP")
                     print("[Setup Basic Device] auto connect succeeded, installing firmware")
                     self.install_to_pico(basic_mode=True)
                     return
             except Exception:
+                write_session_line(
+                    f"auto connect exception:\n{traceback.format_exc()}",
+                    prefix="SETUP",
+                )
                 print("[Setup Basic Device] auto connect exception:")
                 print(traceback.format_exc())
 
             # No MicroPython found -- check for Pico in BOOTSEL mode
             bootsel_present = self._is_rpi_rp2_present()
+            write_session_line(f"BOOTSEL (RPI-RP2) present: {bootsel_present}", prefix="SETUP")
             print(f"[Setup Basic Device] BOOTSEL (RPI-RP2) present: {bootsel_present}")
             if bootsel_present:
+                write_session_line("Opening InstallMicroPythonDialog", prefix="SETUP")
                 print("[Setup Basic Device] Opening InstallMicroPythonDialog")
                 dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
                 dlg.exec()
@@ -2577,6 +2655,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(500, lambda: self.install_to_pico(basic_mode=True))
                 return
 
+            write_session_line("No compatible Pico detected (user message)", prefix="SETUP")
             print("[Setup Basic Device] No compatible Pico detected")
             QtWidgets.QMessageBox.information(
                 self, "Setup Device",
@@ -2586,6 +2665,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "3. Then click 'Setup Device' again.",
             )
         except Exception:
+            write_session_line(
+                f"FATAL exception in setup flow:\n{traceback.format_exc()}",
+                prefix="SETUP",
+            )
             print("[Setup Basic Device] FATAL exception in setup flow:")
             print(traceback.format_exc())
             QtWidgets.QMessageBox.critical(
@@ -5719,6 +5802,10 @@ class MainWindow(QtWidgets.QMainWindow):
             after_firmware: If True, this was triggered right after flashing MicroPython.
             basic_mode: If True, flash main_basic.py as main.py instead of the standard main.py.
         """
+        write_session_line(
+            f"install_to_pico entered after_firmware={after_firmware} basic_mode={basic_mode}",
+            prefix="INSTALL",
+        )
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
             msg = ("mpremote is not available. In a packaged executable, mpremote should be bundled.\n\n"
