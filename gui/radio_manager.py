@@ -1750,6 +1750,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.test_mode_widget.hw_emulator.db = self.db
             if hasattr(self.test_mode_widget, "sd_manager"):
                 self.test_mode_widget.sd_manager.db = self.db
+        w = getattr(self, "_basic_debug_widget", None)
+        if w is not None:
+            w.set_library_db(self.db)
+        w = getattr(self, "_device_debug_widget", None)
+        if w is not None:
+            w.set_library_db(self.db)
 
     def _update_window_title(self) -> None:
         name = self._lib_registry.active_library_name()
@@ -2058,7 +2064,11 @@ class MainWindow(QtWidgets.QMainWindow):
         debug_layout = QtWidgets.QVBoxLayout(debug_group)
         self._basic_debug_container = debug_group
         self._basic_debug_layout = debug_layout
-        self._basic_debug_widget = DeviceDebugWidget(basic_mode=True, db=self.db)
+        self._basic_debug_widget = DeviceDebugWidget(
+            basic_mode=True,
+            db=self.db,
+            db_getter=lambda: self.db,
+        )
         self._basic_debug_widget.device_presence_changed.connect(
             self._set_basic_device_presence_indicator
         )
@@ -3071,6 +3081,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 f"Basic sync complete. Copied: {copied}, Skipped: {skipped}", 5000
             )
+            for _w in (
+                getattr(self, "_basic_debug_widget", None),
+                getattr(self, "_device_debug_widget", None),
+            ):
+                if _w is not None and hasattr(_w, "refresh_library_db_and_now_playing"):
+                    _w.refresh_library_db_and_now_playing()
             if self.sd_root:
                 try:
                     if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
@@ -3099,7 +3115,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._device_debug_widget is None:
                 self._device_debug_tab_layout.removeWidget(self._device_debug_placeholder)
                 self._device_debug_placeholder.deleteLater()
-                self._device_debug_widget = DeviceDebugWidget()
+                self._device_debug_widget = DeviceDebugWidget(
+                    db=self.db,
+                    db_getter=lambda: self.db,
+                )
                 self._device_debug_tab_layout.addWidget(self._device_debug_widget)
             self._check_device_tab_sync()
 

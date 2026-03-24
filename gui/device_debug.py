@@ -8,7 +8,7 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 try:
     import serial
@@ -54,10 +54,18 @@ class DeviceDebugWidget(QtWidgets.QWidget):
     #: Emitted when USB "device here" state changes: serial port, console connected, or RPI-RP2 (BOOTSEL).
     device_presence_changed = QtCore.pyqtSignal(bool)
     
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, basic_mode: bool = False, db=None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget] = None,
+        basic_mode: bool = False,
+        db=None,
+        db_getter: Optional[Callable[[], Any]] = None,
+    ) -> None:
         super().__init__(parent)
         self._basic_mode = basic_mode
         self._db = db
+        #: If set, always read the active library DB from the manager (survives library switch / reconnect).
+        self._db_getter = db_getter
         self._mpremote_cmd = None
         self._connected = False
         self._output_thread = None
@@ -91,7 +99,34 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._presence_poll_timer.timeout.connect(self._poll_serial_presence)
         self._presence_poll_timer.start()
         self._debug_log("DeviceDebugWidget initialized", "info")
-    
+
+    def _effective_db(self):
+        """Database used for station/track lookup (getter wins when provided)."""
+        if self._db_getter is not None:
+            try:
+                d = self._db_getter()
+                if d is not None:
+                    return d
+            except Exception:
+                pass
+        return self._db
+
+    def set_library_db(self, db) -> None:
+        """Use the active library database for basic-mode track name lookup (library switch)."""
+        self._db = db
+        self._scan_console_for_now_playing()
+
+    def refresh_library_db_and_now_playing(self) -> None:
+        """Re-sync cached DB handle from getter and re-parse the console (connect, SD sync)."""
+        if self._db_getter is not None:
+            try:
+                d = self._db_getter()
+                if d is not None:
+                    self._db = d
+            except Exception:
+                pass
+        self._scan_console_for_now_playing()
+
     def _setup_ui(self) -> None:
         """Set up the user interface."""
         layout = QtWidgets.QVBoxLayout(self)
@@ -877,6 +912,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     self.stream_output_btn.setText("Stop Streaming")
                 self._log("Auto-starting output stream...", "info")
                 self._start_streaming()
+                # Re-bind DB from manager (if getter) and re-scan console after reconnect / SD work.
+                self.refresh_library_db_and_now_playing()
                 # Basic mode: assume main.py is already running when opening serial (matches Run/Stop UX)
                 if self._basic_mode:
                     self._firmware_running = True
@@ -1492,8 +1529,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
     
     def _schedule_now_playing_resync(self) -> None:
         """Re-parse the console after streaming starts — catches mid-track connect when boot lines are already in the buffer."""
-        for ms in (250, 900, 2200, 5000):
-            QtCore.QTimer.singleShot(ms, self._scan_console_for_now_playing)
+        for ms in (80, 250, 900, 2200, 5000):
+            QtCore.QTimer.singleShot(ms, self.refresh_library_db_and_now_playing)
     
     def _start_streaming(self) -> None:
         """Start streaming output from the Pico using the persistent serial connection."""
@@ -1726,7 +1763,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 
                 # In basic mode, the combined line also carries folder/track — resolve
                 # the actual song name immediately so Now Playing updates in one step.
-                if self._basic_mode and self._db:
+                if self._basic_mode and self._effective_db():
                     folder_match = re.search(r"folder=(\d+),?\s*track=(\d+)", line)
                     if folder_match:
                         self._current_basic_folder = int(folder_match.group(1))
@@ -1807,7 +1844,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     title = match.group(1)
                     artist = match.group(2).strip()
                     # In basic mode, resolve generic "Track N" to real song name
-                    if self._basic_mode and self._db and re.match(r"^Track \d+$", title):
+                    if self._basic_mode and self._effective_db() and re.match(r"^Track \d+$", title):
                         folder_match = re.search(r"folder=(\d+),?\s*track=(\d+)", line)
                         if folder_match:
                             self._current_basic_folder = int(folder_match.group(1))
@@ -1834,7 +1871,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 if match:
                     new_title = match.group(2)
                     new_artist = "(auto-advanced)"
-                    if self._basic_mode and self._db and re.match(r"^Track \d+$", new_title):
+                    if self._basic_mode and self._effective_db() and re.match(r"^Track \d+$", new_title):
                         folder_match = re.search(r"station (\d+) track (\d+) -> station (\d+) track (\d+)", line)
                         if folder_match:
                             resolved = self._resolve_basic_track_name(
@@ -1878,7 +1915,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                             track_num = int(pairs[-1][1])
                             self._current_basic_folder = folder_num
                             self._current_basic_track = track_num
-                            if self._db:
+                            if self._effective_db():
                                 resolved = self._resolve_basic_track_name(folder_num, track_num)
                                 if resolved:
                                     self._current_track_title, self._current_track_artist = resolved
@@ -1900,7 +1937,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                         track_num = int(m.group(2))
                         self._current_basic_folder = folder_num
                         self._current_basic_track = track_num
-                        if self._db:
+                        if self._effective_db():
                             resolved = self._resolve_basic_track_name(folder_num, track_num)
                             if resolved:
                                 self._current_track_title, self._current_track_artist = resolved
@@ -1923,17 +1960,22 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         Also updates _current_device_source to the station name so the display
         shows which station the track belongs to (useful for library shuffle)."""
         try:
-            stations = self._db.list_basic_stations()
+            db = self._effective_db()
+            if db is None:
+                return None
+            fn = int(folder_num)
+            tn = int(track_num)
+            stations = db.list_basic_stations()
             for station in stations:
-                if station["folder_number"] == folder_num:
-                    station_name = station["name"] or f"Station {folder_num}"
-                    songs = self._db.list_basic_station_songs(station["id"])
-                    if 0 < track_num <= len(songs):
-                        song = songs[track_num - 1]
+                if int(station["folder_number"]) == fn:
+                    station_name = station["name"] or f"Station {fn}"
+                    songs = db.list_basic_station_songs(station["id"])
+                    if 0 < tn <= len(songs):
+                        song = songs[tn - 1]
                         try:
-                            title = song["title"] or song["original_filename"] or f"Track {track_num}"
+                            title = song["title"] or song["original_filename"] or f"Track {tn}"
                         except (KeyError, TypeError):
-                            title = f"Track {track_num}"
+                            title = f"Track {tn}"
                         try:
                             artist = song["artist"] or ""
                         except (KeyError, TypeError):
