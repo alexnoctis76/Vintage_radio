@@ -55,6 +55,41 @@ def populated_sd(sd_db, tmp_path):
     return mgr, sd_db, songs, aid, pid
 
 
+class TestRemoveHiddenJunk:
+    def test_removes_macos_and_windows_junk(self, tmp_path):
+        sd = tmp_path / "sd"
+        (sd / "01").mkdir(parents=True)
+        (sd / "01" / "001.mp3").write_bytes(b"x")
+        (sd / "01" / "._001.mp3").write_bytes(b"junk")
+        (sd / "01" / ".DS_Store").write_bytes(b"")
+        (sd / "01" / "Thumbs.db").write_bytes(b"")
+        (sd / "01" / "desktop.ini").write_bytes(b"")
+        mac = sd / "__MACOSX" / "01"
+        mac.mkdir(parents=True)
+        (mac / "001.mp3").write_bytes(b"z")
+
+        n = SDManager.remove_hidden_junk_from_sd(sd)
+        assert n >= 5
+        assert (sd / "01" / "001.mp3").exists()
+        assert not (sd / "01" / "._001.mp3").exists()
+        assert not (sd / "01" / ".DS_Store").exists()
+        assert not (sd / "__MACOSX").exists()
+
+    def test_sync_strips_junk_after_copy(self, populated_sd, tmp_path):
+        mgr, db, songs, aid, pid = populated_sd
+        sd_root = tmp_path / "sd_junk"
+        sd_root.mkdir()
+        junk = sd_root / "01" / "._999.mp3"
+        junk.parent.mkdir(parents=True, exist_ok=True)
+        junk.write_bytes(b"junk")
+
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library(sd_root, audio_target="dfplayer_rp2040")
+
+        assert not junk.exists()
+        assert (sd_root / "01" / "001.mp3").exists()
+
+
 class TestPathHelpers:
     def test_library_root(self, tmp_path):
         assert SDManager.library_root(tmp_path) == tmp_path / "VintageRadio" / "library"

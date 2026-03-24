@@ -25,13 +25,19 @@ project_dir = Path(SPECPATH).parent
 gui_resources = project_dir / 'gui' / 'resources'
 datas = [
     (str(gui_resources), 'gui/resources'),
-    (str(project_dir / 'firmware' / 'pico' / 'main.py'), '.'),
-    (str(project_dir / 'firmware' / 'radio_core.py'), '.'),
-    (str(project_dir / 'firmware' / 'pico' / 'dfplayer_hardware.py'), 'components'),
+    # Mirror source tree so project_root() / "firmware/..." works when frozen.
+    (str(project_dir / 'firmware' / 'pico' / 'main.py'), 'firmware/pico'),
+    (str(project_dir / 'firmware' / 'pico' / 'main_basic.py'), 'firmware/pico'),
+    (str(project_dir / 'firmware' / 'radio_core.py'), 'firmware'),
+    (str(project_dir / 'firmware' / 'pico' / 'dfplayer_hardware.py'), 'firmware/pico'),
+    (str(project_dir / 'firmware' / 'pico' / 'sdcard.py'), 'firmware/pico'),
     (str(project_dir / 'firmware' / 'custom_driver_template.py'), 'firmware'),
     (str(project_dir / 'firmware' / 'pin_config_loader.py'), 'firmware'),
     (str(project_dir / 'docs' / 'CUSTOM_DRIVER.md'), 'docs'),
 ]
+_vs1053 = project_dir / 'firmware' / 'pico' / 'vs1053_hardware.py'
+if _vs1053.exists():
+    datas.append((str(_vs1053), 'firmware/pico'))
 # Bundle mpremote fully (modules + any data files)
 try:
     mpremote_datas, mpremote_binaries, mpremote_hidden = collect_all('mpremote')
@@ -75,7 +81,8 @@ else:
 entitlements_file = str(project_dir / 'build' / 'macos_entitlements.plist') if (project_dir / 'build' / 'macos_entitlements.plist').exists() else None
 
 a = Analysis(
-    ['run_vintage_radio.py'],
+    # Absolute path: PyInstaller resolves scripts relative to the spec dir (build/).
+    [str(project_dir / 'run_vintage_radio.py')],
     pathex=[str(project_dir)],
     binaries=mpremote_binaries,
     datas=datas,

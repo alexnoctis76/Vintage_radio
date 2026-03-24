@@ -25,13 +25,26 @@ try:
 except ImportError:
     PYDUB_AVAILABLE = False
 
-try:
-    import vlc
-    VLC_AVAILABLE = True
-except (ImportError, OSError):
-    # OSError when libvlc/libvlccore.dylib not installed (e.g. VLC app not present)
-    VLC_AVAILABLE = False
-    vlc = None
+# Import vlc lazily in _get_vlc_module(): a top-level ``import vlc`` can block for a long time
+# on some macOS setups while libVLC loads, which would delay ``import gui`` / MainWindow build.
+_vlc_import_attempted = False
+_vlc_module = None
+
+
+def _get_vlc_module():
+    """Return the vlc module or None (cached). Do not import at module load time."""
+    global _vlc_import_attempted, _vlc_module
+    if _vlc_import_attempted:
+        return _vlc_module
+    _vlc_import_attempted = True
+    try:
+        import vlc as m
+
+        _vlc_module = m
+    except (ImportError, OSError):
+        _vlc_module = None
+    return _vlc_module
+
 
 from .database import DatabaseManager
 
@@ -81,14 +94,18 @@ class PygameHardwareEmulator(HardwareInterface):
         # Debounce spurious "track finished": ignore for a short window after stop/play
         # (VLC/media transitions can briefly report not-playing and trigger false auto-advance)
         self._ignore_track_finished_until = 0.0
-        
-        # Check if ffmpeg is available (needed for seeking all formats with pygame fallback)
+        # vlc Python API (for State enum); set when VLC audio init succeeds
+        self._vlc_api = None
+
+        # Check if ffmpeg is available (needed for seeking all formats for pygame fallback)
         self._ffmpeg_available = self._check_ffmpeg()
         
         # Track metadata cache
         self._track_cache: Dict[int, Dict] = {}
-        
-        self._init_audio()
+
+        # Defer _init_audio() until first real use. On macOS, vlc.Instance() can block 30s+ and
+        # would freeze the GUI during MainWindow / TestModeWidget construction.
+        self._lazy_audio_init_done = False
     
     def _check_ffmpeg(self) -> bool:
         """Check if ffmpeg is available (needed for seeking all audio formats)."""
@@ -103,15 +120,25 @@ class PygameHardwareEmulator(HardwareInterface):
             return result.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
+
+    def _ensure_audio_initialized(self) -> None:
+        """Run _init_audio once. Avoid calling from hot paths like check_track_finished (20ms tick)."""
+        if self._lazy_audio_init_done:
+            return
+        self._lazy_audio_init_done = True
+        self.log("Initializing audio (VLC/pygame); first launch may take a moment on some Macs…")
+        self._init_audio()
     
     def _init_audio(self):
         """Initialize audio - try VLC first (better seeking), fall back to pygame."""
         # Try VLC first (native seeking for all formats, no temp files needed)
-        if VLC_AVAILABLE:
+        vlc_mod = _get_vlc_module()
+        if vlc_mod:
             try:
-                self._vlc_instance = vlc.Instance('--intf', 'dummy', '--quiet')
+                self._vlc_instance = vlc_mod.Instance('--intf', 'dummy', '--quiet')
                 self._vlc_player = self._vlc_instance.media_player_new()
                 self._vlc_am_player = self._vlc_instance.media_player_new()
+                self._vlc_api = vlc_mod
                 self._audio_ready = True
                 self.log("Audio initialized (VLC - native seeking for all formats)")
                 
@@ -186,7 +213,7 @@ class PygameHardwareEmulator(HardwareInterface):
             # or if delay_playback was cleared before AM overlay finished
             self.log("execute_pending_playback called but no pending playback (playback may have already started)")
     
-    def play_track(self, folder: int, track: int, start_ms: int = 0, fade_in: bool = False):
+    def play_track(self, folder: int, track: int, start_ms: int = 0, fade_in: bool = False, folder_wrap: bool = False):
         """Play a track by folder/track number or by resolving from database.
         
         Args:
@@ -194,7 +221,9 @@ class PygameHardwareEmulator(HardwareInterface):
             track: Track number
             start_ms: Start position in milliseconds
             fade_in: If True, start at volume 0 for fade-in effect
+            folder_wrap: Loop last->first in same folder (ignored by emulator)
         """
+        self._ensure_audio_initialized()
         if not self._audio_ready:
             self.log("Audio not ready")
             return False
@@ -467,9 +496,9 @@ class PygameHardwareEmulator(HardwareInterface):
         if not self._audio_ready:
             return False
         try:
-            if self._vlc_player and VLC_AVAILABLE:
+            if self._vlc_player and self._vlc_api:
                 state = self._vlc_player.get_state()
-                return state in (vlc.State.Playing, vlc.State.Buffering)
+                return state in (self._vlc_api.State.Playing, self._vlc_api.State.Buffering)
             elif pygame and getattr(pygame, 'mixer', None):
                 # Check Sound object if using one
                 if self._current_channel:
@@ -532,6 +561,7 @@ class PygameHardwareEmulator(HardwareInterface):
 
     def play_am_overlay(self):
         """Play the AM radio sound overlay."""
+        self._ensure_audio_initialized()
         if not self._audio_ready:
             return
         try:

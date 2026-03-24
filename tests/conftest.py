@@ -137,8 +137,8 @@ class MockHardwareInterface(HardwareInterface):
         self._position_ms = 0
         self._delay_playback = False
 
-    def play_track(self, folder, track, start_ms=0):
-        self.calls.append(("play_track", folder, track, start_ms))
+    def play_track(self, folder, track, start_ms=0, folder_wrap=False):
+        self.calls.append(("play_track", folder, track, start_ms, folder_wrap))
         self._playing = True
         return True
 

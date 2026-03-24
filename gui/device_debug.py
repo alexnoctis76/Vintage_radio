@@ -8,7 +8,7 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 try:
     import serial
@@ -17,11 +17,42 @@ try:
 except ImportError:
     SERIAL_AVAILABLE = False
 
+
+def _serial_io_errno(exc: BaseException) -> Optional[int]:
+    """Best-effort errno from OSError / pyserial (used for USB CDC recovery)."""
+    if isinstance(exc, OSError):
+        return exc.errno
+    err = getattr(exc, "errno", None)
+    if isinstance(err, int):
+        return err
+    args = getattr(exc, "args", ())
+    if args and isinstance(args[0], int):
+        return args[0]
+    return None
+
+
+def _is_recoverable_usb_serial_error(exc: BaseException) -> bool:
+    """True if the OS likely invalidated the CDC handle but the device may still be present."""
+    eno = _serial_io_errno(exc)
+    # 6 = ENXIO (macOS/BSD: "Device not configured") — common stale USB-serial handle.
+    if eno == 6:
+        return True
+    if eno == 19:  # ENODEV
+        return True
+    msg = str(exc).lower()
+    return "device not configured" in msg or "could not configure port" in msg
+
+
 from PyQt6 import QtCore, QtGui, QtWidgets
+
+from .sd_manager import SDManager
 
 
 class DeviceDebugWidget(QtWidgets.QWidget):
     """Widget for debugging the physical Pico device via mpremote."""
+
+    #: Emitted when USB "device here" state changes: serial port, console connected, or RPI-RP2 (BOOTSEL).
+    device_presence_changed = QtCore.pyqtSignal(bool)
     
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None, basic_mode: bool = False, db=None) -> None:
         super().__init__(parent)
@@ -47,8 +78,18 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._current_track_artist = ""
         self._current_album_idx = 0  # Track album/playlist index for fallback display
         self._am_wav_loaded = None  # None = unknown, True/False = detected from stream
+        # USB LED: after Disconnect, stay "off" until the OS port list changes (unplug/replug, etc.)
+        self._mask_presence_until_port_change = False
+        self._ports_signature_at_mask: Optional[Tuple[str, ...]] = None
+        self._last_presence_emitted: Optional[bool] = None
+        self._poll_signature: Optional[Tuple[str, ...]] = None
+        self._poll_usb_signature: Optional[Tuple[Tuple[str, ...], bool]] = None
         self._setup_ui()
         self._scan_ports()  # Port scanning uses serial.tools.list_ports (no mpremote needed)
+        self._presence_poll_timer = QtCore.QTimer(self)
+        self._presence_poll_timer.setInterval(1500)
+        self._presence_poll_timer.timeout.connect(self._poll_serial_presence)
+        self._presence_poll_timer.start()
         self._debug_log("DeviceDebugWidget initialized", "info")
     
     def _setup_ui(self) -> None:
@@ -143,7 +184,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self.stream_output_btn = QtWidgets.QPushButton("Start Streaming")
         self.stream_output_btn.setToolTip(
             "Stream real-time output from the Pico (non-intrusive, like Thonny). "
-            "This just reads from the serial port and doesn't interrupt the firmware."
+            "Streaming starts automatically when you connect; use this to stop or start again."
         )
         self.stream_output_btn.clicked.connect(self._toggle_streaming)
         self.stream_output_btn.setEnabled(False)
@@ -156,7 +197,11 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         # Start/Stop button (Thonny-style, shown in basic mode)
         self.run_stop_btn = QtWidgets.QPushButton("Start")
-        self.run_stop_btn.setToolTip("Start or stop the firmware on the device")
+        self.run_stop_btn.setToolTip(
+            "Stop sends Ctrl+C to the serial port (same as Thonny). "
+            "After Connect we assume main.py is already running and show Stop; "
+            "use Start if you stopped the firmware or are at the REPL."
+        )
         self.run_stop_btn.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
             "QPushButton:hover { background-color: #45a049; }"
@@ -308,7 +353,46 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         """Resume the streaming thread after a command completes."""
         self._streaming_pause_event.clear()  # Clear pause signal so streaming continues
         self._streaming_resume_event.clear()
-    
+
+    def _try_reopen_serial_connection(self, port_name: str) -> Any:
+        """
+        Close and reopen USB serial on the same port path.
+
+        macOS often returns errno 6 (ENXIO / 'Device not configured') when the CDC
+        file handle goes stale even though the Pico is still plugged in. Reopening
+        usually restores streaming without disconnecting in the UI.
+        """
+        if not SERIAL_AVAILABLE or not port_name or not self._connected:
+            return None
+        new_ser = None
+        with self._port_lock:
+            old = self._serial_connection
+            try:
+                if old is not None:
+                    try:
+                        if old.is_open:
+                            old.close()
+                    except Exception:
+                        pass
+                new_ser = serial.Serial(
+                    port=port_name,
+                    baudrate=115200,
+                    timeout=0.5,
+                    write_timeout=2.0,
+                )
+                self._serial_connection = new_ser
+            except Exception as ex:
+                self._serial_connection = None
+                self._debug_log(
+                    f"Serial reopen after USB I/O error failed: {ex}", "warning"
+                )
+                return None
+        self._debug_log(
+            "Serial port reopened after recoverable USB error (stream continues).",
+            "info",
+        )
+        return new_ser
+
     def _send_serial_command(self, port: str, command: str, timeout: float = 5.0) -> tuple[int, str, str]:
         """
         Send a command via the persistent serial connection.
@@ -423,36 +507,123 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             if was_streaming:
                 self._resume_streaming()
     
-    def _scan_ports(self) -> None:
+    def _list_port_devices(self) -> Tuple[str, ...]:
+        """Sorted tuple of serial device paths (stable signature for plug/unplug detection)."""
+        if not SERIAL_AVAILABLE:
+            return tuple()
+        try:
+            return tuple(sorted(p.device for p in serial.tools.list_ports.comports()))
+        except Exception:
+            return tuple()
+
+    def _computed_presence_for_led(self) -> bool:
+        """Whether the Device Setup LED should show 'device available'."""
+        bootsel = SDManager.is_rp2040_bootsel_present()
+        has_ports = len(self._list_port_devices()) > 0
+        if self._connected:
+            try:
+                open_port = (
+                    self._serial_connection.port
+                    if self._serial_connection is not None
+                    else None
+                )
+            except Exception:
+                open_port = None
+            devs = self._list_port_devices()
+            if open_port is not None and str(open_port) not in devs:
+                return False
+            self._mask_presence_until_port_change = False
+            self._ports_signature_at_mask = None
+            return True
+        if self._mask_presence_until_port_change and self._ports_signature_at_mask is not None:
+            if bootsel:
+                return True
+            cur = self._list_port_devices()
+            if cur == self._ports_signature_at_mask:
+                return False
+            self._mask_presence_until_port_change = False
+            self._ports_signature_at_mask = None
+        return has_ports or bootsel
+
+    def _update_device_presence_led(self, *, force_emit: bool = False) -> None:
+        effective = self._computed_presence_for_led()
+        if force_emit or self._last_presence_emitted != effective:
+            self._last_presence_emitted = effective
+            self.device_presence_changed.emit(effective)
+
+    def _poll_serial_presence(self) -> None:
+        """Periodic poll so plug/unplug, BOOTSEL drive, and LED update without clicking Scan Ports."""
+        cur_ports = self._list_port_devices()
+        cur_bootsel = SDManager.is_rp2040_bootsel_present()
+        cur = (cur_ports, cur_bootsel)
+        prev = self._poll_usb_signature
+        if cur != prev:
+            self._poll_usb_signature = cur
+            self._poll_signature = cur_ports
+            if prev is not None and SERIAL_AVAILABLE:
+                self._scan_ports(from_auto_poll=True)
+            else:
+                self._update_device_presence_led(force_emit=True)
+        else:
+            self._update_device_presence_led()
+
+    def _arm_presence_mask_after_user_disconnect(self) -> None:
+        """After Disconnect/Reset, hide 'device detected' until ports change (same as unplug/replug)."""
+        sig = self._list_port_devices()
+        self._mask_presence_until_port_change = True
+        self._ports_signature_at_mask = sig
+        self._poll_signature = sig
+        self._poll_usb_signature = (sig, SDManager.is_rp2040_bootsel_present())
+        self._update_device_presence_led(force_emit=True)
+
+    def _scan_ports(self, *, from_auto_poll: bool = False) -> None:
         """Scan for available COM ports using serial.tools.list_ports (no mpremote needed)."""
-        self._debug_log("Starting port scan...", "info")
+        if not from_auto_poll:
+            self._debug_log("Starting port scan...", "info")
+        preserve = self.port_combo.currentData()
         self.port_combo.clear()
-        
+
         if not SERIAL_AVAILABLE:
             self._log("Cannot scan ports: pyserial not available. Install with: pip install pyserial", "error")
+            self._poll_signature = tuple()
+            self._poll_usb_signature = (tuple(), SDManager.is_rp2040_bootsel_present())
+            self._update_device_presence_led(force_emit=True)
             return
-        
+
         try:
-            # Use serial.tools.list_ports to find all COM ports (like Thonny does)
             ports = serial.tools.list_ports.comports()
-            self._debug_log(f"Found {len(ports)} serial port(s)", "info")
-            
+            if not from_auto_poll:
+                self._debug_log(f"Found {len(ports)} serial port(s)", "info")
+
             for port_info in ports:
                 port_name = port_info.device
                 description = f"{port_info.description or 'Unknown'} {port_info.hwid or ''}".strip()
                 self.port_combo.addItem(f"{port_name} - {description}", port_name)
-                self._debug_log(f"Added port: {port_name} - {description}", "info")
-            
+                if not from_auto_poll:
+                    self._debug_log(f"Added port: {port_name} - {description}", "info")
+
+            if preserve:
+                for i in range(self.port_combo.count()):
+                    if self.port_combo.itemData(i) == preserve:
+                        self.port_combo.setCurrentIndex(i)
+                        break
+
             if self.port_combo.count() == 0:
                 self.port_combo.addItem("(No COM ports found)", None)
-                self._log("No COM ports found. Connect your Pico via USB.", "warning")
-            else:
+                if not from_auto_poll:
+                    self._log("No COM ports found. Connect your Pico via USB.", "warning")
+            elif not from_auto_poll:
                 self._log(f"Found {self.port_combo.count()} device(s)", "info")
         except Exception as e:
             error_msg = f"Error scanning ports: {e}\n{traceback.format_exc()}"
             self._debug_log(error_msg, "error")
             self._log(f"Error scanning ports: {e}", "error")
-    
+            if self.port_combo.count() == 0:
+                self.port_combo.addItem("(No COM ports found)", None)
+        self._poll_signature = self._list_port_devices()
+        self._poll_usb_signature = (self._poll_signature, SDManager.is_rp2040_bootsel_present())
+        self._update_device_presence_led(force_emit=True)
+
     def _toggle_connection(self) -> None:
         """Connect or disconnect from the device."""
         if self._connected:
@@ -626,12 +797,14 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         self._connected = False
         self._active_operations.clear()
-        
+
         import time
         time.sleep(1.0)
-        
+
         self._restore_disconnected_state()
         self._log("Connection reset complete. You can now reconnect.", "info")
+        self._poll_signature = self._list_port_devices()
+        self._update_device_presence_led(force_emit=True)
     
     def _disconnect(self) -> None:
         """Disconnect from the device - close the persistent serial connection."""
@@ -660,7 +833,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._active_operations.clear()
         self._restore_disconnected_state()
         self._log("Disconnected", "info")
-    
+        self._arm_presence_mask_after_user_disconnect()
+
     @QtCore.pyqtSlot(str, int, str, str)
     def _execute_ui_update(self, port: str, returncode: int, stdout: str, stderr: str):
         """Execute UI update on main thread - called via QMetaObject.invokeMethod."""
@@ -699,9 +873,18 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 # Auto-start streaming so user sees logs immediately
                 self._stop_streaming = False
                 self._stop_output = False
-                self.stream_output_btn.setText("Stop Streaming")
+                if not self._basic_mode:
+                    self.stream_output_btn.setText("Stop Streaming")
                 self._log("Auto-starting output stream...", "info")
                 self._start_streaming()
+                # Basic mode: assume main.py is already running when opening serial (matches Run/Stop UX)
+                if self._basic_mode:
+                    self._firmware_running = True
+                    self.run_stop_btn.setText("Stop")
+                    self.run_stop_btn.setStyleSheet(
+                        "QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 6px 16px; }"
+                        "QPushButton:hover { background-color: #d32f2f; }"
+                    )
                 
                 # Disable port selection
                 self.port_combo.setEnabled(False)
@@ -733,6 +916,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 # Force a repaint to ensure UI updates
                 self.update()
                 self.repaint()  # Force immediate repaint
+                self._update_device_presence_led(force_emit=True)
             else:
                 self._debug_log(f"Connection failed with return code {returncode}", "error")
                 self._log(f"Connection failed: {stderr or stdout}", "error")
@@ -793,8 +977,22 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self.stream_output_btn.setEnabled(False)
             self.stream_output_btn.setText("Start Streaming")
             self.reset_connection_btn.setEnabled(False)
+            self.run_stop_btn.setEnabled(False)
+            self._firmware_running = False
+            self.run_stop_btn.setText("Start")
+            self.run_stop_btn.setStyleSheet(
+                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
+                "QPushButton:hover { background-color: #45a049; }"
+            )
             
             self.now_playing_label.setText("Not connected")
+            self._current_device_mode = ""
+            self._current_device_source = ""
+            self._current_shuffle_type = ""
+            self._current_track_title = ""
+            self._current_track_artist = ""
+            self._current_basic_folder = None
+            self._current_basic_track = None
             
             self.port_combo.setEnabled(True)
             self.scan_btn.setEnabled(True)
@@ -1291,8 +1489,11 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self.stream_output_btn.setText("Stop Streaming")
             self._log("Starting output stream (capturing print statements from firmware)...", "info")
             self._start_streaming()
-            # Try to detect current track from existing console output
-            QtCore.QTimer.singleShot(500, self._scan_console_for_now_playing)
+    
+    def _schedule_now_playing_resync(self) -> None:
+        """Re-parse the console after streaming starts — catches mid-track connect when boot lines are already in the buffer."""
+        for ms in (250, 900, 2200, 5000):
+            QtCore.QTimer.singleShot(ms, self._scan_console_for_now_playing)
     
     def _start_streaming(self) -> None:
         """Start streaming output from the Pico using the persistent serial connection."""
@@ -1317,6 +1518,10 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         def stream_thread():
             """Background thread: reads output from Pico via the shared serial connection."""
             import time
+            # Local binding required: any later `ser = ...` in this function makes `ser` local
+            # for the whole body; without this, `str(ser.port)` above the first assignment raises
+            # UnboundLocalError ("cannot access local variable 'ser'...").
+            ser = self._serial_connection
             try:
                 self._debug_log("Streaming started on persistent connection", "info")
                 QtCore.QMetaObject.invokeMethod(
@@ -1327,7 +1532,23 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 )
                 self._serial_error_count = 0
                 buffer = ""
-                
+                try:
+                    port_name = str(ser.port)
+                except Exception:
+                    port_name = str(self.port_combo.currentData() or "")
+
+                def _recover_stream_serial(exc: BaseException) -> bool:
+                    """If USB CDC handle is stale, reopen port. Returns True to retry loop."""
+                    nonlocal ser
+                    if not port_name or not _is_recoverable_usb_serial_error(exc):
+                        return False
+                    new_ser = self._try_reopen_serial_connection(port_name)
+                    if new_ser is not None:
+                        ser = new_ser
+                        self._serial_error_count = 0
+                        return True
+                    return False
+
                 while not self._stop_output and not self._stop_streaming:
                     if not self._connected:
                         break
@@ -1342,11 +1563,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                                 return
                             time.sleep(0.05)
                         self._debug_log("Streaming resumed", "info")
+                        ser = self._serial_connection
                         # After resuming, clear any stale data from the command
                         try:
-                            if ser.is_open and ser.in_waiting > 0:
+                            if ser and ser.is_open and ser.in_waiting > 0:
                                 ser.read(ser.in_waiting)
-                        except:
+                        except Exception:
                             pass
                         continue
                     
@@ -1358,6 +1580,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                         try:
                             waiting = ser.in_waiting
                         except (serial.SerialException, OSError) as e:
+                            if _recover_stream_serial(e):
+                                time.sleep(0.05)
+                                continue
                             self._serial_error_count += 1
                             if self._serial_error_count > 25:
                                 self._debug_log(f"Too many serial errors ({self._serial_error_count}), stopping stream: {e}", "error")
@@ -1388,6 +1613,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                                     )
                                     buffer = ""
                             except (serial.SerialException, OSError) as e:
+                                if _recover_stream_serial(e):
+                                    time.sleep(0.05)
+                                    continue
                                 self._serial_error_count += 1
                                 if self._serial_error_count > 25:
                                     self._debug_log(f"Too many serial read errors, stopping stream: {e}", "error")
@@ -1402,6 +1630,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                                 time.sleep(0.1)
                     
                     except Exception as e:
+                        if _recover_stream_serial(e):
+                            time.sleep(0.05)
+                            continue
                         self._serial_error_count += 1
                         if self._serial_error_count > 40:
                             self._debug_log(f"Too many stream errors ({self._serial_error_count}), stopping: {e}", "error")
@@ -1425,6 +1656,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         self._streaming_thread = threading.Thread(target=stream_thread, daemon=True)
         self._streaming_thread.start()
+        self._schedule_now_playing_resync()
     
     @QtCore.pyqtSlot(str)
     def _display_stream_output(self, content: str):
@@ -1543,6 +1775,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     self._current_device_source = source
                     if source == "Library":
                         self._current_shuffle_type = "library"
+                    elif source.startswith("Station"):
+                        self._current_shuffle_type = "station"
                     else:
                         # Source is an album or playlist name
                         self._current_shuffle_type = "source"
@@ -1622,21 +1856,26 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             if not text:
                 return
             lines = text.split('\n')
+            import re as _re
+            # Prefer full metadata lines (same order as stream parsing)
             for line in reversed(lines):
-                if "_start_playback_for_current: mode=" in line or "Starting playback:" in line:
+                if "_start_playback_for_current: mode=" in line:
                     self._parse_stream_for_now_playing(line)
                     return
-            # Fallback: in basic mode look for the most recent DFPlayer play command,
-            # which is always present in the boot log even when _start_playback_for_current
-            # is not (e.g. initial boot goes through start_with_am).
+            for line in reversed(lines):
+                if "Starting playback:" in line or "Playback started successfully:" in line:
+                    self._parse_stream_for_now_playing(line)
+                    return
+            # Fallback: DFPlayer firmware prints e.g.
+            #   DF: Playing 'Track 1' ... (folder=01, track=001) -> ... (folder=1, track=1)
+            # Use the last (folder=N, track=M) pair on the line (command uses unpadded ints).
             if self._basic_mode:
-                import re as _re
                 for line in reversed(lines):
-                    if "DF: Playing folder=" in line:
-                        m = _re.search(r"folder=(\d+),\s*track=(\d+)", line)
-                        if m:
-                            folder_num = int(m.group(1))
-                            track_num = int(m.group(2))
+                    if "DF: Playing" in line:
+                        pairs = _re.findall(r"folder=(\d+),\s*track=(\d+)", line)
+                        if pairs:
+                            folder_num = int(pairs[-1][0])
+                            track_num = int(pairs[-1][1])
                             self._current_basic_folder = folder_num
                             self._current_basic_track = track_num
                             if self._db:
@@ -1649,7 +1888,31 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                             else:
                                 self._current_track_title = f"Track {track_num}"
                                 self._current_track_artist = ""
+                            # Mode/source may be missing until next _start_playback line — infer station from DB
+                            if not getattr(self, "_current_device_mode", ""):
+                                self._current_device_mode = "station"
                             self._update_now_playing_display()
+                        return
+                for line in reversed(lines):
+                    m = _re.search(r"Expected SD path:\s*(\d+)/(\d+)\.", line)
+                    if m:
+                        folder_num = int(m.group(1))
+                        track_num = int(m.group(2))
+                        self._current_basic_folder = folder_num
+                        self._current_basic_track = track_num
+                        if self._db:
+                            resolved = self._resolve_basic_track_name(folder_num, track_num)
+                            if resolved:
+                                self._current_track_title, self._current_track_artist = resolved
+                            else:
+                                self._current_track_title = f"Track {track_num}"
+                                self._current_track_artist = ""
+                        else:
+                            self._current_track_title = f"Track {track_num}"
+                            self._current_track_artist = ""
+                        if not getattr(self, "_current_device_mode", ""):
+                            self._current_device_mode = "station"
+                        self._update_now_playing_display()
                         return
         except Exception:
             pass
@@ -1703,6 +1966,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     mode_display = f"Album Shuffle ({source})"
                 elif shuffle_type == "playlist" and source:
                     mode_display = f"Playlist Shuffle ({source})"
+                elif shuffle_type == "station" and source:
+                    mode_display = f"Station Shuffle ({source})"
                 elif shuffle_type == "source" and source:
                     mode_display = f"Shuffle ({source})"
                 elif source:

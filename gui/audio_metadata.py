@@ -26,7 +26,13 @@ def extract_metadata(file_path: Path) -> Dict[str, Any]:
     duration = None
     format_name = file_path.suffix.lower().lstrip(".") or None
 
-    audio = MutagenFile(file_path, easy=True)
+    audio = None
+    try:
+        audio = MutagenFile(file_path, easy=True)
+    except Exception:
+        # Corrupt file, wrong extension, truncated sync, non-audio data, etc.
+        # (e.g. mutagen.mp3.HeaderNotFoundError: can't sync to MPEG frame)
+        audio = None
     if audio is not None:
         tags = audio.tags or {}
         title = _first_tag_value(tags, "title")

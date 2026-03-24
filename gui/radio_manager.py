@@ -9,12 +9,13 @@ import subprocess
 import sys
 import threading
 import traceback
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices, QFont, QIcon
+from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QFont, QIcon
 
 from .audio_metadata import compute_file_hash, extract_metadata
 from .board_profiles import get_board_profile, get_default_board_profile, BOARD_PROFILES_BY_ID
@@ -29,6 +30,28 @@ from .test_mode import TestModeWidget
 from . import sd_manager as sd_manager_module
 
 BASIC_MAX_TRACKS_PER_STATION = 255
+
+
+def _volume_name_key(name: Optional[str]) -> str:
+    """Normalize volume / folder names for comparison (macOS NFD vs NFC, stray spaces)."""
+    if not name:
+        return ""
+    return unicodedata.normalize("NFC", str(name).strip()).upper()
+
+
+def _qt_widget_alive(widget: Optional[QtCore.QObject]) -> bool:
+    """True if *widget* still has a live C++ Qt object (not destroyed).
+
+    After ``_rebuild_tabs()``, widgets from the old central tab tree are deleted;
+    Python may still hold references — any call on them raises RuntimeError.
+    """
+    if widget is None:
+        return False
+    try:
+        widget.metaObject()
+    except RuntimeError:
+        return False
+    return True
 
 
 # ───────────────────────────────────────────────────────────
@@ -1737,6 +1760,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tabs_widget = tabs
 
         if self.devices_view_mode == "basic":
+            # Devices tab (advanced) is not built; sd_root_label may point at a
+            # QLabel destroyed when switching from advanced — clear stale refs.
+            if not _qt_widget_alive(getattr(self, "sd_root_label", None)):
+                self.sd_root_label = None
             tabs.addTab(self._build_basic_mcu_tab(), "Microprocessor")
             tabs.addTab(self._build_basic_sd_card_tab(), "SD Card")
             self._device_debug_tab_index = -1
@@ -1775,6 +1802,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Left panel: single setup button ──
         left = QtWidgets.QWidget()
+        left.setMinimumWidth(260)
         left_layout = QtWidgets.QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 8, 0)
 
@@ -1786,8 +1814,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "MicroPython will be installed automatically if needed."
         )
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #555; padding: 4px;")
+        info_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
+        info_label.setStyleSheet("padding: 4px;")
         fw_layout.addWidget(info_label)
+
+        presence_row = QtWidgets.QHBoxLayout()
+        presence_row.addWidget(QtWidgets.QLabel("USB"))
+        self._basic_device_detected_led = QtWidgets.QLabel()
+        self._basic_device_detected_led.setFixedSize(16, 16)
+        self._set_basic_device_presence_indicator(False)
+        presence_row.addWidget(self._basic_device_detected_led)
+        self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
+        self._basic_device_detected_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
+        presence_row.addWidget(self._basic_device_detected_label)
+        presence_row.addStretch()
+        fw_layout.addLayout(presence_row)
 
         fw_layout.addSpacing(8)
 
@@ -1798,6 +1839,208 @@ class MainWindow(QtWidgets.QMainWindow):
         setup_btn.setStyleSheet("font-weight: bold; padding: 10px; font-size: 14px;")
         setup_btn.clicked.connect(self._setup_basic_device)
         fw_layout.addWidget(setup_btn)
+
+        # Collapsible reference: low-saturation grays (section / gesture / action differ by value).
+        btn_cheatsheet_toggle = QtWidgets.QPushButton()
+        btn_cheatsheet_toggle.setFlat(True)
+        btn_cheatsheet_toggle.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        )
+        btn_cheatsheet_toggle.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        btn_cheatsheet_toggle.setStyleSheet(
+            "QPushButton { text-align: left; font-weight: bold; font-size: 14px; "
+            "margin-top: 10px; padding: 6px 4px; border: none; background: transparent; }"
+            "QPushButton:hover { background: rgba(128, 128, 128, 0.12); border-radius: 4px; }"
+        )
+        _cheatsheet_expanded = True
+
+        def _toggle_basic_button_cheatsheet() -> None:
+            nonlocal _cheatsheet_expanded
+            _cheatsheet_expanded = not _cheatsheet_expanded
+            btn_cheatsheet_table.setVisible(_cheatsheet_expanded)
+            arrow = "\u25bc " if _cheatsheet_expanded else "\u25b6 "
+            btn_cheatsheet_toggle.setText(arrow + "Button presses")
+
+        btn_cheatsheet_toggle.clicked.connect(_toggle_basic_button_cheatsheet)
+        btn_cheatsheet_toggle.setText("\u25bc Button presses")
+        btn_cheatsheet_toggle.setToolTip("Show or hide the on-device button reference.")
+        fw_layout.addWidget(btn_cheatsheet_toggle)
+
+        # Table cheatsheet: shades of black (tiny lightness steps only).
+        _cs_header_bg = QColor(38, 38, 40)
+        _cs_header_fg = QColor(240, 240, 242)
+        _cs_label_bg = QColor(22, 22, 24)
+        _cs_label_fg = QColor(190, 190, 194)
+        _cs_action_bg = QColor(30, 30, 32)
+        _cs_action_fg = QColor(208, 208, 212)
+
+        btn_cheatsheet_table = QtWidgets.QTableWidget()
+        btn_cheatsheet_table.setObjectName("basicButtonCheatsheetTable")
+        btn_cheatsheet_table.setColumnCount(2)
+        btn_cheatsheet_table.verticalHeader().setVisible(False)
+        btn_cheatsheet_table.horizontalHeader().setVisible(False)
+        btn_cheatsheet_table.setShowGrid(True)
+        btn_cheatsheet_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        btn_cheatsheet_table.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        btn_cheatsheet_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        # Vertical Minimum makes Qt give a short viewport → pointless scrollbar. We
+        # size exactly to rows + turn scroll bars off so the cheatsheet never scrolls.
+        btn_cheatsheet_table.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        btn_cheatsheet_table.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        btn_cheatsheet_table.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        btn_cheatsheet_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        btn_cheatsheet_table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        btn_cheatsheet_table.setStyleSheet(
+            "QTableWidget#basicButtonCheatsheetTable { "
+            "gridline-color: #2a2a2c; border: 1px solid #2a2a2c; "
+            "background-color: #141416; border-radius: 4px; }"
+            "QTableWidget#basicButtonCheatsheetTable::item { padding: 8px; }"
+        )
+
+        def _cs_header_row(title: str) -> None:
+            r = btn_cheatsheet_table.rowCount()
+            btn_cheatsheet_table.insertRow(r)
+            it = QtWidgets.QTableWidgetItem(title)
+            it.setBackground(QBrush(_cs_header_bg))
+            it.setForeground(QBrush(_cs_header_fg))
+            _hf = QFont(it.font())
+            _hf.setBold(True)
+            it.setFont(_hf)
+            it.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+            btn_cheatsheet_table.setItem(r, 0, it)
+            btn_cheatsheet_table.setSpan(r, 0, 1, 2)
+
+        def _cs_data_row(gesture: str, desc_plain: str) -> None:
+            r = btn_cheatsheet_table.rowCount()
+            btn_cheatsheet_table.insertRow(r)
+            left = QtWidgets.QTableWidgetItem(gesture)
+            left.setBackground(QBrush(_cs_label_bg))
+            left.setForeground(QBrush(_cs_label_fg))
+            lf = QFont(left.font())
+            lf.setWeight(QFont.Weight.DemiBold)
+            left.setFont(lf)
+            left.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+            btn_cheatsheet_table.setItem(r, 0, left)
+            right = QtWidgets.QTableWidgetItem(desc_plain)
+            right.setBackground(QBrush(_cs_action_bg))
+            right.setForeground(QBrush(_cs_action_fg))
+            right.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+            right.setTextAlignment(
+                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+            btn_cheatsheet_table.setItem(r, 1, right)
+
+        def _cs_data_row_html(gesture: str, desc_html: str) -> None:
+            r = btn_cheatsheet_table.rowCount()
+            btn_cheatsheet_table.insertRow(r)
+            left = QtWidgets.QTableWidgetItem(gesture)
+            left.setBackground(QBrush(_cs_label_bg))
+            left.setForeground(QBrush(_cs_label_fg))
+            lf = QFont(left.font())
+            lf.setWeight(QFont.Weight.DemiBold)
+            left.setFont(lf)
+            left.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+            btn_cheatsheet_table.setItem(r, 0, left)
+            # Cell widget + flat QLabel: a bare QLabel in a table cell often picks up a
+            # sunken/frame border on macOS; wrapper + WA_StyledBackground + NoFrame fixes it.
+            cell_wrap = QtWidgets.QWidget()
+            cell_wrap.setObjectName("basicButtonCheatsheetCell")
+            cell_wrap.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+            cell_wrap.setAutoFillBackground(True)
+            _cw_pal = cell_wrap.palette()
+            _cw_pal.setColor(QtGui.QPalette.ColorRole.Window, _cs_action_bg)
+            cell_wrap.setPalette(_cw_pal)
+            cell_lay = QtWidgets.QVBoxLayout(cell_wrap)
+            cell_lay.setContentsMargins(0, 0, 0, 0)
+            cell_lay.setSpacing(0)
+            desc_lbl = QtWidgets.QLabel()
+            desc_lbl.setObjectName("basicButtonCheatsheetRich")
+            desc_lbl.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            desc_lbl.setLineWidth(0)
+            desc_lbl.setMidLineWidth(0)
+            desc_lbl.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+            desc_lbl.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            desc_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            desc_lbl.setText(desc_html)
+            desc_lbl.setWordWrap(True)
+            desc_lbl.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop
+            )
+            desc_lbl.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.MinimumExpanding,
+            )
+            _ag = _cs_action_bg.name()
+            _afg = _cs_action_fg.name()
+            desc_lbl.setStyleSheet(
+                f"QLabel#basicButtonCheatsheetRich {{ "
+                f"background-color: {_ag}; color: {_afg}; "
+                "border: none; outline: none; margin: 0px; padding: 8px; }}"
+            )
+            cell_lay.addWidget(desc_lbl, 1)
+            btn_cheatsheet_table.setCellWidget(r, 1, cell_wrap)
+
+        _cs_header_row("Taps")
+        _cs_data_row("Single", "Next track")
+        _cs_data_row("Double", "Previous track")
+        _cs_data_row("Triple", "Restart station from track 1")
+
+        _cs_header_row("Hold (long press, no taps)")
+        _cs_data_row_html(
+            "Hold",
+            "Next station (also applies in <b>Station Shuffle</b> mode)",
+        )
+
+        _cs_header_row("Tap + hold")
+        _cs_data_row(
+            "1 tap + hold",
+            "Exit shuffle mode and switch back to normal station mode",
+        )
+        _cs_data_row("2 taps + hold", "Shuffle current station")
+        _cs_data_row("3 taps + hold", "Shuffle all tracks (entire library)")
+
+        btn_cheatsheet_table.verticalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+
+        def _refit_basic_button_cheatsheet_height() -> None:
+            t = btn_cheatsheet_table
+            t.resizeRowsToContents()
+            h = 0
+            hh = t.horizontalHeader()
+            if hh.isVisible():
+                h += hh.height()
+            for r in range(t.rowCount()):
+                rh = t.rowHeight(r)
+                if rh <= 0:
+                    rh = t.sizeHintForRow(r)
+                h += max(rh, 1)
+            h += 2 * t.frameWidth() + 4
+            t.setFixedHeight(max(h, 120))
+
+        _refit_basic_button_cheatsheet_height()
+        QtCore.QTimer.singleShot(0, _refit_basic_button_cheatsheet_height)
+
+        btn_cheatsheet_table.setToolTip(
+            "Same gestures as firmware (radio_core). A tap is a short press; "
+            "for Tap + hold, do your tap(s), then keep holding until the radio reacts."
+        )
+        fw_layout.addWidget(btn_cheatsheet_table)
 
         fw_layout.addStretch()
         left_layout.addWidget(fw_group)
@@ -1812,12 +2055,407 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_debug_container = debug_group
         self._basic_debug_layout = debug_layout
         self._basic_debug_widget = DeviceDebugWidget(basic_mode=True, db=self.db)
+        self._basic_debug_widget.device_presence_changed.connect(
+            self._set_basic_device_presence_indicator
+        )
         debug_layout.addWidget(self._basic_debug_widget)
         right_layout.addWidget(debug_group)
+
+        has_usb = any(
+            self._basic_debug_widget.port_combo.itemData(i)
+            for i in range(self._basic_debug_widget.port_combo.count())
+        ) or SDManager.is_rp2040_bootsel_present()
+        self._set_basic_device_presence_indicator(bool(has_usb))
 
         layout.addWidget(left, 1)
         layout.addWidget(right, 2)
         return widget
+
+    def _set_basic_device_presence_indicator(self, detected: bool) -> None:
+        """Green LED when a Pico shows up as serial, console connected, or BOOTSEL (RPI-RP2 drive)."""
+        led = getattr(self, "_basic_device_detected_led", None)
+        lbl = getattr(self, "_basic_device_detected_label", None)
+        if not _qt_widget_alive(led):
+            return
+        if detected:
+            led.setStyleSheet(
+                "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
+                "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
+            )
+            led.setToolTip(
+                "USB: MicroPython serial port, connected Device Console, or unflashed Pico in "
+                "BOOTSEL mode (RPI-RP2 removable drive)."
+            )
+            if _qt_widget_alive(lbl):
+                lbl.setText("Device detected")
+                lbl.setForegroundRole(QtGui.QPalette.ColorRole.Text)
+                lbl.setStyleSheet("font-weight: bold;")
+        else:
+            led.setStyleSheet(
+                "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
+                "border-radius: 7px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
+            )
+            led.setToolTip(
+                "No Pico detected. Plug in USB, or hold BOOTSEL while plugging in (RPI-RP2 drive); "
+                "after Disconnect, unplug/replug or wait for the port list to change."
+            )
+            if _qt_widget_alive(lbl):
+                lbl.setText("No serial device detected")
+                lbl.setForegroundRole(QtGui.QPalette.ColorRole.Text)
+                lbl.setStyleSheet("")
+
+    def _basic_sd_path_volume_tag(self, path_str: str) -> str:
+        """Volume / mount name for wrong-card messaging (best-effort)."""
+        try:
+            p = Path(path_str).expanduser()
+            if p.is_dir():
+                p = p.resolve()
+        except OSError:
+            p = Path(path_str)
+        lab = self._get_volume_label(p)
+        if lab and str(lab).strip():
+            return str(lab).strip()
+        try:
+            if p.is_dir():
+                parent = p.parent
+                if parent.name == "Volumes" or str(parent).endswith("Volumes"):
+                    return p.name
+        except Exception:
+            pass
+        return p.name or str(path_str)
+
+    def _basic_should_warn_different_card(self, new_root: str) -> bool:
+        trusted = (self.db.get_setting("basic_trusted_sd_volume") or "").strip()
+        if not trusted:
+            return False
+        cur = self._basic_sd_path_volume_tag(new_root).strip()
+        if not cur:
+            return False
+        return _volume_name_key(cur) != _volume_name_key(trusted)
+
+    def _basic_confirm_first_sd_sync_target(self, sd_path_str: str) -> bool:
+        """One-time check before the first successful basic sync (no trusted volume yet)."""
+        if self.devices_view_mode != "basic":
+            return True
+        if (self.db.get_setting("basic_trusted_sd_volume") or "").strip():
+            return True
+        vol = self._basic_sd_path_volume_tag(sd_path_str)
+        vol_line = vol if vol else "(unknown)"
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm SD card",
+            "This library has not completed a basic-mode sync to an SD card yet.\n\n"
+            f"You are about to write station folders to:\n  {sd_path_str}\n"
+            f"Volume name (best guess): {vol_line}\n\n"
+            "Make sure this is the correct SD card or USB drive. Writing to the "
+            "wrong device can erase important data.\n\n"
+            "Proceed with sync to this location?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return reply == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _basic_confirm_different_card(self, new_root: str, *, for_sync: bool) -> bool:
+        """If the volume differs from the last basic sync target, confirm. Returns False to abort."""
+        if self.devices_view_mode != "basic":
+            return True
+        if not self._basic_should_warn_different_card(new_root):
+            return True
+        trusted = (self.db.get_setting("basic_trusted_sd_volume") or "").strip()
+        cur = self._basic_sd_path_volume_tag(new_root)
+        verb = "sync stations to" if for_sync else "use"
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Different SD card",
+            f'Your last successful basic-mode sync used the volume named "{trusted}".\n\n'
+            f'The selected path looks like "{cur}".\n\n'
+            "If this is the wrong card, you could overwrite the wrong device.\n\n"
+            f'Do you want to {verb} this volume anyway?',
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return reply == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _basic_sd_label_match_set(self) -> set:
+        """Normalized uppercase volume keys we use to recognize the user's SD card across reconnects."""
+        names: set = set()
+        for raw in (
+            self.sd_label,
+            self.db.get_setting("sd_volume_label"),
+            self.db.get_setting("basic_trusted_sd_volume"),
+        ):
+            k = _volume_name_key(raw)
+            if k:
+                names.add(k)
+        if (self.db.get_setting("sd_volume_label") or "").strip():
+            k = _volume_name_key(SYNC_TARGET_VOLUME_LABEL)
+            if k:
+                names.add(k)
+        return names
+
+    def _basic_sd_identity_match_set(self) -> set:
+        """Like _basic_sd_label_match_set plus the last folder name of sd_root (macOS volume name)."""
+        names = set(self._basic_sd_label_match_set())
+        if self.sd_root:
+            try:
+                tail = Path(self.sd_root).expanduser().name
+                k = _volume_name_key(tail)
+                if k:
+                    names.add(k)
+            except (OSError, ValueError):
+                pass
+        return names
+
+    def _basic_sync_target_identity_match_set(self) -> set:
+        """Volume keys for the card last used for SD sync (settings DB only).
+
+        Omits :attr:`sd_label` and ``sd_root`` so after **Select** switches to another
+        volume, **Detect** can still resolve the original sync-target card from
+        ``basic_trusted_sd_volume`` / ``sd_volume_label`` / ``VINTAGERADIO``.
+        """
+        names: set = set()
+        for raw in (
+            self.db.get_setting("sd_volume_label"),
+            self.db.get_setting("basic_trusted_sd_volume"),
+        ):
+            k = _volume_name_key(raw)
+            if k:
+                names.add(k)
+        if (self.db.get_setting("sd_volume_label") or "").strip():
+            k = _volume_name_key(SYNC_TARGET_VOLUME_LABEL)
+            if k:
+                names.add(k)
+        return names
+
+    @staticmethod
+    def _basic_candidate_matches_identity(path: Path, label: str, identity: set) -> bool:
+        if not identity:
+            return False
+        lab_k = _volume_name_key(label)
+        if lab_k and lab_k in identity:
+            return True
+        try:
+            name_k = _volume_name_key(path.name)
+            if name_k and name_k in identity:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def detect_basic_sd_root(self) -> None:
+        """Basic mode: set sd_root to the removable volume that matches saved identity (no dialogs)."""
+        if self.devices_view_mode != "basic":
+            self.select_sd_root()
+            return
+
+        self._try_rebind_basic_sd_mount()
+
+        candidates = self.sd_manager.detect_sd_roots()
+        if not candidates:
+            QtWidgets.QMessageBox.information(
+                self, "SD Detect", "No removable drives detected."
+            )
+            return
+
+        sync_id = self._basic_sync_target_identity_match_set()
+        sync_matched: List[Tuple[Path, str]] = []
+        if sync_id:
+            sync_matched = [
+                (path, label)
+                for path, label in candidates
+                if self._basic_candidate_matches_identity(path, label, sync_id)
+            ]
+            if len(sync_matched) == 1:
+                path, lab = sync_matched[0]
+                new_label = (lab or "").strip() or (self._get_volume_label(path) or "")
+                self.sd_root = str(path)
+                self.sd_label = new_label
+                self.db.set_setting("sd_root", self.sd_root)
+                self.db.set_setting("sd_label", self.sd_label)
+                self._update_sd_root_label()
+                self._check_basic_sd_sync()
+                self.statusBar().showMessage(
+                    f"SD card (last sync target): {self.sd_root}", 5000
+                )
+                return
+            if len(sync_matched) > 1:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "SD Detect",
+                    "Several removable drives match your last sync target.\n\n"
+                    "Use Select to pick the correct one.",
+                )
+                return
+
+        # Saved path shortcut: only if no sync record, or current root is already the sync-target card.
+        use_saved_path = True
+        if self.sd_root and sync_id:
+            try:
+                saved = Path(self.sd_root).expanduser().resolve()
+                if saved.is_dir():
+                    slabel = self._get_volume_label(saved) or saved.name or ""
+                    if not self._basic_candidate_matches_identity(saved, slabel, sync_id):
+                        use_saved_path = False
+            except OSError:
+                use_saved_path = False
+
+        if use_saved_path and self.sd_root:
+            try:
+                saved = Path(self.sd_root).expanduser().resolve()
+                if saved.is_dir():
+                    for path, label in candidates:
+                        try:
+                            if path.resolve() == saved:
+                                lab = (label or "").strip() or (
+                                    self._get_volume_label(path) or path.name
+                                )
+                                self.sd_root = str(path)
+                                self.sd_label = lab
+                                self.db.set_setting("sd_root", self.sd_root)
+                                self.db.set_setting("sd_label", self.sd_label)
+                                self._update_sd_root_label()
+                                self._check_basic_sd_sync()
+                                self.statusBar().showMessage(
+                                    f"SD card: {self.sd_root}", 4000
+                                )
+                                return
+                        except OSError:
+                            continue
+            except OSError:
+                pass
+
+        if sync_id and not sync_matched:
+            QtWidgets.QMessageBox.information(
+                self,
+                "SD Detect",
+                "Could not find the SD card used for your last sync "
+                "(trusted volume / sync label not among detected drives).\n\n"
+                "Connect that card and try Detect again, or use Select.",
+            )
+            return
+
+        identity = self._basic_sd_identity_match_set()
+        matched = [
+            (path, label)
+            for path, label in candidates
+            if self._basic_candidate_matches_identity(path, label, identity)
+        ]
+
+        if len(matched) == 1:
+            path, lab = matched[0]
+            new_label = (lab or "").strip() or (self._get_volume_label(path) or "")
+            self.sd_root = str(path)
+            self.sd_label = new_label
+            self.db.set_setting("sd_root", self.sd_root)
+            self.db.set_setting("sd_label", self.sd_label)
+            self._update_sd_root_label()
+            self._check_basic_sd_sync()
+            self.statusBar().showMessage(f"Detected SD card: {self.sd_root}", 5000)
+            return
+
+        if len(matched) > 1:
+            QtWidgets.QMessageBox.information(
+                self,
+                "SD Detect",
+                "Several removable drives match your saved volume name.\n\n"
+                "Use Select to pick the correct one.",
+            )
+            return
+
+        if len(candidates) == 1:
+            path, lab = candidates[0]
+            self.sd_root = str(path)
+            self.sd_label = (lab or "") or (self._get_volume_label(path) or "")
+            self.db.set_setting("sd_root", self.sd_root)
+            self.db.set_setting("sd_label", self.sd_label)
+            self._update_sd_root_label()
+            self._check_basic_sd_sync()
+            self.statusBar().showMessage(
+                "Using the only removable drive found. Use Select if this is not your SD card.",
+                6000,
+            )
+            return
+
+        if not identity:
+            QtWidgets.QMessageBox.information(
+                self,
+                "SD Detect",
+                "Multiple removable drives are connected, and no saved SD identity is set yet.\n\n"
+                "Use Select to pick your SD card. After a successful sync, Detect will "
+                "find that card automatically by name.",
+            )
+            return
+
+        QtWidgets.QMessageBox.information(
+            self,
+            "SD Detect",
+            "Could not match any detected removable drive to your saved SD card "
+            "(by volume name).\n\n"
+            "On macOS many volumes appear under /Volumes; if you renamed the card, "
+            "use Select or Browse once, then sync so the app can remember the new name.\n\n"
+            "Use Select to choose from the list, or Browse to pick a folder.",
+        )
+
+    def _try_rebind_basic_sd_mount(self) -> None:
+        """If saved sd_root is missing, reattach to the same card by volume name (basic mode)."""
+        if self.devices_view_mode != "basic":
+            return
+        if not self.sd_root:
+            return
+        try:
+            if Path(self.sd_root).is_dir():
+                return
+        except OSError:
+            pass
+        candidates = self.sd_manager.detect_sd_roots()
+        if not candidates:
+            return
+        identity = self._basic_sd_identity_match_set()
+        matched = [
+            (path, label)
+            for path, label in candidates
+            if self._basic_candidate_matches_identity(path, label, identity)
+        ]
+        if len(matched) == 1:
+            path, label = matched[0]
+            self.sd_root = str(path)
+            self.sd_label = label or self._get_volume_label(path) or ""
+            self.db.set_setting("sd_root", self.sd_root)
+            self.db.set_setting("sd_label", self.sd_label)
+            self._update_sd_root_label()
+
+    def _check_basic_sd_sync(self) -> None:
+        """Show a warning when basic stations and the mounted SD layout disagree."""
+        warn = getattr(self, "_basic_sd_sync_warning", None)
+        if not _qt_widget_alive(warn):
+            return
+        warn.setVisible(False)
+        if self.devices_view_mode != "basic":
+            return
+        self._try_rebind_basic_sd_mount()
+        # Compare as soon as sd_root is a readable directory — do not require
+        # is_sync_target_sd_present(). Removable-volume detection can miss valid mounts
+        # (e.g. some macOS cases), which hid the warning entirely. Unplugged cards
+        # typically make sd_root non-existent, which clears the warning below.
+        if not self.sd_root:
+            return
+        try:
+            root = Path(self.sd_root)
+            if not root.is_dir():
+                return
+        except OSError:
+            return
+        msgs = self.sd_manager.validate_basic_sd(root)
+        if not msgs:
+            return
+        cap = 12
+        lines = [f"  - {m}" for m in msgs[:cap]]
+        if len(msgs) > cap:
+            lines.append(f"  ... and {len(msgs) - cap} more issue(s).")
+        warn.setText(
+            "Warning: stations and SD card may be out of sync:\n" + "\n".join(lines)
+        )
+        warn.setVisible(True)
 
     def _setup_basic_device(self) -> None:
         """One-click: install MicroPython if needed, then flash basic-mode firmware."""
@@ -1868,6 +2506,12 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
+        self._basic_sd_sync_warning = QtWidgets.QLabel()
+        self._basic_sd_sync_warning.setWordWrap(True)
+        self._basic_sd_sync_warning.setStyleSheet("color: #c00; font-weight: bold;")
+        self._basic_sd_sync_warning.setVisible(False)
+        layout.addWidget(self._basic_sd_sync_warning)
+
         # ── Storage selector row ──
         storage_group = QtWidgets.QGroupBox("Storage")
         storage_layout = QtWidgets.QHBoxLayout(storage_group)
@@ -1876,10 +2520,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_sd_root_label.setStyleSheet("color: #555;")
         storage_layout.addWidget(self._basic_sd_root_label, 1)
         detect_btn = QtWidgets.QPushButton("Detect")
+        detect_btn.setToolTip(
+            "Find your SD card again using the saved volume name (e.g. after reconnecting USB). "
+            "Does not ask to confirm a different card."
+        )
         detect_btn.clicked.connect(self._select_sd_root_basic)
+        select_btn = QtWidgets.QPushButton("Select")
+        select_btn.setToolTip(
+            "Choose from detected removable drives (list opens if more than one). "
+            "The wrong-card safety prompt only appears when you Sync to SD, not here."
+        )
+        select_btn.clicked.connect(self._select_sd_root_manual_basic)
         browse_btn = QtWidgets.QPushButton("Browse")
         browse_btn.clicked.connect(self._browse_sd_root_basic)
         storage_layout.addWidget(detect_btn)
+        storage_layout.addWidget(select_btn)
         storage_layout.addWidget(browse_btn)
         layout.addWidget(storage_group)
 
@@ -1982,17 +2637,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_auto_eject_cb = QtWidgets.QCheckBox("Automatically safely remove SD card after syncing")
         self._basic_auto_eject_cb.setChecked(self.db.get_setting("auto_eject_after_sync", "0") == "1")
         self._basic_auto_eject_cb.stateChanged.connect(self._on_auto_eject_after_sync_changed)
-        self._basic_loop_stations_cb = QtWidgets.QCheckBox("Loop stations (restart from track 1 when station ends)")
-        self._basic_loop_stations_cb.setToolTip(
-            "When enabled, a station will automatically restart from the beginning after the last track. "
-            "This setting is synced to the SD card as a feature flag (no firmware reflash needed)."
+        end_box = QtWidgets.QGroupBox("Choose what happens when a station ends")
+        end_layout = QtWidgets.QHBoxLayout(end_box)
+        self._basic_end_mode_combo = QtWidgets.QComboBox()
+        self._basic_end_mode_combo.setMinimumWidth(240)
+        self._basic_end_mode_combo.addItem("Loop", "loop")
+        self._basic_end_mode_combo.addItem("Proceed to next station", "advance")
+        self._basic_end_mode_combo.addItem("End playback", "none")
+        self._basic_end_mode_combo.setToolTip(
+            "Synced to SD folder 99 as extra tiny MP3 stubs so the DFPlayer file count (UART 0x4E) "
+            "tells the firmware the mode — no separate flag file on the microcontroller. "
+            "Proceed mode writes three stubs (002–004) because many DFPlayers do not count 001.wav; "
+            "otherwise the count would look like loop mode. "
+            "Loop: repeat the station or shuffle order. "
+            "Proceed: after the last track (or one full station shuffle), play the next station. "
+            "End: stop after the station or one shuffle pass through tracks."
         )
-        self._basic_loop_stations_cb.setChecked(self.db.get_setting("basic_loop_stations", "1") == "1")
-        self._basic_loop_stations_cb.stateChanged.connect(self._on_basic_loop_stations_changed)
+        mode = self._get_basic_station_end_mode()
+        _end_idx = {"loop": 0, "advance": 1, "none": 2}.get(mode, 1)
+        self._basic_end_mode_combo.blockSignals(True)
+        self._basic_end_mode_combo.setCurrentIndex(_end_idx)
+        self._basic_end_mode_combo.blockSignals(False)
+        self._basic_end_mode_combo.currentIndexChanged.connect(
+            self._on_basic_station_end_combo_changed
+        )
+        end_layout.addWidget(self._basic_end_mode_combo)
+        end_layout.addStretch()
         sync_layout.addWidget(sync_btn)
         sync_layout.addWidget(eject_btn)
         sync_layout.addWidget(self._basic_auto_eject_cb)
-        sync_layout.addWidget(self._basic_loop_stations_cb)
+        sync_layout.addWidget(end_box)
         sync_layout.addStretch()
         layout.addWidget(sync_group)
 
@@ -2004,29 +2678,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_basic_sd_capacity(self) -> None:
         """Update the SD capacity bar and label from the current sd_root."""
+        bar = getattr(self, "_basic_sd_capacity_bar", None)
+        cap_label = getattr(self, "_basic_sd_capacity_label", None)
+        if not _qt_widget_alive(bar) or not _qt_widget_alive(cap_label):
+            return
         sd_root = self._resolve_sd_root()
         if not sd_root:
-            self._basic_sd_capacity_bar.setValue(0)
-            self._basic_sd_capacity_label.setText("No SD card selected")
+            bar.setValue(0)
+            cap_label.setText("No SD card selected")
             return
         try:
             usage = shutil.disk_usage(str(sd_root))
             pct = int(usage.used * 100 / usage.total) if usage.total else 0
-            self._basic_sd_capacity_bar.setValue(pct)
+            bar.setValue(pct)
             used_mb = usage.used / (1024 * 1024)
             total_mb = usage.total / (1024 * 1024)
             free_mb = usage.free / (1024 * 1024)
             if total_mb >= 1024:
-                self._basic_sd_capacity_label.setText(
+                cap_label.setText(
                     f"{used_mb / 1024:.1f} / {total_mb / 1024:.1f} GB  ({free_mb / 1024:.1f} GB free)"
                 )
             else:
-                self._basic_sd_capacity_label.setText(
+                cap_label.setText(
                     f"{used_mb:.0f} / {total_mb:.0f} MB  ({free_mb:.0f} MB free)"
                 )
         except OSError:
-            self._basic_sd_capacity_bar.setValue(0)
-            self._basic_sd_capacity_label.setText("Cannot read SD card")
+            bar.setValue(0)
+            cap_label.setText("Cannot read SD card")
 
     # ── Basic-mode station list management ──
 
@@ -2098,6 +2776,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.db.create_basic_station(name.strip(), folder)
         self._refresh_basic_station_list()
+        self._update_basic_stations_size()
 
     def _rename_basic_station(self) -> None:
         item = self._basic_station_list.currentItem()
@@ -2141,6 +2820,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ids:
             self.db.update_basic_station_order(ids)
             self._refresh_basic_station_list()
+            self._update_basic_stations_size()
 
     def _get_selected_basic_station_id(self) -> Optional[int]:
         """Return the selected station id, or None."""
@@ -2182,7 +2862,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             files = files[:remaining]
 
-        song_ids = self.import_files([Path(f) for f in files])
+        song_ids = self.import_files([Path(f) for f in files], silent=True)
         if song_ids:
             next_order = self.db.next_basic_station_track_order(station_id)
             for sid in song_ids:
@@ -2208,7 +2888,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        song_ids = self.import_files(paths)
+        song_ids = self.import_files(paths, silent=True)
         if song_ids:
             if len(song_ids) > remaining:
                 QtWidgets.QMessageBox.warning(
@@ -2242,6 +2922,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if song_ids:
             self.db.replace_basic_station_tracks(station_id, song_ids)
             self._refresh_basic_station_tracks(station_id)
+            self._update_basic_stations_size()
 
     def _remove_songs_from_basic_station(self) -> None:
         station_item = self._basic_station_list.currentItem()
@@ -2266,17 +2947,18 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Basic-mode SD root wrappers (auto-refresh capacity) ──
 
     def _select_sd_root_basic(self) -> None:
-        """Detect SD root and auto-refresh capacity."""
-        self.select_sd_root()
-        if hasattr(self, "_basic_sd_root_label"):
-            self._basic_sd_root_label.setText(self.sd_root or "(not set)")
+        """Re-detect the same SD card by saved labels (no wrong-card dialog)."""
+        self.detect_basic_sd_root()
+        self._refresh_basic_sd_capacity()
+
+    def _select_sd_root_manual_basic(self) -> None:
+        """Pick a removable drive from the list (dropdown if several). Wrong-card warning is only on Sync."""
+        self.select_sd_root(manual=True)
         self._refresh_basic_sd_capacity()
 
     def _browse_sd_root_basic(self) -> None:
         """Browse SD root and auto-refresh capacity."""
         self.browse_sd_root()
-        if hasattr(self, "_basic_sd_root_label"):
-            self._basic_sd_root_label.setText(self.sd_root or "(not set)")
         self._refresh_basic_sd_capacity()
 
     # ── Basic-mode context menus ──
@@ -2331,6 +3013,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._basic_stations_size_label.setText(f"~{total_bytes / (1024 * 1024):.1f} MB")
         else:
             self._basic_stations_size_label.setText(f"~{total_bytes / (1024 * 1024 * 1024):.2f} GB")
+        if self.devices_view_mode == "basic":
+            self._check_basic_sd_sync()
 
     # ── Basic-mode SD sync ──
 
@@ -2344,6 +3028,12 @@ class MainWindow(QtWidgets.QMainWindow):
         stations = self.db.list_basic_stations()
         if not stations:
             QtWidgets.QMessageBox.information(self, "No Stations", "Create at least one station with tracks first.")
+            return
+
+        if not self._basic_confirm_first_sd_sync_target(str(sd_root)):
+            return
+
+        if not self._basic_confirm_different_card(str(sd_root), for_sync=True):
             return
 
         force_clean = False
@@ -2378,9 +3068,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
                         self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                    tag = self._basic_sd_path_volume_tag(self.sd_root)
+                    if tag:
+                        self.db.set_setting("basic_trusted_sd_volume", tag)
                 except Exception:
                     pass
             self._refresh_basic_sd_capacity()
+            self._check_basic_sd_sync()
             if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
                 QtCore.QTimer.singleShot(300, self.safely_remove_sd)
 
@@ -2404,9 +3098,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Basic mode: SD Card tab (index 1) - refresh capacity
         if self.devices_view_mode == "basic" and index == 1:
-            if hasattr(self, "_basic_sd_root_label"):
-                self._basic_sd_root_label.setText(self.sd_root or "(not set)")
+            self._try_rebind_basic_sd_mount()
+            self._update_sd_root_label()
             self._refresh_basic_sd_capacity()
+            self._check_basic_sd_sync()
 
         # Advanced mode: Devices tab warning
         if self.devices_view_mode == "advanced" and index == 3 and hasattr(self, "_check_basic_sd_pico_warning"):
@@ -2612,6 +3307,8 @@ class MainWindow(QtWidgets.QMainWindow):
         storage_layout = QtWidgets.QVBoxLayout(storage_group)
         root_layout = QtWidgets.QHBoxLayout()
         root_layout.addWidget(QtWidgets.QLabel("SD / media root:"))
+        if not _qt_widget_alive(getattr(self, "sd_root_label", None)):
+            self.sd_root_label = QtWidgets.QLabel()
         root_layout.addWidget(self.sd_root_label)
         detect_btn = QtWidgets.QPushButton("Detect")
         detect_btn.setToolTip("Auto-detect removable drives (e.g. SD card or USB) as the storage root.")
@@ -3004,25 +3701,59 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_auto_eject_after_sync_changed(self) -> None:
         sender = self.sender()
-        if isinstance(sender, QtWidgets.QCheckBox):
+        if isinstance(sender, QtWidgets.QCheckBox) and _qt_widget_alive(sender):
             checked = sender.isChecked()
-        elif hasattr(self, "_auto_eject_after_sync_cb") and self._auto_eject_after_sync_cb is not None:
+        elif _qt_widget_alive(getattr(self, "_auto_eject_after_sync_cb", None)):
             checked = self._auto_eject_after_sync_cb.isChecked()
+        elif _qt_widget_alive(getattr(self, "_basic_auto_eject_cb", None)):
+            checked = self._basic_auto_eject_cb.isChecked()
         else:
             checked = False
         self.db.set_setting("auto_eject_after_sync", "1" if checked else "0")
-        # Keep the other view's checkbox in sync (Basic vs Advanced)
-        if hasattr(self, "_auto_eject_after_sync_cb") and self._auto_eject_after_sync_cb is not None and sender is not self._auto_eject_after_sync_cb:
-            self._auto_eject_after_sync_cb.blockSignals(True)
-            self._auto_eject_after_sync_cb.setChecked(checked)
-            self._auto_eject_after_sync_cb.blockSignals(False)
-        if hasattr(self, "_auto_eject_after_sync_cb_advanced") and self._auto_eject_after_sync_cb_advanced is not None and sender is not self._auto_eject_after_sync_cb_advanced:
-            self._auto_eject_after_sync_cb_advanced.blockSignals(True)
-            self._auto_eject_after_sync_cb_advanced.setChecked(checked)
-            self._auto_eject_after_sync_cb_advanced.blockSignals(False)
+        # Keep the other view's checkboxes in sync (Basic vs Advanced); skip destroyed widgets.
+        cb = getattr(self, "_auto_eject_after_sync_cb", None)
+        if _qt_widget_alive(cb) and sender is not cb:
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+        cb_adv = getattr(self, "_auto_eject_after_sync_cb_advanced", None)
+        if _qt_widget_alive(cb_adv) and sender is not cb_adv:
+            cb_adv.blockSignals(True)
+            cb_adv.setChecked(checked)
+            cb_adv.blockSignals(False)
+        cb_basic = getattr(self, "_basic_auto_eject_cb", None)
+        if _qt_widget_alive(cb_basic) and sender is not cb_basic:
+            cb_basic.blockSignals(True)
+            cb_basic.setChecked(checked)
+            cb_basic.blockSignals(False)
 
-    def _on_basic_loop_stations_changed(self, state: int) -> None:
-        self.db.set_setting("basic_loop_stations", "1" if state else "0")
+    def _get_basic_station_end_mode(self) -> str:
+        """Return 'loop', 'advance', or 'none' (mutually exclusive basic-mode end behavior)."""
+        m = self.db.get_setting("basic_station_end_mode", "")
+        if m in ("loop", "advance", "none"):
+            return m
+        # Legacy single flag before end-mode combo
+        legacy = self.db.get_setting("basic_loop_stations", "")
+        if legacy == "1":
+            return "loop"
+        if legacy == "0":
+            return "none"
+        # Fresh install / unset: default to advance
+        return "advance"
+
+    def _set_basic_station_end_mode(self, mode: str) -> None:
+        if mode not in ("loop", "advance", "none"):
+            return
+        self.db.set_setting("basic_station_end_mode", mode)
+        self.db.set_setting("basic_loop_stations", "1" if mode == "loop" else "0")
+
+    def _on_basic_station_end_combo_changed(self, index: int) -> None:
+        combo = getattr(self, "_basic_end_mode_combo", None)
+        if not _qt_widget_alive(combo) or index < 0:
+            return
+        data = combo.itemData(index)
+        if data is not None:
+            self._set_basic_station_end_mode(str(data))
 
     def _create_song_table(self, reorderable: bool = False) -> QtWidgets.QTableWidget:
         table: QtWidgets.QTableWidget
@@ -3062,12 +3793,35 @@ class MainWindow(QtWidgets.QMainWindow):
             retention = 10
         self.db.auto_backup = auto_backup
         self.db.backup_retention = retention
+        self._try_rebind_basic_sd_mount()
         self._update_sd_root_label()
 
     def _refresh_all(self) -> None:
         self.refresh_library()
         self.refresh_albums()
         self.refresh_playlists()
+        self._refresh_basic_stations_if_visible()
+
+    def _refresh_basic_stations_if_visible(self) -> None:
+        """Reload basic-mode station list when the active library DB changes.
+
+        ``_refresh_all`` is invoked on library switch, but basic SD Card UI was
+        never refreshed — the list kept showing the previous library's stations
+        (often empty after switching to a new/empty DB, or stale rows).
+        """
+        if self.devices_view_mode != "basic":
+            return
+        if not hasattr(self, "_basic_station_list"):
+            return
+        if not _qt_widget_alive(self._basic_station_list):
+            return
+        self._basic_station_list.clearSelection()
+        self._refresh_basic_station_list()
+        self._update_basic_stations_size()
+        if _qt_widget_alive(self._basic_station_tracks_table):
+            self._basic_station_tracks_table.setRowCount(0)
+        if _qt_widget_alive(getattr(self, "_basic_station_detail", None)):
+            self._basic_station_detail.setText("Select a station to view tracks.")
 
     def refresh_library(self) -> None:
         rows = self.db.list_songs()
@@ -3193,18 +3947,23 @@ class MainWindow(QtWidgets.QMainWindow):
         files = [path for path in Path(folder).rglob("*") if path.is_file()]
         self.import_files(files)
 
-    def import_files(self, files: Iterable[Path]) -> List[int]:
+    def import_files(
+        self, files: Iterable[Path], *, silent: bool = False
+    ) -> List[int]:
         file_list = [p for p in files if p.exists() and p.is_file()]
         if not file_list:
             return []
-        
+
         # For small imports (≤3 files), do it inline to keep it snappy
         if len(file_list) <= 3:
-            return self._import_files_sync(file_list)
-        
-        # For larger imports, run in background thread with progress
+            return self._import_files_sync(file_list, show_status=not silent)
+
+        if silent:
+            return self._import_files_silent_threaded(file_list)
+
+        # For larger imports, run in background thread with progress dialog
         self._pending_import_ids: List[int] = []
-        
+
         dlg = TaskProgressDialog(
             parent=self,
             title="Importing Files",
@@ -3228,7 +3987,51 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.on_success = on_success
         dlg.on_error = on_error
         dlg.exec()
-        return getattr(self, '_pending_import_ids', [])
+        return getattr(self, "_pending_import_ids", [])
+
+    def _import_files_silent_threaded(self, file_list: List[Path]) -> List[int]:
+        """Import many files on a worker thread without a modal progress dialog."""
+        results: List[Tuple[int, int, List[int]]] = []
+        errors: List[str] = []
+        loop = QtCore.QEventLoop(self)
+        thread = QtCore.QThread(self)
+        worker = _BackgroundWorker(
+            self._import_files_worker,
+            file_list,
+            self.db,
+            progress_callback=None,
+        )
+        worker.moveToThread(thread)
+
+        def on_finished(result: object) -> None:
+            results.append(result)  # type: ignore[arg-type]
+            thread.quit()
+            loop.quit()
+
+        def on_error(msg: str) -> None:
+            errors.append(msg)
+            thread.quit()
+            loop.quit()
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        thread.start()
+        loop.exec()
+        thread.wait(300_000)
+        worker.deleteLater()
+        thread.deleteLater()
+
+        self.refresh_library()
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self, "Import Error", f"Error during import:\n\n{errors[0]}"
+            )
+            return []
+        if not results:
+            return []
+        _added, _skipped, added_ids = results[0]
+        return added_ids
 
     @staticmethod
     def _import_files_worker(
@@ -3279,7 +4082,9 @@ class MainWindow(QtWidgets.QMainWindow):
             progress_callback(total, total, "Import complete!")
         return added, skipped, added_ids
 
-    def _import_files_sync(self, files: Iterable[Path]) -> List[int]:
+    def _import_files_sync(
+        self, files: Iterable[Path], *, show_status: bool = True
+    ) -> List[int]:
         """Synchronous import for small batches (≤3 files)."""
         added = 0
         skipped = 0
@@ -3316,9 +4121,10 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 skipped += 1
         self.refresh_library()
-        self.statusBar().showMessage(
-            f"Import complete. Added: {added}, skipped: {skipped}", 5000
-        )
+        if show_status:
+            self.statusBar().showMessage(
+                f"Import complete. Added: {added}, skipped: {skipped}", 5000
+            )
         return added_ids
 
     def edit_selected_metadata(self) -> None:
@@ -3647,14 +4453,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_sd_root_label()
 
     def _update_sd_root_label(self) -> None:
+        """Update advanced Devices tab label and/or basic SD Card tab label."""
         if not self.sd_root:
-            self.sd_root_label.setText("Not set")
-            return
-        label = self.sd_label or self._get_volume_label(Path(self.sd_root))
-        if label:
-            self.sd_root_label.setText(f"{self.sd_root} ({label})")
+            adv_text = "Not set"
+            basic_text = "(not set)"
         else:
-            self.sd_root_label.setText(self.sd_root)
+            vol = self.sd_label or self._get_volume_label(Path(self.sd_root))
+            if vol:
+                adv_text = f"{self.sd_root} ({vol})"
+                basic_text = adv_text
+            else:
+                adv_text = self.sd_root
+                basic_text = self.sd_root
+        if _qt_widget_alive(getattr(self, "sd_root_label", None)):
+            self.sd_root_label.setText(adv_text)
+        if _qt_widget_alive(getattr(self, "_basic_sd_root_label", None)):
+            self._basic_sd_root_label.setText(basic_text)
 
     def _get_volume_label(self, path: Path) -> str:
         if hasattr(self.sd_manager, "volume_label"):
@@ -3673,16 +4487,75 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_album_combo.blockSignals(False)
         self.sd_playlist_combo.blockSignals(False)
 
-    def select_sd_root(self) -> None:
+    def select_sd_root(self, *, manual: bool = False) -> None:
+        """Pick SD root from detected removable volumes (dropdown if several).
+
+        When *manual* is False (e.g. advanced Devices "Detect"), we may apply the saved
+        path or a single identity match without opening a dialog.
+
+        When *manual* is True (basic-mode **Select**), always show the drive list if
+        more than one removable volume exists so the user can pick a different card.
+        """
         candidates = self.sd_manager.detect_sd_roots()
         if not candidates:
             QtWidgets.QMessageBox.information(
                 self, "SD Detect", "No removable drives detected."
             )
             return
+
+        if not manual:
+            # Saved path still present (resolved match — handles same card, normalized path).
+            if self.sd_root:
+                try:
+                    saved = Path(self.sd_root).expanduser().resolve()
+                    if saved.is_dir():
+                        for path, label in candidates:
+                            try:
+                                if path.resolve() == saved:
+                                    lab = (label or "").strip() or (
+                                        self._get_volume_label(path) or path.name
+                                    )
+                                    self.sd_root = str(path)
+                                    self.sd_label = lab
+                                    self.db.set_setting("sd_root", self.sd_root)
+                                    self.db.set_setting("sd_label", self.sd_label)
+                                    self._update_sd_root_label()
+                                    self._check_basic_sd_sync()
+                                    self.statusBar().showMessage(
+                                        f"SD card: {self.sd_root}", 4000
+                                    )
+                                    return
+                            except OSError:
+                                continue
+                except OSError:
+                    pass
+
+            identity = self._basic_sd_identity_match_set()
+            matched = [
+                (path, label)
+                for path, label in candidates
+                if self._basic_candidate_matches_identity(path, label, identity)
+            ]
+
+            if len(matched) == 1:
+                path, lab = matched[0]
+                new_label = (lab or "").strip() or (self._get_volume_label(path) or "")
+                self.sd_root = str(path)
+                self.sd_label = new_label
+                self.db.set_setting("sd_root", self.sd_root)
+                self.db.set_setting("sd_label", self.sd_label)
+                self._update_sd_root_label()
+                self._check_basic_sd_sync()
+                self.statusBar().showMessage(
+                    f"Detected SD card: {self.sd_root}", 5000
+                )
+                return
+        else:
+            identity = self._basic_sd_identity_match_set()
+
         if len(candidates) == 1:
-            self.sd_root = str(candidates[0][0])
-            self.sd_label = candidates[0][1]
+            new_root = str(candidates[0][0])
+            new_label = candidates[0][1]
         else:
             choices = []
             mapping = {}
@@ -3690,24 +4563,47 @@ class MainWindow(QtWidgets.QMainWindow):
                 display = f"{path} ({label})" if label else str(path)
                 choices.append(display)
                 mapping[display] = str(path)
+
+            default_idx = 0
+            if self.sd_root:
+                try:
+                    saved = Path(self.sd_root).expanduser().resolve()
+                    for i, (path, label) in enumerate(candidates):
+                        try:
+                            if path.resolve() == saved:
+                                default_idx = i
+                                break
+                        except OSError:
+                            continue
+                except OSError:
+                    pass
+            if default_idx == 0 and identity:
+                for i, (path, label) in enumerate(candidates):
+                    if self._basic_candidate_matches_identity(path, label, identity):
+                        default_idx = i
+                        break
+
             selection, ok = QtWidgets.QInputDialog.getItem(
                 self,
                 "Select SD Root",
                 "Choose SD card root:",
                 choices,
-                0,
+                default_idx,
                 False,
             )
             if not ok or not selection:
                 return
-            self.sd_root = mapping.get(selection, selection)
-            self.sd_label = ""
+            new_root = mapping.get(selection, selection)
+            new_label = ""
             for path, label in candidates:
-                if str(path) == self.sd_root:
-                    self.sd_label = label
+                if str(path) == new_root:
+                    new_label = label
+        self.sd_root = new_root
+        self.sd_label = new_label
         self.db.set_setting("sd_root", self.sd_root)
         self.db.set_setting("sd_label", self.sd_label)
         self._update_sd_root_label()
+        self._check_basic_sd_sync()
 
     def browse_sd_root(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(
@@ -3722,6 +4618,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.db.set_setting("sd_root", folder)
         self.db.set_setting("sd_label", self.sd_label)
         self._update_sd_root_label()
+        self._check_basic_sd_sync()
 
     def run_backup(self) -> None:
         backup_path = self.db.backup_now()
@@ -3880,6 +4777,17 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.on_error = on_error
         dlg.exec()
 
+    def _clear_sd_storage_selection_after_eject(self) -> None:
+        """Drop saved SD path so the UI matches an unplugged card (Detect / Select will re-bind)."""
+        self.sd_root = ""
+        self.sd_label = ""
+        self.db.set_setting("sd_root", "")
+        self.db.set_setting("sd_label", "")
+        self._update_sd_root_label()
+        if self.devices_view_mode == "basic":
+            self._refresh_basic_sd_capacity()
+            self._check_basic_sd_sync()
+
     def safely_remove_sd(self) -> None:
         """Safely eject/remove the SD card."""
         sd_root = self._resolve_sd_root()
@@ -3937,6 +4845,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         None
                     )
                     if result:
+                        self._clear_sd_storage_selection_after_eject()
                         QtWidgets.QMessageBox.information(
                             self,
                             "SD Card Ejected",
@@ -3951,25 +4860,42 @@ class MainWindow(QtWidgets.QMainWindow):
                 finally:
                     kernel32.CloseHandle(handle)
             elif system == "Darwin":
-                # macOS: use diskutil to eject the volume
+                # macOS: eject, then force-unmount if the volume is busy (Finder still refreshing).
+                mount = str(sd_root)
                 try:
-                    result = subprocess.run(
-                        ["diskutil", "eject", str(sd_root)],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    if result.returncode == 0:
+                    last_err = ""
+                    ok = False
+                    for cmd in (
+                        ["diskutil", "eject", mount],
+                        ["diskutil", "unmount", "force", mount],
+                    ):
+                        result = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=20,
+                        )
+                        out = (result.stderr or result.stdout or "").strip()
+                        if out:
+                            last_err = out
+                        if result.returncode == 0:
+                            ok = True
+                            break
+                    if ok:
+                        self._clear_sd_storage_selection_after_eject()
                         QtWidgets.QMessageBox.information(
                             self,
                             "SD Card Ejected",
-                            "SD card has been safely ejected.\n\nYou can now safely remove it."
+                            "SD card has been unmounted or ejected.\n\n"
+                            "The app cleared the saved SD path; use Detect when you plug the card in again.\n\n"
+                            "If Finder still shows the volume, eject it there too.",
                         )
                     else:
                         QtWidgets.QMessageBox.warning(
                             self,
                             "Eject Failed",
-                            f"Could not eject SD card: {result.stderr or result.stdout}\n\nPlease try ejecting manually using Finder or Disk Utility."
+                            f"Could not eject SD card: {last_err or 'unknown error'}\n\n"
+                            "Close any Finder windows on the card, then try again or eject from Finder.",
                         )
                 except FileNotFoundError:
                     QtWidgets.QMessageBox.warning(
@@ -3987,6 +4913,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         timeout=10,
                     )
                     if result.returncode == 0:
+                        self._clear_sd_storage_selection_after_eject()
                         QtWidgets.QMessageBox.information(
                             self,
                             "SD Card Ejected",
@@ -4003,6 +4930,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         timeout=10,
                     )
                     if result.returncode == 0:
+                        self._clear_sd_storage_selection_after_eject()
                         QtWidgets.QMessageBox.information(
                             self,
                             "SD Card Ejected",
@@ -4329,10 +5257,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _is_rpi_rp2_present(self) -> bool:
         """True if a drive with label RPI-RP2 (Pico in BOOTSEL) is present."""
-        for _path, label in self.sd_manager.detect_sd_roots():
-            if label and label.strip().upper() == "RPI-RP2":
-                return True
-        return False
+        return SDManager.is_rp2040_bootsel_present()
 
     def _check_basic_sd_pico_warning(self) -> None:
         """Show warning in basic view only when both our SD card and RPI-RP2 (unflashed Pico) are present."""
@@ -4870,13 +5795,36 @@ class MainWindow(QtWidgets.QMainWindow):
             path = Path(self.sd_root)
             if path.exists():
                 return path
+            if self.devices_view_mode == "basic":
+                self._try_rebind_basic_sd_mount()
+                if self.sd_root:
+                    path2 = Path(self.sd_root)
+                    if path2.exists():
+                        return path2
         if self.sd_auto_detect:
             candidates = self.sd_manager.detect_sd_roots()
-            if self.sd_label:
-                matched = [path for path, label in candidates if label == self.sd_label]
+            label_matches: set = set()
+            if self.sd_label and str(self.sd_label).strip():
+                label_matches.add(str(self.sd_label).strip().upper())
+            sv = (self.db.get_setting("sd_volume_label") or "").strip().upper()
+            if sv:
+                label_matches.add(sv)
+            bt = (self.db.get_setting("basic_trusted_sd_volume") or "").strip().upper()
+            if bt:
+                label_matches.add(bt)
+            if sv:
+                label_matches.add(SYNC_TARGET_VOLUME_LABEL.strip().upper())
+            if label_matches:
+                matched = [
+                    path
+                    for path, label in candidates
+                    if label and label.strip().upper() in label_matches
+                ]
                 if len(matched) == 1:
                     self.sd_root = str(matched[0])
+                    self.sd_label = self._get_volume_label(matched[0])
                     self.db.set_setting("sd_root", self.sd_root)
+                    self.db.set_setting("sd_label", self.sd_label)
                     self._update_sd_root_label()
                     return matched[0]
             if len(candidates) == 1:

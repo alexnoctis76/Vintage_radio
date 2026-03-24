@@ -95,6 +95,93 @@ class TestLongPress:
         assert core.current_album_index == 0
 
 
+class TestStationShuffleLongPress:
+    """Basic-mode station shuffle uses _shuffle_source_type 'station'; long press must advance station and rebuild shuffle_tracks."""
+
+    def test_next_album_replaces_stale_shuffle_tracks(self, core, mock_hardware):
+        core.playlists = [
+            {"id": 1, "name": "Station 1", "tracks": [{"title": "A", "folder": 1, "track_number": 1}]},
+            {"id": 2, "name": "Station 2", "tracks": [{"title": "B", "folder": 2, "track_number": 1}]},
+        ]
+        core.mode = MODE_SHUFFLE
+        core._shuffle_source_type = "station"
+        core.current_album_index = 0
+        core.shuffle_tracks = [{"title": "STALE", "folder": 99, "track_number": 9}]
+        core.shuffle_index = 0
+        core.current_track = 1
+
+        core._next_album()
+
+        assert core.current_album_index == 1
+        assert core.mode == MODE_SHUFFLE
+        assert core._shuffle_source_type == "station"
+        assert len(core.shuffle_tracks) == 1
+        assert core.shuffle_tracks[0].get("folder") == 2
+        assert core.shuffle_index == 0
+        assert core.current_track == 1
+
+
+class TestBasicStationEndAutoAdvance:
+    """basic_mode: advance_next_station at end of sequential station or station shuffle."""
+
+    def test_sequential_last_track_advances_station(self, mock_hardware):
+        mock_hardware._albums = []
+        mock_hardware._playlists = [
+            {"id": 1, "name": "S1", "tracks": [{"title": "a", "folder": 1, "track_number": 1}]},
+            {"id": 2, "name": "S2", "tracks": [{"title": "b", "folder": 2, "track_number": 1}]},
+        ]
+        rc = RadioCore(mock_hardware, basic_mode=True)
+        rc.albums = []
+        rc.playlists = list(mock_hardware._playlists)
+        rc.mode = MODE_PLAYLIST
+        rc.current_album_index = 0
+        rc.current_track = 1
+        rc.power_on = True
+        rc.advance_next_station = True
+        rc.loop_stations = False
+        rc.is_playing = True
+
+        rc.on_track_finished()
+
+        assert rc.current_album_index == 1
+        assert rc.current_track == 1
+        assert any(c[0] == "play_track" for c in mock_hardware.calls)
+
+    def test_station_shuffle_last_track_advances_station(self, mock_hardware):
+        mock_hardware._albums = []
+        mock_hardware._playlists = [
+            {
+                "id": 1,
+                "name": "S1",
+                "tracks": [
+                    {"title": "a", "folder": 1, "track_number": 1},
+                    {"title": "b", "folder": 1, "track_number": 2},
+                ],
+            },
+            {"id": 2, "name": "S2", "tracks": [{"title": "c", "folder": 2, "track_number": 1}]},
+        ]
+        rc = RadioCore(mock_hardware, basic_mode=True)
+        rc.albums = []
+        rc.playlists = list(mock_hardware._playlists)
+        rc.mode = MODE_SHUFFLE
+        rc._shuffle_source_type = "station"
+        rc.current_album_index = 0
+        rc.shuffle_tracks = list(mock_hardware._playlists[0]["tracks"])
+        rc.shuffle_index = 1
+        rc.current_track = 2
+        rc.power_on = True
+        rc.advance_next_station = True
+        rc.loop_stations = False
+        rc.is_playing = True
+
+        rc.on_track_finished()
+
+        assert rc.current_album_index == 1
+        assert rc.shuffle_index == 0
+        assert len(rc.shuffle_tracks) == 1
+        assert rc.shuffle_tracks[0].get("title") == "c"
+
+
 class TestOneTapHold:
     def test_toggles_to_playlist(self, core, mock_hardware):
         assert core.mode == MODE_ALBUM

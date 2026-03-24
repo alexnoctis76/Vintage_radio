@@ -182,7 +182,7 @@ class PiHardware(HardwareInterface):
         """When True, play_track() no-ops so firmware can run start_with_am() first."""
         self._delay_playback = bool(delay)
 
-    def play_track(self, folder: int, track: int, start_ms: int = 0) -> bool:
+    def play_track(self, folder: int, track: int, start_ms: int = 0, folder_wrap: bool = False) -> bool:
         if self._am_overlay_active:
             return True
         if self._delay_playback:

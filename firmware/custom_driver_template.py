@@ -76,7 +76,7 @@ class CustomHardware(HardwareInterface):
     #  Playback
     # ------------------------------------------------------------------
 
-    def play_track(self, folder, track, start_ms=0):
+    def play_track(self, folder, track, start_ms=0, folder_wrap=False):
         """Start playing the given track.
 
         The core always passes folder (1-99) and track (1-999).  Map these
@@ -88,6 +88,7 @@ class CustomHardware(HardwareInterface):
             folder:   Folder number (1-99).
             track:    Track number within folder (1-999).
             start_ms: Optional seek position in ms.
+            folder_wrap: True when looping same folder from last track to 1 (optional).
 
         Returns:
             True if playback started successfully.

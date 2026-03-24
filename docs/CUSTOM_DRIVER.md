@@ -79,7 +79,7 @@ are optional — override them only if your hardware supports that feature.
 
 | Method | What it does |
 |---|---|
-| `play_track(folder, track, start_ms)` | Start playing a song |
+| `play_track(folder, track, start_ms, folder_wrap=False)` | Start playing a song (`folder_wrap` when looping last track to 1 in same folder) |
 | `stop()` | Stop playback |
 | `set_volume(level)` | Set volume (0-100, you map to hardware range) |
 | `is_playing()` | Return `True` while audio is active |

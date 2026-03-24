@@ -13,6 +13,7 @@ from radio_core import (
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
     FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
+    DF_UART_END_GUARD_MS,
     ticks_ms, ticks_diff,
 )
 
@@ -35,6 +36,7 @@ class VintageRadioFirmware:
         self.prev_busy = 1
         self._busy_high_since = 0
         self._was_playing = False
+        self._last_stuck_query_ms = 0
 
     def wait_for_power(self):
         skip_power_check = self._check_skip_power_sense()
@@ -217,11 +219,44 @@ class VintageRadioFirmware:
             return
 
         if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
+            armed = getattr(self.hw, "_uart_track_end_armed", False)
+            start_tick = getattr(self.hw, "_playback_start_tick", 0)
+            now = ticks_ms()
+            # DFPlayer often emits duplicate 0x3D in the first few hundred ms; see
+            # DF_UART_END_GUARD_MS in radio_core.py.
+            if armed and start_tick and ticks_diff(now, start_tick) < DF_UART_END_GUARD_MS:
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                print(
+                    "DF: UART track-finished ignored (<{}ms after play start)".format(
+                        DF_UART_END_GUARD_MS
+                    )
+                )
+                return
+
+            # Past startup guard: if BUSY is still LOW, 0x3D is often stale (buffered at
+            # overlay/volume boundaries). Consume without advancing; real end uses BUSY HIGH.
+            pin_busy_uart = getattr(self.hw, "pin_busy", None)
+            if (
+                armed
+                and start_tick
+                and ticks_diff(now, start_tick) >= DF_UART_END_GUARD_MS
+                and pin_busy_uart is not None
+                and pin_busy_uart.value() == 0
+            ):
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                print("DF: UART track-finished ignored (BUSY LOW, still playing)")
+                return
+
             getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-            print("Track finished (UART)")
-            pin_busy = getattr(self.hw, "pin_busy", None)
-            if pin_busy is not None:
-                self.prev_busy = pin_busy.value()
+            if armed:
+                self.hw._uart_track_end_armed = False
+                print("Track finished (UART)")
+                pin_busy = getattr(self.hw, "pin_busy", None)
+                if pin_busy is not None:
+                    self.prev_busy = pin_busy.value()
+                self._fire_track_finished()
+            # Spurious 0x3D before playback is armed: discard without touching prev_busy
+            # so the BUSY LOW->HIGH edge is still detectable.
             return
 
         pin_busy = getattr(self.hw, "pin_busy", None)
@@ -233,10 +268,33 @@ class VintageRadioFirmware:
             elif self.hw.is_playing():
                 self._was_playing = True
             return
-        BUSY_DEBOUNCE_MS = 5000
+        # Short debounce only: old 5000ms forced ~5s between every track.
+        BUSY_DEBOUNCE_MS = 400
+        STUCK_BUSY_QUERY_MIN_MS = 800
+        STUCK_QUERY_INTERVAL_MS = 400
         b = pin_busy.value()
         now = ticks_ms()
         ignore_until = getattr(self.hw, "ignore_busy_until", 0)
+        start_tick = getattr(self.hw, "_playback_start_tick", 0)
+
+        # BUSY stuck LOW but module reports stopped (some bad MP3s / clones)
+        if (
+            b == 0
+            and getattr(self.hw, "query_status", None)
+            and ticks_diff(now, ignore_until) >= 0
+            and start_tick
+            and ticks_diff(now, start_tick) > STUCK_BUSY_QUERY_MIN_MS
+        ):
+            if ticks_diff(now, self._last_stuck_query_ms) >= STUCK_QUERY_INTERVAL_MS:
+                self._last_stuck_query_ms = now
+                qs = self.hw.query_status()
+                if qs == 0:
+                    print("Track finished (query_status=stopped, BUSY still LOW)")
+                    self._busy_high_since = 0
+                    self.prev_busy = 1
+                    self._fire_track_finished()
+                    return
+
         if b == 0:
             self._busy_high_since = 0
         elif b == 1 and self.prev_busy == 0:
@@ -271,9 +329,9 @@ class VintageRadioFirmware:
         print("  tap = next track")
         print("  double-tap = previous track")
         print("  triple-tap = restart station")
-        print("  hold = next station")
-        print("  tap + hold = toggle station/shuffle")
-        print("  double-tap + hold = shuffle current station")
+        print("  hold = next station (in station shuffle: next station, still shuffled)")
+        print("  tap + hold = exit shuffle to normal station order")
+        print("  double-tap + hold = shuffle current station (repeat = reshuffle same station)")
         print("  triple-tap + hold = shuffle library")
 
         while True:
@@ -291,14 +349,14 @@ class VintageRadioFirmware:
                 old_track_idx = self.core.current_track
                 self.core.tick()
 
-                if self.core.current_track != old_track_idx:
-                    self._busy_high_since = 0
-
                 if self.hw._delay_playback:
                     self._play_am_for_change()
                     self._busy_high_since = 0
 
                 self.handle_track_finished()
+                # tick() or auto-advance may have changed track; reset BUSY debounce
+                if self.core.current_track != old_track_idx:
+                    self._busy_high_since = 0
                 self.handle_power_change()
 
                 if getattr(self.hw, 'poll_volume_adc', None):

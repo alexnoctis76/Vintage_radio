@@ -60,8 +60,15 @@ PWM_CARRIER     = 125_000
 ALBUM_FILE      = "VintageRadio/album_state.txt"
 METADATA_FILE   = "VintageRadio/radio_metadata.json"
 
-BUSY_CONFIRM_MS = 1800
+BUSY_CONFIRM_MS = 2200
 POST_CMD_GUARD_MS = 120
+# After stop, wait for BUSY HIGH so rapid auto-advance does not outrun the module
+BUSY_IDLE_WAIT_MS = 700
+# After a successful play: short BUSY-ignore window only (see main loop BUSY fallback).
+# 4000ms here previously blocked real track-end detection for ~4s after every track start.
+BUSY_IGNORE_MS_AFTER_PLAY_OK = 800
+# Longer suppress after UART errors / failed play — BUSY can lie for a while.
+BUSY_IGNORE_MS_LONG = 4000
 ALBUM_PROBE_MS  = 650
 
 # DFPlayer response (command) codes (from DFPlayer TX -> Pico RX)
@@ -145,6 +152,11 @@ class DFPlayerHardware(HardwareInterface):
         self._uart_rx_buf = bytearray()
         self._track_finished_via_uart = False
         self._track_finished_track_num = None
+        # After BUSY/query confirms playback started, accept one UART 0x3D as track end
+        # (main loop previously consumed 0x3D without advancing, so short tracks never
+        # triggered the BUSY HIGH edge path reliably).
+        self._uart_track_end_armed = False
+        self._playback_start_tick = 0
         self._last_error_code = None
         self._pending_ack = False
         self._query_status_result = None
@@ -196,6 +208,9 @@ class DFPlayerHardware(HardwareInterface):
         
         # When True, play_track() no-ops so firmware can play AM overlay first (mode switch / power-on)
         self._delay_playback = False
+        # Dedupe noisy duplicate 0x3D logs (same TF index back-to-back)
+        self._last_3d_uart_log_tick = 0
+        self._last_3d_uart_log_num = None
     
     def set_delay_playback(self, delay):
         """When True, play_track() will no-op so the firmware can run start_with_am() first."""
@@ -398,6 +413,35 @@ class DFPlayerHardware(HardwareInterface):
         print("DF: stop")
         self._df_send(0x16, 0, 0)
     
+    def _df_folder_wrap_preplay(self, folder):
+        """Prepare finicky DFPlayer clones before 0x0F folder/track 001 after last track in same folder.
+
+        Some modules ignore the first play command for 01/001 while internal state
+        still reflects the previous last file; a full stop + UART drain helps, and
+        briefly selecting another file (at volume 0) forces a clean selection.
+        """
+        print("DF: folder-wrap precondition (loop to track 1 in same folder)")
+        self._uart_track_end_armed = False
+        self._df_stop()
+        time.sleep_ms(POST_CMD_GUARD_MS * 2)
+        self._wait_for_busy_high(BUSY_IDLE_WAIT_MS + 600)
+        self._clear_uart_track_finished_stale(250)
+        known = int(self._known_tracks.get(folder, 0) or 0)
+        if known >= 2:
+            print("DF: folder-wrap silent bridge via track 2")
+            v = self._df_volume
+            self._df_set_vol(0)
+            time.sleep_ms(POST_CMD_GUARD_MS)
+            self._df_play_folder_track(folder, 2)
+            self._wait_for_busy_low(700)
+            time.sleep_ms(80)
+            self._df_stop()
+            time.sleep_ms(POST_CMD_GUARD_MS)
+            self._wait_for_busy_high(BUSY_IDLE_WAIT_MS + 500)
+            self._clear_uart_track_finished_stale(200)
+            self._df_set_vol(v)
+            time.sleep_ms(POST_CMD_GUARD_MS)
+    
     # ===========================
     #   DFPLAYER RESPONSE PARSING (two-way UART)
     # ===========================
@@ -461,7 +505,14 @@ class DFPlayerHardware(HardwareInterface):
                 track_num = (p1 << 8) | p2
                 self._track_finished_via_uart = True
                 self._track_finished_track_num = track_num
-                print("DF: UART track finished, track=", track_num)
+                now = time.ticks_ms()
+                if (
+                    track_num != self._last_3d_uart_log_num
+                    or time.ticks_diff(now, self._last_3d_uart_log_tick) > 200
+                ):
+                    print("DF: UART track finished, track=", track_num)
+                self._last_3d_uart_log_num = track_num
+                self._last_3d_uart_log_tick = now
             elif cmd == DF_RESP_ERROR:
                 self._last_error_code = p2
                 err_msg = DF_ERROR_MSGS.get(p2, "Unknown error 0x%02X" % p2)
@@ -492,6 +543,21 @@ class DFPlayerHardware(HardwareInterface):
         self._track_finished_via_uart = False
         self._track_finished_track_num = None
         return track_num
+
+    def _clear_uart_track_finished_stale(self, drain_ms=100):
+        """Drain UART and discard 0x3D track-finished notifications.
+
+        Clones often queue spurious or delayed 0x3D packets (parameter may be a
+        global TF index, not folder track). If we start a new play while one is
+        pending, the main loop thinks the new track already finished and BUSY
+        confirmation can fail — especially noticeable with very short MP3s.
+        """
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < drain_ms:
+            self._df_read_pending()
+            if self._track_finished_via_uart:
+                self.consume_track_finished_uart()
+            time.sleep_ms(5)
     
     def query_status(self):
         """Query playback status (0x42). Returns 0=stopped, 1=playing, or None on timeout."""
@@ -541,20 +607,35 @@ class DFPlayerHardware(HardwareInterface):
             time.sleep_ms(10)
         return None
 
-    def query_files_in_folder(self, folder_num, suppress_errors=False):
-        """Query file count in a specific folder (0x4E). Returns count or None.
+    def _df_drain_uart_for_query_ms(self, drain_ms=50):
+        """Drain RX before a 0x4E/0x4F query so older frames are not read as the response."""
+        t0 = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), t0) < drain_ms:
+            self._df_read_pending()
+            if self._track_finished_via_uart:
+                self.consume_track_finished_uart()
+            time.sleep_ms(4)
+
+    def query_files_in_folder(self, folder_num, suppress_errors=False, timeout_ms=500):
+        """Query file count in a specific folder using command 0x4E (DFPlayer Mini serial API).
+
+        Official protocol: 0x4E with parameter = folder number (1-99); module returns
+        the number of valid audio files in that folder (MP3/WAV/WMA as supported).
 
         If the DFPlayer returns an error (e.g. 0x06 = file not found for a
         non-existent folder), returns 0 immediately rather than waiting for timeout.
 
         suppress_errors: if True, do not print the error message (used during
             station discovery to avoid spamming the console).
+        timeout_ms: how long to wait for the 0x4E response (ms).
         """
         self._query_folder_files_result = None
         self._last_error_code = None
+        self._df_drain_uart_for_query_ms(40)
+        time.sleep_ms(30)
         self._df_send(0x4E, 0, folder_num & 0xFF, feedback=True)
         start = time.ticks_ms()
-        while time.ticks_diff(time.ticks_ms(), start) < 300:
+        while time.ticks_diff(time.ticks_ms(), start) < timeout_ms:
             # Drain UART manually so we can intercept error responses
             while True:
                 r = self._df_read_response()
@@ -588,19 +669,48 @@ class DFPlayerHardware(HardwareInterface):
             time.sleep_ms(10)
         return None
 
+    def num_tracks_in_folder(self, folder_num, suppress_errors=False, timeout_ms=500):
+        """Arduino/DFPlayerMini-style alias (same as query_files_in_folder).
+
+        DFPlayerMini_Fast's ``numTracksInFolder(folder)`` sends command 0x4E.
+        Note: 0x4E counts ALL files in the folder including hidden macOS ``._*``
+        resource-fork files. On macOS-prepared SD cards the count is typically 2x
+        the number of playable tracks.
+        """
+        return self.query_files_in_folder(
+            folder_num, suppress_errors=suppress_errors, timeout_ms=timeout_ms
+        )
+
+    def query_files_in_folder_consensus(self, folder_num, suppress_errors=False):
+        """Run 0x4E until two consecutive reads return the same count (stable result).
+
+        Reduces rare UART skew when the module is still reporting a prior operation.
+        """
+        last = None
+        for attempt in range(4):
+            n = self.query_files_in_folder(
+                folder_num, suppress_errors=suppress_errors, timeout_ms=650
+            )
+            if n is None:
+                time.sleep_ms(120)
+                continue
+            if last is not None and n == last:
+                return n
+            last = n
+            time.sleep_ms(100)
+        return last
+
     def discover_stations(self):
         """Discover stations from DFPlayer SD card folder structure via UART queries.
 
-        Queries the DFPlayer for total folder count (0x4F), then for each folder
-        01..98 (skipping folder 99 reserved for AM WAV), queries the file count
-        (0x4E). Stops early after 3 consecutive empty/missing folders since valid
-        station folders are always numbered consecutively from 01.
-
-        Error responses (0x40) from the DFPlayer for non-existent folders are
-        treated as empty and suppressed from the console.
+        For each folder 01..98, queries file count with command 0x4E using a short
+        consensus pass (no play commands). Hidden macOS ``._*`` files double the
+        0x4E count; use **Sync to SD** in the desktop app, which strips those files
+        after each sync. Playback failures from a volume-0 discovery probe were
+        observed on real hardware, so we avoid probing during discovery.
 
         Returns:
-            List of dicts: [{"name": "Station 1", "folder": 1, "tracks": [...]}, ...]
+            List of station dicts.
         """
         print("BASIC: Discovering stations from DFPlayer SD card...")
 
@@ -616,17 +726,21 @@ class DFPlayerHardware(HardwareInterface):
         MAX_CONSECUTIVE_EMPTY = 3
 
         for folder in range(1, 99):
-            file_count = self.query_files_in_folder(folder, suppress_errors=True)
+            file_count = self.query_files_in_folder_consensus(folder, suppress_errors=True)
 
             if file_count is None or file_count == 0:
                 consecutive_empty += 1
                 if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
-                    print(f"BASIC: {MAX_CONSECUTIVE_EMPTY} consecutive empty folders, stopping scan at folder {folder:02d}")
+                    print(
+                        "BASIC: {} consecutive empty folders, stopping scan "
+                        "at folder {:02d}".format(MAX_CONSECUTIVE_EMPTY, folder)
+                    )
                     break
                 continue
 
             consecutive_empty = 0
             station_num += 1
+
             tracks = []
             for track_idx in range(1, file_count + 1):
                 tracks.append({
@@ -645,8 +759,20 @@ class DFPlayerHardware(HardwareInterface):
             }
             stations.append(station)
             self._known_tracks[folder] = file_count
-            print(f"BASIC: Station {station_num} -> folder {folder:02d}, {file_count} tracks")
+            print(
+                "BASIC: Station {} -> folder {:02d}, {} tracks (0x4E)".format(
+                    station_num, folder, file_count
+                )
+            )
+            time.sleep_ms(80)
 
+        self._df_stop()
+        time.sleep_ms(POST_CMD_GUARD_MS)
+        self._wait_for_busy_high(BUSY_IDLE_WAIT_MS + 400)
+        self._df_set_vol(self._df_volume)
+        self._df_drain_uart_for_query_ms(150)
+        if self._track_finished_via_uart:
+            self.consume_track_finished_uart()
         print(f"BASIC: Discovered {len(stations)} stations")
         return stations
 
@@ -670,10 +796,28 @@ class DFPlayerHardware(HardwareInterface):
                 return True
             time.sleep_ms(25)
         return False
+
+    def _wait_for_busy_high(self, timeout_ms=BUSY_IDLE_WAIT_MS):
+        """Wait for BUSY HIGH (module idle). Skipping this before the next play after
+        fast UART-driven advances causes many clones to ignore play folder/track (BUSY
+        never goes LOW for the new file)."""
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < timeout_ms:
+            if self.pin_busy.value() == 1:
+                return True
+            time.sleep_ms(10)
+        return False
     
     def is_playing(self):
         """Return True if DFPlayer is currently playing."""
         return self.pin_busy.value() == 0
+
+    def _arm_dfplayer_track_end_detection(self):
+        """Call after playback is confirmed (BUSY LOW or query_status). Next UART 0x3D in the
+        main loop may be treated as end-of-track so short clips auto-advance without waiting
+        for BUSY HIGH debounce."""
+        self._uart_track_end_armed = True
+        self._playback_start_tick = time.ticks_ms()
     
     def get_playback_position_ms(self):
         """Return current playback position (not supported by DFPlayer Mini)."""
@@ -683,7 +827,7 @@ class DFPlayerHardware(HardwareInterface):
     #   HardwareInterface IMPLEMENTATION
     # ===========================
     
-    def play_track(self, folder, track, start_ms=0):
+    def play_track(self, folder, track, start_ms=0, folder_wrap=False):
         """Play a track with optional seeking to start_ms position."""
         # If AM overlay is active, skip this call (start_with_am already started the track)
         if self._am_overlay_active:
@@ -695,45 +839,76 @@ class DFPlayerHardware(HardwareInterface):
             return True
         
         print(f"play_track: Starting folder={folder}, track={track}, start_ms={start_ms}")
-        self._df_stop()
-        time.sleep_ms(POST_CMD_GUARD_MS)
-        self._df_set_vol(self._df_volume)
-        time.sleep_ms(POST_CMD_GUARD_MS)
-        self._df_play_folder_track(folder, track)
-        
-        # Poll UART and BUSY in parallel: catch 0x40 errors (which may arrive late)
-        # and wait for BUSY LOW (definitive playback confirmation)
-        self._last_error_code = None
-        confirmed = False
-        start = time.ticks_ms()
-        while time.ticks_diff(time.ticks_ms(), start) < BUSY_CONFIRM_MS:
-            self._df_read_pending()
-            if self._last_error_code is not None:
-                err_msg = DF_ERROR_MSGS.get(self._last_error_code, f"Unknown 0x{self._last_error_code:02X}")
-                print(f"DF: play rejected (0x{self._last_error_code:02X}): {err_msg}")
-                self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
-                return False
-            if self.pin_busy.value() == 0:
+        self._uart_track_end_armed = False
+        if folder_wrap and track == 1:
+            self._df_folder_wrap_preplay(folder)
+
+        for attempt in range(2):
+            if attempt > 0:
+                print(f"DF: play settle+retry (folder={folder}, track={track})")
+                time.sleep_ms(POST_CMD_GUARD_MS * 2)
+                self._wait_for_busy_high(BUSY_IDLE_WAIT_MS + 400)
+
+            self._df_stop()
+            time.sleep_ms(POST_CMD_GUARD_MS)
+            # Critical for fast UART auto-advance: module must be idle before play
+            idle_extra = 0
+            if attempt == 0 and folder_wrap:
+                idle_extra = 350
+            self._wait_for_busy_high(
+                BUSY_IDLE_WAIT_MS + idle_extra
+                if attempt == 0
+                else BUSY_IDLE_WAIT_MS + 200
+            )
+            self._df_set_vol(self._df_volume)
+            time.sleep_ms(POST_CMD_GUARD_MS)
+            stale_ms = 100 if attempt == 0 else 120
+            if attempt == 0 and folder_wrap:
+                stale_ms = max(stale_ms, 160)
+            self._clear_uart_track_finished_stale(stale_ms)
+            self._last_error_code = None
+            self._df_play_folder_track(folder, track)
+            self._clear_uart_track_finished_stale(70)
+
+            confirmed = False
+            poll_start = time.ticks_ms()
+            while time.ticks_diff(time.ticks_ms(), poll_start) < BUSY_CONFIRM_MS:
+                self._df_read_pending()
+                if self._track_finished_via_uart:
+                    self.consume_track_finished_uart()
+                if self._last_error_code is not None:
+                    err_msg = DF_ERROR_MSGS.get(self._last_error_code, f"Unknown 0x{self._last_error_code:02X}")
+                    print(f"DF: play rejected (0x{self._last_error_code:02X}): {err_msg}")
+                    self.ignore_busy_until = time.ticks_add(time.ticks_ms(), BUSY_IGNORE_MS_LONG)
+                    return False
+                if self.pin_busy.value() == 0:
+                    confirmed = True
+                    break
+                time.sleep_ms(10)
+
+            if confirmed:
+                print("DF: BUSY went LOW -> playback started")
+            elif self.query_status() == 1:
                 confirmed = True
-                break
-            time.sleep_ms(25)
-        
-        if confirmed:
-            print("DF: BUSY went LOW -> playback started")
-        elif self.query_status() == 1:
-            confirmed = True
-            print("DF: query_status -> playing")
-        
-        if confirmed:
-            self._note_track_learned(folder, track)
-            self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
-            if start_ms > 0:
-                start_seconds = start_ms // 1000
-                time.sleep_ms(80)
-                self._df_set_time(start_seconds)
-                print(f"DF: seeking to {start_seconds}s ({start_ms}ms)")
-            return True
-        
+                print("DF: query_status -> playing")
+
+            if confirmed:
+                self._note_track_learned(folder, track)
+                self.ignore_busy_until = time.ticks_add(
+                    time.ticks_ms(), BUSY_IGNORE_MS_AFTER_PLAY_OK
+                )
+                self._arm_dfplayer_track_end_detection()
+                if start_ms > 0:
+                    start_seconds = start_ms // 1000
+                    time.sleep_ms(80)
+                    self._df_set_time(start_seconds)
+                    print(f"DF: seeking to {start_seconds}s ({start_ms}ms)")
+                return True
+
+            # No UART error: worth one retry (clone timing / BUSY not idle yet)
+            if attempt == 0 and self._last_error_code is None:
+                continue
+
         print(f"DF: playback not confirmed (folder={folder}, track={track})")
         print(f"DF: Expected SD path: {folder:02d}/{track:03d}.mp3")
         if self._last_error_code is not None:
@@ -742,12 +917,13 @@ class DFPlayerHardware(HardwareInterface):
         else:
             print("DF: No UART error received; BUSY stayed HIGH (DFPlayer may not have responded)")
             print("DF: Tip: If UART errors never appear, ensure DFPlayer TX is wired to Pico GP1 (UART RX)")
-        self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
+        self.ignore_busy_until = time.ticks_add(time.ticks_ms(), BUSY_IGNORE_MS_LONG)
         return False
     
     def stop(self):
         """Stop playback."""
         self._df_stop()
+        self._uart_track_end_armed = False
     
     def set_volume(self, level):
         """Set volume (0-100)."""
@@ -796,7 +972,10 @@ class DFPlayerHardware(HardwareInterface):
         
         self._am_overlay_active = False
         self._delay_playback = False
-        self.ignore_busy_until = time.ticks_add(time.ticks_ms(), 4000)
+        # Music already playing under overlay; only brief BUSY debounce after PWM teardown.
+        self.ignore_busy_until = time.ticks_add(
+            time.ticks_ms(), BUSY_IGNORE_MS_AFTER_PLAY_OK
+        )
         
         return confirmed
     
@@ -809,7 +988,17 @@ class DFPlayerHardware(HardwareInterface):
         - Fade from 0 to DFPLAYER_VOL during AM playback
         """
         print("AM: PWM overlay mode (GPIO 3 + DFPlayer simultaneous)")
-        
+        # Arm UART end-detection when music *starts*, not when overlay ends. Re-arming at
+        # overlay completion reset _playback_start_tick so buffered 0x3D looked <450ms old
+        # and were discarded — music then appeared "stuck" until a button press.
+        self._pwm_overlay_music_uart_armed = False
+
+        def _arm_music_uart_once():
+            if self._pwm_overlay_music_uart_armed:
+                return
+            self._pwm_overlay_music_uart_armed = True
+            self._arm_dfplayer_track_end_detection()
+
         # Start the music track on DFPlayer (volume already at 0 from caller)
         # Matches original: df_stop() → POST_CMD_GUARD_MS → df_play_folder_track()
         confirmed = False
@@ -831,6 +1020,7 @@ class DFPlayerHardware(HardwareInterface):
             if self.pin_busy.value() == 0:
                 confirmed = True
                 print("AM: BUSY LOW -> music playing (confirmed before overlay)")
+                _arm_music_uart_once()
             else:
                 print(f"AM: BUSY still HIGH after play cmd (pin={self.pin_busy.value()})")
         
@@ -901,6 +1091,7 @@ class DFPlayerHardware(HardwareInterface):
                     if not confirmed and self.pin_busy.value() == 0:
                         confirmed = True
                         print("AM: BUSY LOW -> music playing (confirmed during overlay)")
+                        _arm_music_uart_once()
                     if state["done"]:
                         break
                     time.sleep_ms(10)
@@ -913,6 +1104,7 @@ class DFPlayerHardware(HardwareInterface):
                 if not confirmed and self.pin_busy.value() == 0:
                     confirmed = True
                     print("AM: BUSY LOW -> music playing (confirmed late during overlay)")
+                    _arm_music_uart_once()
                 time.sleep_ms(20)
         
         finally:
@@ -948,6 +1140,8 @@ class DFPlayerHardware(HardwareInterface):
             if self._wait_for_busy_low(2000):
                 confirmed = True
                 print("AM: Retry confirmed (BUSY LOW)")
+                # New play command: always reset UART end window from this point.
+                self._arm_dfplayer_track_end_detection()
         return confirmed
     
     def _play_am_dfplayer_sequential(self, folder=None, track=None):
@@ -989,6 +1183,8 @@ class DFPlayerHardware(HardwareInterface):
             confirmed = self._wait_for_busy_low()
             if confirmed:
                 print("AM: Music started (BUSY confirmed)")
+                # Arm when music starts, not after fade (avoids resetting _playback_start_tick late).
+                self._arm_dfplayer_track_end_detection()
             
             # Fade from 0 to DFPLAYER_VOL
             fade_steps = 15

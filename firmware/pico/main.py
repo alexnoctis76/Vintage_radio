@@ -13,6 +13,7 @@ from radio_core import (
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
     FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
+    DF_UART_END_GUARD_MS,
     ticks_ms, ticks_diff,
 )
 
@@ -52,7 +53,8 @@ class VintageRadioFirmware:
         self.prev_busy = 1
         self._busy_high_since = 0  # Timestamp when BUSY first went HIGH (for debounce)
         self._was_playing = False  # For drivers without BUSY (e.g. VS1053) track-finished
-    
+        self._last_stuck_query_ms = 0
+
     def wait_for_power(self):
         """Wait for power sense pin to go HIGH, or skip if configured."""
         # Check if power sense check is disabled
@@ -68,8 +70,11 @@ class VintageRadioFirmware:
         print("(Turn pot on, or create skip_power_sense.txt with 'true' to skip)")
         last_hint = ticks_ms()
         while not self.hw.is_power_on():
-            if ticks_diff(ticks_ms(), last_hint) > 500:
-                print("...waiting for power sense HIGH")
+            if ticks_diff(ticks_ms(), last_hint) > 5000:
+                print(
+                    "...still waiting for power sense HIGH "
+                    "(turn the volume pot ON, or skip_power_sense.txt)"
+                )
                 last_hint = ticks_ms()
             time.sleep_ms(20)
         
@@ -284,11 +289,38 @@ class VintageRadioFirmware:
             return
 
         if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
+            armed = getattr(self.hw, "_uart_track_end_armed", False)
+            start_tick = getattr(self.hw, "_playback_start_tick", 0)
+            now = ticks_ms()
+            if armed and start_tick and ticks_diff(now, start_tick) < DF_UART_END_GUARD_MS:
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                print(
+                    "DF: UART track-finished ignored (<{}ms after play start)".format(
+                        DF_UART_END_GUARD_MS
+                    )
+                )
+                return
+
+            pin_busy_uart = getattr(self.hw, "pin_busy", None)
+            if (
+                armed
+                and start_tick
+                and ticks_diff(now, start_tick) >= DF_UART_END_GUARD_MS
+                and pin_busy_uart is not None
+                and pin_busy_uart.value() == 0
+            ):
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                print("DF: UART track-finished ignored (BUSY LOW, still playing)")
+                return
+
             getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-            print("Track finished (UART)")
-            pin_busy = getattr(self.hw, "pin_busy", None)
-            if pin_busy is not None:
-                self.prev_busy = pin_busy.value()
+            if armed:
+                self.hw._uart_track_end_armed = False
+                print("Track finished (UART)")
+                pin_busy = getattr(self.hw, "pin_busy", None)
+                if pin_busy is not None:
+                    self.prev_busy = pin_busy.value()
+                self._fire_track_finished()
             return
 
         pin_busy = getattr(self.hw, "pin_busy", None)
@@ -301,10 +333,31 @@ class VintageRadioFirmware:
             elif self.hw.is_playing():
                 self._was_playing = True
             return
-        BUSY_DEBOUNCE_MS = 5000
+        BUSY_DEBOUNCE_MS = 400
+        STUCK_BUSY_QUERY_MIN_MS = 800
+        STUCK_QUERY_INTERVAL_MS = 400
         b = pin_busy.value()
         now = ticks_ms()
         ignore_until = getattr(self.hw, "ignore_busy_until", 0)
+        start_tick = getattr(self.hw, "_playback_start_tick", 0)
+
+        if (
+            b == 0
+            and getattr(self.hw, "query_status", None)
+            and ticks_diff(now, ignore_until) >= 0
+            and start_tick
+            and ticks_diff(now, start_tick) > STUCK_BUSY_QUERY_MIN_MS
+        ):
+            if ticks_diff(now, getattr(self, "_last_stuck_query_ms", 0)) >= STUCK_QUERY_INTERVAL_MS:
+                self._last_stuck_query_ms = now
+                qs = self.hw.query_status()
+                if qs == 0:
+                    print("Track finished (query_status=stopped, BUSY still LOW)")
+                    self._busy_high_since = 0
+                    self.prev_busy = 1
+                    self._fire_track_finished()
+                    return
+
         if b == 0:
             self._busy_high_since = 0
         elif b == 1 and self.prev_busy == 0:
@@ -388,10 +441,6 @@ class VintageRadioFirmware:
                 old_track_idx = self.core.current_track
                 self.core.tick()
                 
-                # If tick() changed the track (button-driven skip), reset debounce
-                if self.core.current_track != old_track_idx:
-                    self._busy_high_since = 0
-                
                 # After tick(), check if a mode/album change set delay_playback
                 if self.hw._delay_playback:
                     self._play_am_for_change()
@@ -399,6 +448,8 @@ class VintageRadioFirmware:
                 
                 # Detect track finished
                 self.handle_track_finished()
+                if self.core.current_track != old_track_idx:
+                    self._busy_high_since = 0
                 
                 # Watch power sense line
                 self.handle_power_change()

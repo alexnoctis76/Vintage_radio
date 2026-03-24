@@ -311,14 +311,8 @@ class TestModeWidget(QtWidgets.QWidget):
             am_wav_path=am_wav if am_wav.exists() else None,
         )
 
-        # Ensure emulator audio is initialized after any other potential init
-        try:
-            # Re-initialize audio inside the emulator to ensure mixer is set up correctly
-            # (some systems may have audio devices initialized by other modules)
-            self.hw_emulator._init_audio()
-        except Exception:
-            # If reinit fails, rely on the emulator's earlier init and continue
-            pass
+        # Audio (VLC/pygame) is initialized lazily on first play so the main window can appear
+        # immediately; vlc.Instance() can block for tens of seconds on some macOS systems.
 
         # Reflect emulator audio state in the widget
         self.audio_ready = getattr(self.hw_emulator, '_audio_ready', False)
@@ -506,9 +500,8 @@ class TestModeWidget(QtWidgets.QWidget):
         self.radio_face.set_power(self.rail2_on)
         
         self.refresh_from_db()
-        # Check SD card sync status on initialization
-        # Use QTimer to ensure widget is visible before checking
-        QtCore.QTimer.singleShot(100, self._check_sd_sync)
+        # SD sync check is scheduled from refresh_from_db (singleShot) so /Volumes scan
+        # cannot block widget construction.
         self._init_log_file()
         # Auto-start playback on boot only if power was on last time
         if self.rail2_on:
@@ -695,8 +688,9 @@ class TestModeWidget(QtWidgets.QWidget):
             self.radio_mode_start_time = None
         
             self._update_status("Loaded albums for emulator.")
-        # Check SD card sync status
-        self._check_sd_sync()
+        # Defer SD sync check: detect_sd_roots() scans /Volumes; a stale SMB/network
+        # mount can block for minutes and would prevent the main window from appearing.
+        QtCore.QTimer.singleShot(0, self._check_sd_sync)
 
     def current_album(self) -> AlbumState:
         return self.albums[self.current_album_index]

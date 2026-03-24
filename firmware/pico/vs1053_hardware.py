@@ -605,7 +605,7 @@ class VS1053Hardware(HardwareInterface):
         print("_path_for_track({},{}) -> NOT FOUND ({}ms)".format(folder, track, time.ticks_diff(time.ticks_ms(), t0)))
         return None
 
-    def play_track(self, folder, track, start_ms=0):
+    def play_track(self, folder, track, start_ms=0, folder_wrap=False):
         t0 = time.ticks_ms()
         if self._delay_playback:
             print("play_track({},{}) -> delay_playback=True".format(folder, track))
