@@ -1384,7 +1384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_status.setReadOnly(True)
         self.sd_album_combo = QtWidgets.QComboBox()
         self.sd_playlist_combo = QtWidgets.QComboBox()
-        self.test_mode_widget = TestModeWidget(self.db)
+        self.test_mode_widget = None
         self._device_debug_widget = None  # Lazy-load to avoid crash during init (macOS/pyserial)
 
         self._apply_saved_settings()
@@ -1778,13 +1778,19 @@ class MainWindow(QtWidgets.QMainWindow):
             tabs.addTab(self._build_albums_tab(), "Albums")
             tabs.addTab(self._build_playlists_tab(), "Playlists")
             tabs.addTab(self._build_sd_tab(), "Devices")
-            tabs.addTab(self.test_mode_widget, "Emulator")
+            tabs.addTab(self._ensure_test_mode_widget(), "Emulator")
             device_tab_container = self._build_device_debug_tab()
             self._device_debug_tab_index = tabs.count()
             tabs.addTab(device_tab_container, "Device Debug")
 
         tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(tabs)
+
+    def _ensure_test_mode_widget(self) -> TestModeWidget:
+        """Create emulator widget lazily so basic view does not start hidden playback."""
+        if self.test_mode_widget is None:
+            self.test_mode_widget = TestModeWidget(self.db)
+        return self.test_mode_widget
 
     def _build_device_debug_tab(self) -> QtWidgets.QWidget:
         """Build Device Debug tab with optional SD/library out-of-sync warning."""
@@ -2075,10 +2081,16 @@ class MainWindow(QtWidgets.QMainWindow):
         debug_layout.addWidget(self._basic_debug_widget)
         right_layout.addWidget(debug_group)
 
-        has_usb = any(
-            self._basic_debug_widget.port_combo.itemData(i)
-            for i in range(self._basic_debug_widget.port_combo.count())
-        ) or SDManager.is_rp2040_bootsel_present()
+        has_usb = SDManager.is_rp2040_bootsel_present()
+        try:
+            import serial.tools.list_ports as list_ports
+
+            has_usb = has_usb or any(
+                DeviceDebugWidget._is_rp2040_port(port_info)
+                for port_info in list_ports.comports()
+            )
+        except Exception:
+            pass
         self._set_basic_device_presence_indicator(bool(has_usb))
 
         layout.addWidget(left, 1)
@@ -2487,7 +2499,29 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
             return
 
-        # Test: can we reach a running MicroPython?
+        # Prefer explicit RP2040 ports first to avoid grabbing unrelated serial devices (e.g. Bluetooth COM).
+        try:
+            import serial.tools.list_ports as list_ports
+
+            for port_info in list_ports.comports():
+                port_dev = getattr(port_info, "device", None) or str(port_info)
+                if not DeviceDebugWidget._is_rp2040_port(port_info):
+                    continue
+                r = _run_mpremote(
+                    mpremote_cmd,
+                    ["connect", port_dev, "exec", "print(1)"],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if r.returncode == 0:
+                    self.install_to_pico(basic_mode=True)
+                    return
+        except Exception:
+            pass
+
+        # Fallback: can we reach a running MicroPython via auto-detected port?
         try:
             r = _run_mpremote(
                 mpremote_cmd,
@@ -3099,7 +3133,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_basic_sd_capacity()
             self._check_basic_sd_sync()
             if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
-                QtCore.QTimer.singleShot(300, self.safely_remove_sd)
+                QtCore.QTimer.singleShot(300, lambda: self.safely_remove_sd(auto=True, attempt=1))
 
         def on_error(msg):
             QtWidgets.QMessageBox.critical(self, "Sync Error", f"Error during basic sync:\n\n{msg}")
@@ -4804,7 +4838,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
             # Auto-eject when option is on (for both "files copied" and "nothing copied" outcomes)
             if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
-                QtCore.QTimer.singleShot(300, self.safely_remove_sd)
+                QtCore.QTimer.singleShot(300, lambda: self.safely_remove_sd(auto=True, attempt=1))
             if hasattr(self, 'test_mode_widget') and self.test_mode_widget:
                 self.test_mode_widget.refresh_from_db()
 
@@ -4826,77 +4860,126 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_basic_sd_capacity()
             self._check_basic_sd_sync()
 
-    def safely_remove_sd(self) -> None:
+    def safely_remove_sd(self, *, auto: bool = False, attempt: int = 1) -> None:
         """Safely eject/remove the SD card."""
         sd_root = self._resolve_sd_root()
         if not sd_root:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "No SD Card",
-                "No SD card root selected. Please select an SD card first."
-            )
+            if not auto:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "No SD Card",
+                    "No SD card root selected. Please select an SD card first."
+                )
             return
-        
+
+        def _report_success(msg: str) -> None:
+            self._clear_sd_storage_selection_after_eject()
+            if auto:
+                self.statusBar().showMessage(msg, 6000)
+            else:
+                QtWidgets.QMessageBox.information(self, "SD Card Ejected", msg)
+
+        def _report_failure(title: str, msg: str) -> None:
+            if auto and attempt < 3:
+                delay_ms = 1200 * attempt
+                QtCore.QTimer.singleShot(delay_ms, lambda: self.safely_remove_sd(auto=True, attempt=attempt + 1))
+                return
+            if auto:
+                self.statusBar().showMessage(f"Auto-eject failed: {msg}", 8000)
+            else:
+                QtWidgets.QMessageBox.warning(self, title, msg)
+
         try:
             import platform
             system = platform.system()
             if system == "Windows":
-                # Existing Windows API handling preserved
-                import ctypes
-                from ctypes import wintypes
                 drive_letter = sd_root.drive
                 if not drive_letter:
-                    QtWidgets.QMessageBox.warning(
-                        self,
+                    sd_root_str = str(sd_root)
+                    if len(sd_root_str) >= 2 and sd_root_str[1] == ":":
+                        drive_letter = sd_root_str[:2]
+                if not drive_letter:
+                    _report_failure(
                         "Cannot Eject",
                         "Could not determine drive letter. Please eject manually using Windows Explorer."
                     )
                     return
                 drive = drive_letter.rstrip(":")
-                kernel32 = ctypes.windll.kernel32
-                volume_path = f"\\\\.\\{drive}:"
-                handle = kernel32.CreateFileW(
-                    volume_path,
-                    0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
-                    0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE
-                    None,
-                    0x3,  # OPEN_EXISTING
-                    0,  # No flags
-                    None
-                )
-                if handle == -1:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Cannot Eject",
-                        f"Could not lock drive {drive}:. The drive may be in use.\n\nPlease close any programs using the SD card and try again, or eject manually using Windows Explorer."
-                    )
-                    return
                 try:
-                    result = kernel32.DeviceIoControl(
-                        handle,
-                        0x2D4808,  # IOCTL_STORAGE_EJECT_MEDIA
-                        None,
-                        0,
-                        None,
-                        0,
-                        ctypes.byref(wintypes.DWORD()),
-                        None
+                    ps_script = (
+                        "$sh=New-Object -ComObject Shell.Application;"
+                        "$ns=$sh.Namespace(17);"
+                        f"$it=$ns.ParseName('{drive}:');"
+                        "if($null -eq $it){exit 2};"
+                        "$it.InvokeVerb('Eject');"
+                        "Start-Sleep -Milliseconds 700;"
+                        "exit 0;"
                     )
-                    if result:
-                        self._clear_sd_storage_selection_after_eject()
-                        QtWidgets.QMessageBox.information(
-                            self,
-                            "SD Card Ejected",
-                            f"SD card ({drive}:) has been safely ejected.\n\nYou can now safely remove it."
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+                        capture_output=True,
+                        text=True,
+                        timeout=12,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                    )
+                    drive_root = Path(f"{drive}:\\")
+                    if result.returncode == 0 and not drive_root.exists():
+                        _report_success(f"SD card ({drive}:) has been safely ejected.\n\nYou can now safely remove it.")
+                        return
+                except Exception:
+                    pass
+
+                # Fallback: low-level eject API for systems where shell verb is unavailable.
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    kernel32 = ctypes.windll.kernel32
+                    volume_path = f"\\\\.\\{drive}:"
+                    handle = kernel32.CreateFileW(
+                        volume_path,
+                        0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                        0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+                        None,
+                        0x3,  # OPEN_EXISTING
+                        0,
+                        None,
+                    )
+                    invalid_handle = ctypes.c_void_p(-1).value
+                    if handle == invalid_handle:
+                        _report_failure(
+                            "Cannot Eject",
+                            f"Could not open drive {drive}:. The drive may be in use.\n\n"
+                            "Please close any programs using the SD card and try again, or eject manually using Windows Explorer."
                         )
+                        return
+                    try:
+                        bytes_returned = wintypes.DWORD()
+                        result = kernel32.DeviceIoControl(
+                            handle,
+                            0x2D4808,  # IOCTL_STORAGE_EJECT_MEDIA
+                            None,
+                            0,
+                            None,
+                            0,
+                            ctypes.byref(bytes_returned),
+                            None,
+                        )
+                    finally:
+                        kernel32.CloseHandle(handle)
+                    if result:
+                        _report_success(f"SD card ({drive}:) has been safely ejected.\n\nYou can now safely remove it.")
                     else:
-                        QtWidgets.QMessageBox.warning(
-                            self,
+                        _report_failure(
                             "Eject Failed",
                             f"Could not eject drive {drive}:.\n\nPlease try ejecting manually using Windows Explorer."
                         )
-                finally:
-                    kernel32.CloseHandle(handle)
+                except Exception as e:
+                    _report_failure(
+                        "Eject Error",
+                        f"An error occurred while trying to eject the SD card:\n{str(e)}\n\n"
+                        "Please eject manually using Windows Explorer."
+                    )
             elif system == "Darwin":
                 # macOS: eject, then force-unmount if the volume is busy (Finder still refreshing).
                 mount = str(sd_root)
@@ -4920,24 +5003,19 @@ class MainWindow(QtWidgets.QMainWindow):
                             ok = True
                             break
                     if ok:
-                        self._clear_sd_storage_selection_after_eject()
-                        QtWidgets.QMessageBox.information(
-                            self,
-                            "SD Card Ejected",
+                        _report_success(
                             "SD card has been unmounted or ejected.\n\n"
                             "The app cleared the saved SD path; use Detect when you plug the card in again.\n\n"
-                            "If Finder still shows the volume, eject it there too.",
+                            "If Finder still shows the volume, eject it there too."
                         )
                     else:
-                        QtWidgets.QMessageBox.warning(
-                            self,
+                        _report_failure(
                             "Eject Failed",
                             f"Could not eject SD card: {last_err or 'unknown error'}\n\n"
-                            "Close any Finder windows on the card, then try again or eject from Finder.",
+                            "Close any Finder windows on the card, then try again or eject from Finder."
                         )
                 except FileNotFoundError:
-                    QtWidgets.QMessageBox.warning(
-                        self,
+                    _report_failure(
                         "Eject Unavailable",
                         "diskutil not found on this system. Please eject the SD card manually using Finder or Disk Utility."
                     )
@@ -4951,12 +5029,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         timeout=10,
                     )
                     if result.returncode == 0:
-                        self._clear_sd_storage_selection_after_eject()
-                        QtWidgets.QMessageBox.information(
-                            self,
-                            "SD Card Ejected",
-                            "SD card has been safely unmounted.\n\nYou can now safely remove it."
-                        )
+                        _report_success("SD card has been safely unmounted.\n\nYou can now safely remove it.")
                         return
                 except Exception:
                     pass
@@ -4968,29 +5041,22 @@ class MainWindow(QtWidgets.QMainWindow):
                         timeout=10,
                     )
                     if result.returncode == 0:
-                        self._clear_sd_storage_selection_after_eject()
-                        QtWidgets.QMessageBox.information(
-                            self,
-                            "SD Card Ejected",
-                            "SD card has been safely ejected.\n\nYou can now safely remove it."
-                        )
+                        _report_success("SD card has been safely ejected.\n\nYou can now safely remove it.")
                     else:
-                        QtWidgets.QMessageBox.warning(
-                            self,
+                        _report_failure(
                             "Eject Failed",
                             f"Could not eject SD card: {result.stderr or result.stdout}\n\nPlease try ejecting manually."
                         )
                 except FileNotFoundError:
-                    QtWidgets.QMessageBox.warning(
-                        self,
+                    _report_failure(
                         "Eject Unavailable",
                         "Eject command not found. Please eject the SD card manually using your OS file manager."
                     )
         except Exception as e:
-            QtWidgets.QMessageBox.warning(
-                self,
+            _report_failure(
                 "Eject Error",
-                f"An error occurred while trying to eject the SD card:\n{str(e)}\n\nPlease eject manually using your operating system's file manager."
+                f"An error occurred while trying to eject the SD card:\n{str(e)}\n\n"
+                "Please eject manually using your operating system's file manager."
             )
     
     def validate_sd(self) -> None:

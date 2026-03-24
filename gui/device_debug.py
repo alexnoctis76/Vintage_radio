@@ -551,10 +551,34 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         except Exception:
             return tuple()
 
+    @staticmethod
+    def _is_rp2040_port(port_info: Any) -> bool:
+        """True when a serial port reports the Raspberry Pi VID (2E8A)."""
+        hwid = (getattr(port_info, "hwid", "") or "").upper()
+        return "2E8A" in hwid
+
+    def _list_rp2040_devices(self) -> Tuple[str, ...]:
+        """Sorted tuple of RP2040 serial ports only."""
+        if not SERIAL_AVAILABLE:
+            return tuple()
+        try:
+            return tuple(
+                sorted(
+                    p.device
+                    for p in serial.tools.list_ports.comports()
+                    if self._is_rp2040_port(p)
+                )
+            )
+        except Exception:
+            return tuple()
+
     def _computed_presence_for_led(self) -> bool:
         """Whether the Device Setup LED should show 'device available'."""
         bootsel = SDManager.is_rp2040_bootsel_present()
-        has_ports = len(self._list_port_devices()) > 0
+        if self._basic_mode:
+            has_ports = len(self._list_rp2040_devices()) > 0
+        else:
+            has_ports = len(self._list_port_devices()) > 0
         if self._connected:
             try:
                 open_port = (
@@ -564,7 +588,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 )
             except Exception:
                 open_port = None
-            devs = self._list_port_devices()
+            devs = self._list_rp2040_devices() if self._basic_mode else self._list_port_devices()
             if open_port is not None and str(open_port) not in devs:
                 return False
             self._mask_presence_until_port_change = False
@@ -630,18 +654,28 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             if not from_auto_poll:
                 self._debug_log(f"Found {len(ports)} serial port(s)", "info")
 
+            rp2040_index: Optional[int] = None
             for port_info in ports:
                 port_name = port_info.device
                 description = f"{port_info.description or 'Unknown'} {port_info.hwid or ''}".strip()
                 self.port_combo.addItem(f"{port_name} - {description}", port_name)
+                if self._basic_mode and rp2040_index is None and self._is_rp2040_port(port_info):
+                    rp2040_index = self.port_combo.count() - 1
                 if not from_auto_poll:
                     self._debug_log(f"Added port: {port_name} - {description}", "info")
 
+            restored_preserve = False
             if preserve:
                 for i in range(self.port_combo.count()):
                     if self.port_combo.itemData(i) == preserve:
                         self.port_combo.setCurrentIndex(i)
+                        restored_preserve = True
                         break
+
+            if self._basic_mode and rp2040_index is not None:
+                # In basic mode we always prefer an attached RP2040 over unrelated serial devices.
+                if not restored_preserve or self.port_combo.currentIndex() != rp2040_index:
+                    self.port_combo.setCurrentIndex(rp2040_index)
 
             if self.port_combo.count() == 0:
                 self.port_combo.addItem("(No COM ports found)", None)
