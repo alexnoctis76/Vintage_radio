@@ -5,19 +5,28 @@
 #
 # Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
 # add a Personal Access Token (classic) with scope "repo" as a repo secret named RELEASE_TOKEN.
+#
+# ---------------------------------------------------------------------------
+# TEMPORARILY DISABLED (2026-03): CI-built Windows artifacts were missing
+# bundled mpremote (PyInstaller/spec vs runner env). Re-enable after fixing
+# the release build so mpremote is always collected. Restore the `on:` block
+# below and remove `if: false` from the `build` job.
+# ---------------------------------------------------------------------------
 
 name: Build release
 
 on:
-  push:
-    branches: [release]
-    tags: ["v*"]
-  release:
-    types: [published]
   workflow_dispatch:
+  # Re-enable when CI mpremote bundling is verified:
+  # push:
+  #   branches: [release]
+  #   tags: ["v*"]
+  # release:
+  #   types: [published]
 
 jobs:
   build:
+    if: false
     strategy:
       fail-fast: false
       matrix:

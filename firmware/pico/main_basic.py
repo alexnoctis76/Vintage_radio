@@ -37,6 +37,8 @@ class VintageRadioFirmware:
         self._busy_high_since = 0
         self._was_playing = False
         self._last_stuck_query_ms = 0
+        # Guard against false "stopped" reads that can cause mid-track artifacts/skips.
+        self._stuck_status_zero_count = 0
 
     def wait_for_power(self):
         skip_power_check = self._check_skip_power_sense()
@@ -270,8 +272,11 @@ class VintageRadioFirmware:
             return
         # Short debounce only: old 5000ms forced ~5s between every track.
         BUSY_DEBOUNCE_MS = 400
-        STUCK_BUSY_QUERY_MIN_MS = 800
-        STUCK_QUERY_INTERVAL_MS = 400
+        # Keep status query as a rare last-resort path (not part of normal playback loop):
+        # frequent 0x42 polling can cause audible pulsing/chop on some DFPlayer clones.
+        STUCK_BUSY_QUERY_MIN_MS = 6000
+        STUCK_QUERY_INTERVAL_MS = 2500
+        STUCK_QUERY_REQUIRED_ZEROES = 2
         b = pin_busy.value()
         now = ticks_ms()
         ignore_until = getattr(self.hw, "ignore_busy_until", 0)
@@ -289,16 +294,27 @@ class VintageRadioFirmware:
                 self._last_stuck_query_ms = now
                 qs = self.hw.query_status()
                 if qs == 0:
-                    print("Track finished (query_status=stopped, BUSY still LOW)")
-                    self._busy_high_since = 0
-                    self.prev_busy = 1
-                    self._fire_track_finished()
-                    return
+                    self._stuck_status_zero_count += 1
+                    print(
+                        "DF: query_status=stopped while BUSY LOW "
+                        f"({self._stuck_status_zero_count}/{STUCK_QUERY_REQUIRED_ZEROES})"
+                    )
+                    if self._stuck_status_zero_count >= STUCK_QUERY_REQUIRED_ZEROES:
+                        print("Track finished (query_status fallback confirmed)")
+                        self._stuck_status_zero_count = 0
+                        self._busy_high_since = 0
+                        self.prev_busy = 1
+                        self._fire_track_finished()
+                        return
+                else:
+                    # Any non-zero/None response cancels this fallback window.
+                    self._stuck_status_zero_count = 0
 
         if b == 0:
             self._busy_high_since = 0
         elif b == 1 and self.prev_busy == 0:
             self._busy_high_since = now
+            self._stuck_status_zero_count = 0
         if b == 1 and self._busy_high_since > 0:
             if ticks_diff(now, self._busy_high_since) >= BUSY_DEBOUNCE_MS:
                 if ticks_diff(now, ignore_until) >= 0:
