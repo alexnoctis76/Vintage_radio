@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -26,6 +27,54 @@ from .resource_paths import resource_path
 
 # Volume label we set on the SD card after first sync so we can recognize it among multiple cards
 SYNC_TARGET_VOLUME_LABEL = "VINTAGERADIO"
+
+# Manifest file written at the SD root during sync so we can reliably detect
+# content mismatches even when two different libraries share folder structure.
+_SYNC_MANIFEST_NAME = ".sync_manifest.json"
+
+# macOS / Windows create these at the volume root when the card is mounted or
+# browsed in Finder/Explorer. We never strip our sync manifest (a file, not
+# in this set). Removing these keeps the card cleaner and avoids extra root
+# clutter; 0x4E is still mostly about junk inside ``01/``, ``02/``, etc.
+_SD_ROOT_SERVICE_DIRS = frozenset({
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".Trashes",
+    ".TemporaryItems",
+    "System Volume Information",
+})
+
+
+def _remove_sd_root_service_dirs(root: Path) -> int:
+    """Delete known OS index / trash folders at *root* only. Returns removal count."""
+    removed = 0
+    for dirname in _SD_ROOT_SERVICE_DIRS:
+        p = root / dirname
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+                removed += 1
+            elif p.is_file():
+                p.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _copy2_with_fallback(src: Path, dest: Path) -> None:
+    """Copy *src* to *dest* preserving timestamps when possible.
+
+    On macOS, FAT32/exFAT volumes reject extended-attribute writes with EINVAL.
+    Fall back to a data-only copy in that case so syncs succeed on every platform.
+    """
+    try:
+        shutil.copy2(src, dest)
+    except OSError as e:
+        if e.errno == errno.EINVAL:
+            shutil.copyfile(src, dest)
+        else:
+            raise
 
 
 class SDManager:
@@ -80,7 +129,7 @@ class SDManager:
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.parent / f"{dest.name}{self._SD_PART_SUFFIX}"
         try:
-            shutil.copy2(src, part)
+            _copy2_with_fallback(src, part)
             os.replace(part, dest)
         except Exception:
             try:
@@ -152,16 +201,130 @@ class SDManager:
         return False
 
     @staticmethod
-    def remove_hidden_junk_from_sd(sd_root: Path) -> int:
+    def _format_sd_card(sd_root: Path, label: str = SYNC_TARGET_VOLUME_LABEL) -> Path:
+        """Reformat the SD card as FAT32 and return the (possibly new) mount path.
+
+        Raises ``RuntimeError`` on failure or unsupported platform configuration.
+        """
+        system = platform.system()
+
+        if system == "Darwin":
+            # Resolve disk identifier from mount path
+            try:
+                info = subprocess.run(
+                    ["diskutil", "info", "-plist", str(sd_root)],
+                    capture_output=True, timeout=10,
+                )
+                if info.returncode != 0:
+                    raise RuntimeError(f"diskutil info failed: {info.stderr.decode(errors='replace')}")
+                import plistlib
+                plist = plistlib.loads(info.stdout)
+                disk_id = plist.get("ParentWholeDisk") or plist.get("DeviceIdentifier")
+                if not disk_id:
+                    raise RuntimeError("Could not determine disk identifier for SD card.")
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("diskutil info timed out")
+
+            result = subprocess.run(
+                ["diskutil", "eraseDisk", "FAT32", label, "MBRFormat", disk_id],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"diskutil eraseDisk failed: {result.stderr}")
+            new_path = Path("/Volumes") / label
+            # Give macOS a moment to mount the freshly formatted volume
+            for _ in range(10):
+                if new_path.is_dir():
+                    return new_path
+                time.sleep(0.5)
+            if new_path.is_dir():
+                return new_path
+            raise RuntimeError(
+                f"Formatted volume not found at {new_path} after diskutil eraseDisk."
+            )
+
+        if system == "Windows":
+            root = str(sd_root.resolve())
+            if len(root) < 2 or root[1] != ":":
+                raise RuntimeError(f"Cannot determine drive letter from {sd_root}")
+            drive = root[:2]
+
+            # Windows `format` refuses FAT32 on >32 GB volumes. Detect and skip.
+            try:
+                import ctypes
+                free = ctypes.c_ulonglong(0)
+                total = ctypes.c_ulonglong(0)
+                ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                    drive + "\\", None, ctypes.pointer(total), ctypes.pointer(free),
+                )
+                if total.value > 32 * 1024 * 1024 * 1024:
+                    print(
+                        f"SD card is larger than 32 GB ({total.value / (1024**3):.1f} GB). "
+                        "Windows cannot format >32 GB as FAT32. Skipping reformat."
+                    )
+                    return sd_root
+            except Exception:
+                pass
+
+            result = subprocess.run(
+                ["format", drive, "/FS:FAT32", "/Q", f"/V:{label}", "/Y"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"format command failed: {result.stderr}")
+            return sd_root
+
+        if system == "Linux":
+            # Resolve the block device from the mount path
+            try:
+                import re as _re
+                mounts = Path("/proc/mounts").read_text()
+                device = None
+                for line in mounts.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == str(sd_root):
+                        device = parts[0]
+                        break
+                if not device:
+                    raise RuntimeError(f"Could not find block device for {sd_root}")
+                subprocess.run(["umount", str(sd_root)], capture_output=True, timeout=10, check=True)
+                subprocess.run(
+                    ["mkfs.fat", "-F", "32", "-n", label, device],
+                    capture_output=True, text=True, timeout=120, check=True,
+                )
+                mount_point = sd_root
+                subprocess.run(["mount", device, str(mount_point)], capture_output=True, timeout=10, check=True)
+                return mount_point
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Linux format failed: {e.stderr}")
+
+        raise RuntimeError(f"Unsupported platform: {system}")
+
+    @staticmethod
+    def remove_hidden_junk_from_sd(sd_root: Path, *, dot_clean_merge: bool = False) -> int:
         """Delete macOS/Windows metadata files that confuse the DFPlayer (0x4E counts them).
 
         Removes:
+        - At the volume root only: ``.Spotlight-V100``, ``.fseventsd``, ``.Trashes``,
+          ``.TemporaryItems``, ``System Volume Information`` (macOS/Windows may
+          recreate these while the volume stays mounted; we remove them again at the
+          end of this pass and once more before eject in the GUI)
         - AppleDouble files ``._*`` (e.g. ``._001.mp3`` next to ``001.mp3``)
-        - ``.DS_Store``, ``.localized``
+        - ``.DS_Store``, ``.apdisk``, ``.localized``
         - ``Thumbs.db``, ``desktop.ini``
         - Entire ``__MACOSX`` directory trees (common after Finder/zip)
 
-        Returns the number of files deleted plus one count per ``__MACOSX`` tree removed.
+        Does not remove ``.sync_manifest.json`` (app sync fingerprint).
+
+        On macOS, creates an empty ``.metadata_never_index`` at the volume root if
+        missing (tells Spotlight to skip indexing on many external volumes).
+
+        *dot_clean_merge*: when True and on macOS, run ``dot_clean -m`` on the volume
+        first (merges AppleDouble on FAT/exFAT), matching the flow described at
+        https://www.javawa.nl/cleanejectreplacement.html . Prefer True only for
+        pre-eject cleanup; it can be slow on large cards.
+
+        Returns the number of files deleted plus one count per directory tree removed.
         """
         removed = 0
         try:
@@ -170,6 +333,19 @@ class SDManager:
             return 0
         if not root.is_dir():
             return 0
+
+        if dot_clean_merge and platform.system() == "Darwin":
+            try:
+                subprocess.run(
+                    ["dot_clean", "-m", str(root)],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+
+        removed += _remove_sd_root_service_dirs(root)
 
         macosx_dirs: List[Path] = []
         try:
@@ -186,7 +362,7 @@ class SDManager:
             except OSError:
                 pass
 
-        junk_exact = frozenset({".DS_Store", "Thumbs.db", "desktop.ini", ".localized"})
+        junk_exact = frozenset({".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini", ".localized"})
         part_suffix = SDManager._SD_PART_SUFFIX
         try:
             for dirpath, _dirnames, filenames in os.walk(root, topdown=False):
@@ -209,6 +385,16 @@ class SDManager:
                             pass
         except OSError:
             pass
+
+        # Spotlight/FSEvents often recreate root service folders during a long walk
+        # or right after many file writes; remove them again before returning.
+        removed += _remove_sd_root_service_dirs(root)
+
+        if platform.system() == "Darwin":
+            try:
+                (root / ".metadata_never_index").touch(exist_ok=True)
+            except OSError:
+                pass
 
         return removed
 
@@ -656,8 +842,10 @@ class SDManager:
 
         Each station maps to a DFPlayer folder (01-98). Tracks are duplicated
         across folders if they appear in multiple stations. Folder 99 is
-        reserved for the AM WAV overlay. No metadata file is written -- the
-        firmware discovers stations by querying the DFPlayer directly.
+        reserved for the AM WAV overlay. The DFPlayer firmware discovers layout
+        by querying the module directly; the app also writes a hidden
+        ``.sync_manifest.json`` at the SD root (for host-side mismatch checks),
+        which the DFPlayer ignores.
         """
         RESERVED_FOLDER = 99
         stations = self.db.list_basic_stations()
@@ -693,12 +881,23 @@ class SDManager:
         copied = 0
         skipped = 0
 
+        manifest_stations: Dict[str, dict] = {}
+        old_manifest = self._read_sync_manifest(sd_root) if not force_clean else None
+        old_manifest_stations = (old_manifest or {}).get("stations", {})
         used_folders: set = set()
         for folder_num, tracks in station_tracks:
             used_folders.add(folder_num)
-            folder_path = sd_root / f"{folder_num:02d}"
+            folder_key = f"{folder_num:02d}"
+            folder_path = sd_root / folder_key
             folder_path.mkdir(parents=True, exist_ok=True)
             valid_track_nums: set = set()
+            manifest_tracks: Dict[str, dict] = {}
+
+            station_name = ""
+            for st in stations:
+                if int(st["folder_number"]) == folder_num:
+                    station_name = (st["name"] or "").strip()
+                    break
 
             for track_order, song in enumerate(tracks, start=1):
                 valid_track_nums.add(track_order)
@@ -716,6 +915,11 @@ class SDManager:
                 target_path = folder_path / f"{track_order:03d}.mp3"
                 source_ext = file_path.suffix.lower()
 
+                manifest_tracks[f"{track_order:03d}"] = {
+                    "source_name": file_path.name,
+                    "source_size": file_path.stat().st_size,
+                }
+
                 if not force_clean and target_path.exists():
                     try:
                         target_size = target_path.stat().st_size
@@ -724,10 +928,25 @@ class SDManager:
                                 skipped += 1
                                 work_done += 1
                                 continue
-                        elif target_size > 1024:
-                            skipped += 1
-                            work_done += 1
-                            continue
+                        else:
+                            # Non-MP3: check old manifest first, then fall
+                            # back to source-mtime comparison.
+                            old_folder = old_manifest_stations.get(folder_key, {})
+                            old_entry = (old_folder.get("tracks") or {}).get(f"{track_order:03d}")
+                            if old_entry and target_size > 0:
+                                if (old_entry.get("source_name") == file_path.name
+                                        and old_entry.get("source_size") == file_path.stat().st_size):
+                                    skipped += 1
+                                    work_done += 1
+                                    continue
+                            elif target_size > 0:
+                                try:
+                                    if file_path.stat().st_mtime <= target_path.stat().st_mtime:
+                                        skipped += 1
+                                        work_done += 1
+                                        continue
+                                except OSError:
+                                    pass
                     except OSError:
                         pass
 
@@ -748,6 +967,11 @@ class SDManager:
                     print(f"Error syncing {file_path.name}: {e}")
                     skipped += 1
                 work_done += 1
+
+            manifest_stations[folder_key] = {
+                "name": station_name,
+                "tracks": manifest_tracks,
+            }
 
             # Remove stale tracks within this folder
             for item in folder_path.iterdir():
@@ -784,14 +1008,56 @@ class SDManager:
                 f"Basic SD sync: removed {n} hidden/junk item(s) "
                 "(macOS ._*, .DS_Store, __MACOSX, etc.)"
             )
+
+        self._write_sync_manifest(sd_root, manifest_stations)
+
         print(f"Basic SD sync complete: {copied} copied, {skipped} skipped across {len(stations)} stations")
         return copied, skipped
+
+    # -- Sync manifest helpers ------------------------------------------------
+
+    @staticmethod
+    def _write_sync_manifest(sd_root: Path, stations: Dict[str, dict]) -> None:
+        """Persist a lightweight manifest at the SD root after a basic-mode sync."""
+        import datetime
+        manifest = {
+            "version": 1,
+            "synced_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "stations": stations,
+        }
+        path = sd_root / _SYNC_MANIFEST_NAME
+        try:
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, separators=(",", ":"))
+        except OSError as e:
+            print(f"Warning: could not write sync manifest: {e}")
+
+    @staticmethod
+    def _read_sync_manifest(sd_root: Path) -> Optional[dict]:
+        """Read the manifest written by a previous sync, or *None* if absent/corrupt."""
+        path = sd_root / _SYNC_MANIFEST_NAME
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and data.get("version") == 1:
+                return data
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+        return None
 
     def validate_basic_sd(self, sd_root: Path) -> List[str]:
         """Compare basic-mode stations to DFPlayer folders on *sd_root*.
 
         Returns human-readable issue strings (empty if layout matches). Mirrors
         :meth:`sync_library_basic` naming: ``NN/001.mp3`` ...
+
+        If a ``.sync_manifest.json`` (written by :meth:`sync_library_basic`) is
+        present on the SD root, it is used as the primary mismatch check: the
+        manifest records the original filename and size of each track that was
+        synced, allowing reliable detection even when a completely different
+        library happens to share the same folder structure or file sizes.  When
+        the manifest is absent (old card, manually copied files), the method
+        falls back to the legacy size/duration heuristics.
         """
         msgs: List[str] = []
         if not sd_root.is_dir():
@@ -801,20 +1067,29 @@ class SDManager:
             stations = self.db.list_basic_stations()
         except Exception:
             return ["Could not read stations from the database."]
+
+        manifest = self._read_sync_manifest(sd_root)
+        manifest_stations = (manifest or {}).get("stations", {})
+
         for st in stations:
             fid = int(st["id"])
             fn = int(st["folder_number"])
             name = (st["name"] or "").strip() or f"Station {fn}"
             if fn == RESERVED_FOLDER:
                 continue
-            folder = sd_root / f"{fn:02d}"
+            folder_key = f"{fn:02d}"
+            folder = sd_root / folder_key
             tracks = self.db.list_basic_station_songs(fid)
             n = len(tracks)
             if n == 0:
                 continue
             if not folder.is_dir():
-                msgs.append(f'Missing folder {fn:02d} for station "{name}" ({n} tracks in the app).')
+                msgs.append(f'Missing folder {folder_key} for station "{name}" ({n} tracks in the app).')
                 continue
+
+            manifest_folder = manifest_stations.get(folder_key, {})
+            manifest_tracks = manifest_folder.get("tracks", {}) if manifest_folder else {}
+
             mp3_indices: List[int] = []
             try:
                 for p in folder.iterdir():
@@ -825,19 +1100,19 @@ class SDManager:
                     if p.stem.isdigit():
                         mp3_indices.append(int(p.stem))
             except OSError as e:
-                msgs.append(f'Station "{name}" (folder {fn:02d}): cannot read folder ({e}).')
+                msgs.append(f'Station "{name}" (folder {folder_key}): cannot read folder ({e}).')
                 continue
             mp3_set = set(mp3_indices)
             for order in range(1, n + 1):
                 if order not in mp3_set:
                     msgs.append(
-                        f'Station "{name}": missing {order:03d}.mp3 on SD (folder {fn:02d}).'
+                        f'Station "{name}": missing {order:03d}.mp3 on SD (folder {folder_key}).'
                     )
             for idx in sorted(mp3_set):
                 if idx > n:
                     msgs.append(
                         f'Station "{name}": extra file {idx:03d}.mp3 on SD '
-                        f"(app has only {n} tracks in folder {fn:02d})."
+                        f"(app has only {n} tracks in folder {folder_key})."
                     )
             for order, song in enumerate(tracks, start=1):
                 fp_raw = song["file_path"]
@@ -858,16 +1133,29 @@ class SDManager:
                 if not slot.is_file():
                     continue  # missing-slot issues already reported above
                 t = song["title"] or song["original_filename"] or f"track {order}"
+                track_key = f"{order:03d}"
+
                 try:
+                    # Primary check: manifest-based comparison (reliable across
+                    # different libraries that happen to share structure/sizes).
+                    m_entry = manifest_tracks.get(track_key)
+                    if m_entry:
+                        if (fp.name != m_entry.get("source_name")
+                                or fp.stat().st_size != m_entry.get("source_size")):
+                            msgs.append(
+                                f'Station "{name}": {track_key}.mp3 on SD was synced from a '
+                                f'different source than "{t}" (sync to SD to update).'
+                            )
+                        continue  # manifest is authoritative; skip heuristic
+
+                    # Fallback: legacy heuristic (no manifest on this card).
                     if fp.suffix.lower() == ".mp3":
-                        # Same rule as sync_library_basic skip: size mismatch => wrong/stale file in slot.
                         if fp.stat().st_size != slot.stat().st_size:
                             msgs.append(
-                                f'Station "{name}": {order:03d}.mp3 on SD does not match '
+                                f'Station "{name}": {track_key}.mp3 on SD does not match '
                                 f'"{t}" in this position (track order or file changed — sync to SD).'
                             )
                     else:
-                        # Non-MP3 sources are converted on sync; compare duration to detect wrong slot content.
                         lib_dur = song["duration"]
                         if lib_dur is not None:
                             try:
@@ -886,7 +1174,7 @@ class SDManager:
                                         tol = max(3.0, 0.05 * lib_sec)
                                         if abs(sd_sec - lib_sec) > tol:
                                             msgs.append(
-                                                f'Station "{name}": {order:03d}.mp3 on SD '
+                                                f'Station "{name}": {track_key}.mp3 on SD '
                                                 f'looks out of sync with "{t}" (duration differs — '
                                                 f"track order may have changed — sync to SD)."
                                             )
@@ -1784,11 +2072,10 @@ class SDManager:
                             dest_file = dest_dir / f"{stem}_{counter}{suffix}"
                             counter += 1
                     try:
-                        shutil.copy2(sd_file, dest_file)
+                        _copy2_with_fallback(sd_file, dest_file)
                         file_path = str(dest_file)
                     except OSError as e:
                         print(f"Failed to copy {sd_file.name} to {dest_dir}: {e}")
-                        # Fall back to using SD path if copy fails
                         file_path = str(sd_file)
                 else:
                     # No destination directory - use SD path (legacy behavior)
@@ -2026,11 +2313,11 @@ class SDManager:
                     print(f"AM WAV converted and copied to: {target}")
                 except Exception as e:
                     print(f"Conversion failed: {e}, copying original file")
-                    shutil.copy2(source, target)
+                    _copy2_with_fallback(source, target)
                     print(f"AM WAV copied to: {target} (original format)")
             else:
                 # Copy as-is (format is already compatible or conversion not available)
-                shutil.copy2(source, target)
+                _copy2_with_fallback(source, target)
                 if not needs_conversion:
                     print(f"AM WAV copied to: {target} (format already compatible)")
                 else:
@@ -2041,7 +2328,7 @@ class SDManager:
             print(f"Unexpected error processing AM WAV: {e}")
             # Fallback: try to copy as-is
             try:
-                shutil.copy2(source, target)
+                _copy2_with_fallback(source, target)
                 print(f"AM WAV copied to: {target} (fallback)")
             except Exception as e2:
                 print(f"Failed to copy AM WAV: {e2}")

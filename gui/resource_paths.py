@@ -49,10 +49,17 @@ def app_data_dir() -> Path:
         lib_src = root / "libraries"
         root_has_libraries = lib_src.exists() and lib_src.is_dir() and any(lib_src.iterdir())
         data_lib = data_dir / "libraries"
+        data_has_library_json = (data_lib / "libraries.json").exists()
         data_has_library_dbs = data_lib.exists() and any(data_lib.glob("*.db"))
+        # The default library still uses data/radio_manager.db, so data/libraries/
+        # may contain only libraries.json (no *.db) until a second library is
+        # opened. Treat an existing registry as "already seeded" so we never
+        # copy project_root/libraries/* on top of it (that overwrote libraries.json
+        # and effectively wiped the default library when creating a new library).
+        data_libraries_seeded = data_has_library_json or data_has_library_dbs
         data_needs_migration = (
-            (not (data_lib / "libraries.json").exists() and not (data_dir / "radio_manager.db").exists())
-            or (root_has_libraries and not data_has_library_dbs)
+            (not data_has_library_json and not (data_dir / "radio_manager.db").exists())
+            or (root_has_libraries and not data_libraries_seeded)
         )
         if data_needs_migration and (root_has_db or root_has_libraries):
             data_dir.mkdir(parents=True, exist_ok=True)

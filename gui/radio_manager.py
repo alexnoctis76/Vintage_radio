@@ -2492,13 +2492,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not _qt_widget_alive(warn):
             return
         warn.setVisible(False)
+        details_btn = getattr(self, "_basic_sd_sync_details_btn", None)
+        if _qt_widget_alive(details_btn):
+            details_btn.setVisible(False)
         if self.devices_view_mode != "basic":
             return
         self._try_rebind_basic_sd_mount()
-        # Compare as soon as sd_root is a readable directory — do not require
-        # is_sync_target_sd_present(). Removable-volume detection can miss valid mounts
-        # (e.g. some macOS cases), which hid the warning entirely. Unplugged cards
-        # typically make sd_root non-existent, which clears the warning below.
         if not self.sd_root:
             return
         try:
@@ -2507,17 +2506,59 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         except OSError:
             return
+
+        trusted = (self.db.get_setting("basic_trusted_sd_volume") or "").strip()
+        is_different_card = trusted and self._basic_should_warn_different_card(self.sd_root)
+
+        if is_different_card:
+            warn.setText("Selected volume does not match your previously synced SD card.")
+            warn.setVisible(True)
+            return
+
         msgs = self.sd_manager.validate_basic_sd(root)
         if not msgs:
             return
-        cap = 12
-        lines = [f"  - {m}" for m in msgs[:cap]]
-        if len(msgs) > cap:
-            lines.append(f"  ... and {len(msgs) - cap} more issue(s).")
-        warn.setText(
-            "Warning: stations and SD card may be out of sync:\n" + "\n".join(lines)
-        )
+
+        self._basic_sd_sync_issues = msgs
+        n = len(msgs)
+        if n > 30:
+            warn.setText(
+                f"SD card may be out of sync: over 30 differences found. A full sync is recommended."
+            )
+        else:
+            warn.setText(f"SD card may be out of sync ({n} issue{'s' if n != 1 else ''} found).")
         warn.setVisible(True)
+        if _qt_widget_alive(details_btn):
+            details_btn.setVisible(True)
+
+    def _show_basic_sd_sync_details(self) -> None:
+        """Open a scrollable dialog listing SD sync mismatch details."""
+        msgs = getattr(self, "_basic_sd_sync_issues", [])
+        if not msgs:
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("SD Card Sync Details")
+        dlg.resize(560, 380)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        text = QtWidgets.QTextEdit()
+        text.setReadOnly(True)
+        if len(msgs) > 30:
+            text.setPlainText(
+                "Over 30 differences found between your library and this SD card.\n"
+                "A full sync is recommended.\n\n"
+                + "\n".join(f"  - {m}" for m in msgs[:30])
+                + f"\n  ... and {len(msgs) - 30} more."
+            )
+        else:
+            text.setPlainText("\n".join(f"  - {m}" for m in msgs))
+        layout.addWidget(text)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec()
 
     def _on_setup_basic_device_clicked(self) -> None:
         """Qt slot: log first (durable) then run setup — isolates signal vs handler crashes."""
@@ -2683,11 +2724,20 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
+        warn_row = QtWidgets.QHBoxLayout()
         self._basic_sd_sync_warning = QtWidgets.QLabel()
         self._basic_sd_sync_warning.setWordWrap(True)
         self._basic_sd_sync_warning.setStyleSheet("color: #c00; font-weight: bold;")
         self._basic_sd_sync_warning.setVisible(False)
-        layout.addWidget(self._basic_sd_sync_warning)
+        warn_row.addWidget(self._basic_sd_sync_warning, 1)
+        self._basic_sd_sync_details_btn = QtWidgets.QPushButton("Details...")
+        self._basic_sd_sync_details_btn.setVisible(False)
+        self._basic_sd_sync_details_btn.setFixedWidth(80)
+        self._basic_sd_sync_details_btn.clicked.connect(self._show_basic_sd_sync_details)
+        warn_row.addWidget(self._basic_sd_sync_details_btn)
+        layout.addLayout(warn_row)
+
+        self._basic_sd_sync_issues: List[str] = []
 
         # ── Storage selector row ──
         storage_group = QtWidgets.QGroupBox("Storage")
@@ -2885,12 +2935,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Basic-mode station list management ──
 
-    def _refresh_basic_station_list(self) -> None:
-        """Reload station list from DB into the QListWidget, preserving the current selection."""
+    def _refresh_basic_station_list(self, *, preserve_selection: bool = True) -> None:
+        """Reload station list from DB into the QListWidget.
+
+        When *preserve_selection* is True, re-select the same station *id* if it
+        still exists (same library). After a library switch, pass False so we clear
+        the row — numeric ids are not stable across databases.
+
+        Always syncs the tracks table to the current row; Qt sometimes skips
+        ``currentItemChanged`` after ``clear()`` + repopulate, which left a
+        highlighted row with an empty track list.
+        """
         if not hasattr(self, "_basic_station_list"):
             return
-        prev_item = self._basic_station_list.currentItem()
-        prev_station_id = prev_item.data(QtCore.Qt.ItemDataRole.UserRole) if prev_item else None
+        prev_station_id = None
+        if preserve_selection:
+            prev_item = self._basic_station_list.currentItem()
+            if prev_item is not None:
+                prev_station_id = prev_item.data(QtCore.Qt.ItemDataRole.UserRole)
         self._basic_station_list.blockSignals(True)
         self._basic_station_list.clear()
         stations = self.db.list_basic_stations()
@@ -2902,11 +2964,21 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             item.setData(QtCore.Qt.ItemDataRole.UserRole, station["id"])
             self._basic_station_list.addItem(item)
-            if station["id"] == prev_station_id:
+            if preserve_selection and prev_station_id is not None and station["id"] == prev_station_id:
                 restore_row = idx
         self._basic_station_list.blockSignals(False)
-        if restore_row >= 0:
+        if preserve_selection and restore_row >= 0:
             self._basic_station_list.setCurrentRow(restore_row)
+        else:
+            self._basic_station_list.setCurrentRow(-1)
+        self._sync_basic_station_tracks_from_selection()
+
+    def _sync_basic_station_tracks_from_selection(self) -> None:
+        """Apply the station list's current row to the detail label and tracks table."""
+        if not hasattr(self, "_basic_station_list"):
+            return
+        cur = self._basic_station_list.currentItem()
+        self._on_basic_station_selected(cur, None)
 
     def _on_basic_station_selected(self, current, _previous) -> None:
         if current is None:
@@ -2914,8 +2986,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._basic_station_tracks_table.setRowCount(0)
             return
         station_id = current.data(QtCore.Qt.ItemDataRole.UserRole)
+        if station_id is None:
+            self._basic_station_detail.setText("Select a station to view tracks.")
+            self._basic_station_tracks_table.setRowCount(0)
+            return
         station = self.db.get_basic_station(station_id)
         if station is None:
+            self._basic_station_detail.setText("Select a station to view tracks.")
+            self._basic_station_tracks_table.setRowCount(0)
             return
         track_count = len(self.db.list_basic_station_tracks(station_id))
         self._basic_station_detail.setText(
@@ -3217,19 +3295,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self._persist_basic_station_end_mode_from_combo()
 
         force_clean = False
-        reply = QtWidgets.QMessageBox.question(
-            self, "Sync Stations to SD",
-            "Sync all stations to SD card?\n\n"
-            "Each station will be written to its own DFPlayer folder.\n\n"
-            "'Yes' = normal sync (skip existing files)\n"
-            "'No' = clean install (re-write all files)",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Yes,
+        sync_choice = QtWidgets.QMessageBox(self)
+        sync_choice.setWindowTitle("Sync Stations to SD")
+        sync_choice.setText("How do you want to sync stations to the SD card?")
+        sync_choice.setInformativeText(
+            "Each station is written to its own DFPlayer folder (01, 02, …).\n\n"
+            "Normal sync — copies only new or changed files.\n\n"
+            "Clean install — reformats the card when your computer allows it, then writes every track again."
         )
-        if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
+        sync_choice.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        btn_normal = sync_choice.addButton(
+            "Normal sync",
+            QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+        )
+        btn_clean = sync_choice.addButton(
+            "Clean install",
+            QtWidgets.QMessageBox.ButtonRole.ActionRole,
+        )
+        sync_choice.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        sync_choice.setDefaultButton(btn_normal)
+        sync_choice.exec()
+        clicked = sync_choice.clickedButton()
+        if clicked is None:
             return
-        if reply == QtWidgets.QMessageBox.StandardButton.No:
+        if clicked == sync_choice.button(QtWidgets.QMessageBox.StandardButton.Cancel):
+            return
+        if clicked == btn_clean:
             force_clean = True
+
+        if force_clean:
+            try:
+                new_root = self.sd_manager._format_sd_card(sd_root)
+                if new_root != sd_root:
+                    sd_root = new_root
+                    self.sd_root = str(sd_root)
+                    self.db.set_setting("sd_root", self.sd_root)
+                    self._update_sd_root_label()
+            except RuntimeError as e:
+                print(f"SD card reformat skipped or failed: {e}")
 
         dlg = TaskProgressDialog(
             parent=self,
@@ -3254,15 +3357,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
                         self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                        # macOS diskutil rename changes the mount path
+                        if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
+                            new_path = Path("/Volumes") / SYNC_TARGET_VOLUME_LABEL
+                            if new_path.is_dir():
+                                self.sd_root = str(new_path)
+                                self.db.set_setting("sd_root", self.sd_root)
                     tag = self._basic_sd_path_volume_tag(self.sd_root)
                     if tag:
                         self.db.set_setting("basic_trusted_sd_volume", tag)
                 except Exception:
                     pass
+            self._update_sd_root_label()
             self._refresh_basic_sd_capacity()
             self._check_basic_sd_sync()
             if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
-                QtCore.QTimer.singleShot(300, lambda: self.safely_remove_sd(auto=True, attempt=1))
+                QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
 
         def on_error(msg):
             QtWidgets.QMessageBox.critical(self, "Sync Error", f"Error during basic sync:\n\n{msg}")
@@ -4016,13 +4126,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not _qt_widget_alive(self._basic_station_list):
             return
-        self._basic_station_list.clearSelection()
-        self._refresh_basic_station_list()
+        self._refresh_basic_station_list(preserve_selection=False)
         self._update_basic_stations_size()
-        if _qt_widget_alive(self._basic_station_tracks_table):
-            self._basic_station_tracks_table.setRowCount(0)
-        if _qt_widget_alive(getattr(self, "_basic_station_detail", None)):
-            self._basic_station_detail.setText("Select a station to view tracks.")
 
     def refresh_library(self) -> None:
         rows = self.db.list_songs()
@@ -4963,11 +5068,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     try:
                         if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
                             self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                            if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
+                                new_path = Path("/Volumes") / SYNC_TARGET_VOLUME_LABEL
+                                if new_path.is_dir():
+                                    self.sd_root = str(new_path)
+                                    self.db.set_setting("sd_root", self.sd_root)
                     except Exception:
                         pass
+                    self._update_sd_root_label()
             # Auto-eject when option is on (for both "files copied" and "nothing copied" outcomes)
             if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
-                QtCore.QTimer.singleShot(300, lambda: self.safely_remove_sd(auto=True, attempt=1))
+                QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
             if hasattr(self, 'test_mode_widget') and self.test_mode_widget:
                 self.test_mode_widget.refresh_from_db()
 
@@ -5017,6 +5128,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(f"Auto-eject failed: {msg}", 8000)
             else:
                 QtWidgets.QMessageBox.warning(self, title, msg)
+
+        # Last pass: OSes recreate .Spotlight-V100 / .fseventsd while the volume
+        # stays mounted; strip them again right before flush + eject. On macOS,
+        # dot_clean -m first matches JaVaWa-style cleanup (AppleDouble on FAT).
+        try:
+            self.sd_manager.remove_hidden_junk_from_sd(
+                sd_root, dot_clean_merge=(sys.platform == "darwin")
+            )
+        except Exception:
+            pass
+        if sys.platform == "darwin":
+            try:
+                subprocess.run(
+                    ["mdutil", "-i", "off", str(sd_root)],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+            except Exception:
+                pass
+            try:
+                self.sd_manager.remove_hidden_junk_from_sd(sd_root)
+            except Exception:
+                pass
+
+        # Flush filesystem buffers before attempting eject (macOS/Linux)
+        if sys.platform != "win32":
+            try:
+                os.sync()
+            except (AttributeError, OSError):
+                pass
 
         try:
             import platform
@@ -5116,6 +5258,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     last_err = ""
                     ok = False
                     for cmd in (
+                        ["hdiutil", "unmount", mount],
                         ["diskutil", "eject", mount],
                         ["diskutil", "unmount", "force", mount],
                     ):

@@ -52,6 +52,10 @@ class DatabaseManager:
         self._apply_migrations()
 
     def close(self) -> None:
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except sqlite3.Error:
+            pass
         self.conn.close()
 
     def _apply_pragmas(self) -> None:

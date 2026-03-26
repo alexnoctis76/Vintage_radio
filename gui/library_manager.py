@@ -59,8 +59,10 @@ class LibraryRegistry:
         if data is None:
             data = self._data
         self._lib_dir.mkdir(parents=True, exist_ok=True)
-        with self._registry_path.open("w", encoding="utf-8") as f:
+        tmp = self._registry_path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        tmp.replace(self._registry_path)
 
     def list_libraries(self) -> List[Dict]:
         """Return a list of ``{"slug", "name", "filename", "is_active"}`` dicts."""

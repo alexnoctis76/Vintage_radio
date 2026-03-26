@@ -75,6 +75,21 @@ class TestRemoveHiddenJunk:
         assert not (sd / "01" / ".DS_Store").exists()
         assert not (sd / "__MACOSX").exists()
 
+    def test_removes_spotlight_and_fseventsd_at_sd_root(self, tmp_path):
+        sd = tmp_path / "sd"
+        sd.mkdir()
+        (sd / ".Spotlight-V100" / "sub").mkdir(parents=True)
+        (sd / ".Spotlight-V100" / "sub" / "x").write_text("a")
+        (sd / ".fseventsd" / "uuid").write_text("b")
+        (sd / "01").mkdir()
+        (sd / "01" / "001.mp3").write_bytes(b"x")
+
+        n = SDManager.remove_hidden_junk_from_sd(sd)
+        assert n >= 2
+        assert not (sd / ".Spotlight-V100").exists()
+        assert not (sd / ".fseventsd").exists()
+        assert (sd / "01" / "001.mp3").exists()
+
     def test_sync_strips_junk_after_copy(self, populated_sd, tmp_path):
         mgr, db, songs, aid, pid = populated_sd
         sd_root = tmp_path / "sd_junk"
