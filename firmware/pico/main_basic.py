@@ -235,19 +235,9 @@ class VintageRadioFirmware:
                 )
                 return
 
-            # Past startup guard: if BUSY is still LOW, 0x3D is often stale (buffered at
-            # overlay/volume boundaries). Consume without advancing; real end uses BUSY HIGH.
-            pin_busy_uart = getattr(self.hw, "pin_busy", None)
-            if (
-                armed
-                and start_tick
-                and ticks_diff(now, start_tick) >= DF_UART_END_GUARD_MS
-                and pin_busy_uart is not None
-                and pin_busy_uart.value() == 0
-            ):
-                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-                print("DF: UART track-finished ignored (BUSY LOW, still playing)")
-                return
+            # Do not require BUSY HIGH before accepting 0x3D: during normal playback BUSY is
+            # LOW the whole time; the module often sends 0x3D before BUSY rises. Ignoring UART
+            # whenever BUSY was LOW made every real track end a no-op on PWM overlay / many boards.
 
             getattr(self.hw, "consume_track_finished_uart", lambda: None)()
             if armed:
