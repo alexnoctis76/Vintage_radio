@@ -47,6 +47,14 @@ goto parse_args
 
 :done_parsing
 
+REM Force-stop Vintage Radio (process tree + retries) so dist\Vintage Radio can be deleted
+echo Force-stopping Vintage Radio (unlocks dist folder^)...
+python "%SCRIPT_DIR%kill_vintage_radio_build_locks.py"
+if errorlevel 1 (
+    echo Warning: kill helper failed; trying taskkill /T anyway...
+    taskkill /IM "Vintage Radio.exe" /F /T >nul 2>&1
+)
+
 REM Clean previous build
 if "%CLEAN%"=="true" (
     echo Cleaning previous build...

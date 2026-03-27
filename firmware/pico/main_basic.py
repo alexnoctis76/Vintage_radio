@@ -282,9 +282,12 @@ class VintageRadioFirmware:
         ignore_until = getattr(self.hw, "ignore_busy_until", 0)
         start_tick = getattr(self.hw, "_playback_start_tick", 0)
 
-        # BUSY stuck LOW but module reports stopped (some bad MP3s / clones)
+        # BUSY stuck LOW but module reports stopped (some bad MP3s / clones).
+        # Guard: skip when UART track-end detection is armed — 0x3D will handle end-of-track
+        # cleanly. Sending 0x42 mid-track causes audible pulsing on many DFPlayer clones.
         if (
             b == 0
+            and not getattr(self.hw, "_uart_track_end_armed", False)
             and getattr(self.hw, "query_status", None)
             and ticks_diff(now, ignore_until) >= 0
             and start_tick

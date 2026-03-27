@@ -6,12 +6,15 @@
 #   macOS:   dist/Vintage Radio.app                (.app bundle)
 #   Linux:   dist/Vintage Radio/Vintage Radio      (one-folder)
 #
-# Note: Close any running Vintage Radio app before rebuilding, or you may get "Access is denied" when PyInstaller cleans the output dir.
+# Windows: COLLECT writes to dist/_pyi_staging first, then promote to dist/Vintage Radio (avoids cleaning a locked folder).
+# macOS/Linux: unchanged. You can still close the running app if promotion (copy) hits locks.
 # The SyntaxWarnings during build come from the pydub dependency; they are harmless and the build still succeeds.
 # If the exe icon looks wrong in Explorer (e.g. small icons), try renaming the exe so Windows refreshes its icon cache.
 
 import sys
 import platform
+import subprocess
+import time
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules, collect_all
@@ -20,6 +23,37 @@ block_cipher = None
 
 # Project root (parent of build/ which contains this spec)
 project_dir = Path(SPECPATH).parent
+
+# Windows: try to stop running instances; COLLECT uses staging (see CONF['distpath'] below).
+if platform.system() == "Windows":
+    _kill_helper = project_dir / "build" / "kill_vintage_radio_build_locks.py"
+    if _kill_helper.is_file():
+        try:
+            subprocess.run(
+                [sys.executable, str(_kill_helper)],
+                cwd=str(project_dir),
+                timeout=120,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+    else:
+        for _ in range(5):
+            try:
+                subprocess.run(
+                    ["taskkill", "/IM", "Vintage Radio.exe", "/F", "/T"],
+                    capture_output=True,
+                    timeout=45,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+            time.sleep(0.6)
+
+    # COLLECT reads PyInstaller CONF['distpath'], not the spec DISTPATH variable.
+    from PyInstaller.config import CONF
+
+    _win_staging = (project_dir / "dist" / "_pyi_staging").resolve()
+    _win_staging.mkdir(parents=True, exist_ok=True)
+    CONF["distpath"] = str(_win_staging)
 
 # Data files: gui/resources, firmware files, and mpremote (for bundled Pico flashing)
 gui_resources = project_dir / 'gui' / 'resources'
@@ -163,6 +197,15 @@ coll = COLLECT(
     upx_exclude=[],
     name='Vintage Radio',
 )
+
+if platform.system() == "Windows":
+    _promote = project_dir / "build" / "pyi_windows_promote_dist.py"
+    if _promote.is_file():
+        subprocess.run(
+            [sys.executable, str(_promote), str(project_dir)],
+            cwd=str(project_dir),
+            timeout=900,
+        )
 
 # macOS: wrap the COLLECT folder into a proper .app bundle
 if platform.system() == "Darwin":

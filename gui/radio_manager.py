@@ -3331,7 +3331,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.sd_root = str(sd_root)
                     self.db.set_setting("sd_root", self.sd_root)
                     self._update_sd_root_label()
-            except RuntimeError as e:
+            except (RuntimeError, OSError) as e:
+                # OSError covers FileNotFoundError (e.g. missing format helper); avoid crashing sync
                 print(f"SD card reformat skipped or failed: {e}")
 
         dlg = TaskProgressDialog(
@@ -6176,14 +6177,20 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if self.sd_root:
             path = Path(self.sd_root)
-            if path.exists():
-                return path
+            try:
+                if path.exists():
+                    return path
+            except OSError:
+                pass  # volume temporarily unrecognized (e.g. WinError 1005 post-format)
             if self.devices_view_mode == "basic":
                 self._try_rebind_basic_sd_mount()
                 if self.sd_root:
                     path2 = Path(self.sd_root)
-                    if path2.exists():
-                        return path2
+                    try:
+                        if path2.exists():
+                            return path2
+                    except OSError:
+                        pass
         if self.sd_auto_detect:
             candidates = self.sd_manager.detect_sd_roots()
             label_matches: set = set()

@@ -266,13 +266,40 @@ class SDManager:
             except Exception:
                 pass
 
+            # `format` is a cmd.exe built-in, not on PATH as an executable — use format.com
+            # so subprocess can spawn it (avoids FileNotFoundError on Windows).
+            system_root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+            format_com = Path(system_root) / "System32" / "format.com"
+            if not format_com.is_file():
+                raise RuntimeError(
+                    f"Windows format utility not found at {format_com}. Cannot reformat the SD card."
+                )
             result = subprocess.run(
-                ["format", drive, "/FS:FAT32", "/Q", f"/V:{label}", "/Y"],
+                [str(format_com), drive, "/FS:FAT32", "/Q", f"/V:{label}", "/Y"],
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"format command failed: {result.stderr}")
-            return sd_root
+                err = (result.stderr or "") + (result.stdout or "")
+                raise RuntimeError(f"format command failed: {err.strip() or result.returncode}")
+
+            # Windows remounts the freshly formatted volume asynchronously.
+            # Poll until the path is accessible (mirrors macOS diskutil wait loop).
+            for _ in range(16):
+                try:
+                    if sd_root.is_dir():
+                        return sd_root
+                except OSError:
+                    pass
+                time.sleep(0.5)
+            try:
+                if sd_root.is_dir():
+                    return sd_root
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"Formatted volume at {sd_root} is not accessible after format. "
+                "Try ejecting and reinserting the SD card."
+            )
 
         if system == "Linux":
             # Resolve the block device from the mount path
@@ -923,23 +950,33 @@ class SDManager:
                 if not force_clean and target_path.exists():
                     try:
                         target_size = target_path.stat().st_size
-                        if source_ext == ".mp3":
-                            if target_size == file_path.stat().st_size:
+                        src_sz = file_path.stat().st_size
+                        old_folder = old_manifest_stations.get(folder_key, {})
+                        old_entry = (old_folder.get("tracks") or {}).get(
+                            f"{track_order:03d}"
+                        )
+                        # Same manifest slot as last successful sync → skip (all formats).
+                        if old_entry and target_size > 0:
+                            if (
+                                old_entry.get("source_name") == file_path.name
+                                and old_entry.get("source_size") == src_sz
+                            ):
                                 skipped += 1
                                 work_done += 1
                                 continue
-                        else:
-                            # Non-MP3: check old manifest first, then fall
-                            # back to source-mtime comparison.
-                            old_folder = old_manifest_stations.get(folder_key, {})
-                            old_entry = (old_folder.get("tracks") or {}).get(f"{track_order:03d}")
-                            if old_entry and target_size > 0:
-                                if (old_entry.get("source_name") == file_path.name
-                                        and old_entry.get("source_size") == file_path.stat().st_size):
+                        if source_ext == ".mp3":
+                            # Never trust size alone — different MP3s often match byte size.
+                            if target_size == src_sz and src_sz > 0:
+                                if compute_file_hash(file_path) == compute_file_hash(
+                                    target_path
+                                ):
                                     skipped += 1
                                     work_done += 1
                                     continue
-                            elif target_size > 0:
+                        else:
+                            # Non-MP3: no manifest match — only mtime heuristic when we
+                            # have no prior manifest entry (avoids skipping after source change).
+                            if target_size > 0 and not old_entry:
                                 try:
                                     if file_path.stat().st_mtime <= target_path.stat().st_mtime:
                                         skipped += 1
@@ -973,12 +1010,18 @@ class SDManager:
                 "tracks": manifest_tracks,
             }
 
-            # Remove stale tracks within this folder
-            for item in folder_path.iterdir():
-                if item.suffix.lower() == ".mp3" and item.stem.isdigit():
-                    if int(item.stem) not in valid_track_nums:
-                        print(f"Removing stale track: {item}")
-                        item.unlink(missing_ok=True)
+            # Remove stale tracks within this folder (always, even when tracks were skipped).
+            try:
+                for item in folder_path.iterdir():
+                    if item.suffix.lower() == ".mp3" and item.stem.isdigit():
+                        if int(item.stem) not in valid_track_nums:
+                            print(f"Removing stale track: {item}")
+                            try:
+                                item.unlink(missing_ok=True)
+                            except OSError as e:
+                                print(f"Warning: could not remove stale track {item}: {e}")
+            except OSError as e:
+                print(f"Warning: could not scan folder for stale tracks {folder_path}: {e}")
 
         # Clean up folders not assigned to any station
         work_done += 1
@@ -1017,32 +1060,67 @@ class SDManager:
     # -- Sync manifest helpers ------------------------------------------------
 
     @staticmethod
+    def _local_manifest_path(sd_root: Path) -> Optional[Path]:
+        """Return a machine-local cache path for the manifest keyed to *sd_root*.
+
+        Used as a fallback when the SD card root is not writable (e.g. Windows
+        permission restrictions immediately after a format).  Returns *None* on
+        any error so callers can skip it gracefully.
+        """
+        try:
+            import re
+            import platformdirs
+            cache_dir = Path(platformdirs.user_cache_dir("Vintage Radio"))
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            key = re.sub(r"[^A-Za-z0-9_-]", "_", str(sd_root.resolve()))[:80]
+            return cache_dir / f"sd_manifest_{key}.json"
+        except Exception:
+            return None
+
+    @staticmethod
     def _write_sync_manifest(sd_root: Path, stations: Dict[str, dict]) -> None:
-        """Persist a lightweight manifest at the SD root after a basic-mode sync."""
+        """Persist a lightweight manifest after a basic-mode sync.
+
+        Tries the SD card root first (works on macOS/Linux and most Windows
+        configs). Falls back to a machine-local app cache so Windows permission
+        restrictions on the drive root do not silently discard the manifest.
+        """
         import datetime
         manifest = {
             "version": 1,
             "synced_at": datetime.datetime.now().isoformat(timespec="seconds"),
             "stations": stations,
         }
-        path = sd_root / _SYNC_MANIFEST_NAME
-        try:
-            with path.open("w", encoding="utf-8") as fh:
-                json.dump(manifest, fh, separators=(",", ":"))
-        except OSError as e:
-            print(f"Warning: could not write sync manifest: {e}")
+        sd_path = sd_root / _SYNC_MANIFEST_NAME
+        local_path = SDManager._local_manifest_path(sd_root)
+        wrote_any = False
+        for path in filter(None, [sd_path, local_path]):
+            try:
+                with path.open("w", encoding="utf-8") as fh:
+                    json.dump(manifest, fh, separators=(",", ":"))
+                wrote_any = True
+            except OSError:
+                pass
+        if not wrote_any:
+            print("Warning: could not write sync manifest to any location")
 
     @staticmethod
     def _read_sync_manifest(sd_root: Path) -> Optional[dict]:
-        """Read the manifest written by a previous sync, or *None* if absent/corrupt."""
-        path = sd_root / _SYNC_MANIFEST_NAME
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, dict) and data.get("version") == 1:
-                return data
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
+        """Read the manifest written by a previous sync, or *None* if absent/corrupt.
+
+        Checks the SD card root first (backward-compatible with cards synced
+        on macOS), then falls back to the machine-local app cache.
+        """
+        sd_path = sd_root / _SYNC_MANIFEST_NAME
+        local_path = SDManager._local_manifest_path(sd_root)
+        for path in filter(None, [sd_path, local_path]):
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict) and data.get("version") == 1:
+                    return data
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
         return None
 
     def validate_basic_sd(self, sd_root: Path) -> List[str]:
