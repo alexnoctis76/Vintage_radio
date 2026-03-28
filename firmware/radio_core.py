@@ -13,13 +13,15 @@ Compatible with both MicroPython and CPython.
 
 # Try MicroPython time, fall back to CPython
 try:
-    from time import ticks_ms, ticks_diff
+    from time import ticks_ms, ticks_diff, sleep_ms as _sleep_ms
 except ImportError:
     import time as _time
     def ticks_ms():
         return int(_time.monotonic() * 1000)
     def ticks_diff(a, b):
         return a - b
+    def _sleep_ms(ms):
+        _time.sleep(ms / 1000.0)
 
 # Try MicroPython random
 try:
@@ -37,12 +39,39 @@ LONG_PRESS_MS = 500   # Hold >= 500ms = long press
 TAP_WINDOW_MS = 350   # ms after last release to resolve taps (single-tap next/prev feels snappier; double-tap still detectable)
 BUSY_CONFIRM_MS = 2200
 POST_CMD_GUARD_MS = 120
-# After play is confirmed, ignore UART 0x3D "track finished" for this long. DFPlayer often
-# sends two spurious 0x3D pulses within ~200-350 ms; 150 ms let the second pulse advance
-# an extra track. Some tracks only saw both pulses inside 150 ms, so UART end was lost
-# until BUSY fallback (looked like "track 3 errors").
-DF_UART_END_GUARD_MS = 450
+# After 0x3D, poll this long for BUSY idle (HIGH) or query_status stopped (0) before
+# advancing.  Startup noise often sends 0x3D while the module is still playing; waiting
+# for hardware to agree avoids skipping ahead without discarding real ends (0x3D usually
+# arrives slightly before BUSY rises).
+DF_UART_STOP_CONFIRM_MS = 320
 MAX_ALBUM_NUM = 99
+
+
+def dfplayer_confirms_playback_stopped(hw, timeout_ms=None):
+    """True if DFPlayer looks idle: BUSY HIGH and/or query_status == 0.
+
+    Drains UART while polling so late 0x40/0x3D bytes do not confuse the next command.
+    If neither BUSY nor query_status exists, returns True (nothing to verify).
+    """
+    if timeout_ms is None:
+        timeout_ms = DF_UART_STOP_CONFIRM_MS
+    poll = getattr(hw, "_df_read_pending", None)
+    pin_busy = getattr(hw, "pin_busy", None)
+    qstatus = getattr(hw, "query_status", None)
+    if pin_busy is None and qstatus is None:
+        return True
+    t0 = ticks_ms()
+    while ticks_diff(ticks_ms(), t0) <= timeout_ms:
+        if poll:
+            poll()
+        if pin_busy is not None and pin_busy.value() == 1:
+            return True
+        if qstatus is not None:
+            st = qstatus()
+            if st == 0:
+                return True
+        _sleep_ms(12)
+    return False
 
 # ===========================
 #      MODE ENUM

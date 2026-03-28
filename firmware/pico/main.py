@@ -13,7 +13,7 @@ from radio_core import (
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
     FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
-    DF_UART_END_GUARD_MS,
+    dfplayer_confirms_playback_stopped,
     ticks_ms, ticks_diff,
 )
 
@@ -291,20 +291,10 @@ class VintageRadioFirmware:
 
         if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
             armed = getattr(self.hw, "_uart_track_end_armed", False)
-            start_tick = getattr(self.hw, "_playback_start_tick", 0)
-            now = ticks_ms()
-            if armed and start_tick and ticks_diff(now, start_tick) < DF_UART_END_GUARD_MS:
+            if armed and not dfplayer_confirms_playback_stopped(self.hw):
                 getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-                print(
-                    "DF: UART track-finished ignored (<{}ms after play start)".format(
-                        DF_UART_END_GUARD_MS
-                    )
-                )
+                print("DF: UART track-finished discarded (module still playing)")
                 return
-
-            # Do not require BUSY HIGH before accepting 0x3D: during normal playback BUSY is
-            # LOW the whole time; 0x3D often arrives before BUSY rises. Ignoring UART whenever
-            # BUSY was LOW broke auto-advance on PWM overlay and many DFPlayer setups.
 
             getattr(self.hw, "consume_track_finished_uart", lambda: None)()
             if armed:
