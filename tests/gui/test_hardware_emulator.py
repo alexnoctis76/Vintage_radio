@@ -3,7 +3,6 @@
 from pathlib import Path
 from unittest import mock
 import json
-
 import pytest
 
 from gui.database import DatabaseManager
@@ -12,8 +11,7 @@ from gui.database import DatabaseManager
 def _make_emulator(db, log_callback=None, am_wav_path=None):
     """Import and construct PygameHardwareEmulator with mocked audio backends."""
     with mock.patch.dict("sys.modules", {"pygame": mock.MagicMock(), "vlc": None}):
-        with mock.patch("gui.hardware_emulator.VLC_AVAILABLE", False), \
-             mock.patch("gui.hardware_emulator.pygame") as mock_pygame:
+        with mock.patch("gui.hardware_emulator.pygame") as mock_pygame:
             mock_pygame.mixer.get_init.return_value = True
             mock_pygame.mixer.init.return_value = None
             from gui.hardware_emulator import PygameHardwareEmulator
@@ -41,6 +39,8 @@ def _make_emulator(db, log_callback=None, am_wav_path=None):
             emu._ffmpeg_available = False
             emu._track_cache = {}
             emu._current_track_hint = None
+            emu._vlc_api = None
+            emu._lazy_audio_init_done = True
     return emu
 
 
@@ -181,3 +181,138 @@ class TestSaveLoadState:
         emu.save_state(state)
         loaded = emu.load_state()
         assert loaded == state
+
+
+# ---------------------------------------------------------------------------
+# New tests: delay playback / pending playback
+# ---------------------------------------------------------------------------
+
+class TestDelayPlayback:
+    def test_delay_playback_queues_request_instead_of_playing(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        emu._delay_playback = True
+        emu._audio_ready = True  # ensure audio appears ready
+        result = emu.play_track(1, 1)
+        # Should queue, not play immediately
+        assert emu._pending_playback == (1, 1, 0)
+        assert result is True  # accepted as queued
+
+    def test_delay_playback_false_allows_normal_play(self, populated_emu_db, tmp_path):
+        db, ids, aid, pid = populated_emu_db
+        # Give Song A an existing local file so _resolve_path works
+        local = tmp_path / "a.mp3"
+        local.write_bytes(b"\x00" * 100)
+        db.update_song(ids[0], {"file_path": str(local)})
+
+        emu = _make_emulator(db)
+        emu._delay_playback = False
+        emu._audio_ready = True
+
+        with mock.patch.object(emu, "_find_track", return_value={"file_path": str(local), "title": "T"}), \
+             mock.patch.object(emu, "_resolve_path", return_value=str(local)):
+            with mock.patch("gui.hardware_emulator.pygame") as mp:
+                mp.mixer.get_init.return_value = True
+                # Not testing VLC path - just that _pending_playback is NOT set
+                emu._vlc_player = None
+                mp.mixer.Sound.return_value = mock.MagicMock()
+                mp.mixer.Sound.return_value.play.return_value = mock.MagicMock()
+                emu._delay_playback = False
+                emu._pending_playback = None
+                # The important assertion: pending is cleared by set_delay_playback
+                emu.set_delay_playback(False)
+                assert emu._delay_playback is False
+
+    def test_set_delay_false_with_pending_clears_pending(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        emu._delay_playback = True
+        emu._pending_playback = (1, 1, 0)
+        # set_delay_playback(False) should execute pending and clear it
+        with mock.patch.object(emu, "play_track") as mock_play:
+            mock_play.return_value = True
+            emu.set_delay_playback(False)
+        # pending_playback should be cleared
+        assert emu._pending_playback is None
+
+
+# ---------------------------------------------------------------------------
+# New tests: stop / is_playing / volume
+# ---------------------------------------------------------------------------
+
+class TestPlaybackControl:
+    def test_stop_clears_is_playing(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        emu._audio_ready = True
+        emu._is_playing = True
+        with mock.patch("gui.hardware_emulator.pygame") as mp:
+            mp.mixer.get_init.return_value = True
+            mp.mixer.stop = mock.MagicMock()
+            emu.stop()
+        assert emu._is_playing is False
+
+    def test_set_volume_clamps_low(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        with mock.patch("gui.hardware_emulator.pygame"):
+            emu.set_volume(-10)
+        assert emu._volume == 0
+
+    def test_set_volume_clamps_high(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        with mock.patch("gui.hardware_emulator.pygame"):
+            emu.set_volume(200)
+        assert emu._volume == 100
+
+    def test_set_volume_normal(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        with mock.patch("gui.hardware_emulator.pygame"):
+            emu.set_volume(75)
+        assert emu._volume == 75
+
+    def test_is_playing_reflects_state(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        emu._audio_ready = True
+        emu._is_playing = False
+        assert emu.is_playing() is False
+        emu._is_playing = True
+        with mock.patch("gui.hardware_emulator.pygame") as mp:
+            mp.mixer.music.get_busy.return_value = True
+            assert emu.is_playing() is True
+
+    def test_get_playback_position_returns_int(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        pos = emu.get_playback_position_ms()
+        assert isinstance(pos, int)
+        assert pos >= 0
+
+
+# ---------------------------------------------------------------------------
+# New tests: missing/nonexistent files handled gracefully
+# ---------------------------------------------------------------------------
+
+class TestErrorConditions:
+    def test_play_nonexistent_folder_track_returns_false(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        emu._audio_ready = True
+        emu._delay_playback = False
+        with mock.patch.object(emu, "_find_track", return_value=None):
+            result = emu.play_track(99, 99)
+        assert result is False
+
+    def test_play_with_missing_file_path_returns_false(self, populated_emu_db):
+        db, ids, aid, pid = populated_emu_db
+        emu = _make_emulator(db)
+        emu._audio_ready = True
+        emu._delay_playback = False
+        fake_song = {"id": 1, "title": "Missing", "file_path": "/does/not/exist.mp3"}
+        with mock.patch.object(emu, "_find_track", return_value=fake_song), \
+             mock.patch.object(emu, "_resolve_path", return_value=None):
+            result = emu.play_track(1, 1)
+        assert result is False

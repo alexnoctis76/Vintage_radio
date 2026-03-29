@@ -30,7 +30,7 @@ class TestPinConfigLoader:
 
         monkeypatch.setattr(loader_mod, "_cached_config", None)
         monkeypatch.setattr(
-            loader_mod, "_SEARCH_PATHS_CPYTHON", [str(tmp_path / "nonexistent.json")]
+            loader_mod, "_get_search_paths", lambda: [str(tmp_path / "nonexistent.json")]
         )
         cfg = loader_mod.load_pin_config(force_reload=True)
         assert cfg["board"] == "raspberry_pi_linux"
@@ -50,7 +50,7 @@ class TestPinConfigLoader:
         cfg_path = tmp_path / "pin_config.json"
         cfg_path.write_text(json.dumps(cfg_data))
 
-        monkeypatch.setattr(loader_mod, "_SEARCH_PATHS_CPYTHON", [str(cfg_path)])
+        monkeypatch.setattr(loader_mod, "_get_search_paths", lambda: [str(cfg_path)])
         result = loader_mod.load_pin_config(force_reload=True)
         assert result["board"] == "test_board"
         assert result["pins"]["uart_tx"] == 99
@@ -61,7 +61,7 @@ class TestPinConfigLoader:
 
         monkeypatch.setattr(loader_mod, "_cached_config", None)
         monkeypatch.setattr(
-            loader_mod, "_SEARCH_PATHS_CPYTHON", [str(tmp_path / "nonexistent.json")]
+            loader_mod, "_get_search_paths", lambda: [str(tmp_path / "nonexistent.json")]
         )
 
         cfg1 = loader_mod.load_pin_config(force_reload=True)
@@ -75,7 +75,7 @@ class TestPinConfigLoader:
 
         monkeypatch.setattr(loader_mod, "_cached_config", {"old": True})
         monkeypatch.setattr(
-            loader_mod, "_SEARCH_PATHS_CPYTHON", [str(tmp_path / "nonexistent.json")]
+            loader_mod, "_get_search_paths", lambda: [str(tmp_path / "nonexistent.json")]
         )
 
         cfg = loader_mod.load_pin_config(force_reload=True)
@@ -123,7 +123,7 @@ class TestPinConfigLoader:
         monkeypatch.setattr(loader_mod, "_cached_config", None)
         bad_file = tmp_path / "pin_config.json"
         bad_file.write_text("{not valid json}")
-        monkeypatch.setattr(loader_mod, "_SEARCH_PATHS_CPYTHON", [str(bad_file)])
+        monkeypatch.setattr(loader_mod, "_get_search_paths", lambda: [str(bad_file)])
 
         cfg = loader_mod.load_pin_config(force_reload=True)
         assert "board" in cfg

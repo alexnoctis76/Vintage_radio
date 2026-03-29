@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 import pytest
 
 from gui.database import DatabaseManager
-from radio_core import HardwareInterface, RadioCore
+from radio_core import HardwareInterface, RadioCore, MODE_PLAYLIST
 
 
 def pytest_runtest_setup(item):
@@ -183,6 +183,9 @@ class MockHardwareInterface(HardwareInterface):
             tracks.extend(a.get("tracks", []))
         return tracks
 
+    def discover_stations(self):
+        return []
+
     def set_delay_playback(self, delay):
         self._delay_playback = delay
 
@@ -241,3 +244,126 @@ def core(mock_hardware):
     rc = RadioCore(mock_hardware)
     rc.init(skip_initial_playback=True)
     return rc
+
+
+# ---------------------------------------------------------------------------
+# Basic-mode fixtures
+# ---------------------------------------------------------------------------
+
+def _make_basic_stations():
+    """Two stations with 3 tracks each for basic-mode tests."""
+    stations = []
+    for folder in range(1, 3):
+        tracks = []
+        for track_num in range(1, 4):
+            tracks.append({
+                "id": (folder - 1) * 3 + track_num,
+                "title": f"Station{folder} Track{track_num}",
+                "artist": f"Artist {folder}",
+                "duration": 120.0 + track_num * 10,
+                "folder": folder,
+                "track_number": track_num,
+            })
+        stations.append({"id": folder, "name": f"Station {folder}", "tracks": tracks})
+    return stations
+
+
+class MockBasicHardware(MockHardwareInterface):
+    """MockHardwareInterface for basic mode: has discover_stations, query_files_in_folder."""
+
+    def __init__(self, stations=None, folder_99_count=3):
+        super().__init__(albums=[], playlists=[])
+        self._stations = stations if stations is not None else _make_basic_stations()
+        self._folder_99_count = folder_99_count
+        self._known_tracks = {}
+
+    def discover_stations(self):
+        # Populate _known_tracks from stations as firmware would
+        for station in self._stations:
+            folder = station["tracks"][0]["folder"] if station["tracks"] else 1
+            self._known_tracks[folder] = len(station["tracks"])
+        return list(self._stations)
+
+    def query_files_in_folder(self, folder_num, suppress_errors=False, timeout_ms=500):
+        if folder_num == 99:
+            return self._folder_99_count
+        for station in self._stations:
+            if station["tracks"] and station["tracks"][0]["folder"] == folder_num:
+                return len(station["tracks"])
+        return 0
+
+    def query_files_in_folder_consensus(self, folder_num, suppress_errors=False):
+        return self.query_files_in_folder(folder_num, suppress_errors)
+
+
+@pytest.fixture
+def mock_basic_hardware():
+    """MockBasicHardware with 2 stations, folder 99 count=3 (advance mode)."""
+    return MockBasicHardware()
+
+
+@pytest.fixture
+def basic_core(mock_basic_hardware):
+    """RadioCore in basic_mode, initialized with skip_initial_playback."""
+    rc = RadioCore(mock_basic_hardware, basic_mode=True)
+    rc.init(skip_initial_playback=True)
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# DFPlayer protocol helpers (pure-Python, no hardware)
+# ---------------------------------------------------------------------------
+
+def build_dfplayer_packet(cmd, p1=0, p2=0, feedback=False):
+    """Build a 10-byte DFPlayer command packet (matches firmware _df_send logic)."""
+    fb = 0x01 if feedback else 0x00
+    body = bytes([0xFF, 0x06, cmd, fb, p1 & 0xFF, p2 & 0xFF])
+    csum = (-sum(body)) & 0xFFFF
+    return bytes([0x7E]) + body + bytes([(csum >> 8) & 0xFF, csum & 0xFF, 0xEF])
+
+
+def build_dfplayer_response(cmd, p1=0, p2=0):
+    """Build a 10-byte DFPlayer response packet (module → Pico)."""
+    return build_dfplayer_packet(cmd, p1, p2, feedback=False)
+
+
+@pytest.fixture
+def make_dfplayer_packet():
+    """Fixture exposing build_dfplayer_packet helper."""
+    return build_dfplayer_packet
+
+
+@pytest.fixture
+def make_dfplayer_response():
+    """Fixture exposing build_dfplayer_response helper."""
+    return build_dfplayer_response
+
+
+# ---------------------------------------------------------------------------
+# Minimal WAV builder
+# ---------------------------------------------------------------------------
+
+def make_minimal_wav_u8(num_samples=64, sample_rate=8000):
+    """Return bytes of a valid 8-bit PCM WAV file."""
+    data = bytes([128] * num_samples)  # silence at mid-level
+    data_chunk = b"data" + struct.pack("<I", len(data)) + data
+    fmt_chunk = (
+        b"fmt "
+        + struct.pack("<I", 16)       # chunk size
+        + struct.pack("<H", 1)        # PCM
+        + struct.pack("<H", 1)        # mono
+        + struct.pack("<I", sample_rate)
+        + struct.pack("<I", sample_rate)  # byte rate
+        + struct.pack("<H", 1)        # block align
+        + struct.pack("<H", 8)        # bits per sample
+    )
+    riff_body = b"WAVE" + fmt_chunk + data_chunk
+    return b"RIFF" + struct.pack("<I", len(riff_body)) + riff_body
+
+
+@pytest.fixture
+def minimal_wav_path(tmp_path):
+    """Write a minimal 8-bit mono WAV to a temp file and return its Path."""
+    p = tmp_path / "test.wav"
+    p.write_bytes(make_minimal_wav_u8())
+    return p

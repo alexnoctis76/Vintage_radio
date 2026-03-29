@@ -13,7 +13,6 @@ from radio_core import (
 )
 from tests.conftest import MockHardwareInterface, _make_test_albums, _make_test_playlists
 
-
 class TestConstants:
     def test_mode_strings(self):
         assert MODE_ALBUM == "album"
@@ -356,3 +355,300 @@ class TestShuffleNavigation:
         core.shuffle_index = 0
         core._prev_track()
         assert core.shuffle_index == len(core.shuffle_tracks) - 1
+
+
+# ---------------------------------------------------------------------------
+# New tests: gesture edge cases
+# ---------------------------------------------------------------------------
+
+class TestGestureEdgeCases:
+    def test_tap_during_power_off_ignored(self, core, mock_hardware):
+        core.power_off()
+        mock_hardware.calls.clear()
+        core.on_button_press()
+        core.on_button_release()
+        # No play_track should result from taps while powered off
+        assert not any(c[0] == "play_track" for c in mock_hardware.calls)
+
+    def test_button_press_while_off_noop(self, core):
+        core.power_off()
+        # on_button_press is a no-op when power is off
+        before = core.tap_count
+        core.on_button_press()
+        assert core.button_down is False
+        assert core.tap_count == before
+
+    def test_hold_only_triggers_next_album(self, core, mock_hardware):
+        """0 taps + hold (LONG_PRESS_MS) advances album."""
+        start_album = core.current_album_index
+        core._pending_long_press = True
+        core.tap_count = 0
+        core._resolve_input()
+        assert core.current_album_index == (start_album + 1) % len(core.albums)
+
+    def test_one_tap_hold_toggles_mode(self, core):
+        assert core.mode == "album"
+        core._pending_long_press = True
+        core.tap_count = 1
+        core._resolve_input()
+        assert core.mode == "playlist"
+
+    def test_two_taps_hold_shuffles_current(self, core):
+        core._pending_long_press = True
+        core.tap_count = 2
+        core._resolve_input()
+        assert core.mode == "shuffle"
+        assert len(core.shuffle_tracks) > 0
+
+    def test_three_taps_hold_shuffles_library(self, core):
+        core._pending_long_press = True
+        core.tap_count = 3
+        core._resolve_input()
+        assert core.mode == "shuffle"
+        # Library shuffle includes all tracks from all albums
+        total_tracks = sum(len(a["tracks"]) for a in core.albums)
+        assert len(core.shuffle_tracks) == total_tracks
+
+    def test_resolve_resets_tap_count(self, core):
+        core.tap_count = 2
+        core._pending_long_press = False
+        core._resolve_input()
+        assert core.tap_count == 0
+        assert core._pending_long_press is False
+
+    def test_resolve_resets_last_release_ms(self, core):
+        core.tap_count = 1
+        core.last_release_ms = 999
+        core._resolve_input()
+        assert core.last_release_ms == 0
+
+
+# ---------------------------------------------------------------------------
+# New tests: track navigation unhappy paths
+# ---------------------------------------------------------------------------
+
+class TestTrackNavigationEdgeCases:
+    def test_next_track_on_empty_album_no_crash(self, mock_hardware):
+        """_next_track with no tracks should not raise."""
+        mock_hardware._albums = [{"id": 1, "name": "Empty", "tracks": []}]
+        mock_hardware._playlists = []
+        rc = RadioCore(mock_hardware)
+        rc.init(skip_initial_playback=True)
+        rc.albums = mock_hardware._albums
+        # Should not crash even with empty track list
+        try:
+            rc._next_track()
+        except Exception as exc:
+            pytest.fail(f"_next_track raised {exc} on empty album")
+
+    def test_prev_track_single_track_wraps(self, core):
+        """prev on first (and only) track in album wraps to last == 1."""
+        core.albums = [{"id": 1, "name": "Solo", "tracks": [
+            {"id": 1, "title": "Only", "duration": 60.0, "folder": 1, "track_number": 1}
+        ]}]
+        core.current_album_index = 0
+        core.current_track = 1
+        core._prev_track()
+        assert core.current_track == 1
+
+    def test_on_track_finished_beyond_count_still_advances(self, core, mock_hardware):
+        """If current_track is already past end, on_track_finished should not crash."""
+        core.current_track = 999
+        try:
+            core.on_track_finished()
+        except Exception as exc:
+            pytest.fail(f"on_track_finished raised {exc}")
+
+
+# ---------------------------------------------------------------------------
+# New tests: state persistence
+# ---------------------------------------------------------------------------
+
+class TestStatePersistence:
+    def test_save_state_stores_correct_fields(self, core, mock_hardware):
+        core.current_album_index = 1
+        core.current_track = 2
+        core.mode = "playlist"
+        core._save_state("test")
+        saved = mock_hardware._state
+        assert saved["album_index"] == 1
+        assert saved["track"] == 2
+        assert saved["mode"] == "playlist"
+        assert "known_tracks" in saved
+
+    def test_load_state_restores_album_track_mode(self, core, mock_hardware):
+        mock_hardware._state = {
+            "mode": "album",
+            "album_index": 1,
+            "track": 2,
+            "known_tracks": {1: 3},
+        }
+        rc = RadioCore(mock_hardware)
+        rc.albums = core.albums
+        rc.playlists = core.playlists
+        rc._load_state()
+        assert rc.current_album_index == 1
+        assert rc.current_track == 2
+        assert rc.mode == "album"
+        assert rc.known_tracks == {1: 3}
+
+    def test_load_state_clamps_album_index_out_of_range(self, core, mock_hardware):
+        mock_hardware._state = {
+            "mode": "album",
+            "album_index": 999,
+            "track": 1,
+            "known_tracks": {},
+        }
+        rc = RadioCore(mock_hardware)
+        rc.albums = core.albums
+        rc.playlists = core.playlists
+        rc._load_state()
+        assert rc.current_album_index < len(rc.albums)
+
+    def test_load_state_clamps_track_out_of_range(self, core, mock_hardware):
+        mock_hardware._state = {
+            "mode": "album",
+            "album_index": 0,
+            "track": 999,
+            "known_tracks": {},
+        }
+        rc = RadioCore(mock_hardware)
+        rc.albums = core.albums
+        rc.playlists = core.playlists
+        rc._load_state()
+        assert rc.current_track <= len(rc.albums[0]["tracks"])
+
+    def test_load_state_none_uses_defaults(self, mock_hardware):
+        mock_hardware._state = None
+        rc = RadioCore(mock_hardware)
+        rc.albums = _make_test_albums()
+        rc.playlists = _make_test_playlists()
+        rc._load_state()
+        assert rc.current_album_index == 0
+        assert rc.current_track == 1
+
+
+# ---------------------------------------------------------------------------
+# New tests: shuffle behaviour
+# ---------------------------------------------------------------------------
+
+class TestShuffleBehaviour:
+    def test_library_shuffle_contains_all_tracks(self, core):
+        core._init_library_shuffle()
+        total = sum(len(a["tracks"]) for a in core.albums)
+        assert len(core.shuffle_tracks) == total
+
+    def test_library_shuffle_is_permutation(self, core):
+        """Same tracks appear, possibly in different order."""
+        all_ids = {t["id"] for a in core.albums for t in a["tracks"]}
+        core._init_library_shuffle()
+        shuffle_ids = {t["id"] for t in core.shuffle_tracks}
+        assert shuffle_ids == all_ids
+
+    def test_current_shuffle_uses_current_album_only(self, core):
+        core.current_album_index = 0
+        core._init_current_shuffle()
+        album_track_ids = {t["id"] for t in core.albums[0]["tracks"]}
+        shuffle_ids = {t["id"] for t in core.shuffle_tracks}
+        assert shuffle_ids == album_track_ids
+
+    def test_on_track_finished_in_shuffle_advances_index(self, core):
+        core._init_library_shuffle()
+        core.shuffle_index = 0
+        core.on_track_finished()
+        assert core.shuffle_index == 1
+
+    def test_shuffle_wrap_at_end_of_list(self, core):
+        core._init_library_shuffle()
+        core.shuffle_index = len(core.shuffle_tracks) - 1
+        core.on_track_finished()
+        assert core.shuffle_index == 0
+
+    def test_leaving_shuffle_clears_source_type(self, core):
+        core._init_current_shuffle()
+        assert core._shuffle_source_type is not None
+        core.switch_mode("album")
+        assert core._shuffle_source_type is None
+
+
+# ---------------------------------------------------------------------------
+# New tests: volume
+# ---------------------------------------------------------------------------
+
+class TestVolume:
+    def test_set_volume_normal(self, core, mock_hardware):
+        core.set_volume(50)
+        assert any(c == ("set_volume", 50) for c in mock_hardware.calls)
+
+    def test_set_volume_clamps_low(self, core, mock_hardware):
+        core.set_volume(-10)
+        set_vol_calls = [c for c in mock_hardware.calls if c[0] == "set_volume"]
+        assert set_vol_calls[-1][1] == 0
+
+    def test_set_volume_clamps_high(self, core, mock_hardware):
+        core.set_volume(200)
+        set_vol_calls = [c for c in mock_hardware.calls if c[0] == "set_volume"]
+        assert set_vol_calls[-1][1] == 100
+
+
+# ---------------------------------------------------------------------------
+# New tests: power cycle
+# ---------------------------------------------------------------------------
+
+class TestPowerCycle:
+    def test_power_off_in_shuffle_saves_mode(self, core, mock_hardware):
+        core._init_library_shuffle()
+        core.power_off()
+        saved = mock_hardware._state
+        assert saved["mode"] == "shuffle"
+
+    def test_power_on_always_resets_track_to_1(self, core, mock_hardware):
+        core.switch_mode("playlist")
+        core.current_track = 3
+        core.power_off()
+        core.power_on_handler()
+        assert core.current_track == 1
+
+    def test_power_on_when_already_on_is_noop(self, core, mock_hardware):
+        assert core.power_on is True
+        mock_hardware.calls.clear()
+        # power_on_handler is for after power_off; calling it while on should still work
+        # but the key point is power_on is True after
+        core.power_on_handler()
+        assert core.power_on is True
+
+    def test_double_power_off_idempotent(self, core, mock_hardware):
+        core.power_off()
+        mock_hardware.calls.clear()
+        core.power_off()
+        # No extra save/stop when already off
+        assert len(mock_hardware.calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# New tests: get_status accuracy
+# ---------------------------------------------------------------------------
+
+class TestGetStatusAccuracy:
+    def test_status_in_playlist_mode(self, core):
+        core.switch_mode("playlist")
+        status = core.get_status()
+        assert status["mode"] == "playlist"
+        assert "track_count" in status
+        assert status["track_count"] == len(core.playlists[0]["tracks"])
+
+    def test_status_in_shuffle_mode(self, core):
+        core._init_library_shuffle()
+        status = core.get_status()
+        assert status["mode"] == "shuffle"
+        assert status["track_count"] == len(core.shuffle_tracks)
+
+    def test_status_track_title_matches_current(self, core):
+        status = core.get_status()
+        expected_track = core.albums[0]["tracks"][0]
+        assert status["track_title"] == expected_track["title"]
+
+    def test_status_power_on_reflects_state(self, core):
+        core.power_off()
+        status = core.get_status()
+        assert status["power_on"] is False

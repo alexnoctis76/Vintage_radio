@@ -1592,6 +1592,25 @@ class MainWindow(QtWidgets.QMainWindow):
         sync_action.triggered.connect(self.sync_to_sd)
         tools_menu.addAction(sync_action)
 
+        # Secret hardware diagnostics menu item: only visible when Shift is held
+        # while the Tools menu is being opened. The action is always reachable via
+        # Ctrl+Shift+H regardless of whether the menu item is visible.
+        self._hw_diag_action = QtGui.QAction("Hardware Diagnostics...", self)
+        self._hw_diag_action.setShortcut(
+            QtGui.QKeySequence("Ctrl+Shift+H")
+        )
+        self._hw_diag_action.triggered.connect(self._open_hw_diagnostics)
+        self._hw_diag_action.setVisible(False)
+        tools_menu.addSeparator()
+        tools_menu.addAction(self._hw_diag_action)
+
+        # Show the hidden action when Shift is held as the menu is about to open
+        tools_menu.aboutToShow.connect(self._reveal_hw_diag_on_shift)
+        tools_menu.aboutToHide.connect(
+            lambda: self._hw_diag_action.setVisible(False)
+        )
+        self.addAction(self._hw_diag_action)  # shortcut active even without menu
+
         help_menu = self.menuBar().addMenu("Help")
 
         view_log_action = QtGui.QAction("View Session Log", self)
@@ -6587,6 +6606,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.refresh_library()
 
     # ── Session log helpers ────────────────────────────────────
+
+    def _reveal_hw_diag_on_shift(self) -> None:
+        """Show the hidden Hardware Diagnostics menu item when Shift is held."""
+        modifiers = QtWidgets.QApplication.keyboardModifiers()
+        self._hw_diag_action.setVisible(
+            bool(modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        )
+
+    def _open_hw_diagnostics(self) -> None:
+        """Open the Hardware Diagnostics dialog (secret menu / Ctrl+Shift+H)."""
+        from .hardware_test_dialog import HardwareTestDialog
+        # Pre-fill with the port from the Devices tab if available
+        default_port: str | None = None
+        try:
+            default_port = self._device_debug_widget.current_port()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        dlg = HardwareTestDialog(parent=self, default_port=default_port)
+        dlg.exec()
 
     def _view_session_log(self) -> None:
         """Open the current session log in the system's default text editor."""

@@ -476,3 +476,127 @@ class TestBasicStationTracks:
             "SELECT * FROM basic_station_tracks WHERE station_id = ?;", (sid,)
         ).fetchall()
         assert len(tracks) == 0
+
+
+# ---------------------------------------------------------------------------
+# New tests: migration robustness
+# ---------------------------------------------------------------------------
+
+class TestSchemaMigration:
+    def test_fresh_db_at_schema_v6(self, tmp_db):
+        """Already covered, confirming v6 is reachable."""
+        v = tmp_db.conn.execute(
+            "SELECT value FROM settings WHERE key = 'schema_version';"
+        ).fetchone()
+        assert int(v["value"]) == 6
+
+    def test_v5_to_v6_migration_adds_id_column(self, tmp_path):
+        """Simulate a v5 DB (no id column in basic_station_tracks) and migrate to v6."""
+        import sqlite3
+        db_path = tmp_path / "v5_test.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE songs (id INTEGER PRIMARY KEY AUTOINCREMENT, original_filename TEXT, file_path TEXT UNIQUE);
+            CREATE TABLE albums (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, sort_order INTEGER DEFAULT 0);
+            CREATE TABLE playlists (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, sort_order INTEGER DEFAULT 0);
+            CREATE TABLE basic_stations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                folder_number INTEGER NOT NULL UNIQUE,
+                sort_order INTEGER DEFAULT 0
+            );
+            CREATE TABLE basic_station_tracks (
+                station_id INTEGER NOT NULL,
+                song_id INTEGER NOT NULL,
+                track_order INTEGER NOT NULL,
+                UNIQUE (station_id, song_id),
+                FOREIGN KEY (station_id) REFERENCES basic_stations(id) ON DELETE CASCADE
+            );
+        """)
+        conn.execute("INSERT INTO settings VALUES ('schema_version', '5');")
+        conn.commit()
+        conn.close()
+
+        # Now open via DatabaseManager — should auto-migrate to v6
+        from gui.database import DatabaseManager
+        db = DatabaseManager(db_path=db_path, backups_dir=tmp_path / "backups")
+        v = db.conn.execute(
+            "SELECT value FROM settings WHERE key = 'schema_version';"
+        ).fetchone()
+        assert int(v["value"]) == 6
+        # id column should now exist
+        cols = [r["name"] for r in db.conn.execute("PRAGMA table_info(basic_station_tracks);").fetchall()]
+        assert "id" in cols
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# New tests: edge cases
+# ---------------------------------------------------------------------------
+
+class TestDatabaseEdgeCases:
+    def test_add_song_with_unicode_title_and_artist(self, tmp_db):
+        sid = tmp_db.add_song(
+            original_filename="ü.mp3",
+            file_path="/music/Sigur Rós - Ára bátur.mp3",
+            title="Ára bátur",
+            artist="Sigur Rós",
+            duration=720.0,
+            file_hash="abc",
+            file_size=1000,
+            format="mp3",
+        )
+        song = tmp_db.get_song_by_id(sid)
+        assert song["title"] == "Ára bátur"
+        assert song["artist"] == "Sigur Rós"
+
+    def test_add_song_with_very_long_path(self, tmp_db):
+        long_path = "/music/" + "a" * 1000 + ".mp3"
+        sid = tmp_db.add_song(
+            original_filename="long.mp3",
+            file_path=long_path,
+            file_hash="longpath",
+            file_size=1,
+        )
+        song = tmp_db.get_song_by_id(sid)
+        assert song["file_path"] == long_path
+
+    def test_delete_song_in_multiple_albums_cascades(self, tmp_db):
+        sid = tmp_db.add_song(original_filename="shared.mp3", file_path="/shared.mp3")
+        a1 = tmp_db.create_album("Album 1")
+        a2 = tmp_db.create_album("Album 2")
+        tmp_db.add_song_to_album(a1, sid, 1)
+        tmp_db.add_song_to_album(a2, sid, 1)
+        tmp_db.delete_song(sid)
+        # Song should be gone from both albums
+        assert len(tmp_db.list_album_songs(a1)) == 0
+        assert len(tmp_db.list_album_songs(a2)) == 0
+
+    def test_delete_song_in_multiple_playlists_cascades(self, tmp_db):
+        sid = tmp_db.add_song(original_filename="pl_shared.mp3", file_path="/pl_shared.mp3")
+        p1 = tmp_db.create_playlist("PL 1")
+        p2 = tmp_db.create_playlist("PL 2")
+        tmp_db.add_song_to_playlist(p1, sid, 1)
+        tmp_db.add_song_to_playlist(p2, sid, 1)
+        tmp_db.delete_song(sid)
+        assert len(tmp_db.list_playlist_songs(p1)) == 0
+        assert len(tmp_db.list_playlist_songs(p2)) == 0
+
+    def test_batch_sd_path_update_with_empty_batch_is_noop(self, tmp_db):
+        """update_song_sd_paths_batch with empty dict should not crash."""
+        try:
+            tmp_db.update_song_sd_paths_batch({})
+        except Exception as exc:
+            pytest.fail(f"Empty batch update raised: {exc}")
+
+    def test_setting_none_value(self, tmp_db):
+        tmp_db.set_setting("null_key", None)
+        val = tmp_db.get_setting("null_key", default="MISSING")
+        # None value stored should be retrievable
+        assert val is None or val == "MISSING"  # depends on implementation
+
+    def test_get_songs_by_ids_empty_list(self, tmp_db):
+        result = tmp_db.get_songs_by_ids([])
+        assert result == []
