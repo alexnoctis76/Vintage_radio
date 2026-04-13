@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
-from pathlib import Path
+from collections import deque
 from typing import Any, Callable, Optional, Tuple
 
 try:
@@ -18,34 +20,13 @@ except ImportError:
     SERIAL_AVAILABLE = False
 
 
-def _serial_io_errno(exc: BaseException) -> Optional[int]:
-    """Best-effort errno from OSError / pyserial (used for USB CDC recovery)."""
-    if isinstance(exc, OSError):
-        return exc.errno
-    err = getattr(exc, "errno", None)
-    if isinstance(err, int):
-        return err
-    args = getattr(exc, "args", ())
-    if args and isinstance(args[0], int):
-        return args[0]
-    return None
-
-
-def _is_recoverable_usb_serial_error(exc: BaseException) -> bool:
-    """True if the OS likely invalidated the CDC handle but the device may still be present."""
-    eno = _serial_io_errno(exc)
-    # 6 = ENXIO (macOS/BSD: "Device not configured") — common stale USB-serial handle.
-    if eno == 6:
-        return True
-    if eno == 19:  # ENODEV
-        return True
-    msg = str(exc).lower()
-    return "device not configured" in msg or "could not configure port" in msg
-
-
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .sd_manager import SDManager
+from .services.serial_debug import (
+    append_session_ndjson_from_vrdbg_line,
+    is_recoverable_usb_serial_error,
+)
 
 
 class DeviceDebugWidget(QtWidgets.QWidget):
@@ -86,12 +67,11 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._current_track_artist = ""
         self._current_album_idx = 0  # Track album/playlist index for fallback display
         self._am_wav_loaded = None  # None = unknown, True/False = detected from stream
-        # USB LED: after Disconnect, stay "off" until the OS port list changes (unplug/replug, etc.)
-        self._mask_presence_until_port_change = False
-        self._ports_signature_at_mask: Optional[Tuple[str, ...]] = None
         self._last_presence_emitted: Optional[bool] = None
         self._poll_signature: Optional[Tuple[str, ...]] = None
         self._poll_usb_signature: Optional[Tuple[Tuple[str, ...], bool]] = None
+        self._stream_ring_lock = threading.Lock()
+        self._stream_ring: deque[str] = deque(maxlen=2500)
         self._setup_ui()
         self._scan_ports()  # Port scanning uses serial.tools.list_ports (no mpremote needed)
         self._presence_poll_timer = QtCore.QTimer(self)
@@ -232,18 +212,16 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         # Start/Stop button (Thonny-style, shown in basic mode)
         self.run_stop_btn = QtWidgets.QPushButton("Start")
+        self.run_stop_btn.setObjectName("vrRunStopBtn")
         self.run_stop_btn.setToolTip(
-            "Stop sends Ctrl+C to the serial port (same as Thonny). "
+            "Stop interrupts MicroPython (Ctrl+C), runs a short REPL snippet to call "
+            "DFPlayer stop on the running firmware, then leaves you at REPL. "
             "After Connect we assume main.py is already running and show Stop; "
             "use Start if you stopped the firmware or are at the REPL."
         )
-        self.run_stop_btn.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
-            "QPushButton:hover { background-color: #45a049; }"
-        )
         self.run_stop_btn.clicked.connect(self._toggle_run_stop)
-        self.run_stop_btn.setEnabled(False)
         self._firmware_running = False
+        self._set_run_stop_button_state(running=False, enabled=False)
 
         actions_layout.addWidget(self.restart_firmware_btn)
         actions_layout.addWidget(self.soft_reset_btn)
@@ -541,7 +519,90 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         finally:
             if was_streaming:
                 self._resume_streaming()
-    
+
+    def get_stream_ring_tail(self, limit: int = 200) -> list:
+        lim = max(1, min(int(limit), 5000))
+        with self._stream_ring_lock:
+            lines = list(self._stream_ring)
+        return lines[-lim:]
+
+    def run_vrtest_command(self, command: str, timeout: float = 15.0) -> dict:
+        """Send a VRTEST line without Ctrl+C; requires firmware with vintage_radio_ipc in the main loop."""
+        if not SERIAL_AVAILABLE:
+            return {"ok": False, "error": "pyserial_unavailable"}
+        ser = self._serial_connection
+        if not ser or not ser.is_open or not self._connected:
+            return {"ok": False, "error": "not_connected"}
+        cmd = command.strip()
+        if not cmd:
+            return {"ok": False, "error": "empty_command"}
+        # MicroPython USB-CDC stdin often expects CRLF; LF-only can leave lines unseen.
+        payload_line = "VRTEST " + cmd + "\r\n"
+        with self._port_lock:
+            was_streaming = self._streaming_thread and self._streaming_thread.is_alive()
+            if was_streaming:
+                self._pause_streaming()
+            try:
+                try:
+                    if ser.in_waiting:
+                        ser.read(ser.in_waiting)
+                except Exception:
+                    pass
+                ser.write(payload_line.encode("utf-8"))
+                buf = b""
+                start = time.time()
+                mark = b"VRTEST_RESULT "
+                while time.time() - start < timeout:
+                    if ser.in_waiting:
+                        buf += ser.read(ser.in_waiting)
+                    pos = buf.find(mark)
+                    if pos >= 0:
+                        # Firmware may print DF:/radio lines before VRTEST_RESULT; feed them
+                        # through the normal stream path so the ring + Now Playing stay in sync.
+                        preface = buf[:pos]
+                        if preface.strip():
+                            for raw_line in preface.split(b"\n"):
+                                if raw_line.strip():
+                                    line = raw_line.decode("utf-8", errors="replace").rstrip()
+                                    QtCore.QMetaObject.invokeMethod(
+                                        self,
+                                        "_display_stream_output",
+                                        QtCore.Qt.ConnectionType.QueuedConnection,
+                                        QtCore.Q_ARG(str, line),
+                                    )
+                        rest = buf[pos + len(mark) :]
+                        nl = rest.find(b"\n")
+                        if nl >= 0:
+                            raw_json = rest[:nl].decode("utf-8", errors="replace")
+                            try:
+                                obj = json.loads(raw_json)
+                            except json.JSONDecodeError as e:
+                                return {
+                                    "ok": False,
+                                    "error": "bad_json",
+                                    "detail": str(e),
+                                    "raw": raw_json[:400],
+                                }
+                            return {"ok": True, "device": obj}
+                    time.sleep(0.02)
+                return {
+                    "ok": False,
+                    "error": "timeout",
+                    "raw_tail": buf.decode("utf-8", errors="replace")[-800:],
+                    "hint": (
+                        "No VRTEST_RESULT from Pico. Use Developer → Deploy MCP / VRTEST support to Pico… "
+                        "or copy components/vintage_radio_ipc.py; main.py/main_basic.py must call poll_ipc() "
+                        "in the run loop. Boot log should show 'VRTEST IPC: uselect stdin polling enabled'."
+                    ),
+                }
+            except serial.SerialException as e:
+                return {"ok": False, "error": "serial", "detail": str(e)}
+            except Exception as e:
+                return {"ok": False, "error": "exception", "detail": str(e)}
+            finally:
+                if was_streaming:
+                    self._resume_streaming()
+
     def _list_port_devices(self) -> Tuple[str, ...]:
         """Sorted tuple of serial device paths (stable signature for plug/unplug detection)."""
         if not SERIAL_AVAILABLE:
@@ -553,9 +614,34 @@ class DeviceDebugWidget(QtWidgets.QWidget):
 
     @staticmethod
     def _is_rp2040_port(port_info: Any) -> bool:
-        """True when a serial port reports the Raspberry Pi VID (2E8A)."""
+        """Best-effort: Raspberry Pi Pico / RP2040 USB CDC.
+
+        Prefer ``ListPortInfo.vid`` (reliable on Windows) when present. Some drivers
+        omit VID in ``hwid`` or use generic descriptions, so we also match common
+        vendor/product strings.
+        """
+        try:
+            vid = getattr(port_info, "vid", None)
+            if vid is not None and int(vid) == 0x2E8A:
+                return True
+        except (TypeError, ValueError):
+            pass
         hwid = (getattr(port_info, "hwid", "") or "").upper()
-        return "2E8A" in hwid
+        if "2E8A" in hwid:
+            return True
+        desc = (getattr(port_info, "description", "") or "").upper()
+        manufacturer = (getattr(port_info, "manufacturer", "") or "").upper()
+        product = (getattr(port_info, "product", "") or "").upper()
+        interface = (getattr(port_info, "interface", "") or "").upper()
+        combined = f"{desc} {manufacturer} {product} {interface}"
+        needles = (
+            "RASPBERRY PI",
+            "RP2040",
+            "PICO",
+            "PI PICO",
+            "RPI-RP2",
+        )
+        return any(n in combined for n in needles)
 
     def _list_rp2040_devices(self) -> Tuple[str, ...]:
         """Sorted tuple of RP2040 serial ports only."""
@@ -588,20 +674,14 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 )
             except Exception:
                 open_port = None
-            devs = self._list_rp2040_devices() if self._basic_mode else self._list_port_devices()
-            if open_port is not None and str(open_port) not in devs:
+            # Presence while connected: the port must still exist in the OS list.
+            # In basic mode do not require the open port to appear in the RP2040-only
+            # list (VID is sometimes missing from hwid on Windows, which would falsely
+            # turn the LED off despite an active session).
+            all_devs = self._list_port_devices()
+            if open_port is not None and str(open_port) not in all_devs:
                 return False
-            self._mask_presence_until_port_change = False
-            self._ports_signature_at_mask = None
             return True
-        if self._mask_presence_until_port_change and self._ports_signature_at_mask is not None:
-            if bootsel:
-                return True
-            cur = self._list_port_devices()
-            if cur == self._ports_signature_at_mask:
-                return False
-            self._mask_presence_until_port_change = False
-            self._ports_signature_at_mask = None
         return has_ports or bootsel
 
     def _update_device_presence_led(self, *, force_emit: bool = False) -> None:
@@ -625,15 +705,6 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 self._update_device_presence_led(force_emit=True)
         else:
             self._update_device_presence_led()
-
-    def _arm_presence_mask_after_user_disconnect(self) -> None:
-        """After Disconnect/Reset, hide 'device detected' until ports change (same as unplug/replug)."""
-        sig = self._list_port_devices()
-        self._mask_presence_until_port_change = True
-        self._ports_signature_at_mask = sig
-        self._poll_signature = sig
-        self._poll_usb_signature = (sig, SDManager.is_rp2040_bootsel_present())
-        self._update_device_presence_led(force_emit=True)
 
     def _scan_ports(self, *, from_auto_poll: bool = False) -> None:
         """Scan for available COM ports using serial.tools.list_ports (no mpremote needed)."""
@@ -902,7 +973,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._active_operations.clear()
         self._restore_disconnected_state()
         self._log("Disconnected", "info")
-        self._arm_presence_mask_after_user_disconnect()
+        self._poll_signature = self._list_port_devices()
+        self._poll_usb_signature = (
+            self._poll_signature,
+            SDManager.is_rp2040_bootsel_present(),
+        )
+        self._update_device_presence_led(force_emit=True)
 
     @QtCore.pyqtSlot(str, int, str, str)
     def _execute_ui_update(self, port: str, returncode: int, stdout: str, stderr: str):
@@ -950,12 +1026,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 self.refresh_library_db_and_now_playing()
                 # Basic mode: assume main.py is already running when opening serial (matches Run/Stop UX)
                 if self._basic_mode:
-                    self._firmware_running = True
-                    self.run_stop_btn.setText("Stop")
-                    self.run_stop_btn.setStyleSheet(
-                        "QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 6px 16px; }"
-                        "QPushButton:hover { background-color: #d32f2f; }"
-                    )
+                    self._set_run_stop_button_state(running=True, enabled=True)
                 
                 # Disable port selection
                 self.port_combo.setEnabled(False)
@@ -1048,13 +1119,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self.stream_output_btn.setEnabled(False)
             self.stream_output_btn.setText("Start Streaming")
             self.reset_connection_btn.setEnabled(False)
-            self.run_stop_btn.setEnabled(False)
-            self._firmware_running = False
-            self.run_stop_btn.setText("Start")
-            self.run_stop_btn.setStyleSheet(
-                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
-                "QPushButton:hover { background-color: #45a049; }"
-            )
+            self._set_run_stop_button_state(running=False, enabled=False)
             
             self.now_playing_label.setText("Not connected")
             self._current_device_mode = ""
@@ -1497,6 +1562,35 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 self._debug_log("Warning: Streaming thread did not stop within timeout", "warning")
         
         self._stop_output = False  # Reset for next start
+
+    def _set_run_stop_button_state(self, *, running: bool, enabled: Optional[bool] = None) -> None:
+        """Keep Run/Stop button text, style and enablement in sync."""
+        self._firmware_running = bool(running)
+        # In basic mode while connected, always leave the control enabled so Qt does not
+        # paint it with the global disabled (grey) palette; streaming/flash paths were
+        # leaving enabled=False and wiping the green/red styling.
+        if self._connected and self._basic_mode:
+            self.run_stop_btn.setEnabled(True)
+        elif enabled is not None:
+            self.run_stop_btn.setEnabled(bool(enabled))
+        else:
+            self.run_stop_btn.setEnabled(False)
+        if self._firmware_running:
+            self.run_stop_btn.setText("Stop")
+            self.run_stop_btn.setStyleSheet(
+                "QPushButton#vrRunStopBtn { background-color: #f44336; color: white; "
+                "font-weight: bold; padding: 6px 16px; border-radius: 3px; border: none; }"
+                "QPushButton#vrRunStopBtn:hover { background-color: #d32f2f; }"
+                "QPushButton#vrRunStopBtn:disabled { background-color: #f44336; color: #f5f5f5; }"
+            )
+        else:
+            self.run_stop_btn.setText("Start")
+            self.run_stop_btn.setStyleSheet(
+                "QPushButton#vrRunStopBtn { background-color: #4CAF50; color: white; "
+                "font-weight: bold; padding: 6px 16px; border-radius: 3px; border: none; }"
+                "QPushButton#vrRunStopBtn:hover { background-color: #45a049; }"
+                "QPushButton#vrRunStopBtn:disabled { background-color: #4CAF50; color: #f5f5f5; }"
+            )
     
     def _toggle_run_stop(self) -> None:
         """Start or stop the firmware (basic mode Thonny-style button).
@@ -1505,28 +1599,41 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self._log("Not connected. Please connect first.", "error")
             return
         if self._firmware_running:
-            self._log("Stopping firmware...", "info")
+            self._log("Stopping firmware (interrupt + DFPlayer stop)...", "info")
             self._stop_streaming_forcefully()
-            port = self.port_combo.currentData()
-            try:
-                self._send_serial_command(port, "\x03", timeout=2)
-            except Exception:
-                pass
-            self._firmware_running = False
-            self.run_stop_btn.setText("Start")
-            self.run_stop_btn.setStyleSheet(
-                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
-                "QPushButton:hover { background-color: #45a049; }"
+            port_data = self.port_combo.currentData()
+            port = (
+                str(port_data).strip()
+                if port_data is not None and str(port_data).strip()
+                else self.port_combo.currentText().strip()
             )
+            # _send_serial_command already sends Ctrl+C and opens REPL; then run df_stop on __main__.firmware
+            stop_cmd = (
+                "try:\n"
+                " import sys\n"
+                " m=sys.modules.get('__main__',None)\n"
+                " f=getattr(m,'firmware',None) if m else None\n"
+                " if f is not None and getattr(f,'hw',None) is not None:\n"
+                "  f.hw._df_stop()\n"
+                "except Exception as e:\n"
+                " print('device_stop_err',e)\n"
+            )
+            if port:
+                try:
+                    rc, out, err = self._send_serial_command(port, stop_cmd, timeout=6.0)
+                    if rc != 0 and err:
+                        self._log("Stop: {}".format(err), "warning")
+                    elif out:
+                        self._debug_log("Stop REPL output: {}".format(out[:300]), "info")
+                except Exception as ex:
+                    self._log("Stop command failed: {}".format(ex), "warning")
+            else:
+                self._log("Stop: no serial port selected", "error")
+            self._set_run_stop_button_state(running=False, enabled=True)
         else:
             self._log("Starting firmware...", "info")
             self._restart_firmware()
-            self._firmware_running = True
-            self.run_stop_btn.setText("Stop")
-            self.run_stop_btn.setStyleSheet(
-                "QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 6px 16px; }"
-                "QPushButton:hover { background-color: #d32f2f; }"
-            )
+            self._set_run_stop_button_state(running=True, enabled=True)
             # Auto-start streaming so output appears in the console
             is_streaming = self._streaming_thread and self._streaming_thread.is_alive()
             if not is_streaming:
@@ -1611,7 +1718,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 def _recover_stream_serial(exc: BaseException) -> bool:
                     """If USB CDC handle is stale, reopen port. Returns True to retry loop."""
                     nonlocal ser
-                    if not port_name or not _is_recoverable_usb_serial_error(exc):
+                    if not port_name or not is_recoverable_usb_serial_error(exc):
                         return False
                     new_ser = self._try_reopen_serial_connection(port_name)
                     if new_ser is not None:
@@ -1635,12 +1742,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                             time.sleep(0.05)
                         self._debug_log("Streaming resumed", "info")
                         ser = self._serial_connection
-                        # After resuming, clear any stale data from the command
-                        try:
-                            if ser and ser.is_open and ser.in_waiting > 0:
-                                ser.read(ser.in_waiting)
-                        except Exception:
-                            pass
+                        # Do **not** discard ser.in_waiting here: that bytes contained
+                        # firmware print() output emitted while VRTEST held the port. Dropping
+                        # it removed lines from the stream ring and broke Now Playing parsing.
                         continue
                     
                     try:
@@ -1735,15 +1839,53 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         try:
             if content and content.strip():
                 line = content.rstrip()
-                # Add timestamp prefix for streamed output
-                from datetime import datetime
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                self._log(f"[{timestamp}] {line}", "info")
+                append_session_ndjson_from_vrdbg_line(line)
+                with self._stream_ring_lock:
+                    self._stream_ring.append(line)
+                # Pico line already includes ``[HH:MM:SS.mmm]`` from firmware print(); avoid
+                # duplicating host time inside the message (was: host + [host] + device).
+                self._log(line, self._classify_stream_level(line))
                 
                 # Parse stream for "now playing" updates (non-intrusive)
                 self._parse_stream_for_now_playing(line)
         except Exception as e:
             self._debug_log(f"Error displaying stream output: {e}", "error")
+
+    @staticmethod
+    def _classify_stream_level(line: str) -> str:
+        """Map streamed firmware text to log severity for UI/session readability."""
+        s = (line or "").strip().lower()
+        if not s:
+            return "output"
+        error_markers = (
+            "traceback",
+            "memoryerror",
+            "syntaxerror",
+            "fatal:",
+            "boot init error",
+            "error:",
+            "playback failed",
+            "timed out",
+            "timeout",
+            "exception",
+            "not confirmed",
+            "failed to start",
+        )
+        warn_markers = (
+            "warn",
+            "busy stayed high",
+            "fallback",
+            "cooling down",
+            "recovery attempt",
+            "retry",
+            "not playing",
+            "no uart error",
+        )
+        if any(m in s for m in error_markers):
+            return "error"
+        if any(m in s for m in warn_markers):
+            return "warning"
+        return "info"
     
     def _parse_stream_for_now_playing(self, line: str):
         """Parse streaming output to extract now-playing info without interrupting firmware.
@@ -1780,7 +1922,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     self._current_shuffle_type = shuffle_match.group(1)
                 elif self._current_device_mode != "shuffle":
                     self._current_shuffle_type = ""
-                
+
                 # Extract album_idx as fallback for source name
                 idx_match = re.search(r"album_idx=(\d+)", line)
                 if idx_match:
@@ -1837,9 +1979,11 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     return
             
             # Detect shuffle initialization:
-            #   "Mode: Shuffle (Library, 50 tracks)" or "Mode: Shuffle (My Album, 12 tracks)"
-            if "Mode: Shuffle" in line:
-                match = re.search(r"Mode: Shuffle \((.+?),\s*(\d+)\s*tracks?\)", line)
+            #   "Mode: Track shuffle (...)" (basic station) or legacy "Mode: Shuffle (...)"
+            if "Mode: Track shuffle" in line or "Mode: Shuffle" in line:
+                match = re.search(
+                    r"Mode: (?:[Tt]rack )?[Ss]huffle \((.+?),\s*(\d+)\s*tracks?\)", line
+                )
                 if match:
                     source = match.group(1).strip()
                     self._current_device_mode = "shuffle"
@@ -1847,7 +1991,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     if source == "Library":
                         self._current_shuffle_type = "library"
                     elif source.startswith("Station"):
-                        self._current_shuffle_type = "station"
+                        self._current_shuffle_type = "station_tracks"
                     else:
                         # Source is an album or playlist name
                         self._current_shuffle_type = "source"
@@ -1899,8 +2043,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     self._update_now_playing_display()
                     return
             
-            # Detect track finished and advance: "Track finished: 'old' -> 'new'"
-            if "Track finished:" in line:
+            # Detect track auto-advance: "Auto-advanced: 'old' -> 'new'" (legacy: "Track finished:")
+            if "Auto-advanced:" in line or "Track finished:" in line:
                 match = re.search(r"'([^']+)'\s*->\s*'([^']+)'", line)
                 if match:
                     new_title = match.group(2)
@@ -2037,21 +2181,21 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             # Build mode display with shuffle distinction
             if mode.lower() == "shuffle":
                 if shuffle_type == "library":
-                    mode_display = "Library Shuffle"
+                    mode_display = "Library shuffle"
                 elif shuffle_type == "album" and source:
-                    mode_display = f"Album Shuffle ({source})"
+                    mode_display = f"Album track shuffle ({source})"
                 elif shuffle_type == "playlist" and source:
-                    mode_display = f"Playlist Shuffle ({source})"
-                elif shuffle_type == "station" and source:
-                    mode_display = f"Station Shuffle ({source})"
+                    mode_display = f"Playlist track shuffle ({source})"
+                elif shuffle_type in ("station_tracks", "station") and source:
+                    mode_display = f"Track shuffle ({source})"
                 elif shuffle_type == "source" and source:
-                    mode_display = f"Shuffle ({source})"
+                    mode_display = f"Track shuffle ({source})"
                 elif source:
-                    mode_display = f"Shuffle ({source})"
+                    mode_display = f"Track shuffle ({source})"
                 else:
-                    mode_display = "Shuffle"
+                    mode_display = "Track shuffle"
             elif mode.lower() in ("station", "playlist") and self._basic_mode:
-                mode_display = "Station"
+                mode_display = "Station (ordered tracks)"
             else:
                 mode_display = mode.title()
             
@@ -2380,7 +2524,9 @@ GUI Commands (not sent to device):
     @QtCore.pyqtSlot(str, str)
     def _log_impl(self, message: str, level: str = "info") -> None:
         """Internal implementation of log - must be called on main thread."""
-        timestamp = QtCore.QDateTime.currentDateTime().toString("hh:mm:ss")
+        from .session_log import format_session_timestamp
+
+        timestamp = format_session_timestamp()
         
         if level == "error":
             color = "#f48771"  # Red
@@ -2674,6 +2820,8 @@ GUI Commands (not sent to device):
             self._log("Firmware restart initiated - device should be running main.py now", "success")
             if output:
                 self._log(output, "output")
+            if self._basic_mode and self._connected:
+                self._set_run_stop_button_state(running=True, enabled=True)
         except Exception as e:
             self._debug_log(f"Error displaying restart firmware result: {e}\n{traceback.format_exc()}", "error")
     

@@ -67,8 +67,10 @@ def _parse_stream_line(line: str, state: dict, basic_mode: bool = False) -> None
                 state["album_idx"] = int(idx_match.group(1))
         return
 
-    if "Mode: Shuffle" in line:
-        match = re.search(r"Mode: Shuffle \((.+?),\s*(\d+)\s*tracks?\)", line)
+    if "Mode: Track shuffle" in line or "Mode: Shuffle" in line:
+        match = re.search(
+            r"Mode: (?:[Tt]rack )?[Ss]huffle \((.+?),\s*(\d+)\s*tracks?\)", line
+        )
         if match:
             source = match.group(1).strip()
             state["mode"] = "shuffle"
@@ -76,7 +78,7 @@ def _parse_stream_line(line: str, state: dict, basic_mode: bool = False) -> None
             if source == "Library":
                 state["shuffle_type"] = "library"
             elif source.startswith("Station"):
-                state["shuffle_type"] = "station"
+                state["shuffle_type"] = "station_tracks"
             else:
                 state["shuffle_type"] = "source"
 
@@ -144,8 +146,19 @@ class TestStreamParsing:
 
     def test_shuffle_station_type(self):
         state = self._fresh_state()
-        _parse_stream_line("Mode: Shuffle (Station 2, 8 tracks)", state)
-        assert state["shuffle_type"] == "station"
+        _parse_stream_line("Mode: Track shuffle (Station 2, 8 tracks)", state)
+        assert state["shuffle_type"] == "station_tracks"
+
+    def test_parses_station_shuffle_playback_line(self):
+        state = self._fresh_state()
+        _parse_stream_line(
+            "_start_playback_for_current: mode=shuffle, source=Station 3, "
+            "shuffle_type=station_tracks, album_idx=2",
+            state,
+        )
+        assert state["mode"] == "shuffle"
+        assert state["shuffle_type"] == "station_tracks"
+        assert state["album_idx"] == 2
 
     def test_shuffle_named_source_type(self):
         state = self._fresh_state()
