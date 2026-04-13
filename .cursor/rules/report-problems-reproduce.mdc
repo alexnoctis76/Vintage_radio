@@ -1,0 +1,17 @@
+---
+description: When the user reports a bug or regression, reproduce and measure it locally (MCP, scripts, tests)—do not stop at analysis.
+alwaysApply: true
+---
+
+# Reported problems — reproduce, don’t only explain
+
+When the user points out a **problem** (bug, regression, “sounds wrong”, “doesn’t work”, etc.):
+
+1. **Reproduce** using available tools: run **tests**, **scripts** (`scripts/`, `pytest`), **MCP** (Vintage Radio with debug MCP on `invoke_action`, `device_connect`, `line_in_analyze`, serial tail), or **mpremote** on the Pico when the port is free.
+2. **Capture evidence**: serial lines, metrics JSON, before/after numbers, or a minimal failing command — not only a theory.
+3. **Fix only after** you have a verified signal (or a clear negative result from a controlled check).
+4. If hardware or env blocks a check (no Line In, port busy), **run what you can** on the host (e.g. WAV analysis, firmware load simulation) and state the gap explicitly.
+
+5. **Pico firmware changes:** `mpremote connect <PORT> cp … :…` for touched files, soft-reset, then **`python scripts/physical_device_full_check.py --port <PORT>`** (or targeted `mpremote exec`). Confirm in serial/session logs (e.g. `#VRDBG` / boot lines), not only “the code looks right.”
+
+Do **not** answer with “you should try X” as the primary outcome when you can execute X in this environment.

@@ -1,0 +1,103 @@
+---
+description: When the user reports Pico/firmware problems, reproduce via MCP, observe logs and line-in, then fix.
+alwaysApply: true
+---
+
+# Firmware issues — self-test and fix
+
+When the user says there is a problem with **firmware** (Pico / `main_basic.py` / `radio_core` / DFPlayer / AM overlay, etc.), or asks to **verify on the physical device**:
+
+## Non-negotiable: try physical verification every time
+
+1. **If Cursor shows a `vintage-radio-debug` tool** (e.g. `vintage_radio_debug_request`): use it to **`ping`** → **`status`** → **`device_connect`** (with `port` if needed) → **`start_streaming`** → **`invoke_action`** `restart_firmware` → wait ~6–8 s → reconnect/stream if needed → **`get_device_stream_tail`** (limit **400+**). After changes to acceptance, firmware, or device behavior, run **`run_full_acceptance`** (or `python agent_workshop/run_full_acceptance.py` with the app connected on COM) and report **PASS/FAIL** — see `physical-device-testing.mdc`. **Do not** treat host-only `pytest` as sufficient proof unless the user explicitly waived hardware checks.
+2. **If Cursor shows "No tools" for `vintage-radio-debug`**: the **stdio bridge** did not register (wrong `cwd`, missing `pip install mcp`, or Python failed). Fix **`.cursor/mcp.json`** (`cwd` + `${workspaceFolder}` path to the bridge script), restart Cursor, check MCP logs for stderr from the bridge. **State explicitly** that hardware verification is blocked until tools appear.
+3. **If tools exist but `ping` / TCP fails**: start **Vintage Radio** with MCP debug TCP enabled (`--enable-mcp-debug --mcp-autostart` or Developer menu → MCP debug server ON). **State explicitly** that hardware verification is blocked until the app is listening on **127.0.0.1:8765** (or `VINTAGE_RADIO_MCP_PORT`).
+
+**Flashing:** prefer the app's **deploy / copy-to-Pico** actions via **`invoke_action`** when wired; otherwise `mpremote connect <PORT> cp <file> :<dest>` for changed files, then **`restart_firmware`**, then serial tail — same evidence bar as above.
+
+## Line-in USB adapter troubleshooting
+
+If `line_in_analyze` returns `rms_dbfs` near `-85` (silence) even though the DFPlayer BUSY pin confirms playback:
+
+0. **Device selection:** acceptance tests prefer an input named **Vintage Radio Line In** (user-renamed in Windows), then legacy Realtek USB Line In. Standalone `line_in_analyze` must use the correct `device` index if you pass it explicitly.
+
+1. **The USB line-in adapter may need to be physically unplugged and replugged** — Windows sometimes fails to re-enumerate it after the Pico power-cycles or after a long idle period.
+2. Unplug the USB line-in adapter from the PC, wait 3 seconds, replug. The device re-enumerates and the audio input starts working again.
+3. Confirm recovery with a fresh `line_in_analyze` call — a healthy signal is typically `-55` dBfs or louder.
+4. This is distinct from the audio cable being disconnected from the radio device; check both if still silent after replug.
+
+5. **Another app holding the capture device** can make `line_in_analyze` return very low RMS (near silence) or fail to open the device. Close OBS, DAWs, other recorders, or Windows “Listen to this device” loops that use the same Line In, then retry.
+
+6. **Stereo line-in vs mono cable:** USB line-in adapters are usually stereo. Recording only channel 0 (left) while the radio is wired to the right channel reads as silence. `capture_and_analyze` now records stereo and uses the louder channel; if RMS is still wrong after replug and closing other apps, swap the 3.5mm plug orientation or use a TRS cable that carries signal on both channels.
+
+## Session cleanup — end every session cleanly
+
+At the **end of every agent testing block** (including when the user says testing is done, or before you stop replying after MCP / mpremote / acceptance work), **always** tear down what **you** started. Do not leave COM held or harness scripts running in the background.
+
+1. **Kill agent-started background processes** — match both `agent_workshop` and obvious harness names anywhere on the command line:
+   ```
+   Get-WmiObject Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and ($_.CommandLine -match 'agent_workshop|run_full_acceptance|stream_serial|advance_to_station') } | Select-Object ProcessId, CommandLine
+   ```
+   Then stop only those PIDs you recognize as this session’s harness (never kill unrelated `python.exe`):
+   ```
+   Stop-Process -Id <PID> -Force
+   ```
+   Re-list with the same filter to confirm **zero** harness processes remain.
+
+2. **Release the serial device via MCP** (if Vintage Radio is running and was connected): `invoke_action` → `stop_streaming` (optional but good), then **`disconnect`**. That closes the app’s handle on COM so `mpremote` and the user are not blocked.
+
+3. **Vintage Radio (`run_vintage_radio.py`)** — prefer **disconnect** above so the user can keep the app open. If COM is still stuck or you must run `mpremote` / flash with no GUI handle, **stopping the specific Vintage Radio process is allowed** (it is *not* “indiscriminate” killing). The rule is: **do not** mass-kill every `python.exe`; **do** identify the PID by command line and stop only what holds COM or what you started.
+
+## Serial port troubleshooting — clear background processes first
+
+Before any `mpremote` command, if you get `failed to access COMx (it may be in use)`:
+
+1. **Check running Python processes**:
+   ```
+   Get-WmiObject Win32_Process | Where-Object { $_.Name -eq 'python.exe' } | Select-Object ProcessId, CommandLine | Format-List
+   ```
+2. **Identify agent-started processes** vs the user's unrelated apps (e.g. Recipeh MCP server, corsair_lcd, etc.). **Never kill user apps.**
+3. **Kill only the process(es) actually holding the port** — often agent harness (`stream_serial.py`, `run_full_acceptance.py`, stale `mpremote`), sometimes **Vintage Radio** if MCP disconnect failed or you need a hard COM release. Match PIDs to **CommandLine**; do not stop unrelated apps (Recipeh, etc.):
+   ```
+   Stop-Process -Id <PID> -Force
+   ```
+4. **Never run `stream_serial.py` in the background while also running `mpremote` or `run_full_acceptance.py`** — they all compete for COM6. Stop the streamer before flashing or running acceptance tests.
+5. After killing stale processes, wait ~2 s before retrying `mpremote`.
+
+## MCP can drive the Device / microcontroller actions
+
+The agent **can** restart the Pico firmware and use the same operations as the **Device** tab (microcontroller menu), **without** clicking the UI, as long as Vintage Radio is running with the MCP TCP server and the port is connected.
+
+Use **`invoke_action`** with the `action` names below (same as internal MCP wiring for the Device widget). Responses often include **`queued: true`** — work runs on the Qt GUI thread; **wait a few seconds** (soft reset reboots the MCU; USB may briefly glitch) then **`get_connection_state`** and **`get_device_stream_tail`**.
+
+| `action` | Typical UI equivalent |
+|----------|------------------------|
+| `device_connect` | Connect (optional `params`: `port`, `auto_start_streaming`) — top-level MCP method `device_connect` also works |
+| `disconnect` | Disconnect |
+| `scan_ports` | Refresh port list |
+| `connect` | Connect using current combo selection (optional `params.port` to select COM port first) |
+| `start_streaming` / `stop_streaming` | Start / stop serial output stream |
+| **`restart_firmware`** | **Restart firmware (main.py)** — runs `machine.soft_reset()`; **required** for many regression checks |
+| `soft_reset` | Soft reset (REPL-oriented path in UI) |
+| `list_files` | List files on device |
+| `send_command` | `params.command` + optional `timeout` (uses Ctrl+C / REPL — stops `main`; use sparingly vs `restart_firmware`) |
+| `physical_gesture` | VRTEST: `params`: `gesture` (`single_tap`, `long_press`, `get_state`, ...), `target`: `device` or `emulator` |
+| `device_stream_tail` | Recent serial lines (`params.limit`) |
+
+**Mandatory habit:** after connecting, call **`restart_firmware`** (or confirm user just rebooted), **sleep ~6–8 s**, **`device_connect`** again if `connected` went false, ensure **streaming**, then pull a **large** **`get_device_stream_tail`**.
+
+1. **Reproduce from this machine when possible**
+   - Ensure Vintage Radio is running with **MCP** enabled (`--enable-mcp-debug --mcp-autostart` or Developer menu).
+   - **`device_connect`** if needed → **`start_streaming`** if needed → **`invoke_action` / `restart_firmware`** → wait → reconnect/stream if needed → **`get_device_stream_tail`** (limit **400+**).
+   - Use **`line_in_analyze`** with the correct input (**Vintage Radio Line In** if renamed, else Realtek Line In; the full acceptance suite picks this automatically) for **objective audio metrics** vs `gui/resources/AMradioSound.wav`. **Do not** run line-in capture while the DFPlayer is idle — confirm `busy_pin=0` or trigger playback first.
+
+2. **Observe**
+   - Serial: errors, `MemoryError`, `Traceback`, AM WAV retries, state vs playback mismatches, BUSY/UART anomalies.
+   - Audio metrics: RMS/peak, windowed segments, `envelope_pearson_r` / MSE vs reference when relevant.
+
+3. **Fix**
+   - Change **firmware** or **host** code as needed; keep diffs focused on the proven issue.
+   - Remind the user to **copy updated `main_basic.py` / `main.py` / `radio_core.py` / `dfplayer_hardware.py`** to the Pico (or use the app's deploy/install flow) and **restart firmware** to verify.
+
+4. **GUI restarts**
+   - After changing **Python MCP / GUI** code, **fully quit** Vintage Radio and start it again so new code loads. Killing the process that owns **port 8765** is an effective way to ensure a clean restart before MCP tests.
