@@ -1,13 +1,18 @@
 """Tests for gui.sd_manager.SDManager (path helpers, metadata, validation)."""
 
 import json
+import os
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from gui.database import DatabaseManager
-from gui.sd_manager import SDManager
+from gui.sd_manager import (
+    SDManager,
+    _resolve_mount_volume_name,
+    _sanitize_fat_volume_label,
+)
 
 
 @pytest.fixture
@@ -113,6 +118,9 @@ class TestPathHelpers:
     def test_vintage_root(self, tmp_path):
         assert SDManager.vintage_root(tmp_path) == tmp_path / "VintageRadio"
 
+    def test_dfplayer_radio_metadata_path(self, tmp_path):
+        assert SDManager.dfplayer_radio_metadata_path(tmp_path) == tmp_path / "radio_metadata.json"
+
 
 class TestWriteMetadata:
     def test_creates_json(self, populated_sd, tmp_path):
@@ -178,6 +186,8 @@ class TestSyncDFPlayer:
             copied, skipped = mgr.sync_library(sd_root, audio_target="dfplayer_rp2040")
 
         assert copied == 3
+        assert not (sd_root / "VintageRadio").exists()
+        assert (sd_root / "radio_metadata.json").exists()
         # Verify folder/file structure
         folder_01 = sd_root / "01"
         assert folder_01.exists()
@@ -201,12 +211,10 @@ class TestSyncDFPlayer:
 class TestImportFromSD:
     def test_import_reads_metadata(self, sd_db, tmp_path):
         sd_root = tmp_path / "sd_import"
-        vintage = sd_root / "VintageRadio"
-        vintage.mkdir(parents=True)
 
         # Create a fake MP3 file on the SD card
         folder = sd_root / "01"
-        folder.mkdir()
+        folder.mkdir(parents=True)
         track_file = folder / "001.mp3"
         frame = b"\xff\xfb\x90\x00" + b"\x00" * 413
         track_file.write_bytes(frame * 10)
@@ -223,8 +231,30 @@ class TestImportFromSD:
             ],
             "playlists": [],
         }
-        (vintage / "radio_metadata.json").write_text(json.dumps(metadata))
+        (sd_root / "radio_metadata.json").write_text(json.dumps(metadata))
 
+        mgr = SDManager(sd_db)
+        result = mgr.import_from_sd(sd_root)
+        assert result["albums"] == 1
+        assert result["songs"] == 1
+
+    def test_import_reads_metadata_legacy_vintage_subfolder(self, sd_db, tmp_path):
+        sd_root = tmp_path / "sd_import_legacy"
+        vintage = sd_root / "VintageRadio"
+        vintage.mkdir(parents=True)
+        folder = sd_root / "01"
+        folder.mkdir(parents=True)
+        track_file = folder / "001.mp3"
+        frame = b"\xff\xfb\x90\x00" + b"\x00" * 413
+        track_file.write_bytes(frame * 10)
+        metadata = {
+            "songs": {
+                "1": {"title": "L", "artist": "A", "duration": 1, "folder": 1, "track": 1},
+            },
+            "albums": [{"id": 1, "name": "Alb", "tracks": [{"song_id": 1, "folder": 1, "track": 1}]}],
+            "playlists": [],
+        }
+        (vintage / "radio_metadata.json").write_text(json.dumps(metadata))
         mgr = SDManager(sd_db)
         result = mgr.import_from_sd(sd_root)
         assert result["albums"] == 1
@@ -375,10 +405,9 @@ class TestAmWavCopy:
         except Exception as exc:
             pytest.fail(f"_copy_am_wav_to_dfplayer_sd raised on missing WAV: {exc}")
 
-    def test_am_wav_copy_to_folder_99(self, sd_db, tmp_path):
-        """If AM WAV exists on disk, it should be copied to folder 99."""
+    def test_am_wav_not_copied_to_dfplayer_sd(self, sd_db, tmp_path):
+        """AM WAV is Pico PWM only; sync must not place it on the DFPlayer SD card."""
         mgr = SDManager(sd_db)
-        # Mock resource path to point to a real temp file
         am_source = tmp_path / "AMradioSound.wav"
         am_source.write_bytes(b"RIFF" + b"\x00" * 100)
         sd_root = tmp_path / "sd_am_copy"
@@ -386,10 +415,8 @@ class TestAmWavCopy:
 
         with mock.patch("gui.sd_manager.resource_path", return_value=am_source):
             result = mgr._copy_am_wav_to_dfplayer_sd(sd_root)
-        # Result can be True or False depending on implementation;
-        # key assertion: no exception
-        assert isinstance(result, bool)
-
+        assert result is False
+        assert not (sd_root / "99" / "001.wav").exists()
 
 # ---------------------------------------------------------------------------
 # New tests: validation edge cases
@@ -417,3 +444,102 @@ class TestValidateSDEdgeCases:
         mgr = SDManager(sd_db)
         results = mgr.validate_sd()
         assert len(results["source_file_missing"]) >= 1
+
+
+def test_sanitize_fat_volume_label_strips_and_truncates():
+    assert _sanitize_fat_volume_label("my-sd_12") == "MYSD12"
+    assert len(_sanitize_fat_volume_label("ABCDEFGHIJKLMNOP")) == 11
+    assert _sanitize_fat_volume_label("   ") == ""
+
+
+def test_resolve_mount_volume_name_windows_prefers_get_volume_label():
+    p = Path("E:/")
+    with mock.patch("gui.sd_manager.os.name", "nt"):
+        with mock.patch("gui.sd_manager._get_volume_label", return_value="CANON"):
+            assert _resolve_mount_volume_name(p, "HINT") == "CANON"
+
+
+def test_resolve_mount_volume_name_falls_back_to_db_hint_on_windows():
+    p = Path("E:/")
+    with mock.patch("gui.sd_manager.os.name", "nt"):
+        with mock.patch("gui.sd_manager._get_volume_label", return_value=""):
+            assert _resolve_mount_volume_name(p, "FALLBACK") == "FALLBACK"
+
+
+def test_resolve_mount_volume_name_uses_mount_folder_name():
+    p = Path("/Volumes/MyRadioCard")
+    with mock.patch("gui.sd_manager.os.name", "posix"):
+        assert _resolve_mount_volume_name(p, "") == "MyRadioCard"
+
+
+class TestBasicConvertWorkersAuto:
+    """_basic_convert_workers_auto tiers: RAM + logical CPU count (see sd_manager)."""
+
+    def test_workstation_tier_uses_2x_logical_cpus_capped_32(self, sd_mgr):
+        with mock.patch("gui.sd_manager.os.cpu_count", return_value=8):
+            vm = mock.Mock()
+            vm.total = 64 * 1024**3
+            with mock.patch("gui.sd_manager.psutil.virtual_memory", return_value=vm):
+                w, tier = sd_mgr._basic_convert_workers_auto(100000)
+        assert w == 16
+        assert "workstation" in tier
+
+    def test_workstation_16_threads_caps_at_32(self, sd_mgr):
+        with mock.patch("gui.sd_manager.os.cpu_count", return_value=16):
+            vm = mock.Mock()
+            vm.total = 64 * 1024**3
+            with mock.patch("gui.sd_manager.psutil.virtual_memory", return_value=vm):
+                w, _ = sd_mgr._basic_convert_workers_auto(100000)
+        assert w == 32
+
+    def test_balanced_tier_one_per_core(self, sd_mgr):
+        with mock.patch("gui.sd_manager.os.cpu_count", return_value=8):
+            vm = mock.Mock()
+            vm.total = 16 * 1024**3
+            with mock.patch("gui.sd_manager.psutil.virtual_memory", return_value=vm):
+                w, tier = sd_mgr._basic_convert_workers_auto(100000)
+        assert w == 8
+        assert "balanced" in tier
+
+    def test_modest_tier_8gb_ram(self, sd_mgr):
+        with mock.patch("gui.sd_manager.os.cpu_count", return_value=8):
+            vm = mock.Mock()
+            vm.total = 8 * 1024**3
+            with mock.patch("gui.sd_manager.psutil.virtual_memory", return_value=vm):
+                w, tier = sd_mgr._basic_convert_workers_auto(100000)
+        assert w == 8
+        assert "modest" in tier
+
+    def test_env_overrides_auto_tiers(self, sd_mgr):
+        with mock.patch.dict(os.environ, {"VINTAGE_RADIO_CONVERT_WORKERS": "5"}, clear=False):
+            with mock.patch("gui.sd_manager.os.cpu_count", return_value=8):
+                vm = mock.Mock()
+                vm.total = 64 * 1024**3
+                with mock.patch("gui.sd_manager.psutil.virtual_memory", return_value=vm):
+                    w, note = sd_mgr._resolve_basic_convert_workers(999)
+        assert w == 5
+        assert "manual" in note
+
+
+def test_clear_basic_sync_mp3_cache_for_library_removes_tree(sd_mgr, tmp_path):
+    fp = sd_mgr._library_cache_fingerprint()
+    fake_base = tmp_path / "cache_root"
+    root = fake_base / "basic_sync_mp3" / fp
+    root.mkdir(parents=True)
+    (root / "dfplayer_safe_auto").mkdir()
+    (root / "dfplayer_safe_auto" / "h.mp3").write_bytes(b"x")
+    with mock.patch("platformdirs.user_cache_dir", return_value=str(fake_base)):
+        ok, err = sd_mgr.clear_basic_sync_mp3_cache_for_library()
+    assert ok
+    assert err == ""
+    assert not root.exists()
+
+
+def test_clear_basic_sync_mp3_cache_for_library_noop_when_missing(sd_mgr, tmp_path):
+    fp = sd_mgr._library_cache_fingerprint()
+    fake_base = tmp_path / "cache_root"
+    fake_base.mkdir()
+    with mock.patch("platformdirs.user_cache_dir", return_value=str(fake_base)):
+        ok, err = sd_mgr.clear_basic_sync_mp3_cache_for_library()
+    assert ok
+    assert err == ""

@@ -1,0 +1,215 @@
+"""Wizard dialog for experimental SD disk image build + raw flash (Windows)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from ..resource_paths import app_data_dir
+from ..sd_disk_image_flash import (
+    LAST_CACHED_SD_IMAGE_FILENAME,
+    format_disk_size,
+    is_windows_admin,
+    windows_list_non_system_disks,
+)
+
+
+class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
+    """Collect options for: optional prepare on PC → build .img → write to physical disk."""
+
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget],
+        *,
+        sd_root: Path,
+        default_disk_number: Optional[int],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Experimental: SD image (clean install)")
+        self.setModal(True)
+        self.resize(520, 420)
+
+        self._sd_root = sd_root
+        self._disk_number: Optional[int] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        warn = QtWidgets.QLabel(
+            "This will erase the entire target SD card / USB drive and replace it with a fresh "
+            "FAT32 image built from your library. All other data on that disk will be destroyed.\n\n"
+            "The write goes only to the PhysicalDrive number you pick below. The list hides typical "
+            "internal fixed disks (NVMe/SATA), but USB covers external drives too — confirm the size "
+            "and volume labels match your SD card before you continue."
+        )
+        warn.setWordWrap(True)
+        warn.setStyleSheet("font-weight: bold; color: #a33;")
+        layout.addWidget(warn)
+
+        self._admin_label = QtWidgets.QLabel()
+        self._admin_label.setWordWrap(True)
+        layout.addWidget(self._admin_label)
+
+        src = QtWidgets.QLabel(
+            f"Selected SD path (used to pick the default USB disk and for 'use existing' mode):\n{sd_root}\n\n"
+            "When preparing for an image, tracks are copied to a temporary folder on this PC "
+            "(not onto the SD card), then a single .img is built and flashed."
+        )
+        src.setWordWrap(True)
+        layout.addWidget(src)
+
+        self._prepare_on_pc_cb = QtWidgets.QCheckBox(
+            "Prepare library on this PC (recommended): clean output to a temp folder, then build image"
+        )
+        self._prepare_on_pc_cb.setChecked(True)
+        layout.addWidget(self._prepare_on_pc_cb)
+
+        self._last_img_path = app_data_dir() / "sd_image_cache" / LAST_CACHED_SD_IMAGE_FILENAME
+        self._flash_last_cb = QtWidgets.QCheckBox(
+            "Flash only (reuse last built disk image — skips prepare and build; faster for testing)"
+        )
+        self._flash_last_cb.setToolTip(
+            f"If a previous run succeeded in building an image, it is kept at:\n{self._last_img_path}"
+        )
+        self._flash_last_cb.stateChanged.connect(self._on_flash_last_changed)
+        self._refresh_flash_last_available()
+        layout.addWidget(self._flash_last_cb)
+
+        layout.addWidget(QtWidgets.QLabel("Target physical disk (Windows):"))
+        self._disk_combo = QtWidgets.QComboBox()
+        self._disk_combo.setMinimumWidth(480)
+        layout.addWidget(self._disk_combo)
+
+        self._populate_disks(default_disk_number)
+
+        hint = QtWidgets.QLabel(
+            "Only USB and MMC (SD slot) disks are listed; internal NVMe/SATA system drives are filtered "
+            "out. Drive letters and volume labels shown are what Windows reports for each disk — use them "
+            "to confirm you are not selecting a USB hard drive or the wrong stick.\n\n"
+            "Uncheck 'Prepare library on this PC' only if this folder already has a full DFPlayer sync; "
+            "then no track copy runs and the image is built from that folder alone."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(hint)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._refresh_admin()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._refresh_flash_last_available()
+
+    def _refresh_flash_last_available(self) -> None:
+        try:
+            ok = self._last_img_path.is_file() and self._last_img_path.stat().st_size > 0
+        except OSError:
+            ok = False
+        self._flash_last_cb.setEnabled(ok)
+        if not ok:
+            self._flash_last_cb.setChecked(False)
+            self._prepare_on_pc_cb.setEnabled(True)
+
+    def _on_flash_last_changed(self) -> None:
+        if self._flash_last_cb.isChecked():
+            self._prepare_on_pc_cb.setChecked(False)
+            self._prepare_on_pc_cb.setEnabled(False)
+        else:
+            self._prepare_on_pc_cb.setEnabled(True)
+
+    def _refresh_admin(self) -> None:
+        if is_windows_admin():
+            self._admin_label.setText("")
+            self._admin_label.hide()
+        else:
+            self._admin_label.setText(
+                "The final write step uses a Windows security prompt (UAC). If that fails, you can "
+                "right-click Vintage Radio → Run as administrator and try again."
+            )
+            self._admin_label.show()
+
+    def _populate_disks(self, default_disk_number: Optional[int]) -> None:
+        self._disk_combo.clear()
+        rows: List[Tuple[int, str]] = []
+        for d in windows_list_non_system_disks():
+            try:
+                num = int(d["Number"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            try:
+                size = int(d["Size"])
+            except (KeyError, TypeError, ValueError):
+                size = 0
+            name = str(d.get("FriendlyName") or "Disk")
+            bus = str(d.get("BusType") or "")
+            vol = str(d.get("VolumeSummary") or "").strip()
+            removable = d.get("IsRemovable")
+            rem_txt = ""
+            if removable is True:
+                rem_txt = " — removable"
+            elif removable is False:
+                rem_txt = " — not marked removable"
+            label = f"PhysicalDrive{num} — {format_disk_size(size)} — {name}"
+            if bus:
+                label += f" ({bus})"
+            label += rem_txt
+            if vol:
+                label += f" — volumes: {vol}"
+            else:
+                label += " — volumes: (none mounted / no label)"
+            rows.append((num, label))
+
+        if not rows:
+            self._disk_combo.addItem("(No disks found — run as Administrator?)", None)
+            return
+
+        default_idx = 0
+        for i, (num, label) in enumerate(rows):
+            self._disk_combo.addItem(label, num)
+            if default_disk_number is not None and num == default_disk_number:
+                default_idx = i
+        self._disk_combo.setCurrentIndex(default_idx)
+
+    @property
+    def prepare_on_pc(self) -> bool:
+        return self._prepare_on_pc_cb.isChecked()
+
+    @property
+    def flash_last_image_only(self) -> bool:
+        return self._flash_last_cb.isChecked() and self._flash_last_cb.isEnabled()
+
+    @property
+    def selected_disk_number(self) -> Optional[int]:
+        return self._disk_number
+
+    def _on_accept(self) -> None:
+        num = self._disk_combo.currentData()
+        if num is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No disk",
+                "Select a target physical disk.",
+            )
+            return
+        if self._flash_last_cb.isChecked():
+            try:
+                ok_img = self._last_img_path.is_file() and self._last_img_path.stat().st_size > 0
+            except OSError:
+                ok_img = False
+            if not ok_img:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "No cached image",
+                    f"Cached disk image not found or empty:\n{self._last_img_path}\n\n"
+                    "Run a full SD image sync once to build it.",
+                )
+                return
+        self._disk_number = int(num)
+        self.accept()

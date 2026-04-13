@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import platform
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import psutil
 
@@ -22,7 +26,7 @@ except ImportError:
 
 from .audio_metadata import compute_file_hash, extract_metadata, file_matches_metadata
 from .database import DatabaseManager
-from .resource_paths import resource_path
+from .resource_paths import resource_path, resolve_ffmpeg_executable
 
 
 # Volume label we set on the SD card after first sync so we can recognize it among multiple cards
@@ -77,12 +81,194 @@ def _copy2_with_fallback(src: Path, dest: Path) -> None:
             raise
 
 
+def _sd_copy_file_fast(src: Path, dest: Path) -> None:
+    """Copy file bytes quickly for SD sync (large buffers; Windows uses ``CopyFileW``).
+
+    Many small MP3s are still limited by FAT metadata updates per file; this matches
+    typical Explorer/FastCopy-style buffering better than default ``shutil`` chunks.
+    Override buffer size with env ``VINTAGE_RADIO_SD_COPY_BUFFER_BYTES`` (default 4 MiB).
+    """
+    src = Path(src)
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        raw = (os.environ.get("VINTAGE_RADIO_SD_COPY_BUFFER_BYTES", "") or "").strip()
+        buf = int(raw) if raw else 4 * 1024 * 1024
+    except ValueError:
+        buf = 4 * 1024 * 1024
+    buf = max(64 * 1024, min(buf, 128 * 1024 * 1024))
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ok = ctypes.windll.kernel32.CopyFileW(
+                str(src.resolve()),
+                str(dest.resolve()),
+                False,
+            )
+            if ok:
+                return
+        except Exception:
+            pass
+
+    with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
+        shutil.copyfileobj(fsrc, fdst, length=buf)
+
+
 class SDManager:
     # Temp suffix for copy/convert-then-rename (atomic slot on FAT/USB)
     _SD_PART_SUFFIX = ".vrpart"
 
     def __init__(self, db: DatabaseManager) -> None:
         self.db = db
+        self._ffmpeg_exe: Optional[str] = None
+        self._ffmpeg_checked = False
+        self._ffmpeg_available = False
+        self._vlc_checked = False
+        self._vlc_available = False
+        self._active_proc_lock = threading.Lock()
+        self._active_ffmpeg_processes: set[subprocess.Popen[Any]] = set()
+
+    @staticmethod
+    def _safe_rmtree(path: Path) -> None:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _clean_install_purge(
+        self,
+        sd_root: Path,
+        progress_callback: Optional[callable] = None,
+        volume_label: str = SYNC_TARGET_VOLUME_LABEL,
+    ) -> Path:
+        """Wipe app-managed content for a clean install.
+
+        Strategy (fastest first):
+        1. PowerShell ``Format-Volume`` quick-format (instant, Windows <= 32 GB)
+        2. macOS ``diskutil eraseDisk`` (instant, any size)
+        3. Parallel folder deletion fallback (works everywhere, slower)
+        """
+        root = Path(sd_root)
+        fmt_label = _sanitize_fat_volume_label(volume_label) or SYNC_TARGET_VOLUME_LABEL
+
+        # ── Attempt quick format ──
+        system = platform.system()
+        if system == "Windows":
+            try:
+                return self._quick_format_windows(
+                    root,
+                    progress_callback=progress_callback,
+                    volume_label=fmt_label,
+                )
+            except Exception as e:
+                print(f"Quick format unavailable ({e}), falling back to parallel purge")
+        elif system == "Darwin":
+            try:
+                formatted = self._format_sd_card(root, label=fmt_label)
+                if progress_callback:
+                    progress_callback(1, 1, "Format complete")
+                return formatted
+            except Exception as e:
+                print(f"diskutil format failed ({e}), falling back to parallel purge")
+
+        # ── Fallback: parallel folder deletion ──
+        if progress_callback:
+            progress_callback(0, 1, "Removing SD content (parallel)...")
+
+        items_to_delete: List[Path] = []
+        try:
+            for item in root.iterdir():
+                name = item.name
+                if len(name) == 2 and name.isdigit():
+                    items_to_delete.append(item)
+        except OSError:
+            pass
+
+        items_to_delete.append(root / "VintageRadio")
+        for name in (
+            _SYNC_MANIFEST_NAME,
+            "radio_metadata.json",
+            "advanced_runtime.json",
+            ".metadata_never_index",
+            ".DS_Store",
+            "Thumbs.db",
+            "desktop.ini",
+        ):
+            items_to_delete.append(root / name)
+
+        items_to_delete = [p for p in items_to_delete if p.exists()]
+        total = max(1, len(items_to_delete))
+        done = 0
+
+        num_workers = min(8, total)
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = {pool.submit(self._safe_rmtree, p): p for p in items_to_delete}
+            for future in as_completed(futures):
+                done += 1
+                if progress_callback and (done % 5 == 0 or done == total):
+                    progress_callback(done, total + 1, f"Removed {done}/{total} items...")
+
+        _remove_sd_root_service_dirs(root)
+
+        if progress_callback:
+            progress_callback(total + 1, total + 1, "Clean install purge complete")
+        return root
+
+    def _quick_format_windows(
+        self,
+        sd_root: Path,
+        progress_callback: Optional[callable] = None,
+        volume_label: str = SYNC_TARGET_VOLUME_LABEL,
+    ) -> Path:
+        """Quick-format an SD card via PowerShell ``Format-Volume``.
+
+        Raises ``RuntimeError`` if the format fails or the drive is > 32 GB
+        (Windows native FAT32 limitation).
+        """
+        drive_str = str(sd_root.resolve())
+        if len(drive_str) < 2 or drive_str[1] != ":":
+            raise RuntimeError(f"Cannot determine drive letter from {sd_root}")
+        drive_letter = drive_str[0]
+
+        if progress_callback:
+            progress_callback(0, 1, "Quick-formatting SD card (FAT32)...")
+
+        safe_label = (volume_label or SYNC_TARGET_VOLUME_LABEL).replace("'", "''")
+        ps_cmd = (
+            f"Format-Volume -DriveLetter {drive_letter} "
+            f"-FileSystem FAT32 "
+            f"-NewFileSystemLabel '{safe_label}' "
+            f"-Force -Confirm:$false"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Format-Volume failed (rc={result.returncode}): "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+
+        for _ in range(30):
+            if sd_root.is_dir():
+                try:
+                    list(sd_root.iterdir())
+                    if progress_callback:
+                        progress_callback(1, 1, "Format complete")
+                    return sd_root
+                except OSError:
+                    pass
+            time.sleep(0.5)
+        raise RuntimeError("SD card not accessible after format")
 
     @staticmethod
     def _wait_for_stable_file_size(
@@ -129,7 +315,10 @@ class SDManager:
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.parent / f"{dest.name}{self._SD_PART_SUFFIX}"
         try:
-            _copy2_with_fallback(src, part)
+            try:
+                _sd_copy_file_fast(src, part)
+            except OSError:
+                _copy2_with_fallback(src, part)
             os.replace(part, dest)
         except Exception:
             try:
@@ -144,12 +333,17 @@ class SDManager:
         os.replace(part, final)
 
     @staticmethod
-    def set_sync_target_volume_label(sd_root: Path) -> bool:
+    def set_sync_target_volume_label(sd_root: Path, label: Optional[str] = None) -> bool:
         """
-        Try to set the volume label of the given path to SYNC_TARGET_VOLUME_LABEL
-        so we can detect "our" SD card when multiple are present.
+        Try to set the volume label of the given path so we can detect "our" SD card
+        when multiple are present.
+
+        If *label* is None, uses :data:`SYNC_TARGET_VOLUME_LABEL` (default app label).
         Returns True if we believe the label was set (or already matched).
         """
+        target = _sanitize_fat_volume_label(label) if label else SYNC_TARGET_VOLUME_LABEL
+        if not target:
+            target = SYNC_TARGET_VOLUME_LABEL
         try:
             system = platform.system()
             if system == "Windows":
@@ -159,13 +353,13 @@ class SDManager:
                     try:
                         import ctypes
                         from ctypes import wintypes
-                        if ctypes.windll.kernel32.SetVolumeLabelW(drive + "\\", SYNC_TARGET_VOLUME_LABEL):
+                        if ctypes.windll.kernel32.SetVolumeLabelW(drive + "\\", target):
                             return True
                     except Exception:
                         pass
                     try:
                         r = subprocess.run(
-                            ["label", drive, SYNC_TARGET_VOLUME_LABEL],
+                            ["label", drive, target],
                             capture_output=True,
                             text=True,
                             timeout=5,
@@ -184,10 +378,10 @@ class SDManager:
                     try:
                         if sd_root.resolve() == item.resolve():
                             current = item.name
-                            if current == SYNC_TARGET_VOLUME_LABEL:
+                            if current == target:
                                 return True
                             r = subprocess.run(
-                                ["diskutil", "rename", current, SYNC_TARGET_VOLUME_LABEL],
+                                ["diskutil", "rename", current, target],
                                 capture_output=True,
                                 text=True,
                                 timeout=10,
@@ -206,6 +400,7 @@ class SDManager:
 
         Raises ``RuntimeError`` on failure or unsupported platform configuration.
         """
+        label = _sanitize_fat_volume_label(label) or SYNC_TARGET_VOLUME_LABEL
         system = platform.system()
 
         if system == "Darwin":
@@ -274,10 +469,16 @@ class SDManager:
                 raise RuntimeError(
                     f"Windows format utility not found at {format_com}. Cannot reformat the SD card."
                 )
-            result = subprocess.run(
-                [str(format_com), drive, "/FS:FAT32", "/Q", f"/V:{label}", "/Y"],
-                capture_output=True, text=True, timeout=120,
-            )
+            try:
+                result = subprocess.run(
+                    [str(format_com), drive, "/FS:FAT32", "/Q", f"/V:{label}", "/Y"],
+                    capture_output=True, text=True, timeout=300,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(
+                    "SD format timed out on Windows. The card may be busy or very slow. "
+                    "Try normal sync, or eject/reinsert and retry clean install."
+                ) from e
             if result.returncode != 0:
                 err = (result.stderr or "") + (result.stdout or "")
                 raise RuntimeError(f"format command failed: {err.strip() or result.returncode}")
@@ -470,24 +671,38 @@ class SDManager:
         """
         Detect external storage devices (SD cards, USB drives) across platforms.
 
-        Windows: Uses removable flag and filesystem type (FAT, FAT32, ExFAT)
-        macOS: Scans /Volumes excluding system volumes
-        Linux: Scans /mnt and /media for external mounts
+        Windows: Uses psutil (``all=True``) plus ``GetDriveTypeW`` removable drives
+        so internal/USB SD readers are listed even when partition opts omit
+        *removable*.  macOS: /Volumes.  Linux: /mnt, /media.
         """
         roots: List[Tuple[Path, str]] = []
         system = platform.system()
 
         if system == "Windows":
-            # Windows: Use psutil to detect removable drives
             system_drive = os.environ.get("SystemDrive", "C:")
-            for part in psutil.disk_partitions(all=False):
+            seen: set = set()
+
+            def _add(path: Path, label: str) -> None:
+                try:
+                    key = str(path.resolve()).rstrip("\\").upper()
+                except OSError:
+                    key = str(path).rstrip("\\").upper()
+                if key in seen:
+                    return
+                try:
+                    if not path.exists():
+                        return
+                except OSError:
+                    return
+                seen.add(key)
+                roots.append((path, label))
+
+            for part in psutil.disk_partitions(all=True):
                 mount = part.mountpoint
                 if not mount:
                     continue
-                # Skip system drive
                 if mount.upper().startswith(system_drive.upper()):
                     continue
-                # Check for removable flag or typical external filesystem types
                 opts = part.opts.lower()
                 fstype = part.fstype.lower()
                 if "removable" in opts or fstype in {"fat", "fat32", "exfat"}:
@@ -497,8 +712,10 @@ class SDManager:
                     except OSError:
                         accessible = False
                     if accessible:
-                        label = _get_volume_label(path)
-                        roots.append((path, label))
+                        _add(path, _get_volume_label(path))
+
+            for path, label in _windows_get_removable_drive_roots():
+                _add(path, label or _get_volume_label(path))
 
         elif system == "Darwin":
             # macOS: Scan /Volumes for mounted external drives
@@ -578,11 +795,18 @@ class SDManager:
 
     @staticmethod
     def library_root(sd_root: Path) -> Path:
+        """Pi / raspberry_pi layout only — flat library under VintageRadio/."""
         return sd_root / "VintageRadio" / "library"
 
     @staticmethod
     def vintage_root(sd_root: Path) -> Path:
+        """Pi / legacy host layout. DFPlayer SD must not use this folder (numbered dirs only)."""
         return sd_root / "VintageRadio"
+
+    @staticmethod
+    def dfplayer_radio_metadata_path(sd_root: Path) -> Path:
+        """``radio_metadata.json`` at SD root for DFPlayer (no VintageRadio/ directory)."""
+        return sd_root / "radio_metadata.json"
 
     @staticmethod
     def _unique_path(root: Path, filename: str) -> Path:
@@ -595,18 +819,53 @@ class SDManager:
             counter += 1
         return candidate
 
+    def _remove_legacy_vintage_radio_folder_on_dfplayer_sd(self, sd_root: Path) -> None:
+        """Remove ``VintageRadio/`` on the DFPlayer SD card if present.
+
+        The DFPlayer must only see numbered station folders (and reserved ``99/``);
+        metadata and runtime JSON live at the SD root.
+        """
+        vr = sd_root / "VintageRadio"
+        if not vr.is_dir():
+            return
+        try:
+            shutil.rmtree(vr)
+            print("SD: removed VintageRadio/ (DFPlayer: numbered folders + root JSON only)")
+        except OSError as e:
+            print(f"Warning: could not remove VintageRadio/ from SD: {e}")
+
     def _check_ffmpeg(self) -> bool:
         """Check if ffmpeg is available (needed for audio conversion)."""
-        if not PYDUB_AVAILABLE:
+        if self._ffmpeg_checked:
+            return self._ffmpeg_available
+        exe = resolve_ffmpeg_executable()
+        if not exe:
+            self._ffmpeg_checked = True
+            self._ffmpeg_available = False
             return False
         try:
             result = subprocess.run(
-                ['ffmpeg', '-version'],
+                [exe, '-version'],
                 capture_output=True,
                 timeout=2
             )
-            return result.returncode == 0
+            ok = result.returncode == 0
+            if ok:
+                self._ffmpeg_exe = exe
+                if PYDUB_AVAILABLE:
+                    try:
+                        # Tell pydub explicitly which ffmpeg binary to use.
+                        from pydub import AudioSegment as _AudioSegment
+
+                        _AudioSegment.converter = exe
+                    except Exception:
+                        pass
+            self._ffmpeg_checked = True
+            self._ffmpeg_available = ok
+            return ok
         except (FileNotFoundError, subprocess.TimeoutExpired):
+            self._ffmpeg_checked = True
+            self._ffmpeg_available = False
             return False
     
     def _check_vlc(self) -> bool:
@@ -622,12 +881,17 @@ class SDManager:
         python-vlc can block for a long time while libVLC loads and would delay
         GUI startup when this runs from ``run_app`` before the window is shown.
         """
+        if self._vlc_checked:
+            return self._vlc_available
+
         # 1) Executable / app-bundle detection (fast; no python-vlc import)
         try:
             # macOS app bundle path
             if platform.system() == "Darwin":
                 mac_path = Path("/Applications/VLC.app/Contents/MacOS/VLC")
                 if mac_path.exists():
+                    self._vlc_checked = True
+                    self._vlc_available = True
                     return True
             # Windows common install locations or CLI in PATH
             if platform.system() == "Windows":
@@ -637,10 +901,14 @@ class SDManager:
                 ]
                 for vlc_path in vlc_paths:
                     if Path(vlc_path).exists():
+                        self._vlc_checked = True
+                        self._vlc_available = True
                         return True
             # Try invoking vlc --version on PATH
             result = subprocess.run(["vlc", "--version"], capture_output=True, timeout=2)
             if result.returncode == 0:
+                self._vlc_checked = True
+                self._vlc_available = True
                 return True
         except Exception:
             pass
@@ -648,8 +916,12 @@ class SDManager:
         try:
             import vlc as _vlc  # noqa: F401
 
+            self._vlc_checked = True
+            self._vlc_available = True
             return True
         except Exception:
+            self._vlc_checked = True
+            self._vlc_available = False
             return False
     
     def _get_vlc_path(self) -> str:
@@ -693,7 +965,8 @@ class SDManager:
         abs_source = str(source_path.resolve())
 
         def _finalize_part() -> bool:
-            if not self._wait_for_stable_file_size(part_path, min_bytes=512, timeout_s=300.0):
+            # Bound wait time so one bad conversion does not stall sync for minutes.
+            if not self._wait_for_stable_file_size(part_path, min_bytes=512, timeout_s=45.0):
                 print(f"VLC output did not stabilize for {source_path.name}")
                 try:
                     part_path.unlink(missing_ok=True)
@@ -750,7 +1023,7 @@ class SDManager:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=300,
+                timeout=90,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
             )
             if result.returncode != 0:
@@ -786,114 +1059,509 @@ class SDManager:
                 pass
             return False
 
-    def _convert_to_mp3(self, source_path: Path, target_path: Path) -> bool:
-        """
-        Convert audio file to MP3 format for DFPlayer Mini compatibility.
-        Supports: FLAC, WAV, OGG, M4A, AAC, and other formats.
-        Tries VLC first (better FLAC support), falls back to pydub/ffmpeg.
-        Returns True if successful, False otherwise.
-        """
-        source_ext = source_path.suffix.lower()
-        
-        # Try VLC first (especially good for FLAC)
-        if self._check_vlc():
-            if self._convert_to_mp3_vlc(source_path, target_path):
-                return True
-            print(f"VLC conversion failed for {source_path.name}, trying pydub/ffmpeg...")
-        
-        # Fall back to pydub/ffmpeg
-        if not PYDUB_AVAILABLE:
+    def _resolve_basic_convert_mode(self) -> str:
+        """Resolve conversion mode for basic sync: auto|direct_ffmpeg|pydub."""
+        env_raw = (os.environ.get("VINTAGE_RADIO_CONVERT_MODE", "") or "").strip().lower()
+        db_raw = (self.db.get_setting("basic_convert_mode", "") or "").strip().lower()
+        mode = env_raw or db_raw or "auto"
+        if mode in {"auto", "direct_ffmpeg", "pydub"}:
+            return mode
+        return "auto"
+
+    def _register_active_ffmpeg_process(self, proc: subprocess.Popen[Any]) -> None:
+        with self._active_proc_lock:
+            self._active_ffmpeg_processes.add(proc)
+
+    def _unregister_active_ffmpeg_process(self, proc: subprocess.Popen[Any]) -> None:
+        with self._active_proc_lock:
+            self._active_ffmpeg_processes.discard(proc)
+
+    def _terminate_active_ffmpeg_processes(self) -> None:
+        """Best-effort kill for all tracked ffmpeg child processes."""
+        with self._active_proc_lock:
+            procs = list(self._active_ffmpeg_processes)
+        for proc in procs:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            except Exception:
+                pass
+            finally:
+                self._unregister_active_ffmpeg_process(proc)
+
+    def _convert_to_mp3_ffmpeg_direct(
+        self,
+        source_path: Path,
+        target_path: Path,
+        *,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        conversion_profile: str = "dfplayer_safe",
+    ) -> bool:
+        """Convert via direct ffmpeg subprocess (no pydub wrapper)."""
+        ffmpeg_exe = self._ffmpeg_exe or resolve_ffmpeg_executable()
+        if not ffmpeg_exe:
             return False
-        
-        if not self._check_ffmpeg():
-            return False
-        
         target_path.parent.mkdir(parents=True, exist_ok=True)
         part_path = target_path.parent / f"{target_path.name}{self._SD_PART_SUFFIX}"
         try:
             part_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+        cmd = [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            # Keep each process single-threaded so N parallel jobs ~= N cores (no oversubscription).
+            "-threads",
+            "1",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-codec:a",
+            "libmp3lame",
+        ]
+        if conversion_profile == "high_quality":
+            cmd.extend(["-q:a", "2"])
+        else:
+            cmd.extend(["-ar", "44100", "-ac", "2", "-b:a", "128k"])
+        cmd.extend([
+            "-f",
+            "mp3",
+            str(part_path),
+        ])
+
+        proc: Optional[subprocess.Popen[Any]] = None
         try:
-            if source_ext == ".flac":
-                audio = AudioSegment.from_file(str(source_path), format="flac")
-            else:
-                audio = AudioSegment.from_file(str(source_path))
-            audio.export(
-                str(part_path),
-                format="mp3",
-                bitrate="192k",
-                parameters=["-q:a", "2"],
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+            self._register_active_ffmpeg_process(proc)
+            while True:
+                if should_cancel and should_cancel():
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    return False
+                rc = proc.poll()
+                if rc is not None:
+                    break
+                time.sleep(0.15)
+
+            if proc.returncode != 0:
+                try:
+                    err = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", errors="ignore")
+                    if err.strip():
+                        print(f"ffmpeg conversion failed for {source_path.name}: {err[:300]}")
+                except Exception:
+                    print(f"ffmpeg conversion failed for {source_path.name}")
+                try:
+                    part_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
+
+            if not self._wait_for_stable_file_size(part_path, min_bytes=512, timeout_s=45.0):
+                print(f"ffmpeg output did not stabilize for {source_path.name}")
+                try:
+                    part_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
             self._atomic_replace_written_file(part_path, target_path)
             return True
         except Exception as e:
-            print(f"pydub/ffmpeg conversion error for {source_path.name}: {e}")
+            print(f"ffmpeg conversion error for {source_path.name}: {e}")
             try:
                 part_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            if source_ext == ".flac":
-                try:
-                    audio = AudioSegment.from_file(str(source_path))
-                    audio.export(str(part_path), format="mp3", bitrate="192k")
-                    self._atomic_replace_written_file(part_path, target_path)
-                    return True
-                except Exception as e2:
-                    print(f"Alternative FLAC conversion also failed for {source_path.name}: {e2}")
-                    try:
-                        part_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+            return False
+        finally:
+            if proc is not None:
+                self._unregister_active_ffmpeg_process(proc)
+
+    def _convert_to_mp3(
+        self,
+        source_path: Path,
+        target_path: Path,
+        *,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        mode: Optional[str] = None,
+        conversion_profile: str = "dfplayer_safe",
+    ) -> bool:
+        """
+        Convert audio file to MP3 format for DFPlayer Mini compatibility.
+        Supports: FLAC, WAV, OGG, M4A, AAC, and other formats.
+        Prefers pydub/ffmpeg for most formats (faster for bulk WAV), keeps
+        VLC-first for FLAC edge cases.
+        Returns True if successful, False otherwise.
+        """
+        source_ext = source_path.suffix.lower()
+        ffmpeg_available = self._check_ffmpeg()
+        force_ffmpeg_only = (os.environ.get("VINTAGE_RADIO_FORCE_FFMPEG", "").strip() == "1")
+        convert_mode = (mode or self._resolve_basic_convert_mode()).strip().lower()
+        if convert_mode not in {"auto", "direct_ffmpeg", "pydub"}:
+            convert_mode = "auto"
+        vlc_available = (not force_ffmpeg_only) and self._check_vlc()
+        prefer_vlc_first = source_ext == ".flac"
+
+        if should_cancel and should_cancel():
             return False
 
-    def _resolved_basic_station_end_mode(self) -> str:
-        raw = self.db.get_setting("basic_station_end_mode", "") or ""
-        end_mode = raw.strip()
-        if end_mode in ("loop", "advance", "none"):
-            return end_mode
-        legacy = (self.db.get_setting("basic_loop_stations", "") or "").strip()
-        if legacy == "1":
-            return "loop"
-        if legacy == "0":
-            return "none"
-        return "advance"
+        def _try_direct_ffmpeg() -> bool:
+            if not ffmpeg_available:
+                return False
+            return self._convert_to_mp3_ffmpeg_direct(
+                source_path,
+                target_path,
+                should_cancel=should_cancel,
+                conversion_profile=conversion_profile,
+            )
+
+        def _try_pydub() -> bool:
+            if not PYDUB_AVAILABLE or not ffmpeg_available:
+                return False
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            part_path = target_path.parent / f"{target_path.name}{self._SD_PART_SUFFIX}"
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                if source_ext == ".flac":
+                    audio = AudioSegment.from_file(str(source_path), format="flac")
+                else:
+                    audio = AudioSegment.from_file(str(source_path))
+                _p_base = (
+                    ["-q:a", "2"]
+                    if conversion_profile == "high_quality"
+                    else ["-ar", "44100", "-ac", "2", "-b:a", "128k"]
+                )
+                audio.export(
+                    str(part_path),
+                    format="mp3",
+                    bitrate="192k" if conversion_profile == "high_quality" else "128k",
+                    parameters=["-threads", "1"] + _p_base,
+                )
+                self._atomic_replace_written_file(part_path, target_path)
+                return True
+            except Exception as e:
+                print(f"pydub/ffmpeg conversion error for {source_path.name}: {e}")
+                try:
+                    part_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if source_ext == ".flac":
+                    try:
+                        audio = AudioSegment.from_file(str(source_path))
+                        audio.export(
+                            str(part_path),
+                            format="mp3",
+                            bitrate="192k" if conversion_profile == "high_quality" else "128k",
+                        )
+                        self._atomic_replace_written_file(part_path, target_path)
+                        return True
+                    except Exception as e2:
+                        print(f"Alternative FLAC conversion also failed for {source_path.name}: {e2}")
+                        try:
+                            part_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                return False
+
+        if convert_mode == "direct_ffmpeg":
+            if _try_direct_ffmpeg():
+                return True
+            if not force_ffmpeg_only and vlc_available:
+                return self._convert_to_mp3_vlc(source_path, target_path)
+            return _try_pydub()
+
+        if convert_mode == "pydub":
+            if _try_pydub():
+                return True
+            if _try_direct_ffmpeg():
+                return True
+            if not force_ffmpeg_only and vlc_available:
+                return self._convert_to_mp3_vlc(source_path, target_path)
+            return False
+
+        if prefer_vlc_first:
+            if vlc_available and self._convert_to_mp3_vlc(source_path, target_path):
+                return True
+            if _try_direct_ffmpeg():
+                return True
+            return _try_pydub()
+
+        if _try_direct_ffmpeg():
+            return True
+        if _try_pydub():
+            return True
+        if vlc_available:
+            if self._convert_to_mp3_vlc(source_path, target_path):
+                return True
+            print(f"VLC conversion failed for {source_path.name}")
+        return False
+
+    def _basic_convert_workers_auto(self, total_jobs: int) -> Tuple[int, str]:
+        """Pick parallel conversion count from logical CPU count + installed RAM (no model sniffing).
+
+        Uses only ``os.cpu_count()`` and ``psutil.virtual_memory().total`` — safe on all platforms.
+        Tiers keep weaker machines conservative; high RAM + many threads allows ~2× logical CPUs
+        (capped) when FFmpeg runs with ``-threads 1`` per process.
+        """
+        n = max(1, os.cpu_count() or 2)
+        try:
+            ram_gb = float(psutil.virtual_memory().total) / (1024.0**3)
+        except Exception:
+            ram_gb = 16.0
+
+        if ram_gb >= 32.0 and n >= 8:
+            w = min(32, n * 2, total_jobs)
+            tier = "workstation (<=2x logical CPUs, RAM>=32 GiB)"
+        elif ram_gb >= 16.0 and n >= 4:
+            w = min(16, n, total_jobs)
+            tier = "balanced (<=1x logical CPU, RAM>=16 GiB)"
+        elif ram_gb >= 8.0:
+            w = min(12, n, total_jobs)
+            tier = "modest (RAM>=8 GiB)"
+        else:
+            w = min(6, max(1, (n + 1) // 2), total_jobs)
+            tier = "conservative (low RAM)"
+
+        return max(1, w), tier
+
+    def _resolve_basic_convert_workers(self, total_jobs: int) -> Tuple[int, str]:
+        """Resolve conversion worker count with env/db override and auto hardware tiers.
+
+        Returns ``(worker_count, note)`` for session logging (Phase 1b).
+        """
+        # Priority: env var > DB setting > auto hardware tier.
+        env_raw = (os.environ.get("VINTAGE_RADIO_CONVERT_WORKERS", "") or "").strip()
+        db_raw = (self.db.get_setting("basic_convert_workers", "") or "").strip()
+        raw = env_raw or db_raw
+        if raw:
+            try:
+                val = int(raw)
+                return max(1, min(64, val)), "manual (env or basic_convert_workers)"
+            except ValueError:
+                pass
+        w, tier = self._basic_convert_workers_auto(total_jobs)
+        n = os.cpu_count() or "?"
+        return w, f"auto: {tier}; logical_cpus={n}"
+
+    def _library_cache_fingerprint(self) -> str:
+        """Stable short id for this library (database file) for on-disk cache names."""
+        try:
+            raw = str(self.db.db_path.resolve()).encode("utf-8", errors="replace")
+        except Exception:
+            raw = str(self.db.db_path).encode("utf-8", errors="replace")
+        return hashlib.sha256(raw).hexdigest()[:16]
+
+    def _basic_sync_mp3_cache_dir(
+        self,
+        conversion_profile: str,
+        convert_mode: str,
+    ) -> Path:
+        """Persistent host cache for converted MP3s (per library + encode settings).
+
+        Stored under the OS user cache dir (e.g. ``%LOCALAPPDATA%\\Vintage Radio\\Cache``
+        on Windows) so full SD syncs can skip re-encoding when source hash/size matches.
+        """
+        try:
+            import platformdirs
+
+            base = Path(platformdirs.user_cache_dir("Vintage Radio", appauthor=False))
+        except Exception:
+            base = Path.home() / ".cache" / "Vintage Radio"
+        safe = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "_",
+            f"{conversion_profile}_{convert_mode}",
+        ).strip("_") or "default"
+        root = base / "basic_sync_mp3" / self._library_cache_fingerprint() / safe
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return root
+
+    def clear_basic_sync_mp3_cache_for_library(self) -> Tuple[bool, str]:
+        """Delete all locally cached converted MP3s for this library (all profiles/modes).
+
+        Used when the user wants a "super clean" install: SD wipe plus full re-encode
+        with no reuse of host-side cache files.
+        """
+        try:
+            import platformdirs
+
+            base = Path(platformdirs.user_cache_dir("Vintage Radio", appauthor=False))
+        except Exception:
+            base = Path.home() / ".cache" / "Vintage Radio"
+        root = base / "basic_sync_mp3" / self._library_cache_fingerprint()
+        if not root.is_dir():
+            return True, ""
+        try:
+            shutil.rmtree(root)
+            return True, ""
+        except OSError as e:
+            return False, str(e)
+
+    def _resolve_basic_sd_copy_workers(self, total_jobs: int) -> int:
+        """Parallel copy workers for Phase 2 (USB/SD is often slower than conversion)."""
+        env_raw = (os.environ.get("VINTAGE_RADIO_SD_COPY_WORKERS", "") or "").strip()
+        db_raw = (self.db.get_setting("basic_sd_copy_workers", "") or "").strip()
+        raw = env_raw or db_raw
+        if raw:
+            try:
+                return max(1, min(32, int(raw)))
+            except ValueError:
+                pass
+        # Default: more threads than before; cap to reduce FAT/USB contention on weak readers.
+        return max(2, min(12, total_jobs, max(4, (os.cpu_count() or 4))))
+
+    def _cache_key_for_song(self, song: Any, file_path: Path) -> Optional[Tuple[str, int]]:
+        """Return a stable cache key for one source track."""
+        try:
+            file_hash = str(song["file_hash"] or "").strip()
+            if not file_hash:
+                file_hash = compute_file_hash(file_path)
+            size_raw = song["file_size"]
+            if size_raw is None:
+                size_raw = file_path.stat().st_size
+            return file_hash, int(size_raw)
+        except Exception:
+            return None
+
+    def _try_copy_from_cache(
+        self,
+        cache: Dict[Tuple[str, int], Path],
+        cache_key: Optional[Tuple[str, int]],
+        target_path: Path,
+    ) -> bool:
+        if cache_key is None:
+            return False
+        cached_path = cache.get(cache_key)
+        if cached_path is None or not cached_path.exists():
+            return False
+        try:
+            self._atomic_copy2(cached_path, target_path)
+            return True
+        except Exception:
+            return False
+
+    def _remember_cache_entry(
+        self,
+        cache: Dict[Tuple[str, int], Path],
+        cache_key: Optional[Tuple[str, int]],
+        target_path: Path,
+    ) -> None:
+        if cache_key is None:
+            return
+        cache[cache_key] = target_path
 
     def sync_library_basic(
         self,
         sd_root: Path,
         force_clean: bool = False,
         progress_callback: Optional[callable] = None,
-    ) -> Tuple[int, int]:
+        should_cancel: Optional[Callable[[], bool]] = None,
+        conversion_profile: str = "dfplayer_safe",
+        dfplayer_eq: str = "normal",
+        copy_destination_label: str = "SD card",
+        sync_log_prefix: str = "Basic SD",
+    ) -> Dict[str, object]:
         """Sync basic-mode stations to SD card.
 
-        Each station maps to a DFPlayer folder (01-98). Tracks are duplicated
-        across folders if they appear in multiple stations. Folder 99 is
-        reserved for the AM WAV overlay. The DFPlayer firmware discovers layout
-        by querying the module directly; the app also writes a hidden
-        ``.sync_manifest.json`` at the SD root (for host-side mismatch checks),
+        Each station maps to a DFPlayer folder (01-99). Tracks are duplicated
+        across folders if they appear in multiple stations. The DFPlayer firmware
+        discovers layout by querying the module directly; the app also writes a
+        hidden ``.sync_manifest.json`` at the SD root (for host-side mismatch checks),
         which the DFPlayer ignores.
         """
-        RESERVED_FOLDER = 99
+        preserved_volume_label = ""
+        if force_clean:
+            root_in = Path(sd_root)
+            hint = (
+                (self.db.get_setting("sd_volume_label") or "").strip()
+                or (self.db.get_setting("sd_label") or "").strip()
+            )
+            raw = _resolve_mount_volume_name(root_in, hint)
+            preserved_volume_label = (
+                _sanitize_fat_volume_label(raw)
+                or _sanitize_fat_volume_label(hint)
+                or SYNC_TARGET_VOLUME_LABEL
+            )
+            sd_root = self._clean_install_purge(
+                root_in,
+                progress_callback=progress_callback,
+                volume_label=preserved_volume_label,
+            )
+
+        if conversion_profile not in {"dfplayer_safe", "high_quality"}:
+            conversion_profile = "dfplayer_safe"
+        if dfplayer_eq not in {"normal", "pop", "rock", "jazz", "classic", "bass"}:
+            dfplayer_eq = "normal"
         stations = self.db.list_basic_stations()
         if not stations:
             if progress_callback:
                 progress_callback(1, 1, "No stations to sync")
             self._copy_am_wav_to_dfplayer_sd(sd_root)
-            _end = self._resolved_basic_station_end_mode()
-            print(f"Basic SD sync: station end mode = {_end!r} (folder 99 / DFPlayer 0x4E count)")
-            self._write_basic_feature_flags(sd_root, end_mode=_end)
+            self._write_advanced_runtime_sd_config(
+                sd_root,
+                dfplayer_eq=dfplayer_eq,
+                conversion_profile=conversion_profile,
+            )
             n = self.remove_hidden_junk_from_sd(sd_root)
             if n:
                 print(
                     f"Basic SD sync: removed {n} hidden/junk item(s) "
                     "(macOS ._*, .DS_Store, __MACOSX, etc.)"
                 )
-            return 0, 0
+            out: Dict[str, object] = {"copied": 0, "skipped": 0, "sd_root": str(sd_root)}
+            if preserved_volume_label:
+                out["preserved_volume_label"] = preserved_volume_label
+            return out
 
         vlc_available = self._check_vlc()
         ffmpeg_available = self._check_ffmpeg()
-        can_convert = vlc_available or (ffmpeg_available and PYDUB_AVAILABLE)
+        force_ffmpeg_only = (os.environ.get("VINTAGE_RADIO_FORCE_FFMPEG", "").strip() == "1")
+        convert_mode = self._resolve_basic_convert_mode()
+        if force_ffmpeg_only:
+            vlc_available = False
+        # direct_ffmpeg works without pydub; pydub mode requires pydub+ffmpeg.
+        if convert_mode == "pydub":
+            can_convert = vlc_available or (ffmpeg_available and PYDUB_AVAILABLE)
+        else:
+            can_convert = vlc_available or ffmpeg_available
+        # Persistent per-library cache: reuse converted MP3s across full syncs (same profile/mode).
+        conversion_cache_root = self._basic_sync_mp3_cache_dir(
+            conversion_profile, convert_mode
+        )
+        print(f"Basic sync MP3 cache directory: {conversion_cache_root}")
+        print(
+            "Basic sync conversion backend: "
+            f"ffmpeg={'yes' if ffmpeg_available else 'no'}"
+            f"{f' ({self._ffmpeg_exe})' if self._ffmpeg_exe else ''}, "
+            f"vlc={'yes' if vlc_available else 'no'}, "
+            f"force_ffmpeg_only={'yes' if force_ffmpeg_only else 'no'}, "
+            f"mode={convert_mode}, profile={conversion_profile}"
+        )
 
         # Count total tracks for progress
         station_tracks: List[Tuple[int, List]] = []
@@ -903,16 +1571,57 @@ class SDManager:
             station_tracks.append((station["folder_number"], tracks))
             total_tracks += len(tracks)
 
-        total_work = total_tracks + 2  # tracks + cleanup + AM WAV
-        work_done = 0
         copied = 0
         skipped = 0
+        converted = 0
+        cache_copied = 0
+        direct_mp3_copied = 0
+        processed_tracks = 0
+        sync_start = time.monotonic()
+        last_progress_emit = 0.0
 
         manifest_stations: Dict[str, dict] = {}
         old_manifest = self._read_sync_manifest(sd_root) if not force_clean else None
         old_manifest_stations = (old_manifest or {}).get("stations", {})
+        conversion_cache: Dict[Tuple[str, int], Path] = {}
+        deferred_cache_copy_jobs: List[Tuple[Path, Path]] = []
+
+        def _raise_if_cancelled() -> None:
+            if should_cancel and should_cancel():
+                self._terminate_active_ffmpeg_processes()
+                raise RuntimeError("Sync cancelled by user.")
+        station_names_by_folder = {
+            int(st["folder_number"]): (st["name"] or "").strip()
+            for st in stations
+        }
+
+        def _emit_prep_progress(message: str) -> None:
+            nonlocal last_progress_emit
+            if not progress_callback:
+                return
+            now = time.monotonic()
+            if (processed_tracks % 25) != 0 and (now - last_progress_emit) < 0.25:
+                return
+            progress_callback(
+                processed_tracks,
+                total_tracks,
+                f"{message} ({processed_tracks}/{total_tracks})",
+            )
+            last_progress_emit = now
+
+        # ── Phase 1: Prepare copy jobs + run conversions (sequential) ──
+        # Phase 1a scans + schedules conversions; Phase 1b executes conversions.
+        copy_jobs: List[Tuple[Path, Path, str]] = []  # (local_src, sd_target, job_type)
+        convert_jobs: List[Tuple[Path, Path, Path, Optional[Tuple[str, int]]]] = []
+        failed_cache_paths: set[Path] = set()
+
         used_folders: set = set()
         for folder_num, tracks in station_tracks:
+            _raise_if_cancelled()
+            station_start = time.monotonic()
+            station_to_copy = 0
+            station_skipped = 0
+            station_queued_convert = 0
             used_folders.add(folder_num)
             folder_key = f"{folder_num:02d}"
             folder_path = sd_root / folder_key
@@ -920,67 +1629,74 @@ class SDManager:
             valid_track_nums: set = set()
             manifest_tracks: Dict[str, dict] = {}
 
-            station_name = ""
-            for st in stations:
-                if int(st["folder_number"]) == folder_num:
-                    station_name = (st["name"] or "").strip()
-                    break
+            station_name = station_names_by_folder.get(folder_num, "")
 
             for track_order, song in enumerate(tracks, start=1):
+                _raise_if_cancelled()
                 valid_track_nums.add(track_order)
                 file_path = Path(song["file_path"])
                 title = song["title"] or song["original_filename"]
-                if progress_callback:
-                    progress_callback(work_done, total_work, f"Syncing: {title}")
+                _emit_prep_progress(f"Preparing {folder_key}: {title}")
 
                 if not file_path.exists():
                     print(f"Source file missing, skipping: {file_path}")
                     skipped += 1
-                    work_done += 1
+                    station_skipped += 1
+                    processed_tracks += 1
                     continue
 
                 target_path = folder_path / f"{track_order:03d}.mp3"
                 source_ext = file_path.suffix.lower()
+                cache_key = self._cache_key_for_song(song, file_path)
+                src_sz = int(song["file_size"]) if song["file_size"] else file_path.stat().st_size
+                src_hash = str(song["file_hash"] or "").strip()
 
                 manifest_tracks[f"{track_order:03d}"] = {
                     "source_name": file_path.name,
-                    "source_size": file_path.stat().st_size,
+                    "source_size": src_sz,
+                    "source_hash": src_hash or None,
                 }
 
                 if not force_clean and target_path.exists():
                     try:
                         target_size = target_path.stat().st_size
-                        src_sz = file_path.stat().st_size
                         old_folder = old_manifest_stations.get(folder_key, {})
                         old_entry = (old_folder.get("tracks") or {}).get(
                             f"{track_order:03d}"
                         )
-                        # Same manifest slot as last successful sync → skip (all formats).
                         if old_entry and target_size > 0:
-                            if (
-                                old_entry.get("source_name") == file_path.name
-                                and old_entry.get("source_size") == src_sz
-                            ):
-                                skipped += 1
-                                work_done += 1
-                                continue
+                            old_hash = str(old_entry.get("source_hash") or "").strip()
+                            # Strong comparison when hash is available.
+                            if src_hash:
+                                if old_hash and old_hash == src_hash:
+                                    skipped += 1
+                                    processed_tracks += 1
+                                    continue
+                                # If this is a legacy manifest entry with no hash,
+                                # force one rewrite so the manifest upgrades.
+                            else:
+                                # Backward-compatible fallback for old manifests.
+                                if (
+                                    old_entry.get("source_name") == file_path.name
+                                    and old_entry.get("source_size") == src_sz
+                                ):
+                                    skipped += 1
+                                    processed_tracks += 1
+                                    continue
                         if source_ext == ".mp3":
-                            # Never trust size alone — different MP3s often match byte size.
                             if target_size == src_sz and src_sz > 0:
                                 if compute_file_hash(file_path) == compute_file_hash(
                                     target_path
                                 ):
                                     skipped += 1
-                                    work_done += 1
+                                    processed_tracks += 1
                                     continue
                         else:
-                            # Non-MP3: no manifest match — only mtime heuristic when we
-                            # have no prior manifest entry (avoids skipping after source change).
                             if target_size > 0 and not old_entry:
                                 try:
                                     if file_path.stat().st_mtime <= target_path.stat().st_mtime:
                                         skipped += 1
-                                        work_done += 1
+                                        processed_tracks += 1
                                         continue
                                 except OSError:
                                     pass
@@ -988,29 +1704,54 @@ class SDManager:
                         pass
 
                 try:
-                    if source_ext == ".mp3":
-                        self._atomic_copy2(file_path, target_path)
-                        copied += 1
-                    elif can_convert:
-                        if self._convert_to_mp3(file_path, target_path):
-                            copied += 1
+                    cached_src = conversion_cache.get(cache_key) if cache_key else None
+                    if cached_src is not None:
+                        if cached_src.exists():
+                            copy_jobs.append((cached_src, target_path, "cache"))
+                            station_to_copy += 1
                         else:
-                            print(f"Failed to convert {file_path.name}")
-                            skipped += 1
+                            # Same song in another station: wait until Phase 1b finishes
+                            # writing the shared cache file (avoid Phase 2 racing on missing path).
+                            deferred_cache_copy_jobs.append((cached_src, target_path))
+                            station_to_copy += 1
+                    elif source_ext == ".mp3":
+                        copy_jobs.append((file_path, target_path, "direct_mp3"))
+                        self._remember_cache_entry(conversion_cache, cache_key, file_path)
+                        station_to_copy += 1
+                    elif can_convert:
+                        cache_mp3: Optional[Path] = None
+                        if cache_key is not None:
+                            cache_mp3 = conversion_cache_root / f"{cache_key[0]}_{cache_key[1]}.mp3"
+                        if cache_mp3 is not None and cache_mp3.exists():
+                            copy_jobs.append((cache_mp3, target_path, "cache"))
+                            station_to_copy += 1
+                            self._remember_cache_entry(conversion_cache, cache_key, cache_mp3)
+                        else:
+                            if cache_mp3 is None:
+                                tmp_dir = conversion_cache_root / "_tmp"
+                                tmp_dir.mkdir(parents=True, exist_ok=True)
+                                cache_mp3 = tmp_dir / f"nohash_{folder_key}_{track_order:03d}.mp3"
+                            # Reserve cache key immediately so duplicates queue behind one conversion.
+                            self._remember_cache_entry(conversion_cache, cache_key, cache_mp3)
+                            convert_jobs.append((file_path, cache_mp3, target_path, cache_key))
+                            station_to_copy += 1
+                            station_queued_convert += 1
                     else:
                         print(f"Cannot convert {file_path.name} (no converter)")
                         skipped += 1
+                        station_skipped += 1
                 except OSError as e:
-                    print(f"Error syncing {file_path.name}: {e}")
+                    print(f"Error preparing {file_path.name}: {e}")
                     skipped += 1
-                work_done += 1
+                    station_skipped += 1
+                processed_tracks += 1
 
             manifest_stations[folder_key] = {
                 "name": station_name,
                 "tracks": manifest_tracks,
             }
 
-            # Remove stale tracks within this folder (always, even when tracks were skipped).
+            # Remove stale tracks (safe before copy phase — stale slots != valid slots).
             try:
                 for item in folder_path.iterdir():
                     if item.suffix.lower() == ".mp3" and item.stem.isdigit():
@@ -1023,28 +1764,196 @@ class SDManager:
             except OSError as e:
                 print(f"Warning: could not scan folder for stale tracks {folder_path}: {e}")
 
-        # Clean up folders not assigned to any station
-        work_done += 1
+            station_elapsed = time.monotonic() - station_start
+            print(
+                f"Prepare station {folder_key} '{station_name or folder_key}': "
+                f"{station_to_copy} to copy, {station_skipped} skipped, "
+                f"{station_queued_convert} queued for conversion in {station_elapsed:.1f}s"
+            )
+
+        prep_elapsed = time.monotonic() - sync_start
+        print(
+            f"Phase 1a (scan) done: {len(copy_jobs)} provisional copy jobs, "
+            f"{len(convert_jobs)} queued conversions, {skipped} skipped in {prep_elapsed:.1f}s"
+        )
+
+        # ── Phase 1b: Execute local conversions (parallel) ──
+        if convert_jobs:
+            _raise_if_cancelled()
+            convert_start = time.monotonic()
+            max_convert_workers, _convert_workers_note = self._resolve_basic_convert_workers(
+                len(convert_jobs)
+            )
+            done_convert = 0
+            print(
+                f"Phase 1b conversion: {max_convert_workers} workers — {_convert_workers_note}; "
+                f"VINTAGE_RADIO_CONVERT_WORKERS env={os.environ.get('VINTAGE_RADIO_CONVERT_WORKERS', '')!r}"
+            )
+            if progress_callback:
+                progress_callback(
+                    0,
+                    len(convert_jobs),
+                    f"Converting audio ({len(convert_jobs)} files, {max_convert_workers} workers)...",
+                )
+
+            with ThreadPoolExecutor(max_workers=max_convert_workers) as pool:
+                futures = {
+                    pool.submit(
+                        self._convert_to_mp3,
+                        src,
+                        cache_mp3,
+                        should_cancel=should_cancel,
+                        mode=convert_mode,
+                        conversion_profile=conversion_profile,
+                    ): (src, cache_mp3, target, cache_key)
+                    for (src, cache_mp3, target, cache_key) in convert_jobs
+                }
+                for future in as_completed(futures):
+                    _raise_if_cancelled()
+                    src, cache_mp3, target, cache_key = futures[future]
+                    done_convert += 1
+                    ok = False
+                    try:
+                        ok = bool(future.result())
+                    except Exception:
+                        ok = False
+                    if ok:
+                        converted += 1
+                        # Actual SD copy job enters queue only after local conversion succeeds.
+                        copy_jobs.append((cache_mp3, target, "converted"))
+                        self._remember_cache_entry(conversion_cache, cache_key, cache_mp3)
+                    else:
+                        failed_cache_paths.add(cache_mp3)
+                        skipped += 1
+                        print(f"Failed to convert {src.name}")
+
+                    if progress_callback and (done_convert % 50 == 0 or done_convert == len(convert_jobs)):
+                        elapsed = time.monotonic() - convert_start
+                        rate = done_convert / max(0.001, elapsed)
+                        remaining = len(convert_jobs) - done_convert
+                        eta = int(remaining / rate) if rate > 0 else 0
+                        progress_callback(
+                            done_convert,
+                            len(convert_jobs),
+                            f"Converting audio ({done_convert}/{len(convert_jobs)}, {rate:.1f}/s, ETA ~{eta}s)",
+                        )
+
+            # Remove copy jobs that depend on failed conversions.
+            if failed_cache_paths:
+                copy_jobs = [
+                    (src, dst, kind)
+                    for (src, dst, kind) in copy_jobs
+                    if src not in failed_cache_paths
+                ]
+
+            convert_elapsed = time.monotonic() - convert_start
+            print(
+                f"Phase 1b (convert) done: {converted}/{len(convert_jobs)} converted "
+                f"in {convert_elapsed:.1f}s ({converted / max(0.001, convert_elapsed):.1f}/s, "
+                f"{max_convert_workers} workers)"
+            )
+
+        # Duplicate tracks across stations: copy shared cache file to extra targets now.
+        for _src, _dst in deferred_cache_copy_jobs:
+            copy_jobs.append((_src, _dst, "cache"))
+
+        # ── Phase 2: Copy files to SD card (parallel) ──
+        total_copies = len(copy_jobs)
+        copies_done = 0
+        copy_phase_start = time.monotonic()
+        _copy_lock = threading.Lock()
+
+        if total_copies > 0:
+            _raise_if_cancelled()
+            if progress_callback:
+                progress_callback(
+                    0, total_copies,
+                    f"Copying {total_copies} tracks to {copy_destination_label} (multi-threaded)...",
+                )
+
+            num_workers = self._resolve_basic_sd_copy_workers(total_copies)
+            print(
+                f"Phase 2 copy workers: {num_workers} "
+                f"(override env VINTAGE_RADIO_SD_COPY_WORKERS="
+                f"{os.environ.get('VINTAGE_RADIO_SD_COPY_WORKERS', '')!r})"
+            )
+
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                futures = {}
+                for job_src, job_dst, job_type in copy_jobs:
+                    futures[pool.submit(self._atomic_copy2, job_src, job_dst)] = (
+                        job_src,
+                        job_dst,
+                        job_type,
+                    )
+
+                for future in as_completed(futures):
+                    _raise_if_cancelled()
+                    job_src, job_dst, job_type = futures[future]
+                    try:
+                        future.result()
+                        with _copy_lock:
+                            copied += 1
+                            copies_done += 1
+                            if job_type == "cache":
+                                cache_copied += 1
+                            elif job_type == "direct_mp3":
+                                direct_mp3_copied += 1
+                    except Exception as e:
+                        with _copy_lock:
+                            copies_done += 1
+                            skipped += 1
+                        print(f"Copy error: {job_src.name} -> {job_dst}: {e}")
+
+                    if progress_callback and (
+                        copies_done % 100 == 0 or copies_done == total_copies
+                    ):
+                        elapsed = time.monotonic() - copy_phase_start
+                        rate = copies_done / max(0.001, elapsed)
+                        remaining = total_copies - copies_done
+                        eta = int(remaining / rate) if rate > 0 else 0
+                        progress_callback(
+                            copies_done,
+                            total_copies,
+                            f"Copying to {copy_destination_label} ({copies_done}/{total_copies}, "
+                            f"{rate:.0f} files/s, ETA ~{eta}s)",
+                        )
+
+            copy_elapsed = time.monotonic() - copy_phase_start
+            print(
+                f"Phase 2 (copy) done: {copies_done} files in {copy_elapsed:.1f}s "
+                f"({copies_done / max(0.001, copy_elapsed):.1f} files/s, "
+                f"{num_workers} threads)"
+            )
+
+        # ── Phase 3: Cleanup (keep progress scale on file count so a follow-on job
+        # like SD disk imaging does not inherit a bogus 2/2 bar).
+        _tb = max(1, total_copies)
         if progress_callback:
-            progress_callback(work_done, total_work, "Cleaning up...")
+            progress_callback(0, _tb, "Cleaning up stale folders...")
         for item in sd_root.iterdir():
             if item.is_dir() and item.name.isdigit():
                 folder_num = int(item.name)
-                if folder_num != RESERVED_FOLDER and folder_num not in used_folders:
+                if folder_num not in used_folders:
                     print(f"Removing stale folder: {item}")
                     shutil.rmtree(item, ignore_errors=True)
 
-        work_done += 1
         if progress_callback:
-            progress_callback(work_done, total_work, "Copying AM radio sound...")
+            progress_callback(_tb, _tb, "Copying AM radio sound...")
         self._copy_am_wav_to_dfplayer_sd(sd_root)
-
-        _end = self._resolved_basic_station_end_mode()
-        print(f"Basic SD sync: station end mode = {_end!r} (folder 99 / DFPlayer 0x4E count)")
-        self._write_basic_feature_flags(sd_root, end_mode=_end)
+        self._write_advanced_runtime_sd_config(
+            sd_root,
+            dfplayer_eq=dfplayer_eq,
+            conversion_profile=conversion_profile,
+        )
 
         if progress_callback:
-            progress_callback(total_work, total_work, "Basic sync complete!")
+            progress_callback(
+                _tb,
+                _tb,
+                f"{sync_log_prefix} sync finished — continuing with next step…",
+            )
+        self._remove_legacy_vintage_radio_folder_on_dfplayer_sd(sd_root)
         n = self.remove_hidden_junk_from_sd(sd_root)
         if n:
             print(
@@ -1054,8 +1963,22 @@ class SDManager:
 
         self._write_sync_manifest(sd_root, manifest_stations)
 
-        print(f"Basic SD sync complete: {copied} copied, {skipped} skipped across {len(stations)} stations")
-        return copied, skipped
+        total_elapsed = time.monotonic() - sync_start
+        rate = (total_copies / total_elapsed) if total_elapsed > 0 else 0.0
+        print(
+            f"{sync_log_prefix} sync complete: {copied} copied, {skipped} skipped across "
+            f"{len(stations)} stations in {total_elapsed:.1f}s ({rate:.1f} tracks/s). "
+            f"direct_mp3={direct_mp3_copied}, converted={converted}, "
+            f"cache_copied={cache_copied}"
+        )
+        out_end: Dict[str, object] = {
+            "copied": copied,
+            "skipped": skipped,
+            "sd_root": str(sd_root),
+        }
+        if preserved_volume_label:
+            out_end["preserved_volume_label"] = preserved_volume_label
+        return out_end
 
     # -- Sync manifest helpers ------------------------------------------------
 
@@ -1123,24 +2046,24 @@ class SDManager:
                 pass
         return None
 
-    def validate_basic_sd(self, sd_root: Path) -> List[str]:
+    _VALIDATE_MAX_ISSUES = 31
+
+    def validate_basic_sd(self, sd_root: Path, reserved_folder: Optional[int] = 99) -> List[str]:
         """Compare basic-mode stations to DFPlayer folders on *sd_root*.
 
         Returns human-readable issue strings (empty if layout matches). Mirrors
         :meth:`sync_library_basic` naming: ``NN/001.mp3`` ...
 
-        If a ``.sync_manifest.json`` (written by :meth:`sync_library_basic`) is
-        present on the SD root, it is used as the primary mismatch check: the
-        manifest records the original filename and size of each track that was
-        synced, allowing reliable detection even when a completely different
-        library happens to share the same folder structure or file sizes.  When
-        the manifest is absent (old card, manually copied files), the method
-        falls back to the legacy size/duration heuristics.
+        When a ``.sync_manifest.json`` is present (written by
+        :meth:`sync_library_basic`), a **fast manifest-only** comparison is used
+        that avoids per-file stat calls on the SD card.  This keeps startup
+        responsive even for libraries with thousands of tracks.
+
+        Falls back to per-file heuristics only when the manifest is absent.
         """
         msgs: List[str] = []
         if not sd_root.is_dir():
             return ["SD root is missing or not a directory."]
-        RESERVED_FOLDER = 99
         try:
             stations = self.db.list_basic_stations()
         except Exception:
@@ -1149,11 +2072,21 @@ class SDManager:
         manifest = self._read_sync_manifest(sd_root)
         manifest_stations = (manifest or {}).get("stations", {})
 
+        # ── Fast path: manifest-only comparison (no SD file I/O) ──
+        if manifest_stations:
+            return self._validate_basic_sd_manifest_fast(
+                stations, manifest_stations, reserved_folder,
+            )
+
+        # ── Slow path: per-file heuristics (no manifest on card) ──
+        cap = self._VALIDATE_MAX_ISSUES
         for st in stations:
+            if len(msgs) >= cap:
+                break
             fid = int(st["id"])
             fn = int(st["folder_number"])
             name = (st["name"] or "").strip() or f"Station {fn}"
-            if fn == RESERVED_FOLDER:
+            if reserved_folder is not None and fn == reserved_folder:
                 continue
             folder_key = f"{fn:02d}"
             folder = sd_root / folder_key
@@ -1164,9 +2097,6 @@ class SDManager:
             if not folder.is_dir():
                 msgs.append(f'Missing folder {folder_key} for station "{name}" ({n} tracks in the app).')
                 continue
-
-            manifest_folder = manifest_stations.get(folder_key, {})
-            manifest_tracks = manifest_folder.get("tracks", {}) if manifest_folder else {}
 
             mp3_indices: List[int] = []
             try:
@@ -1186,13 +2116,21 @@ class SDManager:
                     msgs.append(
                         f'Station "{name}": missing {order:03d}.mp3 on SD (folder {folder_key}).'
                     )
+                    if len(msgs) >= cap:
+                        break
             for idx in sorted(mp3_set):
+                if len(msgs) >= cap:
+                    break
                 if idx > n:
                     msgs.append(
                         f'Station "{name}": extra file {idx:03d}.mp3 on SD '
                         f"(app has only {n} tracks in folder {folder_key})."
                     )
+            if len(msgs) >= cap:
+                break
             for order, song in enumerate(tracks, start=1):
+                if len(msgs) >= cap:
+                    break
                 fp_raw = song["file_path"]
                 if not fp_raw:
                     t = song["title"] or song["original_filename"] or f"track {order}"
@@ -1209,28 +2147,14 @@ class SDManager:
 
                 slot = folder / f"{order:03d}.mp3"
                 if not slot.is_file():
-                    continue  # missing-slot issues already reported above
+                    continue
                 t = song["title"] or song["original_filename"] or f"track {order}"
-                track_key = f"{order:03d}"
 
                 try:
-                    # Primary check: manifest-based comparison (reliable across
-                    # different libraries that happen to share structure/sizes).
-                    m_entry = manifest_tracks.get(track_key)
-                    if m_entry:
-                        if (fp.name != m_entry.get("source_name")
-                                or fp.stat().st_size != m_entry.get("source_size")):
-                            msgs.append(
-                                f'Station "{name}": {track_key}.mp3 on SD was synced from a '
-                                f'different source than "{t}" (sync to SD to update).'
-                            )
-                        continue  # manifest is authoritative; skip heuristic
-
-                    # Fallback: legacy heuristic (no manifest on this card).
                     if fp.suffix.lower() == ".mp3":
                         if fp.stat().st_size != slot.stat().st_size:
                             msgs.append(
-                                f'Station "{name}": {track_key}.mp3 on SD does not match '
+                                f'Station "{name}": {order:03d}.mp3 on SD does not match '
                                 f'"{t}" in this position (track order or file changed — sync to SD).'
                             )
                     else:
@@ -1252,12 +2176,121 @@ class SDManager:
                                         tol = max(3.0, 0.05 * lib_sec)
                                         if abs(sd_sec - lib_sec) > tol:
                                             msgs.append(
-                                                f'Station "{name}": {track_key}.mp3 on SD '
+                                                f'Station "{name}": {order:03d}.mp3 on SD '
                                                 f'looks out of sync with "{t}" (duration differs — '
                                                 f"track order may have changed — sync to SD)."
                                             )
                 except OSError:
                     pass
+        return msgs
+
+    def _validate_basic_sd_manifest_fast(
+        self,
+        stations: list,
+        manifest_stations: Dict[str, dict],
+        reserved_folder: Optional[int],
+    ) -> List[str]:
+        """Manifest-based validation -- no SD card I/O required.
+
+        Compares the DB station/track list against what the manifest says was
+        last synced.  Catches renamed/added/removed stations and tracks,
+        reordering, and source-file changes.
+        """
+        msgs: List[str] = []
+        cap = self._VALIDATE_MAX_ISSUES
+        db_folder_keys: set = set()
+
+        for st in stations:
+            if len(msgs) >= cap:
+                break
+            fn = int(st["folder_number"])
+            if reserved_folder is not None and fn == reserved_folder:
+                continue
+            folder_key = f"{fn:02d}"
+            db_folder_keys.add(folder_key)
+            name = (st["name"] or "").strip() or f"Station {fn}"
+            m_folder = manifest_stations.get(folder_key)
+            if not m_folder:
+                msgs.append(
+                    f'Station "{name}" (folder {folder_key}) was not in the last sync.'
+                )
+                continue
+
+            m_tracks = m_folder.get("tracks") or {}
+            tracks = self.db.list_basic_station_songs(int(st["id"]))
+            n = len(tracks)
+            if n == 0:
+                continue
+
+            m_count = len(m_tracks)
+            if n != m_count:
+                msgs.append(
+                    f'Station "{name}" (folder {folder_key}): app has {n} tracks '
+                    f"but last sync had {m_count}."
+                )
+
+            for order, song in enumerate(tracks, start=1):
+                if len(msgs) >= cap:
+                    break
+                track_key = f"{order:03d}"
+                m_entry = m_tracks.get(track_key)
+                if not m_entry:
+                    t = song["title"] or song["original_filename"] or f"track {order}"
+                    msgs.append(
+                        f'Station "{name}": track "{t}" (slot {track_key}) '
+                        f"was not in the last sync."
+                    )
+                    continue
+                fp_raw = song["file_path"]
+                if not fp_raw:
+                    continue
+                fp = Path(fp_raw)
+                expected_name = str(m_entry.get("source_name") or "")
+                expected_size = m_entry.get("source_size")
+                expected_hash = str(m_entry.get("source_hash") or "").strip()
+                actual_size: Optional[int] = None
+                actual_hash = str(song["file_hash"] or "").strip()
+                try:
+                    if song["file_size"] is not None:
+                        actual_size = int(song["file_size"])
+                    elif fp.exists():
+                        actual_size = int(fp.stat().st_size)
+                except Exception:
+                    actual_size = None
+
+                if fp.name != expected_name:
+                    t = song["title"] or song["original_filename"] or f"track {order}"
+                    msgs.append(
+                        f'Station "{name}": slot {track_key} was synced from '
+                        f'"{expected_name}" but app now has "{t}".'
+                    )
+                    continue
+
+                if expected_hash and actual_hash and expected_hash != actual_hash:
+                    t = song["title"] or song["original_filename"] or f"track {order}"
+                    msgs.append(
+                        f'Station "{name}": slot {track_key} changed for "{t}" '
+                        "(source hash differs from last sync)."
+                    )
+                    continue
+
+                if expected_size is not None and actual_size is not None:
+                    if int(expected_size) != int(actual_size):
+                        t = song["title"] or song["original_filename"] or f"track {order}"
+                        msgs.append(
+                            f'Station "{name}": slot {track_key} changed for "{t}" '
+                            "(source size differs from last sync)."
+                        )
+
+        for mk in manifest_stations:
+            if len(msgs) >= cap:
+                break
+            if mk not in db_folder_keys:
+                m_name = (manifest_stations[mk].get("name") or mk).strip()
+                msgs.append(
+                    f'Folder {mk} ("{m_name}") is on the SD card but no longer in the app.'
+                )
+
         return msgs
 
     def sync_library(
@@ -1271,7 +2304,8 @@ class SDManager:
         """
         Sync library to SD card. Layout and naming depend on audio_target:
         - dfplayer_rp2040: folders 01/, 02/, ... at SD root with 001.mp3, 002.mp3 inside;
-          VintageRadio/ only for AM WAV, state, metadata. All tracks converted to MP3.
+          ``radio_metadata.json`` and ``advanced_runtime.json`` at SD root (no ``VintageRadio/``
+          on the card). All tracks converted to MP3.
         - raspberry_pi: flat VintageRadio/library/ with original-style filenames;
           if pi_convert_audio convert non-MP3 to MP3, else copy as-is.
         
@@ -1310,18 +2344,14 @@ class SDManager:
         Each unique song is written to the SD card exactly once, spread across
         numbered folders ``01/``, ``02/``, ... (max 255 tracks per folder, the
         DFPlayer track-number limit).  The mapping ``song_id -> (folder, track)``
-        is stored in the ``sd_mapping`` database table and embedded in the
-        ``radio_metadata.json`` so the firmware can look up the real location of
-        any track regardless of which album/playlist it belongs to.
-
-        Folder 99 is reserved for the AM radio WAV file.
+        is stored in the ``sd_mapping`` database table and embedded in
+        ``radio_metadata.json`` at the **SD root** so the firmware can look up the
+        real location of any track regardless of which album/playlist it belongs to.
 
         Args:
             force_clean: If True, re-sync all files even if they already exist.
             progress_callback: Optional callback(current, total, message).
         """
-        vintage_root = self.vintage_root(sd_root)
-        vintage_root.mkdir(parents=True, exist_ok=True)
         vlc_available = self._check_vlc()
         ffmpeg_available = self._check_ffmpeg()
         if vlc_available:
@@ -1357,7 +2387,8 @@ class SDManager:
             if progress_callback:
                 progress_callback(1, 1, "Nothing to sync")
             self._copy_am_wav_to_dfplayer_sd(sd_root)
-            self._write_metadata(vintage_root)
+            self._write_metadata(sd_root)
+            self._remove_legacy_vintage_radio_folder_on_dfplayer_sd(sd_root)
             return 0, 0
 
         # ── Assign each song a (folder, track_number) slot in library order ──
@@ -1365,19 +2396,15 @@ class SDManager:
         # so that metadata and SD card layout always match.
         # Many DFPlayer clones struggle with large directories (>15-20 files per
         # folder), causing playback failures for higher-numbered tracks.  Spreading
-        # songs across folders avoids this.  15 tracks/folder × 98 folders = 1,470
+        # songs across folders avoids this.  15 tracks/folder × 99 folders = 1,485
         # max tracks — more than the 255 per single folder the datasheet allows.
         MAX_TRACKS_PER_FOLDER = 100
-        RESERVED_FOLDER = 99  # AM WAV
 
         song_slot: Dict[int, Tuple[int, int]] = {}  # song_id -> (folder, track)
         next_folder = 1
         next_track = 1
 
         for sid in used_song_ids:
-            if next_folder == RESERVED_FOLDER:
-                next_folder += 1
-                next_track = 1
             song_slot[sid] = (next_folder, next_track)
             next_track += 1
             if next_track > MAX_TRACKS_PER_FOLDER:
@@ -1516,7 +2543,7 @@ class SDManager:
         for item in sd_root.iterdir():
             if item.is_dir() and item.name.isdigit():
                 folder_num = int(item.name)
-                if folder_num != RESERVED_FOLDER and folder_num not in used_folders:
+                if folder_num not in used_folders:
                     print(f"Removing stale folder: {item}")
                     shutil.rmtree(item, ignore_errors=True)
 
@@ -1544,7 +2571,8 @@ class SDManager:
         work_done += 1
         if progress_callback:
             progress_callback(work_done, total_work, "Writing metadata...")
-        self._write_metadata(vintage_root)
+        self._write_metadata(sd_root)
+        self._remove_legacy_vintage_radio_folder_on_dfplayer_sd(sd_root)
 
         if progress_callback:
             progress_callback(total_work, total_work, "Sync complete!")
@@ -1554,128 +2582,30 @@ class SDManager:
             print("No files were copied (all sources missing?). Re-import in Library or fix file paths, then sync again.")
         return copied, skipped
 
-    _BASIC_FLAG_MP3_STUB = b"\xff\xfb\x90\x00" + b"\x00" * 413
-
-    def _write_basic_feature_flags(
-        self, sd_root: Path, end_mode: str = "advance"
+    def _write_advanced_runtime_sd_config(
+        self,
+        sd_root: Path,
+        *,
+        dfplayer_eq: str,
+        conversion_profile: str,
     ) -> None:
-        """Write feature flags under DFPlayer folder 99 (firmware reads count via 0x4E only).
-
-        The Pico does not read a separate text file or flash slot for this — only the
-        DFPlayer ``query_files_in_folder(99)`` result is used.
-
-        Layout:
-          ``001.wav`` — AM sound (always, when synced)
-          ``002.mp3`` — present for loop *or* as part of advance bundle
-          ``003.mp3``, ``004.mp3`` — advance-only extra stubs
-
-        Count (0x4E): many modules skip ``.wav`` in the count, so advance uses **three**
-        MP3 stubs so total is >=3 even when only 002--004 are counted. Otherwise
-        002+003 would read as 2 and firmware would treat it as **loop**.
-
-        1 = end playback, 2 = loop, 3+ = proceed to next station.
-        """
-        if end_mode not in ("loop", "advance", "none"):
-            end_mode = "advance"
-        folder = sd_root / "99"
-        folder.mkdir(parents=True, exist_ok=True)
-        stub = self._BASIC_FLAG_MP3_STUB
-        p002 = folder / "002.mp3"
-        p003 = folder / "003.mp3"
-        p004 = folder / "004.mp3"
-
-        if end_mode == "loop":
-            if not p002.exists():
-                p002.write_bytes(stub)
-                print(f"Feature flag written: {p002} (loop)")
-            for p, label in ((p003, "003"), (p004, "004")):
-                if p.exists():
-                    p.unlink()
-                    print(f"Feature flag removed: {p} ({label} cleared for loop)")
-        elif end_mode == "advance":
-            for p, name in ((p002, "002"), (p003, "003"), (p004, "004")):
-                if not p.exists():
-                    p.write_bytes(stub)
-                    print(f"Feature flag written: {p} (advance bundle)")
-        else:
-            for p, label in ((p002, "002"), (p003, "003"), (p004, "004")):
-                if p.exists():
-                    p.unlink()
-                    print(f"Feature flag removed: {p} (stop at end)")
+        cfg_path = sd_root / "advanced_runtime.json"
+        payload = {
+            "dfplayer_eq": dfplayer_eq,
+            "conversion_profile": conversion_profile,
+        }
+        try:
+            cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError as e:
+            print(f"Warning: could not write advanced runtime config: {e}")
 
     def _copy_am_wav_to_dfplayer_sd(self, sd_root: Path) -> bool:
-        """Copy AMradioSound.wav to folder 99/001.wav on the DFPlayer SD card.
-        
-        The DFPlayer can play WAV files natively (16-bit PCM). By placing the AM
-        static sound on the SD card, the DFPlayer itself plays the sound through
-        its speaker output instead of the Pico trying to play it via PWM on GPIO.
-        
-        Returns True if the file was successfully copied.
-        """
-        source = resource_path("AMradioSound.wav")
-        folder_path = sd_root / "99"
-        folder_path.mkdir(parents=True, exist_ok=True)
-        target_path = folder_path / "001.wav"
-        
-        if not source.exists():
-            print(f"Warning: AM WAV source not found: {source}")
-            return False
-        
-        # Check if already exists and matches
-        if target_path.exists():
-            try:
-                source_size = source.stat().st_size
-                target_size = target_path.stat().st_size
-                if source_size == target_size:
-                    print(f"AM WAV already on SD card: {target_path} (size matches)")
-                    return True
-            except OSError:
-                pass
-        
-        try:
-            # Validate and optionally convert for DFPlayer compatibility
-            import wave
-            needs_conversion = False
-            try:
-                with wave.open(str(source), 'rb') as wav_in:
-                    channels = wav_in.getnchannels()
-                    sample_width = wav_in.getsampwidth()
-                    framerate = wav_in.getframerate()
-                    comptype = wav_in.getcomptype()
-                    print(f"AM WAV format: {sample_width*8}-bit, {channels} ch, {framerate} Hz, {comptype}")
-                    # DFPlayer prefers: 16-bit, mono, PCM
-                    if sample_width != 2 or channels != 1 or comptype != 'NONE':
-                        needs_conversion = True
-                        print("Converting to 16-bit PCM mono for DFPlayer compatibility...")
-            except Exception as e:
-                print(f"Could not read WAV format: {e}, copying as-is")
-            
-            if needs_conversion and PYDUB_AVAILABLE:
-                try:
-                    from pydub import AudioSegment
-                    audio = AudioSegment.from_wav(str(source))
-                    if audio.channels != 1:
-                        audio = audio.set_channels(1)
-                    audio = audio.set_sample_width(2)  # 16-bit
-                    part_wav = target_path.parent / f"{target_path.name}{self._SD_PART_SUFFIX}"
-                    try:
-                        part_wav.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    audio.export(str(part_wav), format="wav", parameters=["-acodec", "pcm_s16le"])
-                    self._atomic_replace_written_file(part_wav, target_path)
-                    print(f"AM WAV converted and copied to SD: {target_path}")
-                    return True
-                except Exception as e:
-                    print(f"Conversion failed: {e}, copying original")
-            
-            self._atomic_copy2(source, target_path)
-            print(f"AM WAV copied to SD: {target_path}")
-            return True
-            
-        except OSError as e:
-            print(f"Error copying AM WAV to SD: {e}")
-            return False
+        """AM static uses Pico PWM only; do not copy AM WAV onto the DFPlayer SD card."""
+        print(
+            "SD sync: skipping AM WAV copy to DFPlayer SD "
+            "(install AMradioSound.wav on Pico flash for PWM AM)"
+        )
+        return False
 
     @staticmethod
     def _row_get(row, key, default=None):
@@ -2066,8 +2996,8 @@ class SDManager:
     ) -> Dict[str, int]:
         """Import albums and playlists from an SD card.
 
-        Reads ``radio_metadata.json`` from the ``VintageRadio/`` directory to
-        reconstruct albums and playlists.  Audio files are resolved from their
+        Reads ``radio_metadata.json`` from the SD root (or legacy ``VintageRadio/``)
+        to reconstruct albums and playlists.  Audio files are resolved from their
         DFPlayer folder/track paths (e.g. ``01/044.mp3``).  Songs that already
         exist in the library (matched by hash+size) are reused; new files are
         copied to ``dest_dir`` (if provided) and added to the library with the
@@ -2077,9 +3007,11 @@ class SDManager:
         imported_albums = 0
         imported_playlists = 0
         imported_songs = 0
-        vintage_root = self.vintage_root(sd_root)
-
-        metadata_path = vintage_root / "radio_metadata.json"
+        metadata_path = self.dfplayer_radio_metadata_path(sd_root)
+        if not metadata_path.exists():
+            legacy = self.vintage_root(sd_root) / "radio_metadata.json"
+            if legacy.exists():
+                metadata_path = legacy
         if not metadata_path.exists():
             # Fall back to legacy folder-based import (doesn't support dest_dir)
             return self._import_from_sd_legacy(sd_root)
@@ -2248,8 +3180,8 @@ class SDManager:
                     imported_playlists += 1
         return {"albums": imported_albums, "playlists": imported_playlists}
 
-    def _write_metadata(self, vintage_root: Path) -> None:
-        """Write ``radio_metadata.json`` with deduplicated SD layout.
+    def _write_metadata(self, metadata_dir: Path) -> None:
+        """Write ``metadata_dir/radio_metadata.json`` with deduplicated SD layout.
 
         Each track entry in an album/playlist includes the **actual** DFPlayer
         folder and track number (from ``sd_mapping``) so the firmware can call
@@ -2259,6 +3191,9 @@ class SDManager:
         The file is kept compact so MicroPython on the Pico can parse it
         within its limited RAM (~256 KB).  Only fields the firmware actually
         needs are included (title, artist, duration, folder, track).
+
+        For DFPlayer SD use ``metadata_dir = sd_root``; for Pi layout use
+        ``metadata_dir = vintage_root``.
         """
         metadata: Dict = {
             "albums": [],
@@ -2327,7 +3262,7 @@ class SDManager:
                 entry["track"] = mapping[1]
             metadata["songs"][str(song["id"])] = entry
 
-        metadata_path = vintage_root / "radio_metadata.json"
+        metadata_path = metadata_dir / "radio_metadata.json"
         try:
             # Write compact JSON (no indent) to minimize file size for MicroPython
             with metadata_path.open("w", encoding="utf-8") as handle:
@@ -2466,6 +3401,66 @@ class SDManager:
             else:
                 self.db.add_song_to_playlist(collection_id, song_id, order)
         return True
+
+
+def _windows_get_removable_drive_roots() -> List[Tuple[Path, str]]:
+    """Drive letters Windows reports as DRIVE_REMOVABLE (2).
+
+    Supplements ``psutil`` when the SD reader does not expose the *removable*
+    partition flag but is still classified as removable by the OS.
+    """
+    if platform.system() != "Windows":
+        return []
+    try:
+        import ctypes
+        import string
+
+        DRIVE_REMOVABLE = 2
+        kernel32 = ctypes.windll.kernel32
+        sys_letter = (os.environ.get("SystemDrive", "C:")[:1]).upper()
+        out: List[Tuple[Path, str]] = []
+        for letter in string.ascii_uppercase:
+            if letter == sys_letter:
+                continue
+            root = f"{letter}:\\"
+            try:
+                if kernel32.GetDriveTypeW(root) != DRIVE_REMOVABLE:
+                    continue
+            except Exception:
+                continue
+            p = Path(root)
+            try:
+                if not p.exists():
+                    continue
+            except OSError:
+                continue
+            out.append((p, _get_volume_label(p)))
+        return out
+    except Exception:
+        return []
+
+
+def _sanitize_fat_volume_label(raw: str) -> str:
+    """Return a FAT32-friendly volume label (max 11 chars, A-Z / 0-9 / space)."""
+    s = (raw or "").strip().upper()
+    s = re.sub(r"[^A-Z0-9 ]+", "", s)
+    s = s[:11].strip()
+    return s
+
+
+def _resolve_mount_volume_name(sd_root: Path, db_hint: str = "") -> str:
+    """Best-effort current volume display name for *sd_root* before a format."""
+    if os.name == "nt":
+        v = (_get_volume_label(sd_root) or "").strip()
+        if v:
+            return v
+    try:
+        name = (sd_root.name or "").strip()
+        if name and name not in (".", "/"):
+            return name
+    except (OSError, ValueError):
+        pass
+    return (db_hint or "").strip()
 
 
 def _get_volume_label(path: Path) -> str:
