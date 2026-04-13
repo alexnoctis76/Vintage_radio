@@ -53,7 +53,7 @@ pip install -r requirements.txt
 To convert non-MP3 files (FLAC, WAV, OGG, etc.) to MP3 when syncing to SD card or exporting, **one of the following is required**:
 
 - **VLC Media Player** (recommended) – [Download from VideoLAN](https://www.videolan.org/vlc/). Install on your system; the app will use it for conversion and for better seeking in the Emulator.
-- **FFmpeg** – [Download from FFmpeg](https://ffmpeg.org/download.html) and add it to your system PATH. The app uses pydub with FFmpeg as a fallback when VLC is not installed.
+- **FFmpeg** – used by pydub for conversion fallback when VLC is unavailable. Packaged app builds bundle an FFmpeg binary; source/dev runs can also use a system FFmpeg from PATH.
 
 Without either VLC or FFmpeg, only MP3 files can be synced (other formats will be skipped).
 
@@ -140,69 +140,21 @@ python gui/radio_manager.py
 
 ## Building standalone executables (Windows / Mac)
 
-To build a standalone folder (no install; user runs the exe or .app directly):
+Packaging behavior differs across Windows and macOS. To avoid drift, use the canonical packaging guide:
 
-1. Install dependencies and PyInstaller:
-   ```bash
-   pip install -r requirements.txt
-   pip install pyinstaller
-   ```
+- [`docs/BUILD_AND_PACKAGE.md`](docs/BUILD_AND_PACKAGE.md)
 
-2. From the project root, run:
-   ```bash
-   pyinstaller build/vintage_radio.spec
-   ```
-   Close any running Vintage Radio app (or process using `dist/Vintage Radio`) before rebuilding, or PyInstaller may fail with "Access is denied". Use `--noconfirm` to skip the "Continue? (y/N)" prompt. SyntaxWarnings from the `pydub` dependency during build are harmless; to hide them use `$env:PYTHONWARNINGS='ignore::SyntaxWarning'` (PowerShell) before running PyInstaller.
+Quick commands:
 
-3. Output is in `dist/Vintage Radio/`. If the exe shows a generic icon in Explorer (especially in list view), try renaming the exe once so Windows refreshes its icon cache. Run the executable inside that folder. All Python dependencies and the radio icon are included. VLC is not bundled; users can install VLC system-wide for better conversion and seeking if desired.
-
-**Windows:** For a proper .exe icon, create an ICO from the PNG (requires Pillow):  
-`python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"`  
-Then rebuild. The spec will use `vintage_radio.ico` if present.
+- **Windows:** `build_windows.bat` (or `pyinstaller build/vintage_radio.spec`)
+- **macOS:** `bash build_macos.sh`
+- Output: `dist/Vintage Radio/`
 
 ## Project Structure
 
-```
-Vintage_radio/
-├── .github/
-│   └── workflows/
-│       ├── build-release.yml   # CI: build Windows/macOS executables
-│       └── build-test.yml      # CI: test build on any branch
-├── firmware/                    # Pico/Pi firmware
-│   ├── radio_core.py           # Shared state machine (GUI + firmware)
-│   ├── pico/
-│   │   ├── main.py             # MicroPython entry for Pico
-│   │   └── dfplayer_hardware.py # DFPlayer driver
-│   └── pi/
-│       ├── main_pi.py          # Raspberry Pi entry
-│       └── pi_hardware.py      # VLC/GPIO driver
-├── gui/                         # Desktop GUI application
-│   ├── __init__.py
-│   ├── radio_manager.py        # Main window
-│   ├── test_mode.py            # Emulator widget
-│   ├── database.py             # Database operations
-│   ├── sd_manager.py           # SD card sync
-│   ├── hardware_emulator.py    # Hardware emulation
-│   ├── audio_metadata.py       # Metadata extraction
-│   ├── resource_paths.py       # Paths for dev vs frozen exe
-│   └── resources/              # Icons, images, sounds
-├── build/                       # Build/packaging config
-│   ├── vintage_radio.spec      # PyInstaller spec
-│   ├── mpremote_helper.spec    # mpremote helper spec
-│   ├── build_macos.sh          # macOS build script
-│   ├── build_windows.bat       # Windows build script
-│   └── build_linux.sh          # Linux build script
-├── docs/                        # Documentation
-│   ├── README_Pi.md            # Raspberry Pi setup
-│   ├── README_RP2040.md        # RP2040 firmware notes
-│   ├── CHANGELOG.md
-│   ├── FIRST_WALKTHROUGH.md
-│   └── images/                 # Screenshots
-├── tests/                       # Test suite
-├── run_vintage_radio.py         # GUI entry point (PyInstaller)
-├── requirements.txt
-└── README.md
-```
+The canonical repository taxonomy and source-vs-generated policy lives in:
+
+- [`docs/REPO_STRUCTURE.md`](docs/REPO_STRUCTURE.md)
 
 ## Architecture
 

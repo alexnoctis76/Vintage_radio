@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.pytest_cache/
 # PyInstaller build output
 build/
 develop-eggs/
@@ -46,6 +47,9 @@ data/
 # Backups (legacy location at project root)
 backups/*.db
 !backups/.gitkeep
+backups/restore/*.patch
+backups/restore/*.bundle
+!backups/restore/RESTORE.md
 
 # Logs
 *.log

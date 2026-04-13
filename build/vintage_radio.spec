@@ -81,6 +81,14 @@ except Exception:
     mpremote_binaries = []
     mpremote_hidden = []
 
+# Bundle imageio-ffmpeg so ffmpeg executable is available in packaged app.
+try:
+    ffmpeg_datas, ffmpeg_binaries, ffmpeg_hidden = collect_all('imageio_ffmpeg')
+    datas += ffmpeg_datas
+    mpremote_binaries += ffmpeg_binaries
+except Exception:
+    ffmpeg_hidden = []
+
 # Force-include stdlib packages needed by mpremote.mip (urllib -> email, http)
 def _collect_stdlib(pkg):
     try:
@@ -131,6 +139,7 @@ a = Analysis(
         'pygame',
         'psutil',
         'pydub',
+        'imageio_ffmpeg',
         'mpremote',
         'mpremote.commands',
         'mpremote.main',
@@ -155,7 +164,7 @@ a = Analysis(
         'http.client',
         'http.server',
         'ssl',
-    ] + mpremote_hidden + collect_submodules('mpremote'),
+    ] + mpremote_hidden + ffmpeg_hidden + collect_submodules('mpremote'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
