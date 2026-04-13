@@ -49,7 +49,7 @@ from .widgets.sd_disk_image_wizard_dialog import SdDiskImageFlashWizardDialog
 from .session_log import write_session_line, get_session_log_path
 from .test_mode import TestModeWidget
 from .debug_mcp_server import DebugMcpServerManager
-from .widgets.task_progress_dialog import TaskProgressDialog
+from .widgets.task_progress_dialog import TaskProgressDialog, _BackgroundWorker
 from . import __version__, sd_manager as sd_manager_module, updater
 from .update_dialog import UpdateAvailableDialog
 
