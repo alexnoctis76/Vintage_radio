@@ -34,6 +34,12 @@ GITHUB_REPO_SLUG = "alexnoctis76/Vintage_radio"
 PREFERRED_WINDOWS_ASSET = "Vintage-Radio-Windows.zip"
 PREFERRED_MACOS_ASSET = "Vintage.Radio.dmg"
 
+# GitHub may show the volume name with a dot instead of a space, e.g. "Vintage.Radio.dmg".
+_VINTAGE_RADIO_DMG_RE = re.compile(
+    r"vintage[\s._-]*radio\.dmg\Z",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ReleaseInfo:
@@ -211,49 +217,61 @@ def _preferred_asset_name_for_platform() -> Optional[str]:
 def get_platform_asset(assets: list[dict]) -> Optional[dict]:
     """Pick the expected release asset for this platform.
 
-    Prefer the canonical ``Vintage-Radio-Windows.zip`` / ``Vintage-Radio-macOS.zip``
-    names. A naive substring match (first asset containing "windows") can pick an
-    older or auxiliary zip attached to the same release.
+    Windows: prefer ``Vintage-Radio-Windows.zip`` among zips whose name contains
+    ``windows`` (avoids picking an auxiliary zip).
+
+    macOS: prefer ``Vintage.Radio.dmg`` when present, else DMG/zip heuristics from
+    :func:`_get_macos_release_asset`.
     """
     matcher = _platform_matcher()
     if matcher is None:
         return None
-    preferred = (_preferred_asset_name_for_platform() or "").lower()
-    candidates: list[dict] = []
-    for asset in assets:
-        name = str(asset.get("name") or "").lower()
-        if not name.endswith(".zip"):
-            continue
-        if matcher not in name:
-            continue
-        candidates.append(asset)
 
-    if not candidates:
-        return None
+    if matcher == "windows":
+        preferred = (PREFERRED_WINDOWS_ASSET or "").lower()
+        candidates: list[dict] = []
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            if not name.endswith(".zip"):
+                continue
+            if matcher not in name:
+                continue
+            candidates.append(asset)
 
-    by_lower = {str(a.get("name") or "").lower(): a for a in candidates}
-    if preferred and preferred in by_lower:
-        return by_lower[preferred]
+        if not candidates:
+            return None
 
-    vintage = [
-        a
-        for a in candidates
-        if str(a.get("name") or "").lower().startswith("vintage-radio-")
-    ]
-    if vintage:
-        vintage.sort(key=lambda a: len(str(a.get("name") or "")))
-        return vintage[0]
+        by_lower = {str(a.get("name") or "").lower(): a for a in candidates}
+        if preferred and preferred in by_lower:
+            return by_lower[preferred]
 
-    candidates.sort(key=lambda a: len(str(a.get("name") or "")))
-    return candidates[0]
+        vintage = [
+            a
+            for a in candidates
+            if str(a.get("name") or "").lower().startswith("vintage-radio-")
+        ]
+        if vintage:
+            vintage.sort(key=lambda a: len(str(a.get("name") or "")))
+            return vintage[0]
+
+        candidates.sort(key=lambda a: len(str(a.get("name") or "")))
+        return candidates[0]
+
+    preferred_mac = (PREFERRED_MACOS_ASSET or "").lower()
+    by_lower_all = {str(a.get("name") or "").lower(): a for a in assets}
+    if preferred_mac and preferred_mac in by_lower_all:
+        return by_lower_all[preferred_mac]
+
+    return _get_macos_release_asset(assets)
 
 
 def direct_download_url_for_release(tag_name: str) -> Optional[str]:
-    """URL for the official installer zip **for this exact release tag** only.
+    """URL for the official installer **for this exact release tag** only.
 
-    Always uses ``/releases/download/{tag}/{zip}``. Do not use release ``assets``
-    ``browser_download_url`` for installers — those blobs can be mis-ordered or
-    duplicated across releases; the tag in the path is the single source of truth.
+    Always uses ``/releases/download/{tag}/{filename}``. Do not use release
+    ``assets`` ``browser_download_url`` for installers — those blobs can be
+    mis-ordered or duplicated across releases; the tag in the path is the single
+    source of truth.
     """
     preferred = official_installer_zip_basename()
     if not (preferred and tag_name.strip()):
@@ -269,8 +287,35 @@ def installer_download_url_for_release(release: ReleaseInfo) -> Optional[str]:
 
 
 def official_installer_zip_basename() -> Optional[str]:
-    """Basename of the official release zip for this OS (``Vintage-Radio-*.zip``)."""
+    """Basename of the official installer for this OS (zip on Windows, DMG on macOS)."""
     return _preferred_asset_name_for_platform()
+
+
+def _get_macos_release_asset(assets: list[dict]) -> Optional[dict]:
+    """Pick macOS update asset: raw DMG (e.g. Vintage.Radio.dmg) preferred, else macOS .zip."""
+    dmg_scored: list[tuple[int, dict]] = []
+    zip_candidates: list[dict] = []
+    for asset in assets:
+        name = str(asset.get("name") or "").lower()
+        if name.endswith(".dmg"):
+            score = 0
+            if _VINTAGE_RADIO_DMG_RE.search(name):
+                score += 100
+            elif "vintage" in name and "radio" in name:
+                score += 80
+            if "macos" in name:
+                score += 50
+            if score == 0:
+                continue
+            dmg_scored.append((score, asset))
+        elif "macos" in name and name.endswith(".zip"):
+            zip_candidates.append(asset)
+    if dmg_scored:
+        dmg_scored.sort(key=lambda t: t[0], reverse=True)
+        return dmg_scored[0][1]
+    if zip_candidates:
+        return zip_candidates[0]
+    return None
 
 
 def download_update(
@@ -280,7 +325,7 @@ def download_update(
     *,
     dest_filename: Optional[str] = None,
 ) -> Path:
-    """Download update zip with optional progress callback.
+    """Download release archive (.zip / .dmg) with optional progress callback.
 
     *dest_filename* — optional local filename (avoids stale collisions when the URL
     path is the same across releases, e.g. ``Vintage-Radio-Windows.zip``).
@@ -326,11 +371,82 @@ def _find_windows_source_dir(extract_dir: Path) -> Optional[Path]:
     return hits[0].parent
 
 
-def _find_macos_source_app(extract_dir: Path) -> Optional[Path]:
-    for p in extract_dir.rglob("*.app"):
-        if p.is_dir():
-            return p
-    return None
+def _macos_app_has_bundle_layout(app_path: Path) -> bool:
+    if not app_path.is_dir():
+        return False
+    if app_path.name.startswith("._"):
+        return False
+    if not app_path.name.lower().endswith(".app"):
+        return False
+    return (app_path / "Contents" / "MacOS").is_dir()
+
+
+def _pick_macos_app_bundle_from_root(root: Path) -> Optional[Path]:
+    """Find a real .app bundle under root (skips __MACOSX / AppleDouble junk)."""
+    candidates: list[Path] = []
+    for dirpath, dirnames, _filenames in os.walk(root, topdown=True):
+        dirnames[:] = [
+            d for d in dirnames if d != "__MACOSX" and not d.startswith("._")
+        ]
+        for d in dirnames:
+            p = Path(dirpath) / d
+            if _macos_app_has_bundle_layout(p):
+                candidates.append(p)
+    if not candidates:
+        return None
+
+    def sort_key(p: Path) -> tuple[int, int]:
+        preferred = 0 if p.name.lower() == "vintage radio.app" else 1
+        return (preferred, len(p.parts))
+
+    candidates.sort(key=sort_key)
+    return candidates[0]
+
+
+def _stage_macos_app_from_dmg(dmg_path: Path, work_dir: Path) -> Path:
+    """Mount DMG, copy the app bundle to work_dir, detach. Returns path to copied .app."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    mount = work_dir / "_dmg_mount"
+    if mount.exists():
+        shutil.rmtree(mount, ignore_errors=True)
+    mount.mkdir(parents=True, exist_ok=True)
+    attach = subprocess.run(
+        [
+            "hdiutil",
+            "attach",
+            "-readonly",
+            "-nobrowse",
+            "-mountpoint",
+            str(mount),
+            str(dmg_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if attach.returncode != 0:
+        msg = (attach.stderr or attach.stdout or "").strip()
+        raise RuntimeError(
+            "Could not mount the downloaded disk image.\n"
+            + (msg or "hdiutil attach failed.")
+        )
+    try:
+        source = _pick_macos_app_bundle_from_root(mount)
+        if source is None:
+            raise RuntimeError(
+                "Could not find a .app bundle inside the DMG (expected Vintage Radio.app)."
+            )
+        dest = work_dir / source.name
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(source, dest, symlinks=True)
+        return dest
+    finally:
+        subprocess.run(
+            ["hdiutil", "detach", str(mount)],
+            capture_output=True,
+            text=True,
+        )
+        shutil.rmtree(mount, ignore_errors=True)
 
 
 def _launch_windows_apply_script(source_dir: Path, target_dir: Path, work_dir: Path, pid: int) -> None:
@@ -370,28 +486,43 @@ open "{target_app}"
     subprocess.Popen(["/bin/bash", str(script)], start_new_session=True)
 
 
-def apply_update(zip_path: Path) -> None:
-    """Extract and launch an update script that replaces app files after exit."""
+def apply_update(archive_path: Path) -> None:
+    """Extract or mount download, then launch an update script that replaces app files after exit."""
     if not getattr(sys, "frozen", False):
         raise RuntimeError("Automatic updates are only supported for packaged builds.")
 
     platform_name = platform.system()
-    extract_dir = zip_path.parent / "extracted"
-    _extract_zip(zip_path, extract_dir)
+    work_dir = archive_path.parent
+    extract_dir = work_dir / "extracted"
 
     pid = int(getattr(os, "getpid", lambda: 0)())
     if platform_name == "Windows":
+        _extract_zip(archive_path, extract_dir)
         source_dir = _find_windows_source_dir(extract_dir)
         if source_dir is None:
             raise RuntimeError("Could not locate 'Vintage Radio.exe' in downloaded update.")
         target_dir = Path(sys.executable).resolve().parent
-        _launch_windows_apply_script(source_dir, target_dir, zip_path.parent, pid)
+        _launch_windows_apply_script(source_dir, target_dir, work_dir, pid)
         return
 
     if platform_name == "Darwin":
-        source_app = _find_macos_source_app(extract_dir)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        suffix = archive_path.suffix.lower()
+        if suffix == ".dmg":
+            source_app = _stage_macos_app_from_dmg(archive_path, extract_dir)
+        elif suffix == ".zip":
+            _extract_zip(archive_path, extract_dir)
+            source_app = _pick_macos_app_bundle_from_root(extract_dir)
+        else:
+            raise RuntimeError(
+                f"Unsupported macOS update format ({archive_path.suffix!r}); "
+                "expected .dmg or .zip."
+            )
         if source_app is None:
-            raise RuntimeError("Could not locate .app bundle in downloaded update.")
+            raise RuntimeError(
+                "Could not locate Vintage Radio.app in the downloaded update."
+            )
         target_app = Path(sys.executable).resolve().parents[2]
         _launch_macos_apply_script(source_app, target_app, pid)
         return
