@@ -902,19 +902,6 @@ class TestModeWidget(QtWidgets.QWidget):
         self._update_status(f"Shuffle: {source_name}")
         if self.rail2_on:
             self._start_playback_for_current()
-    
-    def _switch_to_library_shuffle(self) -> None:
-        """Shuffle the entire library."""
-        self.shuffle_tracks = [dict(track) for track in self.db.list_songs()]
-        random.shuffle(self.shuffle_tracks)
-        self.shuffle_index = 0
-        self.current_track = 1
-        self.mode = "shuffle"
-        self._log(f"Shuffle mode: Full Library ({len(self.shuffle_tracks)} tracks)")
-        self.mode_label.setText("Mode: Shuffle (Library)")
-        self._update_status("Shuffle: Full Library")
-        if self.rail2_on:
-            self._start_playback_for_current()
 
     def _update_status(self, action: str) -> None:
         source_name = self._source_name()
@@ -1656,7 +1643,7 @@ class TestModeWidget(QtWidgets.QWidget):
                 self.core._init_current_shuffle()
                 # Mode will change to shuffle, so continue with AM overlay
             else:
-                # Other mode - switch to library shuffle
+                # Other mode (e.g. radio): let RadioCore build shuffle from current context
                 self.core.switch_mode(mode)
         else:
             self.core.switch_mode(mode)

@@ -527,16 +527,17 @@ class DatabaseManager:
             "SELECT * FROM basic_stations ORDER BY sort_order, folder_number;"
         ).fetchall()
 
-    def next_basic_station_folder(self) -> int:
-        """Return the next unused DFPlayer folder number (1-98)."""
+    def next_basic_station_folder(self, *, max_folder: int = 99) -> int:
+        """Return the next unused DFPlayer folder number."""
+        max_folder = max(1, min(99, int(max_folder)))
         used = {
             r["folder_number"]
             for r in self.conn.execute("SELECT folder_number FROM basic_stations;").fetchall()
         }
-        for n in range(1, 99):
+        for n in range(1, max_folder + 1):
             if n not in used:
                 return n
-        raise ValueError("All 98 DFPlayer folders are in use")
+        raise ValueError(f"All {max_folder} DFPlayer folders are in use")
 
     def update_basic_station_order(self, station_ids: List[int]) -> None:
         """Reorder stations and reassign folder numbers so position matches folder (1-indexed)."""

@@ -47,6 +47,7 @@ def _get_vlc_module():
 
 
 from .database import DatabaseManager
+from .resource_paths import resolve_ffmpeg_executable
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "firmware"))
@@ -111,13 +112,24 @@ class PygameHardwareEmulator(HardwareInterface):
         """Check if ffmpeg is available (needed for seeking all audio formats)."""
         if not PYDUB_AVAILABLE:
             return False
+        exe = resolve_ffmpeg_executable()
+        if not exe:
+            return False
         try:
             result = subprocess.run(
-                ['ffmpeg', '-version'],
+                [exe, '-version'],
                 capture_output=True,
                 timeout=2
             )
-            return result.returncode == 0
+            ok = result.returncode == 0
+            if ok:
+                try:
+                    from pydub import AudioSegment as _AudioSegment
+
+                    _AudioSegment.converter = exe
+                except Exception:
+                    pass
+            return ok
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 

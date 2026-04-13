@@ -3,13 +3,18 @@
 
 from __future__ import annotations
 
+import json
 import os
+import platform
 import shutil
+import time
 import subprocess
 import sys
 import threading
 import traceback
 import unicodedata
+from collections import deque
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 
@@ -26,11 +31,158 @@ from .pin_config_editor import BoardSelectorWidget, PinConfigDialog
 from .profile_manager import ProfileSelectorBar
 from .resource_paths import app_data_dir, project_root, resource_path
 from .sd_manager import SDManager, SYNC_TARGET_VOLUME_LABEL
-from .session_log import write_session_line
+from .experimental_sd_image import (
+    pyfatfs_dependency_message,
+    run_experimental_sd_disk_image_export,
+    suggest_image_size_bytes,
+)
+from .sd_disk_image_flash import (
+    LAST_CACHED_SD_IMAGE_FILENAME,
+    format_disk_size,
+    is_windows_admin,
+    windows_disk_number_for_drive_letter,
+    windows_drive_letter_from_path,
+    windows_get_disk_size_bytes,
+    write_image_to_physical_disk,
+)
+from .widgets.sd_disk_image_wizard_dialog import SdDiskImageFlashWizardDialog
+from .session_log import write_session_line, get_session_log_path
 from .test_mode import TestModeWidget
-from . import sd_manager as sd_manager_module
+from .debug_mcp_server import DebugMcpServerManager
+from .widgets.task_progress_dialog import TaskProgressDialog
+from . import __version__, sd_manager as sd_manager_module, updater
+from .update_dialog import UpdateAvailableDialog
 
 BASIC_MAX_TRACKS_PER_STATION = 255
+BASIC_MAX_TRACKS_EXPERIMENTAL = 999
+
+# Advanced Microprocessor button table: merged heading rows serialize as
+#   ["__SECTION__", "Heading text"]
+ADVANCED_MCU_BTN_SECTION_TAG = "__SECTION__"
+_ADVANCED_MCU_BTN_LEGACY_SECTION_FIRST_COL = frozenset(
+    {"TAPS", "HOLD (long press, no taps)", "TAP + HOLD"}
+)
+
+# Advanced MCU button table: column 0 = gutter handles; 1–2 = gesture / action.
+_ADV_MCU_COL_HANDLE = 0
+_ADV_MCU_COL_GESTURE = 1
+_ADV_MCU_COL_ACTION = 2
+_ADV_MCU_JUNCTION_W = 44
+
+
+class _AdvancedMcuTableLayoutFilter(QtCore.QObject):
+    """Keep the MCU button table width matched to the scroll viewport (resize can skip viewport-only hooks)."""
+
+    def __init__(self, main: "MainWindow") -> None:
+        super().__init__(main)
+        self._main = main
+
+    def eventFilter(self, obj: QtCore.QObject, ev: QtCore.QEvent) -> bool:
+        scroll = getattr(self._main, "_advanced_mcu_buttons_scroll", None)
+        t = getattr(self._main, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(scroll) or not _qt_widget_alive(t):
+            return False
+        vp = t.viewport()
+        if obj not in (vp, scroll):
+            return False
+        if ev.type() == QtCore.QEvent.Type.Resize:
+            self._main._advanced_mcu_table_sync_width_to_scroll()
+            return False
+        if obj is vp and ev.type() == QtCore.QEvent.Type.Leave:
+            self._main._advanced_mcu_set_visible_gutter_row(None)
+        return False
+
+
+class _AdvancedMcuClearTableSelectionFilter(QtCore.QObject):
+    """Clear button-table selection when the user presses outside the table/scroll area."""
+
+    def __init__(self, main: "MainWindow") -> None:
+        super().__init__(main)
+        self._main = main
+
+    def eventFilter(self, obj: QtCore.QObject, ev: QtCore.QEvent) -> bool:
+        if ev.type() != QtCore.QEvent.Type.MouseButtonPress:
+            return False
+        if not isinstance(ev, QtGui.QMouseEvent):
+            return False
+        self._main._advanced_mcu_clear_table_selection_if_press_outside(ev.globalPosition().toPoint())
+        return False
+
+
+class _AdvancedMcuRowGutterHandle(QtWidgets.QFrame):
+    """Left edge: vertical connector line + circular action control (green hover)."""
+
+    def __init__(
+        self,
+        on_activate: Callable[[], None],
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.setMinimumWidth(_ADV_MCU_JUNCTION_W)
+        self.setMaximumWidth(_ADV_MCU_JUNCTION_W)
+        self._on_activate = on_activate
+        self._junction_visible = False
+        self._line_hot = False
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(0)
+        lay.addStretch(1)
+        self._btn = QtWidgets.QToolButton(self)
+        self._btn.setFixedSize(22, 22)
+        self._btn.setAutoRaise(True)
+        self._btn.setToolTip("Row actions: insert, delete, section heading…")
+        self._btn.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_TitleBarMenuButton)
+        )
+        self._btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self._btn.setStyleSheet(
+            "QToolButton { border-radius: 11px; border: 1px solid #4a4a52; background-color: #222226; }"
+            "QToolButton:hover { border: 2px solid #4CAF50; background-color: #1a2e1a; }"
+            "QToolButton:pressed { background-color: #153018; border-color: #6fdc6f; }"
+        )
+        self._btn.clicked.connect(on_activate)
+        self.setMouseTracking(True)
+        lay.addWidget(self._btn, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        lay.addStretch(1)
+        self.set_junction_visible(False)
+
+    def is_junction_visible(self) -> bool:
+        return self._junction_visible
+
+    def set_junction_visible(self, visible: bool) -> None:
+        self._junction_visible = bool(visible)
+        self._btn.setVisible(self._junction_visible)
+        if not self._junction_visible:
+            self._line_hot = False
+        self.update()
+
+    def mouseMoveEvent(self, ev: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        if self._junction_visible:
+            self._line_hot = True
+            self.update()
+        super().mouseMoveEvent(ev)
+
+    def leaveEvent(self, ev: QtCore.QEvent) -> None:  # type: ignore[override]
+        self._line_hot = False
+        self.update()
+        super().leaveEvent(ev)
+
+    def paintEvent(self, ev: QtGui.QPaintEvent) -> None:
+        super().paintEvent(ev)
+        if not self._junction_visible:
+            return
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        cx = self.width() // 2
+        if self._line_hot:
+            pen = QtGui.QPen(QtGui.QColor("#4CAF50"))
+            pen.setWidth(2)
+        else:
+            pen = QtGui.QPen(QtGui.QColor("#2d3236"))
+            pen.setWidth(1)
+        p.setPen(pen)
+        p.drawLine(cx, 0, cx, self.height())
 
 
 def _volume_name_key(name: Optional[str]) -> str:
@@ -53,163 +205,6 @@ def _qt_widget_alive(widget: Optional[QtCore.QObject]) -> bool:
     except RuntimeError:
         return False
     return True
-
-
-# ───────────────────────────────────────────────────────────
-#  Background worker for long-running tasks
-# ───────────────────────────────────────────────────────────
-
-class _BackgroundWorker(QtCore.QObject):
-    """Runs a callable in a QThread and emits signals for progress / completion."""
-    progress = QtCore.pyqtSignal(int, int, str)   # current, total, message
-    finished = QtCore.pyqtSignal(object)           # result (any Python object)
-    error = QtCore.pyqtSignal(str)                 # error message
-
-    def __init__(self, fn: Callable, *args, **kwargs):
-        super().__init__()
-        self._fn = fn
-        self._args = args
-        self._kwargs = kwargs
-
-    @QtCore.pyqtSlot()
-    def run(self):
-        try:
-            result = self._fn(*self._args, **self._kwargs)
-            self.finished.emit(result)
-        except Exception as exc:
-            self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
-
-
-class TaskProgressDialog(QtWidgets.QDialog):
-    """
-    A non-blocking progress dialog that runs *func* in a background thread.
-
-    Usage::
-
-        dlg = TaskProgressDialog(
-            parent=self,
-            title="SD Card Sync",
-            func=self.sd_manager.sync_library,
-            args=(sd_root,),
-            kwargs={"force_clean": True, "progress_callback": dlg.report_progress},
-        )
-        dlg.on_success = lambda result: print("done", result)
-        dlg.exec()
-    """
-
-    def __init__(
-        self,
-        parent: QtWidgets.QWidget,
-        title: str,
-        func: Callable,
-        args: tuple = (),
-        kwargs: dict | None = None,
-        cancelable: bool = False,
-    ):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setModal(True)
-        # Wide enough for long song titles when UI is zoomed in (was 420)
-        self.setMinimumWidth(580)
-        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
-
-        # --- UI ---
-        layout = QtWidgets.QVBoxLayout(self)
-        self._status_label = QtWidgets.QLabel("Starting...")
-        self._status_label.setWordWrap(True)
-        self._status_label.setMinimumWidth(520)
-        self._status_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            self._status_label.sizePolicy().verticalPolicy(),
-        )
-        layout.addWidget(self._status_label)
-
-        self._progress_bar = QtWidgets.QProgressBar()
-        self._progress_bar.setRange(0, 0)  # indeterminate initially
-        layout.addWidget(self._progress_bar)
-
-        self._detail_label = QtWidgets.QLabel("")
-        self._detail_label.setStyleSheet("color: gray; font-size: 11px;")
-        self._detail_label.setWordWrap(True)
-        layout.addWidget(self._detail_label)
-
-        if cancelable:
-            btn_layout = QtWidgets.QHBoxLayout()
-            btn_layout.addStretch()
-            self._cancel_btn = QtWidgets.QPushButton("Cancel")
-            self._cancel_btn.clicked.connect(self.reject)
-            btn_layout.addWidget(self._cancel_btn)
-            layout.addLayout(btn_layout)
-
-        # --- Callbacks set by caller ---
-        self.on_success: Optional[Callable[[Any], None]] = None
-        self.on_error: Optional[Callable[[str], None]] = None
-
-        # --- Thread setup ---
-        self._thread = QtCore.QThread()
-        kw = dict(kwargs or {})
-        kw["progress_callback"] = self._progress_callback
-        self._worker = _BackgroundWorker(func, *args, **kw)
-        self._worker.moveToThread(self._thread)
-
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-
-    def _progress_callback(self, current: int, total: int, message: str):
-        """Thread-safe: emit signal that will be received on the main thread."""
-        self._worker.progress.emit(current, total, message)
-
-    @QtCore.pyqtSlot(int, int, str)
-    def _on_progress(self, current: int, total: int, message: str):
-        if total > 0:
-            self._progress_bar.setRange(0, total)
-            self._progress_bar.setValue(current)
-        self._status_label.setText(message)
-
-    @QtCore.pyqtSlot(object)
-    def _on_finished(self, result):
-        self._progress_bar.setRange(0, 1)
-        self._progress_bar.setValue(1)
-        self._status_label.setText("Complete!")
-        self._cleanup_thread()
-        if self.on_success:
-            self.on_success(result)
-        self.accept()
-
-    @QtCore.pyqtSlot(str)
-    def _on_error(self, error_msg: str):
-        self._cleanup_thread()
-        if self.on_error:
-            self.on_error(error_msg)
-        else:
-            QtWidgets.QMessageBox.critical(self, self.windowTitle(), f"Error:\n\n{error_msg}")
-        self.reject()
-
-    def _cleanup_thread(self):
-        try:
-            self._thread.quit()
-            self._thread.wait(5000)
-        except Exception:
-            pass
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        # Start the thread after the dialog is shown
-        QtCore.QTimer.singleShot(100, self._thread.start)
-
-    def closeEvent(self, event):
-        if self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(3000)
-        super().closeEvent(event)
-
-    def reject(self):
-        if self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(3000)
-        super().reject()
 
 
 class LibraryTable(QtWidgets.QTableWidget):
@@ -401,6 +396,8 @@ def _run_install_main_thread(
     pin_config_json: str = "",
     custom_hw_driver_path: str = "",
     basic_mode: bool = False,
+    install_mode: str = "basic",
+    dfplayer_eq: str = "normal",
 ) -> None:
     """Run install on main thread with progress dialog. Status bar updates via processEvents()."""
     dlg = QtWidgets.QDialog(parent)
@@ -435,6 +432,9 @@ def _run_install_main_thread(
             pin_config_json=pin_config_json,
             custom_hw_driver_path=custom_hw_driver_path,
             basic_mode=basic_mode,
+            install_mode=install_mode,
+            dfplayer_eq=dfplayer_eq,
+            after_firmware=after_firmware,
         )
         dlg.close()
         on_success(result)
@@ -561,6 +561,93 @@ def _run_mpremote(
         creationflags=creationflags,
         env=env,
     )
+
+
+def _mpremote_failure_is_transient_no_device(result: Any) -> bool:
+    if getattr(result, "returncode", 1) == 0:
+        return False
+    err = ((getattr(result, "stderr", None) or "") + (getattr(result, "stdout", None) or "")).lower()
+    return "no device found" in err or "could not open" in err
+
+
+def _wait_mpremote_serial_ready(
+    mpremote_cmd: List[str],
+    cwd: Optional[str],
+    *,
+    progress_callback: Optional[Callable[..., Any]],
+    total_steps: int,
+    creationflags: int = 0,
+    env: Optional[dict] = None,
+    deadline_s: float = 78.0,
+    poll_s: float = 2.0,
+) -> bool:
+    """Poll until ``connect auto exec print(1)`` succeeds (Pico back on USB after UF2 / reboot)."""
+    import time
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < deadline_s:
+        elapsed = int(time.monotonic() - t0)
+        if progress_callback:
+            progress_callback(
+                0,
+                max(1, total_steps),
+                "Waiting for MicroPython on USB serial "
+                f"(elapsed {elapsed}s, timeout {int(deadline_s)}s). "
+                "After a fresh install the port can take several seconds.",
+            )
+        r = _run_mpremote(
+            mpremote_cmd,
+            ["connect", "auto", "exec", "print(1)"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=14,
+            creationflags=creationflags,
+            env=env,
+        )
+        if r.returncode == 0:
+            return True
+        time.sleep(poll_s)
+    return False
+
+
+def _run_mpremote_connect_auto_with_retry(
+    mpremote_cmd: List[str],
+    subargs: List[str],
+    *,
+    cwd: Optional[str] = None,
+    timeout: int = 30,
+    creationflags: int = 0,
+    env: Optional[dict] = None,
+    max_attempts: int = 6,
+) -> Any:
+    """Run ``mpremote connect auto <subargs>`` with backoff while the OS is still enumerating USB serial."""
+    import time
+
+    args = ["connect", "auto"] + list(subargs)
+    last: Any = None
+    for attempt in range(max_attempts):
+        if attempt:
+            time.sleep(min(8.0, 1.5 * (attempt + 1)))
+        last = _run_mpremote(
+            mpremote_cmd,
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=creationflags,
+            env=env,
+        )
+        if last.returncode == 0:
+            return last
+        if not _mpremote_failure_is_transient_no_device(last):
+            return last
+    return last
+
+
+# After copying a .uf2, Windows/macOS often need a few seconds before the new CDC port appears.
+_POST_MICROPYTHON_INSTALL_DELAY_MS = 3500
 
 
 _TABLE_REORDER_MIME = "application/x-vintage-radio-table-reorder"
@@ -945,6 +1032,45 @@ class ReorderListWidget(QtWidgets.QListWidget):
         event.setDropAction(QtCore.Qt.DropAction.CopyAction)
         event.accept()
         QtCore.QTimer.singleShot(0, self.order_changed.emit)
+
+
+class StationImportListWidget(ReorderListWidget):
+    """Station list widget that accepts dropped folders for station import."""
+
+    folders_dropped = QtCore.pyqtSignal(list)
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            folders: List[Path] = []
+            seen: set[str] = set()
+            for url in event.mimeData().urls():
+                if not url.isLocalFile():
+                    continue
+                folder = Path(url.toLocalFile())
+                if not folder.is_dir():
+                    continue
+                key = str(folder)
+                if key in seen:
+                    continue
+                seen.add(key)
+                folders.append(folder)
+            if folders:
+                self.folders_dropped.emit(folders)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
 
 
 class InstallMicroPythonDialog(QtWidgets.QDialog):
@@ -1355,6 +1481,8 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    update_check_finished = QtCore.pyqtSignal(object, bool, str)
+
     def __init__(self) -> None:
         super().__init__()
         self._apply_default_window_geometry()
@@ -1368,6 +1496,26 @@ class MainWindow(QtWidgets.QMainWindow):
         db_path = self._lib_registry.db_path_for(slug)
         self.db = DatabaseManager(db_path=db_path)
         self._update_window_title()
+        self._developer_mode = (
+            os.environ.get("VINTAGE_RADIO_ENABLE_MCP_DEBUG", "").strip().lower()
+            in ("1", "true", "yes")
+            or str(self.db.get_setting("developer_mode", "0")).strip().lower()
+            in ("1", "true", "yes")
+        )
+        try:
+            self._mcp_port = int(os.environ.get("VINTAGE_RADIO_MCP_PORT", "8765"))
+        except ValueError:
+            self._mcp_port = 8765
+        self._mcp_manager = DebugMcpServerManager(
+            get_connection_state=self._mcp_get_connection_state,
+            invoke_action=self._mcp_invoke_action,
+            get_log_path=self._mcp_get_log_path,
+            log=self._mcp_log,
+        )
+        self._mcp_gui_queue: deque = deque()
+        self._mcp_gui_queue_lock = threading.Lock()
+        self._update_check_in_flight = False
+        self.update_check_finished.connect(self._on_update_check_finished)
 
         self._undo_stack: List[dict] = []
         self._redo_stack: List[dict] = []
@@ -1432,6 +1580,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_all()
         self._build_status_bar_zoom()
         self._apply_ui_zoom()
+        self._maybe_auto_start_mcp()
+        QtCore.QTimer.singleShot(1200, self._check_for_updates_on_startup)
 
     def _apply_default_window_geometry(self) -> None:
         """Size and center window to a fraction of available screen (min/max bounds)."""
@@ -1585,12 +1735,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view_advanced_action.setCheckable(True)
         self._view_advanced_action.triggered.connect(lambda: self._set_devices_view_mode("advanced"))
         view_menu.addAction(self._view_advanced_action)
+        self._view_legacy_action = QtGui.QAction("Legacy", self)
+        self._view_legacy_action.setCheckable(True)
+        self._view_legacy_action.triggered.connect(lambda: self._set_devices_view_mode("legacy"))
+        legacy_menu = view_menu.addMenu("Legacy")
+        legacy_menu.addAction(self._view_legacy_action)
         self._update_view_menu_checked()
 
         tools_menu = self.menuBar().addMenu("Tools")
         sync_action = QtGui.QAction("Sync to SD", self)
         sync_action.triggered.connect(self.sync_to_sd)
         tools_menu.addAction(sync_action)
+
+        self._tools_developer_mode_action = QtGui.QAction("Developer mode", self)
+        self._tools_developer_mode_action.setCheckable(True)
+        self._tools_developer_mode_action.setChecked(self._developer_mode)
+        self._tools_developer_mode_action.setToolTip(
+            "Show the Developer menu (MCP debug server, scripts). "
+            "Preference is saved; turn off to hide developer tools."
+        )
+        self._tools_developer_mode_action.triggered.connect(self._set_developer_mode_from_tools_menu)
+        tools_menu.addAction(self._tools_developer_mode_action)
+        tools_menu.aboutToShow.connect(self._sync_tools_developer_mode_action_checked)
 
         # Secret hardware diagnostics menu item: only visible when Shift is held
         # while the Tools menu is being opened. The action is always reachable via
@@ -1611,6 +1777,16 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.addAction(self._hw_diag_action)  # shortcut active even without menu
 
+        # Shortcut is always registered so users get feedback even when dev mode is off.
+        self._mcp_toggle_action = QtGui.QAction("MCP debug server OFF — click to start", self)
+        self._mcp_toggle_action.setCheckable(True)
+        self._mcp_toggle_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+M"))
+        self._mcp_toggle_action.triggered.connect(self._handle_mcp_toggle_action)
+        self.addAction(self._mcp_toggle_action)
+
+        if self._developer_mode:
+            self._install_developer_menu()
+
         help_menu = self.menuBar().addMenu("Help")
 
         view_log_action = QtGui.QAction("View Session Log", self)
@@ -1625,15 +1801,790 @@ class MainWindow(QtWidgets.QMainWindow):
         copy_log_path_action.triggered.connect(self._copy_log_path)
         help_menu.addAction(copy_log_path_action)
 
+        help_menu.addSeparator()
+        reenable_track_warn_action = QtGui.QAction(
+            "Re-enable station track count warning (255+ tracks)", self
+        )
+        reenable_track_warn_action.setToolTip(
+            "Shows the informational dialog again when a station would exceed 255 tracks "
+            "after you chose Don't show again on that warning."
+        )
+        reenable_track_warn_action.triggered.connect(self._reenable_basic_track_count_warning)
+        help_menu.addAction(reenable_track_warn_action)
+
+        help_menu.addSeparator()
+        check_updates_action = QtGui.QAction("Check for Updates", self)
+        check_updates_action.triggered.connect(self._check_for_updates_menu)
+        help_menu.addAction(check_updates_action)
+
+        about_action = QtGui.QAction("About Vintage Radio", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
     def _update_view_menu_checked(self) -> None:
         """Sync View menu check state with current devices_view_mode."""
         if hasattr(self, "_view_basic_action") and hasattr(self, "_view_advanced_action"):
             self._view_basic_action.setChecked(self.devices_view_mode == "basic")
             self._view_advanced_action.setChecked(self.devices_view_mode == "advanced")
+        if hasattr(self, "_view_legacy_action"):
+            self._view_legacy_action.setChecked(self.devices_view_mode == "legacy")
+
+    def _is_basic_like_mode(self) -> bool:
+        return self.devices_view_mode in ("basic", "advanced")
+
+    def _is_advanced_mode(self) -> bool:
+        return self.devices_view_mode == "advanced"
+
+    def _uses_custom_software(self) -> bool:
+        return self._is_advanced_mode() and self.db.get_setting("advanced_software_source", "our") == "custom"
+
+    @staticmethod
+    def _default_advanced_mcu_button_rows() -> List[List[str]]:
+        s = ADVANCED_MCU_BTN_SECTION_TAG
+        return [
+            [s, "TAPS"],
+            ["Single", "Next track"],
+            ["Double", "Previous track"],
+            [
+                "Triple",
+                "Restart from the beginning: track 1 in station order, or first track "
+                "in the current station track-shuffle pass",
+            ],
+            [s, "HOLD (long press, no taps)"],
+            [
+                "Hold",
+                "Next station in folder order (also advances station while in track-shuffle mode).",
+            ],
+            [s, "TAP + HOLD"],
+            [
+                "1 tap + hold",
+                "Exit track shuffle to normal ordered-station mode (no-op if already ordered)",
+            ],
+            ["2 taps + hold", "Shuffle tracks in the current station"],
+        ]
+
+    def _advanced_parse_button_rows_json(self, raw: str) -> List[List[str]]:
+        raw = (raw or "").strip()
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(data, list):
+            return []
+        out: List[List[str]] = []
+        for row in data:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                out.append([str(row[0]), str(row[1])])
+            elif isinstance(row, (list, tuple)) and len(row) == 1:
+                out.append([str(row[0]), ""])
+        migrated: List[List[str]] = []
+        for pair in out:
+            if len(pair) < 2:
+                continue
+            a0 = str(pair[0]).strip()
+            a1 = str(pair[1]).strip() if len(pair) > 1 else ""
+            if a0 == ADVANCED_MCU_BTN_SECTION_TAG:
+                migrated.append([ADVANCED_MCU_BTN_SECTION_TAG, a1 or "Heading"])
+                continue
+            if not a1 and a0 in _ADVANCED_MCU_BTN_LEGACY_SECTION_FIRST_COL:
+                migrated.append([ADVANCED_MCU_BTN_SECTION_TAG, a0])
+                continue
+            migrated.append([str(pair[0]), str(pair[1]) if len(pair) > 1 else ""])
+        return migrated
+
+    @staticmethod
+    def _advanced_button_rows_to_json(rows: List[List[str]]) -> str:
+        clean: List[List[str]] = []
+        for r in rows:
+            if len(r) >= 2:
+                clean.append([str(r[0]), str(r[1])])
+            elif len(r) == 1:
+                clean.append([str(r[0]), ""])
+        return json.dumps(clean, ensure_ascii=False)
+
+    def _advanced_mcu_clear_row_handles(self, t: QtWidgets.QTableWidget) -> None:
+        for r in range(t.rowCount()):
+            if t.cellWidget(r, _ADV_MCU_COL_HANDLE) is not None:
+                t.removeCellWidget(r, _ADV_MCU_COL_HANDLE)
+
+    def _advanced_refresh_mcu_row_handles(self) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        self._advanced_mcu_clear_row_handles(t)
+        for r in range(t.rowCount()):
+            gutter = _AdvancedMcuRowGutterHandle(
+                partial(self._advanced_mcu_row_junction_menu, t, r),
+                parent=t,
+            )
+            t.setCellWidget(r, _ADV_MCU_COL_HANDLE, gutter)
+        self._advanced_mcu_set_visible_gutter_row(None)
+
+    def _advanced_fill_mcu_button_table(
+        self,
+        rows: List[List[str]],
+        *,
+        prefer_blank: bool = False,
+    ) -> None:
+        """Fill the gestures table. If *prefer_blank* and *rows* is empty, show blank starter rows only."""
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        t.blockSignals(True)
+        self._advanced_mcu_clear_row_handles(t)
+        t.clearContents()
+        if hasattr(t, "clearSpans"):
+            t.clearSpans()
+        base = list(rows)
+        if not base:
+            if prefer_blank:
+                base = []
+            else:
+                base = list(self._default_advanced_mcu_button_rows())
+        if not base and prefer_blank:
+            n = 5
+        else:
+            n = len(base) + 2
+        t.setRowCount(n)
+        _sec_bg = QColor(38, 38, 40)
+        _sec_fg = QColor(240, 240, 242)
+        for i, pair in enumerate(base):
+            a = str(pair[0]) if len(pair) > 0 else ""
+            b = str(pair[1]) if len(pair) > 1 else ""
+            if a.strip() == ADVANCED_MCU_BTN_SECTION_TAG:
+                title = b.strip() or "Heading"
+                it = QtWidgets.QTableWidgetItem(title)
+                it.setFlags(
+                    it.flags()
+                    | QtCore.Qt.ItemFlag.ItemIsEditable
+                    | QtCore.Qt.ItemFlag.ItemIsEnabled
+                    | QtCore.Qt.ItemFlag.ItemIsSelectable
+                )
+                _sf = QFont(it.font())
+                _sf.setBold(True)
+                it.setFont(_sf)
+                it.setBackground(QBrush(_sec_bg))
+                it.setForeground(QBrush(_sec_fg))
+                it.setTextAlignment(
+                    QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+                )
+                t.setSpan(i, _ADV_MCU_COL_GESTURE, 1, 2)
+                t.setItem(i, _ADV_MCU_COL_GESTURE, it)
+            else:
+                t.setSpan(i, _ADV_MCU_COL_GESTURE, 1, 1)
+                t.setSpan(i, _ADV_MCU_COL_ACTION, 1, 1)
+                left = QtWidgets.QTableWidgetItem(a)
+                left.setFlags(
+                    left.flags()
+                    | QtCore.Qt.ItemFlag.ItemIsEditable
+                    | QtCore.Qt.ItemFlag.ItemIsEnabled
+                    | QtCore.Qt.ItemFlag.ItemIsSelectable
+                )
+                right = QtWidgets.QTableWidgetItem(b)
+                right.setFlags(
+                    right.flags()
+                    | QtCore.Qt.ItemFlag.ItemIsEditable
+                    | QtCore.Qt.ItemFlag.ItemIsEnabled
+                    | QtCore.Qt.ItemFlag.ItemIsSelectable
+                )
+                t.setItem(i, _ADV_MCU_COL_GESTURE, left)
+                t.setItem(i, _ADV_MCU_COL_ACTION, right)
+        for i in range(len(base), n):
+            t.setSpan(i, _ADV_MCU_COL_GESTURE, 1, 1)
+            t.setSpan(i, _ADV_MCU_COL_ACTION, 1, 1)
+            t.setItem(i, _ADV_MCU_COL_GESTURE, QtWidgets.QTableWidgetItem(""))
+            t.setItem(i, _ADV_MCU_COL_ACTION, QtWidgets.QTableWidgetItem(""))
+        t.blockSignals(False)
+        self._advanced_refresh_mcu_row_handles()
+        self._advanced_refit_mcu_button_table_height()
+
+    def _advanced_ensure_button_table_growing_rows(self) -> None:
+        """Keep at least two trailing blank rows after the last non-empty row (expand row count as needed)."""
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        last_nonempty = -1
+        for r in range(t.rowCount()):
+            if t.columnSpan(r, _ADV_MCU_COL_GESTURE) == 2:
+                itg = t.item(r, _ADV_MCU_COL_GESTURE)
+                if itg and itg.text().strip():
+                    last_nonempty = r
+                continue
+            it0 = t.item(r, _ADV_MCU_COL_GESTURE)
+            it1 = t.item(r, _ADV_MCU_COL_ACTION)
+            a = (it0.text() if it0 else "").strip()
+            b = (it1.text() if it1 else "").strip()
+            if a or b:
+                last_nonempty = r
+        need = last_nonempty + 1 + 2
+        if last_nonempty < 0:
+            need = max(need, 5)
+        if need > t.rowCount():
+            old = t.rowCount()
+            t.setRowCount(need)
+            for r in range(old, need):
+                t.setSpan(r, _ADV_MCU_COL_GESTURE, 1, 1)
+                t.setSpan(r, _ADV_MCU_COL_ACTION, 1, 1)
+                if t.item(r, _ADV_MCU_COL_GESTURE) is None:
+                    t.setItem(r, _ADV_MCU_COL_GESTURE, QtWidgets.QTableWidgetItem(""))
+                if t.item(r, _ADV_MCU_COL_ACTION) is None:
+                    t.setItem(r, _ADV_MCU_COL_ACTION, QtWidgets.QTableWidgetItem(""))
+            self._advanced_refresh_mcu_row_handles()
+
+    def _advanced_mcu_table_sync_width_to_scroll(self) -> None:
+        """Match table width to the scroll viewport (avoids empty band + scrollbar gap after resize)."""
+        scroll = getattr(self, "_advanced_mcu_buttons_scroll", None)
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(scroll) or not _qt_widget_alive(t):
+            return
+        vpw = int(scroll.viewport().width())
+        if vpw < 1:
+            return
+        w = max(200, vpw)
+        t.setFixedWidth(w)
+        t.resizeRowsToContents()
+
+    def _advanced_mcu_on_cell_entered(self, row: int, column: int) -> None:
+        """cellEntered fires on hover (mouse tracking) — drives row gutter visibility."""
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t) or row < 0:
+            return
+        if column in (_ADV_MCU_COL_GESTURE, _ADV_MCU_COL_ACTION, _ADV_MCU_COL_HANDLE):
+            self._advanced_mcu_set_visible_gutter_row(row)
+        else:
+            self._advanced_mcu_set_visible_gutter_row(None)
+
+    def _advanced_mcu_widget_is_descendant_of_table(self, w: Optional[QtWidgets.QWidget]) -> bool:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t) or w is None:
+            return False
+        x: Optional[QtWidgets.QWidget] = w
+        while x is not None:
+            if x is t:
+                return True
+            x = x.parentWidget()
+        return False
+
+    def _advanced_mcu_set_visible_gutter_row(self, row: Optional[int]) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        self._advanced_mcu_gutter_active_row = row
+        for r in range(t.rowCount()):
+            grip = t.cellWidget(r, _ADV_MCU_COL_HANDLE)
+            if isinstance(grip, _AdvancedMcuRowGutterHandle):
+                grip.set_junction_visible(row is not None and r == row)
+
+    def _advanced_mcu_clear_table_selection(self) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        t.clearSelection()
+        sm = t.selectionModel()
+        if sm is not None:
+            sm.clearCurrentIndex()
+        self._advanced_mcu_set_visible_gutter_row(None)
+
+    def _advanced_mcu_clear_table_selection_if_press_outside(self, global_pos: QtCore.QPoint) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t) or not t.isVisible():
+            return
+        w = QtWidgets.QApplication.widgetAt(global_pos)
+        if w is not None and self._advanced_mcu_widget_is_descendant_of_table(w):
+            return
+        self._advanced_mcu_clear_table_selection()
+
+    def _advanced_mcu_install_outside_selection_filters(self, fw_group: QtWidgets.QWidget) -> None:
+        filt = _AdvancedMcuClearTableSelectionFilter(self)
+        self._advanced_mcu_outside_sel_filter = filt
+        fw_group.installEventFilter(filt)
+        scroll = getattr(self, "_advanced_mcu_buttons_scroll", None)
+        for w in fw_group.findChildren(QtWidgets.QWidget):
+            if _qt_widget_alive(scroll) and scroll.isAncestorOf(w):
+                continue
+            w.installEventFilter(filt)
+        if _qt_widget_alive(scroll):
+            scroll.verticalScrollBar().installEventFilter(filt)
+
+    def _advanced_refit_mcu_button_table_height(self) -> None:
+        """Put the table inside a capped-height scroll area; table keeps full content height."""
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        scroll = getattr(self, "_advanced_mcu_buttons_scroll", None)
+        if not _qt_widget_alive(t):
+            return
+        self._advanced_ensure_button_table_growing_rows()
+        self._advanced_mcu_table_sync_width_to_scroll()
+        if hasattr(t, "setWordWrap"):
+            t.setWordWrap(True)
+        t.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
+        t.resizeRowsToContents()
+        header = t.horizontalHeader()
+        h = header.height() + 2 * t.frameWidth() + 6
+        fm = t.fontMetrics()
+        min_row_h = max(22, fm.height() + 10)
+        for r in range(t.rowCount()):
+            rh = t.rowHeight(r)
+            if rh <= 0:
+                rh = t.sizeHintForRow(r)
+            h += max(rh, min_row_h)
+        min_table_h = 120
+        cap = 560
+        win = t.window()
+        if isinstance(win, QtWidgets.QWidget) and win.isVisible():
+            try:
+                cap = max(280, min(620, int(win.height() * 0.52)))
+            except Exception:
+                pass
+        content_h = max(min_table_h, h)
+        if _qt_widget_alive(scroll):
+            scroll_h = min(content_h, cap)
+            scroll.setMinimumHeight(min_table_h)
+            scroll.setMaximumHeight(cap)
+            scroll.setFixedHeight(scroll_h)
+            t.setFixedHeight(content_h)
+            scroll.setVerticalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+                if content_h > scroll_h + 2
+                else QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            QtCore.QTimer.singleShot(0, self._advanced_mcu_table_sync_width_to_scroll)
+        else:
+            if content_h <= cap:
+                t.setFixedHeight(content_h)
+                t.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            else:
+                t.setFixedHeight(cap)
+                t.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+
+    def _advanced_read_mcu_button_table(self) -> List[List[str]]:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return []
+        out: List[List[str]] = []
+        for r in range(t.rowCount()):
+            if t.columnSpan(r, _ADV_MCU_COL_GESTURE) == 2:
+                itg = t.item(r, _ADV_MCU_COL_GESTURE)
+                title = (itg.text() if itg else "").strip()
+                if title:
+                    out.append([ADVANCED_MCU_BTN_SECTION_TAG, title])
+                continue
+            it0 = t.item(r, _ADV_MCU_COL_GESTURE)
+            it1 = t.item(r, _ADV_MCU_COL_ACTION)
+            a = (it0.text() if it0 else "").strip()
+            b = (it1.text() if it1 else "").strip()
+            if a or b:
+                out.append([a, b])
+        return out
+
+    def _advanced_get_active_custom_install_path(self) -> str:
+        """Filesystem path used for custom install (mpremote); mirrors DB legacy key."""
+        profiles = self._advanced_custom_profiles_ensure()
+        combo = getattr(self, "_advanced_custom_profile_combo", None)
+        idx = (
+            combo.currentIndex()
+            if combo is not None and _qt_widget_alive(combo) and combo.count() > 0
+            else self._advanced_active_profile_index()
+        )
+        if 0 <= idx < len(profiles):
+            return (profiles[idx].get("path") or "").strip()
+        return (self.db.get_setting("advanced_custom_software_path", "") or "").strip()
+
+    def _advanced_sync_custom_path_setting_to_active_source(self) -> None:
+        self.db.set_setting("advanced_custom_software_path", self._advanced_get_active_custom_install_path())
+
+    def _advanced_custom_profiles_ensure(self) -> List[Dict[str, str]]:
+        """Load persisted custom-software profiles; migrate legacy single path into one profile."""
+        raw = (self.db.get_setting("advanced_custom_profiles_json", "") or "").strip()
+        profiles: List[Dict[str, str]] = []
+        try:
+            data = json.loads(raw) if raw else []
+        except Exception:
+            data = []
+        if isinstance(data, list):
+            for i, e in enumerate(data):
+                if not isinstance(e, dict):
+                    continue
+                profiles.append(
+                    {
+                        "name": str(e.get("name") or f"Profile {i + 1}").strip() or f"Profile {i + 1}",
+                        "path": str(e.get("path") or "").strip(),
+                        "description": str(e.get("description") or ""),
+                        "buttons": str(e.get("buttons") or ""),
+                    }
+                )
+        legacy = (self.db.get_setting("advanced_custom_software_path", "") or "").strip()
+        if not profiles and legacy:
+            profiles = [
+                {
+                    "name": "Default",
+                    "path": legacy,
+                    "description": "",
+                    "buttons": "",
+                }
+            ]
+            self.db.set_setting("advanced_custom_profiles_json", json.dumps(profiles))
+        return profiles
+
+    def _advanced_custom_profiles_save(self, profiles: List[Dict[str, str]]) -> None:
+        self.db.set_setting("advanced_custom_profiles_json", json.dumps(profiles))
+
+    def _advanced_active_profile_index(self) -> int:
+        try:
+            return max(0, int((self.db.get_setting("advanced_active_custom_profile_index", "0") or "0").strip() or "0"))
+        except ValueError:
+            return 0
+
+    def _advanced_set_active_profile_index(self, idx: int) -> None:
+        self.db.set_setting("advanced_active_custom_profile_index", str(max(0, idx)))
+
+    def _advanced_save_custom_profile_at_index(self, idx: int) -> None:
+        """Write the current Microprocessor fields into profiles[idx] and persist."""
+        notes_w = getattr(self, "_advanced_mcu_notes_edit", None)
+        btn_t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(notes_w) or not _qt_widget_alive(btn_t):
+            return
+        profiles = self._advanced_custom_profiles_ensure()
+        if idx < 0 or idx >= len(profiles):
+            return
+        profiles[idx]["description"] = notes_w.toPlainText()
+        profiles[idx]["buttons"] = self._advanced_button_rows_to_json(self._advanced_read_mcu_button_table())
+        self._advanced_custom_profiles_save(profiles)
+        self._advanced_sync_custom_path_setting_to_active_source()
+
+    def _flush_advanced_mcu_notes_and_buttons(self) -> None:
+        """Persist notes + button reference from the Microprocessor tab (debounced)."""
+        notes_w = getattr(self, "_advanced_mcu_notes_edit", None)
+        btn_t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(notes_w) or not _qt_widget_alive(btn_t):
+            return
+        if self._uses_custom_software():
+            combo = getattr(self, "_advanced_custom_profile_combo", None)
+            if combo is None or not _qt_widget_alive(combo):
+                return
+            idx = combo.currentIndex()
+            self._advanced_save_custom_profile_at_index(idx)
+        else:
+            self.db.set_setting("advanced_mcu_notes", notes_w.toPlainText())
+            self.db.set_setting(
+                "advanced_mcu_button_table_json",
+                self._advanced_button_rows_to_json(self._advanced_read_mcu_button_table()),
+            )
+        self._advanced_refit_mcu_button_table_height()
+
+    def _schedule_flush_advanced_mcu_fields(self) -> None:
+        t = getattr(self, "_advanced_mcu_flush_timer", None)
+        if t is None or not _qt_widget_alive(t):
+            t = QtCore.QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._flush_advanced_mcu_notes_and_buttons)
+            self._advanced_mcu_flush_timer = t
+        else:
+            t.stop()
+        t.start(450)
+
+    def _on_advanced_mcu_button_table_item_changed(self, *_args) -> None:
+        self._schedule_flush_advanced_mcu_fields()
+        QtCore.QTimer.singleShot(0, self._advanced_refit_mcu_button_table_height)
+
+    def _on_advanced_mcu_buttons_table_context_menu(self, pos: QtCore.QPoint) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        r = t.rowAt(pos.y())
+        c = t.columnAt(pos.x())
+        if c == _ADV_MCU_COL_HANDLE:
+            return
+        self._advanced_mcu_open_row_actions_menu(t, r if r >= 0 else 0, t.mapToGlobal(pos))
+
+    def _advanced_mcu_open_row_actions_menu(
+        self,
+        t: QtWidgets.QTableWidget,
+        r: int,
+        global_pos: QtCore.QPoint,
+    ) -> None:
+        """Context menu and gutter button share the same row action set."""
+        if t.rowCount() <= 0:
+            return
+        r = max(0, min(r, t.rowCount() - 1))
+        is_section = t.columnSpan(r, _ADV_MCU_COL_GESTURE) == 2
+        menu = QtWidgets.QMenu(self)
+        act_above = menu.addAction("Insert row above")
+        act_below = menu.addAction("Insert row below")
+        menu.addSeparator()
+        act_sec = menu.addAction("Insert section heading above this row")
+        act_mrg = menu.addAction("Merge this row into section heading (two columns → one)")
+        act_spl = menu.addAction("Split section into two columns")
+        menu.addSeparator()
+        act_del = menu.addAction("Delete this row")
+        act_mrg.setEnabled(not is_section)
+        act_spl.setEnabled(is_section)
+        act_del.setEnabled(t.rowCount() > 1)
+        chosen = menu.exec(global_pos)
+        if chosen == act_above:
+            self._advanced_mcu_table_insert_data_row_at(r)
+        elif chosen == act_below:
+            self._advanced_mcu_table_insert_data_row_at(r + 1)
+        elif chosen == act_sec:
+            self._advanced_mcu_table_insert_section(r)
+        elif chosen == act_mrg:
+            self._advanced_mcu_table_merge_row(r)
+        elif chosen == act_spl:
+            self._advanced_mcu_table_split_row(r)
+        elif chosen == act_del:
+            self._advanced_mcu_table_delete_row(r)
+
+    def _advanced_mcu_row_junction_menu(self, t: QtWidgets.QTableWidget, r: int) -> None:
+        if not _qt_widget_alive(t):
+            return
+        w = t.cellWidget(r, _ADV_MCU_COL_HANDLE)
+        if w is not None:
+            gp = w.mapToGlobal(QtCore.QPoint(w.width(), w.height() // 2))
+        else:
+            idx = t.model().index(r, _ADV_MCU_COL_HANDLE)
+            gp = t.mapToGlobal(t.visualRect(idx).center())
+        self._advanced_mcu_open_row_actions_menu(t, r, gp)
+
+    def _advanced_mcu_table_insert_section(self, r: int) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        row = max(0, min(r, t.rowCount()))
+        t.blockSignals(True)
+        t.insertRow(row)
+        it = QtWidgets.QTableWidgetItem("New heading")
+        it.setFlags(
+            it.flags()
+            | QtCore.Qt.ItemFlag.ItemIsEditable
+            | QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsSelectable
+        )
+        _sec_bg = QColor(38, 38, 40)
+        _sec_fg = QColor(240, 240, 242)
+        _sf = QFont(it.font())
+        _sf.setBold(True)
+        it.setFont(_sf)
+        it.setBackground(QBrush(_sec_bg))
+        it.setForeground(QBrush(_sec_fg))
+        t.setSpan(row, _ADV_MCU_COL_GESTURE, 1, 2)
+        t.setItem(row, _ADV_MCU_COL_GESTURE, it)
+        t.blockSignals(False)
+        self._advanced_refresh_mcu_row_handles()
+        self._advanced_refit_mcu_button_table_height()
+        self._schedule_flush_advanced_mcu_fields()
+
+    def _advanced_mcu_table_insert_data_row_at(self, r: int) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t):
+            return
+        r = max(0, min(r, t.rowCount()))
+        t.blockSignals(True)
+        t.insertRow(r)
+        t.setSpan(r, _ADV_MCU_COL_GESTURE, 1, 1)
+        t.setSpan(r, _ADV_MCU_COL_ACTION, 1, 1)
+        left = QtWidgets.QTableWidgetItem("")
+        right = QtWidgets.QTableWidgetItem("")
+        for it in (left, right):
+            it.setFlags(
+                it.flags()
+                | QtCore.Qt.ItemFlag.ItemIsEditable
+                | QtCore.Qt.ItemFlag.ItemIsEnabled
+                | QtCore.Qt.ItemFlag.ItemIsSelectable
+            )
+        t.setItem(r, _ADV_MCU_COL_GESTURE, left)
+        t.setItem(r, _ADV_MCU_COL_ACTION, right)
+        t.blockSignals(False)
+        self._advanced_refresh_mcu_row_handles()
+        self._advanced_refit_mcu_button_table_height()
+        self._schedule_flush_advanced_mcu_fields()
+
+    def _advanced_mcu_table_delete_row(self, r: int) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t) or r < 0 or r >= t.rowCount():
+            return
+        if t.rowCount() <= 1:
+            return
+        if t.cellWidget(r, _ADV_MCU_COL_HANDLE) is not None:
+            t.removeCellWidget(r, _ADV_MCU_COL_HANDLE)
+        t.removeRow(r)
+        self._advanced_refresh_mcu_row_handles()
+        self._advanced_refit_mcu_button_table_height()
+        self._schedule_flush_advanced_mcu_fields()
+
+    def _advanced_mcu_table_merge_row(self, r: int) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t) or r < 0 or r >= t.rowCount():
+            return
+        if t.columnSpan(r, _ADV_MCU_COL_GESTURE) == 2:
+            return
+        it0 = t.item(r, _ADV_MCU_COL_GESTURE)
+        it1 = t.item(r, _ADV_MCU_COL_ACTION)
+        a = it0.text().strip() if it0 else ""
+        b = it1.text().strip() if it1 else ""
+        title = a if not b else f"{a} — {b}"
+        title = title.strip(" —\u00a0\t")
+        if not title:
+            return
+        t.blockSignals(True)
+        if it1 is not None:
+            t.takeItem(r, _ADV_MCU_COL_ACTION)
+        if it0 is None:
+            it0 = QtWidgets.QTableWidgetItem(title)
+            t.setItem(r, _ADV_MCU_COL_GESTURE, it0)
+        else:
+            it0.setText(title)
+        _sec_bg = QColor(38, 38, 40)
+        _sec_fg = QColor(240, 240, 242)
+        it0.setBackground(QBrush(_sec_bg))
+        it0.setForeground(QBrush(_sec_fg))
+        _sf = QFont(it0.font())
+        _sf.setBold(True)
+        it0.setFont(_sf)
+        t.setSpan(r, _ADV_MCU_COL_GESTURE, 1, 2)
+        t.blockSignals(False)
+        self._advanced_refit_mcu_button_table_height()
+        self._schedule_flush_advanced_mcu_fields()
+
+    def _advanced_mcu_table_split_row(self, r: int) -> None:
+        t = getattr(self, "_advanced_mcu_buttons_table", None)
+        if not _qt_widget_alive(t) or r < 0 or r >= t.rowCount():
+            return
+        if t.columnSpan(r, _ADV_MCU_COL_GESTURE) != 2:
+            return
+        it = t.item(r, _ADV_MCU_COL_GESTURE)
+        title = (it.text() if it else "").strip()
+        t.blockSignals(True)
+        t.setSpan(r, _ADV_MCU_COL_GESTURE, 1, 1)
+        t.setSpan(r, _ADV_MCU_COL_ACTION, 1, 1)
+        left = QtWidgets.QTableWidgetItem(title)
+        left.setFlags(
+            left.flags()
+            | QtCore.Qt.ItemFlag.ItemIsEditable
+            | QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsSelectable
+        )
+        right = QtWidgets.QTableWidgetItem("")
+        right.setFlags(
+            right.flags()
+            | QtCore.Qt.ItemFlag.ItemIsEditable
+            | QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsSelectable
+        )
+        lf = QFont(left.font())
+        lf.setBold(False)
+        left.setFont(lf)
+        t.setItem(r, _ADV_MCU_COL_GESTURE, left)
+        t.setItem(r, _ADV_MCU_COL_ACTION, right)
+        t.blockSignals(False)
+        self._advanced_refit_mcu_button_table_height()
+        self._schedule_flush_advanced_mcu_fields()
+
+    def _load_advanced_mcu_profile_into_ui(self) -> None:
+        """Load notes/button table for the current software source + custom source index."""
+        notes_w = getattr(self, "_advanced_mcu_notes_edit", None)
+        btn_t = getattr(self, "_advanced_mcu_buttons_table", None)
+        combo = getattr(self, "_advanced_custom_profile_combo", None)
+        if not _qt_widget_alive(notes_w) or not _qt_widget_alive(btn_t):
+            return
+        default_rows = self._default_advanced_mcu_button_rows()
+        if self._uses_custom_software():
+            profiles = self._advanced_custom_profiles_ensure()
+            idx = combo.currentIndex() if combo is not None and _qt_widget_alive(combo) else 0
+            if idx < 0 or idx >= len(profiles):
+                idx = 0
+            self._advanced_set_active_profile_index(idx)
+            if not profiles:
+                notes_w.clear()
+                self._advanced_fill_mcu_button_table([], prefer_blank=True)
+                self._advanced_sync_custom_path_setting_to_active_source()
+                return
+            p = profiles[idx]
+            notes_w.setPlainText(p.get("description") or "")
+            rows = self._advanced_parse_button_rows_json(p.get("buttons") or "")
+            self._advanced_fill_mcu_button_table(rows, prefer_blank=True)
+            self._advanced_sync_custom_path_setting_to_active_source()
+        else:
+            notes_w.setPlainText(self.db.get_setting("advanced_mcu_notes", "") or "")
+            rows = self._advanced_parse_button_rows_json(
+                self.db.get_setting("advanced_mcu_button_table_json", "") or ""
+            )
+            if not rows:
+                rows = list(default_rows)
+            self._advanced_fill_mcu_button_table(rows, prefer_blank=False)
+
+    def _on_advanced_custom_profile_changed(self, idx: int) -> None:
+        prev = getattr(self, "_advanced_profile_combo_last_idx", None)
+        if self._uses_custom_software() and prev is not None and prev >= 0:
+            self._advanced_save_custom_profile_at_index(prev)
+        self._advanced_profile_combo_last_idx = idx
+        self._advanced_set_active_profile_index(idx)
+        self._load_advanced_mcu_profile_into_ui()
+
+    def _on_advanced_add_software_source(self) -> None:
+        start = str(Path.home())
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose custom software folder",
+            start,
+        )
+        if not folder or not str(folder).strip():
+            return
+        folder = str(folder).strip()
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Name this source",
+            "Name (shown in Saved custom sources):",
+        )
+        if not ok or not name.strip():
+            return
+        profiles = self._advanced_custom_profiles_ensure()
+        profiles.append(
+            {
+                "name": name.strip(),
+                "path": folder,
+                "description": "",
+                "buttons": "",
+            }
+        )
+        self._advanced_custom_profiles_save(profiles)
+        self._advanced_set_active_profile_index(len(profiles) - 1)
+        self.db.set_setting("advanced_custom_software_path", folder)
+        self._rebuild_tabs()
+
+    def _on_advanced_remove_custom_source(self) -> None:
+        combo = getattr(self, "_advanced_custom_profile_combo", None)
+        if combo is None or not _qt_widget_alive(combo) or combo.count() == 0:
+            return
+        idx = combo.currentIndex()
+        profiles = self._advanced_custom_profiles_ensure()
+        if idx < 0 or idx >= len(profiles):
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Remove custom source",
+            f"Remove “{profiles[idx].get('name', '')}” from this library?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        del profiles[idx]
+        self._advanced_custom_profiles_save(profiles)
+        new_idx = min(idx, max(0, len(profiles) - 1))
+        self._advanced_set_active_profile_index(new_idx)
+        if profiles:
+            self.db.set_setting(
+                "advanced_custom_software_path",
+                (profiles[new_idx].get("path") or "").strip(),
+            )
+        else:
+            self.db.set_setting("advanced_custom_software_path", "")
+        self._rebuild_tabs()
 
     def _set_devices_view_mode(self, mode: str) -> None:
-        """Set Devices tab view mode (basic or advanced), persist, and rebuild tabs."""
-        if mode not in ("basic", "advanced"):
+        """Set Devices tab view mode, persist, and rebuild tabs."""
+        if mode not in ("basic", "advanced", "legacy"):
             return
         old_mode = getattr(self, "devices_view_mode", None)
         self.devices_view_mode = mode
@@ -1644,19 +2595,996 @@ class MainWindow(QtWidgets.QMainWindow):
             self._rebuild_tabs()
 
         if hasattr(self, "_devices_stack") and self._devices_stack is not None:
-            self._devices_stack.setCurrentIndex(0 if mode == "basic" else 1)
-        if mode == "basic" and hasattr(self, "_check_basic_sd_pico_warning"):
+            self._devices_stack.setCurrentIndex(0 if mode in ("basic", "advanced") else 1)
+        if mode in ("basic", "advanced") and hasattr(self, "_check_basic_sd_pico_warning"):
             self._check_basic_sd_pico_warning()
+
+    def _sync_tools_developer_mode_action_checked(self) -> None:
+        act = getattr(self, "_tools_developer_mode_action", None)
+        if act is None:
+            return
+        act.blockSignals(True)
+        act.setChecked(self._developer_mode)
+        act.blockSignals(False)
+
+    def _set_developer_mode_from_tools_menu(self, checked: bool) -> None:
+        self._set_developer_mode(bool(checked))
+
+    def _set_developer_mode(self, enabled: bool) -> None:
+        """Turn developer UI on/off and persist. Stops MCP when turning off."""
+        enabled = bool(enabled)
+        if enabled == self._developer_mode:
+            if enabled and getattr(self, "_dev_menu", None) is None:
+                self._install_developer_menu()
+            elif not enabled and getattr(self, "_dev_menu", None) is not None:
+                self._toggle_mcp_server_from_ui(False)
+                self._uninstall_developer_menu()
+            return
+        self._developer_mode = enabled
+        self.db.set_setting("developer_mode", "1" if enabled else "0")
+        act = getattr(self, "_tools_developer_mode_action", None)
+        if act:
+            act.blockSignals(True)
+            act.setChecked(enabled)
+            act.blockSignals(False)
+        if not enabled:
+            self._toggle_mcp_server_from_ui(False)
+            self._uninstall_developer_menu()
+            self.statusBar().showMessage("Developer mode off (MCP stopped).", 4000)
+        else:
+            self._install_developer_menu()
+            self.statusBar().showMessage("Developer mode on.", 4000)
+
+    def _uninstall_developer_menu(self) -> None:
+        dev = getattr(self, "_dev_menu", None)
+        if dev is None:
+            return
+        self.menuBar().removeAction(dev.menuAction())
+        dev.deleteLater()
+        self._dev_menu = None
+
+    def _refresh_mcp_toggle_action_ui(self) -> None:
+        if not hasattr(self, "_mcp_toggle_action"):
+            return
+        running = self._mcp_manager.is_running()
+        self._mcp_toggle_action.blockSignals(True)
+        self._mcp_toggle_action.setChecked(running)
+        if running:
+            self._mcp_toggle_action.setText(
+                "MCP debug server ON ({}:{})".format("127.0.0.1", self._mcp_port)
+            )
+        else:
+            self._mcp_toggle_action.setText("MCP debug server OFF — click to start")
+        self._mcp_toggle_action.blockSignals(False)
+
+    def _mcp_log(self, message: str) -> None:
+        print(message)
+        write_session_line(message, prefix="MCP")
+        w = self._active_debug_widget()
+        if w is not None and _qt_widget_alive(w):
+            try:
+                w._log("[MCP] {}".format(message), "command")
+            except Exception:
+                pass
+
+    def _mcp_log_acceptance_worker(self, message: str) -> None:
+        """Call from acceptance test worker threads; forwards to the GUI log safely."""
+        self._mcp_queue_on_gui(lambda m=message: self._mcp_log(m))
+
+    def _mcp_queue_on_gui(self, fn: Callable[[], None]) -> None:
+        """Run *fn* on the Qt GUI thread (MCP client runs on a socket thread)."""
+        with self._mcp_gui_queue_lock:
+            self._mcp_gui_queue.append(fn)
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_mcp_drain_gui_queue",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+
+    @QtCore.pyqtSlot()
+    def _mcp_drain_gui_queue(self) -> None:
+        with self._mcp_gui_queue_lock:
+            batch = list(self._mcp_gui_queue)
+            self._mcp_gui_queue.clear()
+        for fn in batch:
+            try:
+                fn()
+            except Exception as e:
+                self._mcp_log("MCP GUI queue error: {}".format(e))
+
+    def _mcp_run_on_gui_sync(
+        self, fn: Callable[[], Dict[str, Any]], *, wait_s: float = 45.0
+    ) -> Dict[str, Any]:
+        """Run *fn* on the GUI thread and block the caller until the result is ready."""
+        result_box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def _wrap() -> None:
+            try:
+                result_box["r"] = fn()
+            except Exception as e:
+                result_box["r"] = {
+                    "ok": False,
+                    "error": "mcp_gui_exception",
+                    "detail": str(e),
+                }
+            finally:
+                done.set()
+
+        self._mcp_queue_on_gui(_wrap)
+        if not done.wait(timeout=wait_s):
+            return {"ok": False, "error": "mcp_gui_timeout"}
+        return result_box.get("r", {"ok": False, "error": "mcp_gui_no_result"})
+
+    def _ensure_device_debug_widget_loaded(self) -> None:
+        """GUI thread: instantiate Device Debug widget if the tab exists but is still a placeholder."""
+        if self._device_debug_tab_index < 0:
+            return
+        if self._device_debug_widget is not None:
+            return
+        layout = getattr(self, "_device_debug_tab_layout", None)
+        ph = getattr(self, "_device_debug_placeholder", None)
+        if layout is None or ph is None:
+            return
+        layout.removeWidget(ph)
+        ph.deleteLater()
+        self._device_debug_placeholder = None
+        self._device_debug_widget = DeviceDebugWidget(
+            db=self.db,
+            db_getter=lambda: self.db,
+        )
+        layout.addWidget(self._device_debug_widget)
+
+    def _mcp_get_log_path(self) -> Optional[str]:
+        p = get_session_log_path()
+        return str(p) if p else None
+
+    def _active_debug_widget(self):
+        """Prefer the **Device** tab debug widget when it exists.
+
+        MCP / VRTEST / serial streaming for the Pico must use the same widget the user
+        connects on the Device tab. The Library tab's *basic* debug widget was checked
+        first previously, so ``device_stream_tail`` and ``get_stream_ring_tail`` often
+        read an empty ring (only the stream-start tip) while firmware logs went to the
+        Device widget — breaking acceptance serial dumps and Now Playing parsing.
+        """
+        self._ensure_device_debug_widget_loaded()
+        for name in ("_device_debug_widget", "_basic_debug_widget"):
+            w = getattr(self, name, None)
+            if _qt_widget_alive(w):
+                return w
+        return None
+
+    def _mcp_get_connection_state(self) -> Dict[str, Any]:
+        w = self._active_debug_widget()
+        if w is None:
+            return {"connected": False, "reason": "debug_widget_unavailable"}
+        port = ""
+        try:
+            port = w.port_combo.currentText().strip()
+        except Exception:
+            pass
+        connected = bool(getattr(w, "_connected", False))
+        streaming = bool(getattr(w, "_streaming_thread", None)) and not bool(
+            getattr(w, "_stop_streaming", False)
+        )
+        return {"connected": connected, "port": port, "streaming": streaming}
+
+    def _mcp_select_serial_port(self, w: DeviceDebugWidget, port_str: str) -> bool:
+        """Select the device combo entry for a port name (e.g. ``COM6``)."""
+        if not port_str or not _qt_widget_alive(w):
+            return False
+        w._scan_ports()  # type: ignore[attr-defined]
+        want = port_str.strip().upper().replace(" ", "")
+        best_i = -1
+        for i in range(w.port_combo.count()):
+            data = w.port_combo.itemData(i)
+            if not data:
+                continue
+            dev = str(data).strip().upper()
+            if dev == want:
+                best_i = i
+                break
+            if want in dev or dev.endswith(want):
+                best_i = i
+        if best_i < 0:
+            return False
+        w.port_combo.setCurrentIndex(best_i)
+        return True
+
+    def _mcp_pick_rp2040_port(self, w: DeviceDebugWidget) -> Optional[str]:
+        """Scan ports and select the first RP2040/Pico in the combo; return device path or None.
+
+        Call **only** from the Qt GUI thread (e.g. inside a queued slot).
+        """
+        if not _qt_widget_alive(w):
+            return None
+        try:
+            import serial.tools.list_ports
+        except ImportError:
+            return None
+        w._scan_ports()  # type: ignore[attr-defined]
+        for p in serial.tools.list_ports.comports():
+            if w._is_rp2040_port(p):
+                dev = p.device
+                for i in range(w.port_combo.count()):
+                    if w.port_combo.itemData(i) == dev:
+                        w.port_combo.setCurrentIndex(i)
+                        return str(dev)
+        return None
+
+    @staticmethod
+    def _mcp_resolve_pico_port(port_hint: Optional[str]) -> Optional[str]:
+        """Resolve Pico serial path without touching Qt (safe from MCP / socket thread)."""
+        if port_hint is not None and str(port_hint).strip():
+            return str(port_hint).strip()
+        try:
+            import serial.tools.list_ports
+        except ImportError:
+            return None
+        for p in serial.tools.list_ports.comports():
+            if DeviceDebugWidget._is_rp2040_port(p):
+                return str(p.device)
+        return None
+
+    def _mcp_ensure_streaming(self, w: DeviceDebugWidget) -> None:
+        """Start serial streaming if connected and not already streaming."""
+        try:
+            if not _qt_widget_alive(w):
+                return
+            if not getattr(w, "_connected", False):
+                return
+            if getattr(w, "_stop_streaming", False):
+                return
+            t = getattr(w, "_streaming_thread", None)
+            if t is not None and t.is_alive():
+                return
+            w._start_streaming()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _mcp_connect_device_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP: pick RP2040 (or ``payload.port``), then connect on the **GUI** thread only."""
+        w = self._active_debug_widget()
+        if w is None:
+            return {"ok": False, "error": "debug_widget_unavailable"}
+        raw_port = payload.get("port")
+        hint_opt: Optional[str] = None
+        if raw_port is not None and str(raw_port).strip():
+            hint_opt = str(raw_port).strip()
+        auto_stream = payload.get("auto_start_streaming")
+        if auto_stream is None:
+            auto_stream = True
+        auto_stream = bool(auto_stream)
+
+        chosen = self._mcp_resolve_pico_port(hint_opt)
+        if not chosen:
+            return {
+                "ok": False,
+                "error": "no_device_found",
+                "hint": "Connect Pico via USB or pass payload.port (e.g. COM6).",
+            }
+
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_mcp_execute_connect_device",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, chosen),
+            QtCore.Q_ARG(bool, auto_stream),
+        )
+        return {
+            "ok": True,
+            "port": chosen,
+            "queued": True,
+            "note": "Connect is asynchronous; poll get_connection_state within a few seconds.",
+            "auto_start_streaming": auto_stream,
+        }
+
+    @QtCore.pyqtSlot(str, bool)
+    def _mcp_execute_connect_device(self, chosen: str, auto_stream: bool) -> None:
+        """GUI thread: select *chosen* in the device combo and open serial (MCP)."""
+        self._ensure_device_debug_widget_loaded()
+        w = self._active_debug_widget()
+        if w is None or not _qt_widget_alive(w):
+            self._mcp_log("MCP connect_device: debug widget unavailable on GUI thread")
+            return
+        w._log("MCP: connect_device ({})".format(chosen), "command")
+        w._scan_ports()  # type: ignore[attr-defined]
+        idx = -1
+        for i in range(w.port_combo.count()):
+            data = w.port_combo.itemData(i)
+            if data is not None and str(data) == chosen:
+                idx = i
+                break
+        if idx < 0:
+            cu = chosen.upper()
+            for i in range(w.port_combo.count()):
+                data = w.port_combo.itemData(i)
+                if data is not None and str(data).upper() == cu:
+                    idx = i
+                    break
+        if idx < 0:
+            self._mcp_log(
+                "MCP connect_device: {} not found in port list after scan".format(chosen)
+            )
+            return
+        w.port_combo.setCurrentIndex(idx)
+        ser = getattr(w, "_serial_connection", None)
+        if getattr(w, "_connected", False) and ser is not None and ser.is_open:
+            try:
+                if str(ser.port) == chosen:
+                    if auto_stream:
+                        self._mcp_ensure_streaming(w)
+                    return
+            except Exception:
+                pass
+        try:
+            w._connect()  # type: ignore[attr-defined]
+        finally:
+            if auto_stream:
+                QtCore.QTimer.singleShot(2500, lambda: self._mcp_ensure_streaming(w))
+
+    def _mcp_invoke_action(self, action: str, payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        payload = payload or {}
+
+        if action == "physical_gesture":
+            target = str(payload.get("target", "device")).strip().lower()
+            gesture = str(payload.get("gesture", "")).strip()
+            if not gesture:
+                return {"ok": False, "error": "missing_gesture"}
+            if target == "emulator":
+                return self._mcp_emulator_gesture(gesture)
+
+            def _gesture_fn() -> Dict[str, Any]:
+                self._ensure_device_debug_widget_loaded()
+                ww = self._active_debug_widget()
+                if ww is None:
+                    return {"ok": False, "error": "debug_widget_unavailable"}
+                ww._log("MCP: physical_gesture {}".format(gesture), "command")
+                try:
+                    tmo = float(payload.get("timeout", 25.0))
+                except (TypeError, ValueError):
+                    tmo = 25.0
+                # Large basic-mode libraries (e.g. 98 folders) can exceed 120s while hydrating
+                # before VRTEST long_press returns; cap high enough for stress / acceptance.
+                return ww.run_vrtest_command(gesture, timeout=max(5.0, min(tmo, 900.0)))  # type: ignore[no-any-return]
+
+            try:
+                sync_wait = float(payload.get("timeout", 25.0)) + 35.0
+            except (TypeError, ValueError):
+                sync_wait = 60.0
+            return self._mcp_run_on_gui_sync(_gesture_fn, wait_s=max(60.0, sync_wait))
+        if action == "device_stream_tail":
+            lim = int(payload.get("limit", 200))
+
+            def _tail_fn() -> Dict[str, Any]:
+                self._ensure_device_debug_widget_loaded()
+                ww = self._active_debug_widget()
+                if ww is None:
+                    return {"ok": False, "error": "debug_widget_unavailable"}
+                return {"ok": True, "lines": ww.get_stream_ring_tail(lim)}  # type: ignore[attr-defined]
+
+            return self._mcp_run_on_gui_sync(_tail_fn)
+
+        def _queue_device_action(label: str, op: Callable[[DeviceDebugWidget], None]) -> Dict[str, Any]:
+            def _do() -> None:
+                self._ensure_device_debug_widget_loaded()
+                ww = self._active_debug_widget()
+                if ww is None:
+                    self._mcp_log("MCP {}: debug widget unavailable".format(label))
+                    return
+                ww._log("MCP: {}".format(label), "command")
+                op(ww)
+
+            self._mcp_queue_on_gui(_do)
+            return {"ok": True, "queued": True}
+
+        if action == "connect_device":
+            return self._mcp_connect_device_action(payload)
+        if action == "scan_ports":
+            return _queue_device_action("scan_ports", lambda ww: ww._scan_ports())  # type: ignore[attr-defined]
+        if action == "connect":
+
+            def _op_connect(ww: DeviceDebugWidget) -> None:
+                p = payload.get("port")
+                if p and str(p).strip():
+                    self._mcp_select_serial_port(ww, str(p))
+                ww._connect()  # type: ignore[attr-defined]
+
+            return _queue_device_action("connect", _op_connect)
+        if action == "disconnect":
+            return _queue_device_action("disconnect", lambda ww: ww._disconnect())  # type: ignore[attr-defined]
+        if action == "restart_firmware":
+            return _queue_device_action(
+                "restart_firmware", lambda ww: ww._restart_firmware()  # type: ignore[attr-defined]
+            )
+        if action == "soft_reset":
+            return _queue_device_action("soft_reset", lambda ww: ww._soft_reset())  # type: ignore[attr-defined]
+        if action == "start_streaming":
+            return _queue_device_action(
+                "start_streaming", lambda ww: ww._start_streaming()  # type: ignore[attr-defined]
+            )
+        if action == "stop_streaming":
+            return _queue_device_action(
+                "stop_streaming", lambda ww: ww._stop_streaming_forcefully()  # type: ignore[attr-defined]
+            )
+        if action == "list_files":
+            return _queue_device_action("list_files", lambda ww: ww._list_files())  # type: ignore[attr-defined]
+        if action == "send_command":
+            cmd = str(payload.get("command", "")).strip()
+            if not cmd:
+                return {"ok": False, "error": "missing_command"}
+            timeout = float(payload.get("timeout", 8.0))
+
+            def _send_fn() -> Dict[str, Any]:
+                self._ensure_device_debug_widget_loaded()
+                ww = self._active_debug_widget()
+                if ww is None:
+                    return {"ok": False, "error": "debug_widget_unavailable"}
+                port_data = ww.port_combo.currentData()
+                port = (
+                    str(port_data).strip()
+                    if port_data is not None and str(port_data).strip()
+                    else ww.port_combo.currentText().strip()
+                )
+                if not port:
+                    return {"ok": False, "error": "no_selected_port"}
+                ww._log("MCP: send_command {!r}".format(cmd[:120]), "command")
+                try:
+                    rc, out, err = ww._send_serial_command(  # type: ignore[attr-defined]
+                        port, cmd, timeout=timeout
+                    )
+                    return {"ok": True, "returncode": rc, "stdout": out, "stderr": err}
+                except Exception as e:
+                    return {"ok": False, "error": "send_failed", "detail": str(e)}
+
+            return self._mcp_run_on_gui_sync(_send_fn, wait_s=max(45.0, timeout + 15.0))
+        if action == "install_basic_to_pico":
+            # Same file set as Device "Setup Pico" / Install to Pico (basic): main_basic as main.py,
+            # radio_core, dfplayer + IPC, pin_config, AM WAV, reboot.
+            def _install_fn() -> Dict[str, Any]:
+                mpremote_cmd = self._resolve_mpremote_cmd()
+                if not mpremote_cmd:
+                    return {
+                        "ok": False,
+                        "error": "mpremote_unavailable",
+                        "detail": getattr(self, "_mpremote_bundle_error", None) or "",
+                    }
+                self._release_serial_if_connected_for_mpremote(log_prefix="MCP_INSTALL")
+                root = self._project_root()
+                profile = self._get_active_profile_install_params()
+                try:
+                    msg = MainWindow._install_to_pico_worker(
+                        mpremote_cmd,
+                        root,
+                        self.sd_root,
+                        self.sd_manager,
+                        progress_callback=None,
+                        pin_config_json=profile.get("pin_config_json") or "",
+                        custom_hw_driver_path=profile.get("custom_hw_driver_path") or "",
+                        basic_mode=True,
+                        install_mode=str(profile.get("install_mode") or "basic"),
+                        dfplayer_eq=str(profile.get("dfplayer_eq") or "normal"),
+                    )
+                    self.statusBar().showMessage(str(msg), 8000)
+                    return {"ok": True, "message": msg}
+                except Exception as e:
+                    return {
+                        "ok": False,
+                        "error": "install_failed",
+                        "detail": str(e),
+                        "traceback": traceback.format_exc(),
+                    }
+
+            return self._mcp_run_on_gui_sync(_install_fn, wait_s=600.0)
+        return {"ok": False, "error": "unknown_action", "action": action}
+
+    def _mcp_emulator_gesture(self, gesture: str) -> Dict[str, Any]:
+        """Run TestModeWidget gestures on the GUI thread (same RadioCore as firmware)."""
+        result: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def work() -> None:
+            try:
+                tw = self.test_mode_widget
+                if tw is None:
+                    tw = self._ensure_test_mode_widget()
+                c = tw.core
+                if gesture == "ping":
+                    result.update({"ok": True, "device": {"ok": True, "cmd": "ping"}})
+                elif gesture == "get_state":
+                    playing = bool(getattr(tw, "is_playing", False))
+                    st = {
+                        "mode": getattr(tw, "mode", c.mode),
+                        "current_track": int(getattr(tw, "current_track", c.current_track)),
+                        "current_album_index": int(c.current_album_index),
+                        "is_playing": playing,
+                        "busy_pin": None,
+                        "power_on": bool(c.power_on),
+                        "tap_count_pending": int(c.tap_count),
+                        "button_down": bool(c.button_down),
+                    }
+                    result.update(
+                        {"ok": True, "device": {"ok": True, "cmd": "get_state", "state": st}}
+                    )
+                elif gesture == "single_tap":
+                    tw.single_tap(auto=True)  # type: ignore[attr-defined]
+                    result.update({"ok": True, "device": {"ok": True, "cmd": "single_tap"}})
+                elif gesture == "double_tap":
+                    tw.double_tap()  # type: ignore[attr-defined]
+                    result.update({"ok": True, "device": {"ok": True, "cmd": "double_tap"}})
+                elif gesture == "triple_tap":
+                    tw.triple_tap()  # type: ignore[attr-defined]
+                    result.update({"ok": True, "device": {"ok": True, "cmd": "triple_tap"}})
+                elif gesture == "long_press":
+                    tw.long_press()  # type: ignore[attr-defined]
+                    result.update({"ok": True, "device": {"ok": True, "cmd": "long_press"}})
+                else:
+                    result.update({"ok": False, "error": "unknown_emulator_gesture", "gesture": gesture})
+            except Exception as e:
+                result.update({"ok": False, "error": str(e)})
+            finally:
+                done.set()
+
+        QtCore.QTimer.singleShot(0, work)
+        if not done.wait(timeout=60.0):
+            return {"ok": False, "error": "timeout_waiting_for_gui_thread"}
+        return result
+
+    def _install_developer_menu(self) -> None:
+        """Create Developer menu when developer mode is on; safe to call if already present."""
+        if getattr(self, "_dev_menu", None) is not None:
+            return
+        self._dev_menu = self.menuBar().addMenu("Developer")
+        self._dev_menu.aboutToShow.connect(self._refresh_mcp_toggle_action_ui)
+        self._dev_menu.addAction(self._mcp_toggle_action)
+
+        if not hasattr(self, "_mcp_status_action"):
+            self._mcp_status_action = QtGui.QAction("Show MCP Status", self)
+            self._mcp_status_action.triggered.connect(self._show_mcp_status)
+        self._dev_menu.addAction(self._mcp_status_action)
+
+        if not hasattr(self, "_mcp_smoke_action"):
+            self._mcp_smoke_action = QtGui.QAction("Run MCP Smoke Script", self)
+            self._mcp_smoke_action.triggered.connect(self._run_mcp_smoke_script)
+        self._dev_menu.addAction(self._mcp_smoke_action)
+
+        if not hasattr(self, "_mcp_acceptance_action"):
+            self._mcp_acceptance_action = QtGui.QAction("Run acceptance suite…", self)
+            self._mcp_acceptance_action.triggered.connect(self._run_mcp_acceptance_suite_dialog)
+        self._dev_menu.addAction(self._mcp_acceptance_action)
+
+        if not hasattr(self, "_mcp_full_acceptance_action"):
+            self._mcp_full_acceptance_action = QtGui.QAction(
+                "Run full device acceptance (physical)…", self
+            )
+            self._mcp_full_acceptance_action.triggered.connect(
+                self._run_mcp_full_acceptance_dialog
+            )
+        self._dev_menu.addAction(self._mcp_full_acceptance_action)
+
+        if not hasattr(self, "_mcp_deploy_ipc_action"):
+            self._mcp_deploy_ipc_action = QtGui.QAction(
+                "Deploy MCP / VRTEST support to Pico…", self
+            )
+            self._mcp_deploy_ipc_action.triggered.connect(self._deploy_mcp_support_to_pico)
+        self._dev_menu.addAction(self._mcp_deploy_ipc_action)
+
+        self._refresh_mcp_toggle_action_ui()
+
+    def _handle_mcp_toggle_action(self, checked: bool) -> None:
+        if not self._developer_mode:
+            # Reset check state immediately; this is only a prompt in non-dev mode.
+            self._mcp_toggle_action.setChecked(False)
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Developer mode",
+                "The MCP debug server is under the Developer menu.\n\n"
+                "Turn on Developer mode (saved in preferences) and start the MCP server?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.Yes,
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                self._set_developer_mode(True)
+                self._toggle_mcp_server_from_ui(True)
+            else:
+                self.statusBar().showMessage(
+                    "MCP not started. Use Tools → Developer mode, or --enable-mcp-debug.",
+                    7000,
+                )
+            return
+        self._toggle_mcp_server_from_ui(checked)
+
+    def _toggle_mcp_server_from_ui(self, checked: bool) -> None:
+        if checked:
+            res = self._mcp_manager.start(port=self._mcp_port)
+            if not res.get("ok"):
+                self._refresh_mcp_toggle_action_ui()
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "MCP Debug Server",
+                    "Could not start MCP debug server:\n{}".format(res),
+                )
+                return
+            self._refresh_mcp_toggle_action_ui()
+            self.statusBar().showMessage(
+                "MCP debug server running on 127.0.0.1:{}".format(self._mcp_port), 5000
+            )
+        else:
+            self._mcp_manager.stop()
+            self._refresh_mcp_toggle_action_ui()
+            self.statusBar().showMessage("MCP debug server stopped", 3000)
+
+    def _show_mcp_status(self) -> None:
+        st = self._mcp_manager.status()
+        QtWidgets.QMessageBox.information(
+            self,
+            "MCP Debug Status",
+            json.dumps(st, indent=2),
+        )
+
+    def _run_mcp_smoke_script(self) -> None:
+        res = self._mcp_manager.run_script("basic_smoke")
+        self._mcp_log("MCP smoke script result: {}".format(res))
+        QtWidgets.QMessageBox.information(self, "MCP Smoke Script", json.dumps(res, indent=2))
+
+    def _mcp_show_acceptance_report_dialog(
+        self, suite: Dict[str, Any], *, window_title: str
+    ) -> None:
+        """Show markdown report on the GUI thread (call via QTimer.singleShot from workers)."""
+        if not _qt_widget_alive(self):
+            return
+        try:
+            self.statusBar().clearMessage()
+        except Exception:
+            pass
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(window_title)
+        dlg.resize(720, 520)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        txt = QtWidgets.QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText(str(suite.get("report_markdown", "")))
+        lay.addWidget(txt)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Close
+        )
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
+        lay.addWidget(bb)
+        ok = bool(suite.get("ok"))
+        self._mcp_log(
+            "MCP acceptance finished: ok={} (see report dialog)".format(ok)
+        )
+        dlg.exec()
+
+    def _run_mcp_acceptance_suite_dialog(self) -> None:
+        """Quick/standard/full scripted suite — must not run on the GUI thread (deadlock)."""
+        from .mcp_device_acceptance import run_acceptance_suite
+
+        profile, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Acceptance suite",
+            "Profile:",
+            ["minimal", "standard", "full"],
+            1,
+            False,
+        )
+        if not ok:
+            return
+        target, ok2 = QtWidgets.QInputDialog.getItem(
+            self,
+            "Acceptance suite",
+            "Target:",
+            ["device", "emulator"],
+            0,
+            False,
+        )
+        if not ok2:
+            return
+
+        self.statusBar().showMessage(
+            "Acceptance suite running in background — watch Device tab / MCP log…",
+            0,
+        )
+        self._mcp_log(
+            "Starting acceptance suite (profile={}, target={}) on worker thread…".format(
+                profile, target
+            )
+        )
+
+        def _work() -> None:
+            try:
+                suite = run_acceptance_suite(
+                    invoke=self._mcp_invoke_action,
+                    target=target,
+                    suite_profile=profile,
+                )
+            except Exception as e:
+                suite = {
+                    "ok": False,
+                    "report_markdown": "Acceptance suite crashed:\n\n{}".format(e),
+                }
+            QtCore.QTimer.singleShot(
+                0,
+                lambda s=suite: self._mcp_show_acceptance_report_dialog(
+                    s, window_title="Acceptance suite report"
+                ),
+            )
+
+        threading.Thread(
+            target=_work, daemon=True, name="McpAcceptanceSuite"
+        ).start()
+
+    def _run_mcp_full_acceptance_dialog(self) -> None:
+        """Comprehensive physical-device suite; logs stream to MCP / Device tab."""
+        from .mcp_device_acceptance import run_device_acceptance_full
+
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Full device acceptance",
+            "Runs the full on-device regression suite — typically 15–35+ minutes "
+            "(5 tracks in playlist, shuffle-station, shuffle-library, 3 station changes, "
+            "three ~6 s line-in captures, serial checks).\n\n"
+            "Progress and Pico serial tails are appended to the MCP / session log "
+            "(same place as [MCP] lines). Line-in steps pause logging for several seconds "
+            "while the PC records audio — that is normal.\n\n"
+            "Keep this window open. Continue?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        target, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Full device acceptance",
+            "Target:",
+            ["device", "emulator"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        mgr = self._mcp_manager
+
+        def _request(method_name: str, method_params: Dict[str, Any]) -> Dict[str, Any]:
+            return mgr._dispatch({"method": method_name, "params": method_params})
+
+        self.statusBar().showMessage(
+            "Full device acceptance running — see MCP log for live progress…",
+            0,
+        )
+        self._mcp_log("Starting full device acceptance (target={})…".format(target))
+
+        def _work() -> None:
+            try:
+                suite = run_device_acceptance_full(
+                    invoke=self._mcp_invoke_action,
+                    request=_request,
+                    target=target,
+                    log_fn=self._mcp_log_acceptance_worker,
+                )
+            except Exception as e:
+                suite = {
+                    "ok": False,
+                    "report_markdown": "Full acceptance crashed:\n\n{}".format(e),
+                }
+            QtCore.QTimer.singleShot(
+                0,
+                lambda s=suite: self._mcp_show_acceptance_report_dialog(
+                    s, window_title="Full device acceptance report"
+                ),
+            )
+
+        threading.Thread(
+            target=_work, daemon=True, name="McpFullAcceptance"
+        ).start()
+
+    def _deploy_mcp_support_to_pico(self) -> None:
+        """Push vintage_radio_ipc (+ optional main files) so VRTEST works; MCP TCP server stays on the PC."""
+        pico_root = self._project_root() / "firmware" / "pico"
+        ipc = pico_root / "components" / "vintage_radio_ipc.py"
+        if not ipc.is_file():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Deploy MCP / VRTEST support",
+                "Could not find firmware file:\n{}".format(ipc),
+            )
+            return
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        if not mpremote_cmd:
+            bundle_err = getattr(self, "_mpremote_bundle_error", None)
+            msg = "mpremote is not available. Install with:\n\npip install mpremote"
+            if bundle_err:
+                msg += "\n\n({})".format(bundle_err)
+            QtWidgets.QMessageBox.information(self, "Deploy MCP / VRTEST support", msg)
+            return
+
+        choice = QtWidgets.QDialog(self)
+        choice.setWindowTitle("Deploy MCP / VRTEST support to Pico")
+        choice.setMinimumWidth(520)
+        v = QtWidgets.QVBoxLayout(choice)
+        intro = QtWidgets.QLabel(
+                "The MCP debug server runs on this computer. For serial automation (VRTEST), "
+                "the Pico needs components/vintage_radio_ipc.py on its flash. "
+                "Flashing a UF2 image alone often does not add new components/*.py files."
+        )
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+        combo = QtWidgets.QComboBox()
+        combo.addItem(
+            "IPC only — components/vintage_radio_ipc.py (fixes ImportError)",
+            False,
+        )
+        combo.addItem(
+            "Full — IPC + main.py + main_basic.py from this app (poll_ipc in loop)",
+            True,
+        )
+        v.addWidget(combo)
+        foot = QtWidgets.QLabel(
+            "Pico must be connected via USB (mpremote connect auto). "
+            "The device will soft-reset after copy."
+        )
+        foot.setWordWrap(True)
+        v.addWidget(foot)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(choice.accept)
+        buttons.rejected.connect(choice.reject)
+        v.addWidget(buttons)
+        if choice.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        include_main = bool(combo.currentData())
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Deploy MCP / VRTEST support",
+            func=MainWindow._deploy_mcp_support_worker,
+            args=(mpremote_cmd, pico_root, include_main),
+        )
+
+        def on_ok(msg: str) -> None:
+            self.statusBar().showMessage(str(msg), 8000)
+            QtWidgets.QMessageBox.information(
+                self,
+                "Deploy MCP / VRTEST support",
+                str(msg),
+            )
+
+        def on_err(msg: str) -> None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Deploy MCP / VRTEST support",
+                msg,
+            )
+
+        dlg.on_success = on_ok
+        dlg.on_error = on_err
+        dlg.exec()
+
+    def _maybe_auto_start_mcp(self) -> None:
+        if not self._developer_mode:
+            return
+        auto = os.environ.get("VINTAGE_RADIO_MCP_AUTOSTART", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if not auto:
+            return
+        QtCore.QTimer.singleShot(1500, lambda: self._toggle_mcp_server_from_ui(True))
+
+    def _capture_serial_debug_session_for_rebuild(self) -> None:
+        """If Device Console is open, remember COM port and release it before the UI is torn down.
+
+        Basic and Advanced views both use ``_basic_debug_widget`` on the Microprocessor tab;
+        ``_rebuild_tabs`` recreates that widget, so we disconnect here and reconnect after rebuild.
+        """
+        self._serial_debug_restore_snapshot = None
+        for name in ("_basic_debug_widget", "_device_debug_widget"):
+            w = getattr(self, name, None)
+            if not _qt_widget_alive(w) or not getattr(w, "_connected", False):
+                continue
+            port = None
+            try:
+                port = w.port_combo.currentData()
+            except Exception:
+                port = None
+            if not port:
+                try:
+                    ser = getattr(w, "_serial_connection", None)
+                    if ser is not None and getattr(ser, "is_open", False):
+                        port = str(ser.port)
+                except Exception:
+                    port = None
+            if not port:
+                try:
+                    w._disconnect()
+                except Exception:
+                    pass
+                continue
+            thr = getattr(w, "_streaming_thread", None)
+            streaming = bool(
+                thr and thr.is_alive() and not getattr(w, "_stop_streaming", True)
+            )
+            self._serial_debug_restore_snapshot = {"port": str(port), "streaming": streaming}
+            try:
+                w._disconnect()
+            except Exception as e:
+                write_session_line(
+                    "pre-rebuild serial disconnect: {}".format(e),
+                    prefix="DEVICE",
+                )
+            return
+
+    def _apply_serial_debug_restore(self) -> None:
+        """GUI thread: reconnect Device Console after ``_rebuild_tabs`` (basic/advanced)."""
+        snap = getattr(self, "_serial_debug_restore_snapshot", None)
+        if not snap or not snap.get("port"):
+            return
+        if self.devices_view_mode not in ("basic", "advanced"):
+            self._serial_debug_restore_snapshot = None
+            return
+        port = str(snap["port"])
+        want_streaming = bool(snap.get("streaming", True))
+        self._serial_debug_restore_snapshot = None
+
+        w = getattr(self, "_basic_debug_widget", None)
+        if not _qt_widget_alive(w):
+            return
+        if getattr(w, "_connected", False):
+            return
+        if not self._mcp_select_serial_port(w, port):
+            self.statusBar().showMessage(
+                "View changed: port {} not found — pick it in Device Console and Connect.".format(
+                    port
+                ),
+                8000,
+            )
+            return
+        try:
+            w._connect()
+        except Exception as e:
+            self.statusBar().showMessage(
+                "View changed: auto-reconnect failed ({}). Use Connect.".format(e),
+                8000,
+            )
+            return
+
+        if not want_streaming:
+
+            def _maybe_stop_stream() -> None:
+                ww = getattr(self, "_basic_debug_widget", None)
+                if not _qt_widget_alive(ww):
+                    return
+                if not getattr(ww, "_connected", False):
+                    return
+                thr = getattr(ww, "_streaming_thread", None)
+                if thr and thr.is_alive():
+                    try:
+                        ww._toggle_streaming()
+                    except Exception:
+                        pass
+
+            QtCore.QTimer.singleShot(1400, _maybe_stop_stream)
 
     def _rebuild_tabs(self) -> None:
         """Tear down the current tab widget and rebuild for the active view mode."""
+        self._capture_serial_debug_session_for_rebuild()
         old_central = self.centralWidget()
         self._device_debug_widget = None
         self._build_tabs()
         if old_central is not None:
             old_central.deleteLater()
-        if self.devices_view_mode == "advanced":
+        if self.devices_view_mode == "legacy":
             self._refresh_all()
+        elif self.devices_view_mode in ("basic", "advanced"):
+            QtCore.QTimer.singleShot(200, self._apply_serial_debug_restore)
 
     # ── Library switcher toolbar ──────────────────────────────
 
@@ -1820,7 +3748,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs = QtWidgets.QTabWidget()
         self._tabs_widget = tabs
 
-        if self.devices_view_mode == "basic":
+        if self.devices_view_mode in ("basic", "advanced"):
             # Devices tab (advanced) is not built; sd_root_label may point at a
             # QLabel destroyed when switching from advanced — clear stale refs.
             if not _qt_widget_alive(getattr(self, "sd_root_label", None)):
@@ -1862,51 +3790,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_debug_tab_layout = layout
         return container
 
-    def _build_basic_mcu_tab(self) -> QtWidgets.QWidget:
-        """Basic mode: Microprocessor tab with single setup button (left) and debug console (right)."""
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(widget)
-
-        # ── Left panel: single setup button ──
-        left = QtWidgets.QWidget()
-        left.setMinimumWidth(260)
-        left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 8, 0)
-
-        fw_group = QtWidgets.QGroupBox("Device Setup")
-        fw_layout = QtWidgets.QVBoxLayout(fw_group)
-
-        info_label = QtWidgets.QLabel(
-            "Connect your RP2040 Pico via USB, then click the button below.\n"
-            "MicroPython will be installed automatically if needed."
-        )
-        info_label.setWordWrap(True)
-        info_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
-        info_label.setStyleSheet("padding: 4px;")
-        fw_layout.addWidget(info_label)
-
-        presence_row = QtWidgets.QHBoxLayout()
-        presence_row.addWidget(QtWidgets.QLabel("USB"))
-        self._basic_device_detected_led = QtWidgets.QLabel()
-        self._basic_device_detected_led.setFixedSize(16, 16)
-        self._set_basic_device_presence_indicator(False)
-        presence_row.addWidget(self._basic_device_detected_led)
-        self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
-        self._basic_device_detected_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
-        presence_row.addWidget(self._basic_device_detected_label)
-        presence_row.addStretch()
-        fw_layout.addLayout(presence_row)
-
-        fw_layout.addSpacing(8)
-
-        setup_btn = QtWidgets.QPushButton("Setup Device")
-        setup_btn.setToolTip(
-            "One-click setup: installs MicroPython (if needed) and flashes basic-mode firmware to the Pico."
-        )
-        setup_btn.setStyleSheet("font-weight: bold; padding: 10px; font-size: 14px;")
-        setup_btn.clicked.connect(self._on_setup_basic_device_clicked)
-        fw_layout.addWidget(setup_btn)
-
+    def _append_basic_mcu_cheatsheet(self, fw_layout: QtWidgets.QVBoxLayout) -> None:
         # Collapsible reference: low-saturation grays (section / gesture / action differ by value).
         btn_cheatsheet_toggle = QtWidgets.QPushButton()
         btn_cheatsheet_toggle.setFlat(True)
@@ -1920,19 +3804,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "QPushButton:hover { background: rgba(128, 128, 128, 0.12); border-radius: 4px; }"
         )
         _cheatsheet_expanded = True
-
+        
         def _toggle_basic_button_cheatsheet() -> None:
             nonlocal _cheatsheet_expanded
             _cheatsheet_expanded = not _cheatsheet_expanded
             btn_cheatsheet_table.setVisible(_cheatsheet_expanded)
             arrow = "\u25bc " if _cheatsheet_expanded else "\u25b6 "
             btn_cheatsheet_toggle.setText(arrow + "Button presses")
-
+        
         btn_cheatsheet_toggle.clicked.connect(_toggle_basic_button_cheatsheet)
         btn_cheatsheet_toggle.setText("\u25bc Button presses")
         btn_cheatsheet_toggle.setToolTip("Show or hide the on-device button reference.")
-        fw_layout.addWidget(btn_cheatsheet_toggle)
-
+        show_button_cheatsheet = not self._uses_custom_software()
+        if show_button_cheatsheet:
+            fw_layout.addWidget(btn_cheatsheet_toggle)
+        
         # Table cheatsheet: shades of black (tiny lightness steps only).
         _cs_header_bg = QColor(38, 38, 40)
         _cs_header_fg = QColor(240, 240, 242)
@@ -1940,7 +3826,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _cs_label_fg = QColor(190, 190, 194)
         _cs_action_bg = QColor(30, 30, 32)
         _cs_action_fg = QColor(208, 208, 212)
-
+        
         btn_cheatsheet_table = QtWidgets.QTableWidget()
         btn_cheatsheet_table.setObjectName("basicButtonCheatsheetTable")
         btn_cheatsheet_table.setColumnCount(2)
@@ -1978,7 +3864,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "background-color: #141416; border-radius: 4px; }"
             "QTableWidget#basicButtonCheatsheetTable::item { padding: 8px; }"
         )
-
+        
         def _cs_header_row(title: str) -> None:
             r = btn_cheatsheet_table.rowCount()
             btn_cheatsheet_table.insertRow(r)
@@ -1991,7 +3877,7 @@ class MainWindow(QtWidgets.QMainWindow):
             it.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
             btn_cheatsheet_table.setItem(r, 0, it)
             btn_cheatsheet_table.setSpan(r, 0, 1, 2)
-
+        
         def _cs_data_row(gesture: str, desc_plain: str) -> None:
             r = btn_cheatsheet_table.rowCount()
             btn_cheatsheet_table.insertRow(r)
@@ -2011,7 +3897,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
             )
             btn_cheatsheet_table.setItem(r, 1, right)
-
+        
         def _cs_data_row_html(gesture: str, desc_html: str) -> None:
             r = btn_cheatsheet_table.rowCount()
             btn_cheatsheet_table.insertRow(r)
@@ -2061,34 +3947,33 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             cell_lay.addWidget(desc_lbl, 1)
             btn_cheatsheet_table.setCellWidget(r, 1, cell_wrap)
-
+        
         _cs_header_row("Taps")
         _cs_data_row("Single", "Next track")
         _cs_data_row("Double", "Previous track")
         _cs_data_row(
             "Triple",
             "Restart from the beginning: track 1 in station order, or first track "
-            "in the current shuffle pass (station / library shuffle)",
+            "in the current station track-shuffle pass",
         )
-
+        
         _cs_header_row("Hold (long press, no taps)")
         _cs_data_row_html(
             "Hold",
-            "Next station (also applies in <b>Station Shuffle</b> mode)",
+            "Next station in folder order (also advances station while in track-shuffle mode).",
         )
-
+        
         _cs_header_row("Tap + hold")
         _cs_data_row(
             "1 tap + hold",
-            "Exit shuffle mode and switch back to normal station mode",
+            "Exit track shuffle to normal ordered-station mode (no-op if already ordered)",
         )
-        _cs_data_row("2 taps + hold", "Shuffle current station")
-        _cs_data_row("3 taps + hold", "Shuffle all tracks (entire library)")
-
+        _cs_data_row("2 taps + hold", "Shuffle tracks in the current station")
+        
         btn_cheatsheet_table.verticalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeMode.ResizeToContents
         )
-
+        
         def _refit_basic_button_cheatsheet_height() -> None:
             t = btn_cheatsheet_table
             t.resizeRowsToContents()
@@ -2103,15 +3988,241 @@ class MainWindow(QtWidgets.QMainWindow):
                 h += max(rh, 1)
             h += 2 * t.frameWidth() + 4
             t.setFixedHeight(max(h, 120))
-
+        
         _refit_basic_button_cheatsheet_height()
         QtCore.QTimer.singleShot(0, _refit_basic_button_cheatsheet_height)
-
+        
         btn_cheatsheet_table.setToolTip(
             "Same gestures as firmware (radio_core). A tap is a short press; "
             "for Tap + hold, do your tap(s), then keep holding until the radio reacts."
         )
-        fw_layout.addWidget(btn_cheatsheet_table)
+        if show_button_cheatsheet:
+            fw_layout.addWidget(btn_cheatsheet_table)
+
+    def _build_basic_mcu_tab(self) -> QtWidgets.QWidget:
+        """Basic mode: Microprocessor tab with single setup button (left) and debug console (right)."""
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(widget)
+
+        # ── Left panel: single setup button ──
+        left = QtWidgets.QWidget()
+        left.setMinimumWidth(260)
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 8, 0)
+
+        fw_group = QtWidgets.QGroupBox("Device Setup")
+        fw_layout = QtWidgets.QVBoxLayout(fw_group)
+
+        info_label = QtWidgets.QLabel(
+            "Connect your RP2040 Pico via USB, then click the button below.\n"
+            "MicroPython is installed automatically if needed, then Vintage Radio "
+            "Pico firmware and supporting files are copied to the device."
+        )
+        info_label.setWordWrap(True)
+        info_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
+        info_label.setStyleSheet("padding: 4px;")
+        fw_layout.addWidget(info_label)
+
+        presence_row = QtWidgets.QHBoxLayout()
+        presence_row.addWidget(QtWidgets.QLabel("USB"))
+        self._basic_device_detected_led = QtWidgets.QLabel()
+        self._basic_device_detected_led.setFixedSize(16, 16)
+        self._set_basic_device_presence_indicator(False)
+        presence_row.addWidget(self._basic_device_detected_led)
+        self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
+        self._basic_device_detected_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
+        presence_row.addWidget(self._basic_device_detected_label)
+        presence_row.addStretch()
+        fw_layout.addLayout(presence_row)
+
+        fw_layout.addSpacing(8)
+
+        setup_btn = QtWidgets.QPushButton("Setup Device")
+        if self._is_advanced_mode():
+            setup_btn.setToolTip(
+                "Advanced setup. For 'Our software' this flashes advanced app firmware. "
+                "For custom software, it installs MicroPython (if needed) and copies your selected files."
+            )
+            setup_btn.clicked.connect(self._on_setup_advanced_device_clicked)
+        else:
+            setup_btn.setToolTip(
+                "One-click setup: installs MicroPython if needed, then copies Vintage Radio "
+                "basic-mode firmware, pin configuration, and the AM overlay sound file to the Pico."
+            )
+            setup_btn.clicked.connect(self._on_setup_basic_device_clicked)
+        setup_btn.setStyleSheet("font-weight: bold; padding: 10px; font-size: 14px;")
+        fw_layout.addWidget(setup_btn)
+
+        if self._is_advanced_mode():
+            source_label = QtWidgets.QLabel("Software source")
+            source_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            fw_layout.addWidget(source_label)
+            self._advanced_software_source_combo = QtWidgets.QComboBox()
+            self._advanced_software_source_combo.addItem("Our software (recommended)", "our")
+            self._advanced_software_source_combo.addItem("Custom software (local files/folder)", "custom")
+            src_setting = self._software_source_for_sync()
+            self._advanced_software_source_combo.setCurrentIndex(1 if src_setting == "custom" else 0)
+            self._advanced_software_source_combo.currentIndexChanged.connect(self._on_advanced_software_source_changed)
+            fw_layout.addWidget(self._advanced_software_source_combo)
+
+            profile_row = QtWidgets.QWidget()
+            profile_layout = QtWidgets.QHBoxLayout(profile_row)
+            profile_layout.setContentsMargins(0, 0, 0, 0)
+            profile_layout.addWidget(QtWidgets.QLabel("Saved custom sources"))
+            self._advanced_custom_profile_combo = QtWidgets.QComboBox()
+            self._advanced_custom_profile_combo.blockSignals(True)
+            profiles = self._advanced_custom_profiles_ensure()
+            active_i = self._advanced_active_profile_index()
+            if profiles and active_i >= len(profiles):
+                active_i = max(0, len(profiles) - 1)
+                self._advanced_set_active_profile_index(active_i)
+            for p in profiles:
+                self._advanced_custom_profile_combo.addItem(p.get("name") or "Unnamed")
+            if self._advanced_custom_profile_combo.count() > 0:
+                self._advanced_custom_profile_combo.setCurrentIndex(
+                    min(active_i, self._advanced_custom_profile_combo.count() - 1)
+                )
+            self._advanced_custom_profile_combo.blockSignals(False)
+            profile_layout.addWidget(self._advanced_custom_profile_combo, 1)
+            add_src_btn = QtWidgets.QPushButton("Add Software Source")
+            add_src_btn.setToolTip("Pick a folder, then name it. It appears in the list for install and notes.")
+            add_src_btn.clicked.connect(self._on_advanced_add_software_source)
+            rem_src_btn = QtWidgets.QPushButton("Remove")
+            rem_src_btn.setToolTip("Remove the selected saved source from this library.")
+            rem_src_btn.clicked.connect(self._on_advanced_remove_custom_source)
+            profile_layout.addWidget(add_src_btn)
+            profile_layout.addWidget(rem_src_btn)
+            fw_layout.addWidget(profile_row)
+            profile_row.setVisible(self._uses_custom_software())
+
+            notes_above_eq = QtWidgets.QLabel("Notes / description (above DFPlayer EQ)")
+            notes_above_eq.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            fw_layout.addWidget(notes_above_eq)
+            self._advanced_mcu_notes_edit = QtWidgets.QTextEdit()
+            self._advanced_mcu_notes_edit.setMinimumHeight(72)
+            self._advanced_mcu_notes_edit.setMaximumHeight(160)
+            fw_layout.addWidget(self._advanced_mcu_notes_edit)
+
+            eq_label = QtWidgets.QLabel("DFPlayer EQ (our software only)")
+            eq_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            fw_layout.addWidget(eq_label)
+            self._advanced_dfplayer_eq_combo = QtWidgets.QComboBox()
+            for lbl, data in (
+                ("Normal", "normal"),
+                ("Pop", "pop"),
+                ("Rock", "rock"),
+                ("Jazz", "jazz"),
+                ("Classic", "classic"),
+                ("Bass", "bass"),
+            ):
+                self._advanced_dfplayer_eq_combo.addItem(lbl, data)
+            eq_current = self._selected_dfplayer_eq()
+            for idx in range(self._advanced_dfplayer_eq_combo.count()):
+                if self._advanced_dfplayer_eq_combo.itemData(idx) == eq_current:
+                    self._advanced_dfplayer_eq_combo.setCurrentIndex(idx)
+                    break
+            self._advanced_dfplayer_eq_combo.currentIndexChanged.connect(self._on_advanced_dfplayer_eq_changed)
+            fw_layout.addWidget(self._advanced_dfplayer_eq_combo)
+
+            btn_doc_label = QtWidgets.QLabel("Button presses (editable table, saved per library or source)")
+            btn_doc_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            btn_doc_label.setToolTip(
+                "Each row has a row-action control on the left (green highlight on hover). "
+                "Click it for insert/delete and section options, or right-click gesture/action cells."
+            )
+            fw_layout.addWidget(btn_doc_label)
+            self._advanced_mcu_buttons_scroll = QtWidgets.QScrollArea()
+            self._advanced_mcu_buttons_scroll.setObjectName("advancedMcuButtonsScroll")
+            self._advanced_mcu_buttons_scroll.setWidgetResizable(False)
+            self._advanced_mcu_buttons_scroll.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self._advanced_mcu_buttons_scroll.setVerticalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            self._advanced_mcu_buttons_scroll.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+            self._advanced_mcu_buttons_scroll.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            self._advanced_mcu_buttons_scroll.setStyleSheet(
+                "QScrollArea#advancedMcuButtonsScroll { border: 1px solid #2a2a2c; border-radius: 4px; "
+                "background-color: #0e0e10; }"
+                "QScrollBar:vertical { min-width: 16px; background: #1a1a1c; margin: 2px; border-radius: 4px; }"
+                "QScrollBar::handle:vertical { min-height: 36px; background: #4a4a52; border-radius: 7px; }"
+                "QScrollBar::handle:vertical:hover { background: #4CAF50; }"
+                "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+            )
+            self._advanced_mcu_buttons_table = QtWidgets.QTableWidget(0, 3)
+            self._advanced_mcu_buttons_table.setObjectName("advancedMcuButtonsTable")
+            self._advanced_mcu_buttons_table.setHorizontalHeaderLabels(
+                ["", "Gesture / control", "Action"]
+            )
+            self._advanced_mcu_buttons_table.verticalHeader().setVisible(False)
+            _mcu_hh = self._advanced_mcu_buttons_table.horizontalHeader()
+            _mcu_hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            _mcu_hh.resizeSection(0, _ADV_MCU_JUNCTION_W)
+            _mcu_hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            _mcu_hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            _mcu_hh.resizeSection(1, 200)
+            self._advanced_mcu_buttons_table.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            )
+            self._advanced_mcu_buttons_table.setEditTriggers(
+                QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+                | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+                | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            )
+            self._advanced_mcu_buttons_table.setVerticalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self._advanced_mcu_buttons_table.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self._advanced_mcu_buttons_table.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            self._advanced_mcu_buttons_table.setStyleSheet(
+                "QTableWidget#advancedMcuButtonsTable { "
+                "gridline-color: #2a2a2c; border: none; "
+                "background-color: #141416; }"
+                "QTableWidget#advancedMcuButtonsTable::item { padding: 6px; color: #e8e8ea; }"
+                "QHeaderView::section { background-color: #262628; color: #f0f0f2; padding: 6px; "
+                "border: 1px solid #2a2a2c; font-weight: bold; }"
+            )
+            self._advanced_mcu_buttons_table.setContextMenuPolicy(
+                QtCore.Qt.ContextMenuPolicy.CustomContextMenu
+            )
+            self._advanced_mcu_buttons_table.customContextMenuRequested.connect(
+                self._on_advanced_mcu_buttons_table_context_menu
+            )
+            self._advanced_mcu_buttons_table.setMouseTracking(True)
+            self._advanced_mcu_buttons_table.viewport().setMouseTracking(True)
+            self._advanced_mcu_buttons_scroll.setWidget(self._advanced_mcu_buttons_table)
+            self._advanced_mcu_layout_filter = _AdvancedMcuTableLayoutFilter(self)
+            self._advanced_mcu_buttons_scroll.viewport().installEventFilter(self._advanced_mcu_layout_filter)
+            self._advanced_mcu_buttons_scroll.installEventFilter(self._advanced_mcu_layout_filter)
+            self._advanced_mcu_buttons_table.cellEntered.connect(self._advanced_mcu_on_cell_entered)
+            fw_layout.addWidget(self._advanced_mcu_buttons_scroll)
+            self._advanced_mcu_install_outside_selection_filters(fw_group)
+
+            self._advanced_custom_profile_combo.currentIndexChanged.connect(
+                self._on_advanced_custom_profile_changed
+            )
+            self._load_advanced_mcu_profile_into_ui()
+            self._advanced_mcu_notes_edit.textChanged.connect(self._schedule_flush_advanced_mcu_fields)
+            self._advanced_mcu_buttons_table.itemChanged.connect(
+                self._on_advanced_mcu_button_table_item_changed
+            )
+            QtCore.QTimer.singleShot(0, self._advanced_refit_mcu_button_table_height)
+            if self._uses_custom_software() and self._advanced_custom_profile_combo.count() > 0:
+                self._advanced_profile_combo_last_idx = self._advanced_custom_profile_combo.currentIndex()
+            else:
+                self._advanced_profile_combo_last_idx = -1
+
+        if not self._is_advanced_mode():
+            self._append_basic_mcu_cheatsheet(fw_layout)
 
         fw_layout.addStretch()
         left_layout.addWidget(fw_group)
@@ -2177,13 +4288,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 "border-radius: 7px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
             )
             led.setToolTip(
-                "No Pico detected. Plug in USB, or hold BOOTSEL while plugging in (RPI-RP2 drive); "
-                "after Disconnect, unplug/replug or wait for the port list to change."
+                "No Pico detected. Plug in USB, or hold BOOTSEL while plugging in (RPI-RP2 drive)."
             )
             if _qt_widget_alive(lbl):
                 lbl.setText("No serial device detected")
                 lbl.setForegroundRole(QtGui.QPalette.ColorRole.Text)
                 lbl.setStyleSheet("")
+
+    def _current_max_tracks_per_station(self) -> int:
+        if not self._is_advanced_mode():
+            return BASIC_MAX_TRACKS_PER_STATION
+        if self._uses_custom_software():
+            return BASIC_MAX_TRACKS_EXPERIMENTAL
+        allow_exp = self.db.get_setting("advanced_allow_our_software_gt255", "0") == "1"
+        return BASIC_MAX_TRACKS_EXPERIMENTAL if allow_exp else BASIC_MAX_TRACKS_PER_STATION
+
+    def _is_track_limit_enforced(self) -> bool:
+        return not (self._is_advanced_mode() and self._uses_custom_software())
+
+    def _software_source_for_sync(self) -> str:
+        if not self._is_advanced_mode():
+            return "our"
+        val = (self.db.get_setting("advanced_software_source", "our") or "our").strip().lower()
+        return "custom" if val == "custom" else "our"
+
+    def _selected_dfplayer_eq(self) -> str:
+        val = (self.db.get_setting("advanced_dfplayer_eq", "normal") or "normal").strip().lower()
+        if val not in {"normal", "pop", "rock", "jazz", "classic", "bass"}:
+            return "normal"
+        return val
 
     def _basic_sd_path_volume_tag(self, path_str: str) -> str:
         """Volume / mount name for wrong-card messaging (best-effort)."""
@@ -2216,7 +4349,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _basic_confirm_first_sd_sync_target(self, sd_path_str: str) -> bool:
         """One-time check before the first successful basic sync (no trusted volume yet)."""
-        if self.devices_view_mode != "basic":
+        if not self._is_basic_like_mode():
             return True
         if (self.db.get_setting("basic_trusted_sd_volume") or "").strip():
             return True
@@ -2238,7 +4371,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _basic_confirm_different_card(self, new_root: str, *, for_sync: bool) -> bool:
         """If the volume differs from the last basic sync target, confirm. Returns False to abort."""
-        if self.devices_view_mode != "basic":
+        if not self._is_basic_like_mode():
             return True
         if not self._basic_should_warn_different_card(new_root):
             return True
@@ -2325,7 +4458,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def detect_basic_sd_root(self) -> None:
         """Basic mode: set sd_root to the removable volume that matches saved identity (no dialogs)."""
-        if self.devices_view_mode != "basic":
+        if not self._is_basic_like_mode():
             self.select_sd_root()
             return
 
@@ -2479,7 +4612,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _try_rebind_basic_sd_mount(self) -> None:
         """If saved sd_root is missing, reattach to the same card by volume name (basic mode)."""
-        if self.devices_view_mode != "basic":
+        if not self._is_basic_like_mode():
             return
         if not self.sd_root:
             return
@@ -2514,7 +4647,7 @@ class MainWindow(QtWidgets.QMainWindow):
         details_btn = getattr(self, "_basic_sd_sync_details_btn", None)
         if _qt_widget_alive(details_btn):
             details_btn.setVisible(False)
-        if self.devices_view_mode != "basic":
+        if not self._is_basic_like_mode():
             return
         self._try_rebind_basic_sd_mount()
         if not self.sd_root:
@@ -2534,7 +4667,10 @@ class MainWindow(QtWidgets.QMainWindow):
             warn.setVisible(True)
             return
 
-        msgs = self.sd_manager.validate_basic_sd(root)
+        msgs = self.sd_manager.validate_basic_sd(
+            root,
+            reserved_folder=(99 if not self._uses_custom_software() else None),
+        )
         if not msgs:
             return
 
@@ -2579,13 +4715,64 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(btn_row)
         dlg.exec()
 
+    def _release_serial_if_connected_for_mpremote(self, *, log_prefix: str = "SERIAL") -> bool:
+        """Close the app's serial session so ``mpremote`` can open the COM port (Windows: exclusive)."""
+        released = False
+        for name in ("_basic_debug_widget", "_device_debug_widget"):
+            w = getattr(self, name, None)
+            if w is None or not _qt_widget_alive(w):
+                continue
+            try:
+                if getattr(w, "_connected", False):
+                    w._disconnect()
+                    released = True
+            except Exception:
+                pass
+        if released:
+            import time
+
+            time.sleep(0.35)
+            write_session_line(
+                "Released app-held serial port(s) so mpremote can access the device",
+                prefix=log_prefix,
+            )
+            print("[Vintage Radio] Released app-held serial port(s) for mpremote")
+        return released
+
     def _on_setup_basic_device_clicked(self) -> None:
         """Qt slot: log first (durable) then run setup — isolates signal vs handler crashes."""
         write_session_line("Setup Device: Qt clicked (before _setup_basic_device)", prefix="SETUP")
         self._setup_basic_device()
 
-    def _setup_basic_device(self) -> None:
-        """One-click: install MicroPython if needed, then flash basic-mode firmware."""
+    def _on_setup_advanced_device_clicked(self) -> None:
+        self._flush_advanced_mcu_notes_and_buttons()
+        source = self._software_source_for_sync()
+        if source == "custom":
+            self._advanced_sync_custom_path_setting_to_active_source()
+            self._setup_basic_device(
+                install_callback=self.install_custom_software_to_pico,
+                install_label="custom software",
+                require_builtin_firmware=False,
+            )
+            return
+        self._setup_basic_device(
+            install_callback=lambda: self.install_to_pico(
+                basic_mode=True,
+                install_mode="advanced",
+                dfplayer_eq=self._selected_dfplayer_eq(),
+            ),
+            install_label="advanced firmware",
+            require_builtin_firmware=True,
+        )
+
+    def _setup_basic_device(
+        self,
+        *,
+        install_callback: Optional[Callable[[], None]] = None,
+        install_label: str = "basic firmware",
+        require_builtin_firmware: bool = True,
+    ) -> None:
+        """One-click: install MicroPython if needed, then install application firmware."""
         try:
             write_session_line("Starting one-click setup flow", prefix="SETUP")
             print("[Setup Basic Device] Starting one-click setup flow")
@@ -2600,15 +4787,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(self, "Setup Device", msg)
                 return
 
+            if self._release_serial_if_connected_for_mpremote(log_prefix="SETUP"):
+                self.statusBar().showMessage(
+                    "Serial console disconnected so Setup Device can use the USB port. "
+                    "Click Connect on the Device tab when finished.",
+                    12000,
+                )
+
             write_session_line(f"Resolved mpremote command: {mpremote_cmd!r}", prefix="SETUP")
             print(f"[Setup Basic Device] Resolved mpremote command: {mpremote_cmd!r}")
             root = self._project_root()
-            main_basic_path = root / "firmware" / "pico" / "main_basic.py"
-            if not main_basic_path.exists():
-                write_session_line(f"Missing firmware file: {main_basic_path}", prefix="SETUP")
-                print(f"[Setup Basic Device] Missing firmware file: {main_basic_path}")
-                QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
-                return
+            if require_builtin_firmware:
+                main_basic_path = root / "firmware" / "pico" / "main_basic.py"
+                if not main_basic_path.exists():
+                    write_session_line(f"Missing firmware file: {main_basic_path}", prefix="SETUP")
+                    print(f"[Setup Basic Device] Missing firmware file: {main_basic_path}")
+                    QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
+                    return
+
+            install_now = install_callback or (lambda: self.install_to_pico(basic_mode=True))
 
             # Prefer explicit RP2040 ports first to avoid grabbing unrelated serial devices (e.g. Bluetooth COM).
             try:
@@ -2664,7 +4861,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             prefix="SETUP",
                         )
                         print(f"[Setup Basic Device] explicit connect succeeded on {port_dev}, installing firmware")
-                        self.install_to_pico(basic_mode=True)
+                        install_now()
                         return
             except Exception:
                 write_session_line(
@@ -2692,7 +4889,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if r.returncode == 0:
                     write_session_line("auto connect OK, calling install_to_pico(basic_mode=True)", prefix="SETUP")
                     print("[Setup Basic Device] auto connect succeeded, installing firmware")
-                    self.install_to_pico(basic_mode=True)
+                    install_now()
                     return
             except Exception:
                 write_session_line(
@@ -2711,18 +4908,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 print("[Setup Basic Device] Opening InstallMicroPythonDialog")
                 dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
                 dlg.exec()
-                self.statusBar().showMessage("MicroPython installed. Installing basic firmware...", 8000)
-                QtCore.QTimer.singleShot(500, lambda: self.install_to_pico(basic_mode=True))
+                self.statusBar().showMessage(f"MicroPython installed. Installing {install_label}...", 8000)
+                QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
                 return
 
             write_session_line("No compatible Pico detected (user message)", prefix="SETUP")
             print("[Setup Basic Device] No compatible Pico detected")
             QtWidgets.QMessageBox.information(
                 self, "Setup Device",
-                "No Pico detected.\n\n"
+                "No Pico detected (mpremote could not open a MicroPython session).\n\n"
                 "1. Connect the Pico via USB.\n"
-                "2. If it's new, hold BOOTSEL while plugging in.\n"
-                "3. Then click 'Setup Device' again.",
+                "2. If another program had the port open, this app disconnects its console "
+                "automatically—try 'Setup Device' again.\n"
+                "3. If it's new, hold BOOTSEL while plugging in.\n"
+                "4. Then click 'Setup Device' again.",
             )
         except Exception:
             write_session_line(
@@ -2737,6 +4936,73 @@ class MainWindow(QtWidgets.QMainWindow):
                 "An unexpected error occurred during Setup Device.\n\n"
                 "Please open Help > View Session Log and send the latest log.",
             )
+
+    def _on_advanced_software_source_changed(self, *_args) -> None:
+        combo = getattr(self, "_advanced_software_source_combo", None)
+        if combo is None:
+            return
+        data = combo.currentData()
+        source = "custom" if str(data) == "custom" else "our"
+        self.db.set_setting("advanced_software_source", source)
+        self._rebuild_tabs()
+
+    def _on_advanced_dfplayer_eq_changed(self, *_args) -> None:
+        combo = getattr(self, "_advanced_dfplayer_eq_combo", None)
+        if combo is None:
+            return
+        self.db.set_setting("advanced_dfplayer_eq", str(combo.currentData() or "normal"))
+
+    def _selected_conversion_profile(self) -> str:
+        if not self._is_advanced_mode():
+            return "dfplayer_safe"
+        profile = (self.db.get_setting("advanced_conversion_profile", "dfplayer_safe") or "").strip().lower()
+        if profile not in {"dfplayer_safe", "high_quality"}:
+            return "dfplayer_safe"
+        return profile
+
+    def _on_advanced_conversion_profile_changed(self, *_args) -> None:
+        combo = getattr(self, "_advanced_conversion_profile_combo", None)
+        if combo is None:
+            return
+        self.db.set_setting(
+            "advanced_conversion_profile",
+            str(combo.currentData() or "dfplayer_safe"),
+        )
+
+    def _read_pico_install_mode(self) -> Optional[str]:
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        if not mpremote_cmd:
+            return None
+        try:
+            r = _run_mpremote(
+                mpremote_cmd,
+                [
+                    "connect",
+                    "auto",
+                    "exec",
+                    "import json\n"
+                    "try:\n"
+                    "  d=json.load(open('VintageRadio/advanced_runtime.json','r'))\n"
+                    "  print(d.get('install_mode','basic'))\n"
+                    "except Exception:\n"
+                    "  print('basic')",
+                ],
+                cwd=str(self._project_root()),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            return None
+        if r.returncode != 0:
+            return None
+        out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip().splitlines()
+        if not out:
+            return None
+        mode = out[-1].strip().lower()
+        if mode in {"basic", "advanced", "legacy"}:
+            return mode
+        return None
 
     def _build_basic_sd_card_tab(self) -> QtWidgets.QWidget:
         """Basic mode: SD Card tab with station manager, track list, capacity, and sync."""
@@ -2773,8 +5039,8 @@ class MainWindow(QtWidgets.QMainWindow):
         detect_btn.clicked.connect(self._select_sd_root_basic)
         select_btn = QtWidgets.QPushButton("Select")
         select_btn.setToolTip(
-            "Choose from detected removable drives (list opens if more than one). "
-            "The wrong-card safety prompt only appears when you Sync to SD, not here."
+            "Pick from detected removable drives (dropdown). "
+            "If nothing is listed, use Browse. Wrong-card safety is only on Sync."
         )
         select_btn.clicked.connect(self._select_sd_root_manual_basic)
         browse_btn = QtWidgets.QPushButton("Browse")
@@ -2806,7 +5072,10 @@ class MainWindow(QtWidgets.QMainWindow):
         station_heading = QtWidgets.QHBoxLayout()
         stations_label = QtWidgets.QLabel("Stations")
         stations_label.setStyleSheet("font-weight: bold;")
-        stations_label.setToolTip("Drag stations to reorder. Each station maps to a numbered folder on the SD card.")
+        stations_label.setToolTip(
+            "Drag stations to reorder. Each station maps to a numbered folder on the SD card. "
+            "You can also drop folders here to import each folder as a station."
+        )
         station_heading.addWidget(stations_label)
         self._basic_stations_size_label = QtWidgets.QLabel("")
         self._basic_stations_size_label.setStyleSheet("color: #888; font-size: 11px;")
@@ -2815,9 +5084,10 @@ class MainWindow(QtWidgets.QMainWindow):
         station_heading.addStretch()
         station_layout.addLayout(station_heading)
 
-        self._basic_station_list = ReorderListWidget()
+        self._basic_station_list = StationImportListWidget()
         self._basic_station_list.order_changed.connect(self._on_basic_station_reordered)
         self._basic_station_list.currentItemChanged.connect(self._on_basic_station_selected)
+        self._basic_station_list.folders_dropped.connect(self._import_folders_as_basic_stations)
         self._basic_station_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._basic_station_list.customContextMenuRequested.connect(self._show_station_context_menu)
         station_layout.addWidget(self._basic_station_list)
@@ -2883,36 +5153,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_auto_eject_cb = QtWidgets.QCheckBox("Automatically safely remove SD card after syncing")
         self._basic_auto_eject_cb.setChecked(self.db.get_setting("auto_eject_after_sync", "0") == "1")
         self._basic_auto_eject_cb.stateChanged.connect(self._on_auto_eject_after_sync_changed)
-        end_box = QtWidgets.QGroupBox("Choose what happens when a station ends")
-        end_layout = QtWidgets.QHBoxLayout(end_box)
-        self._basic_end_mode_combo = QtWidgets.QComboBox()
-        self._basic_end_mode_combo.setMinimumWidth(240)
-        self._basic_end_mode_combo.addItem("Loop", "loop")
-        self._basic_end_mode_combo.addItem("Proceed to next station", "advance")
-        self._basic_end_mode_combo.addItem("End playback", "none")
-        self._basic_end_mode_combo.setToolTip(
-            "Synced to SD folder 99 as extra tiny MP3 stubs so the DFPlayer file count (UART 0x4E) "
-            "tells the firmware the mode — no separate flag file on the microcontroller. "
-            "Proceed mode writes three stubs (002–004) because many DFPlayers do not count 001.wav; "
-            "otherwise the count would look like loop mode. "
-            "Loop: repeat the station or shuffle order. "
-            "Proceed: after the last track (or one full station shuffle), play the next station. "
-            "End: stop after the station or one shuffle pass through tracks."
-        )
-        mode = self._get_basic_station_end_mode()
-        _end_idx = {"loop": 0, "advance": 1, "none": 2}.get(mode, 1)
-        self._basic_end_mode_combo.blockSignals(True)
-        self._basic_end_mode_combo.setCurrentIndex(_end_idx)
-        self._basic_end_mode_combo.blockSignals(False)
-        self._basic_end_mode_combo.currentIndexChanged.connect(
-            self._on_basic_station_end_combo_changed
-        )
-        end_layout.addWidget(self._basic_end_mode_combo)
-        end_layout.addStretch()
+
+        if self._is_advanced_mode():
+            conv_box = QtWidgets.QGroupBox("Conversion Profile")
+            conv_layout = QtWidgets.QHBoxLayout(conv_box)
+            self._advanced_conversion_profile_combo = QtWidgets.QComboBox()
+            self._advanced_conversion_profile_combo.addItem("DFPlayer-safe (default)", "dfplayer_safe")
+            self._advanced_conversion_profile_combo.addItem("Higher quality (advanced)", "high_quality")
+            current_profile = self._selected_conversion_profile()
+            self._advanced_conversion_profile_combo.setCurrentIndex(
+                1 if current_profile == "high_quality" else 0
+            )
+            self._advanced_conversion_profile_combo.currentIndexChanged.connect(
+                self._on_advanced_conversion_profile_changed
+            )
+            conv_layout.addWidget(self._advanced_conversion_profile_combo)
+            sync_layout.addWidget(conv_box)
+
         sync_layout.addWidget(sync_btn)
+        exp_img_btn = QtWidgets.QPushButton("Experimental: SD image sync (clean install)…")
+        exp_img_btn.setToolTip(
+            "Build a FAT32 disk image from your stations, then write it to a physical SD card "
+            "(Windows, Administrator; experimental)."
+        )
+        exp_img_btn.clicked.connect(self._on_experimental_sd_disk_image)
+        sync_layout.addWidget(exp_img_btn)
         sync_layout.addWidget(eject_btn)
         sync_layout.addWidget(self._basic_auto_eject_cb)
-        sync_layout.addWidget(end_box)
         sync_layout.addStretch()
         layout.addWidget(sync_group)
 
@@ -3015,9 +5282,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._basic_station_tracks_table.setRowCount(0)
             return
         track_count = len(self.db.list_basic_station_tracks(station_id))
+        max_tracks = self._current_max_tracks_per_station()
         self._basic_station_detail.setText(
             f'Station: {station["name"]}  |  Folder: {station["folder_number"]:02d}'
-            f'  |  Tracks: {track_count}/{BASIC_MAX_TRACKS_PER_STATION}'
+            f"  |  Tracks: {track_count}/{max_tracks}"
         )
         self._refresh_basic_station_tracks(station_id)
 
@@ -3044,9 +5312,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok or not name.strip():
             return
         try:
-            folder = self.db.next_basic_station_folder()
+            folder = self.db.next_basic_station_folder(max_folder=99)
         except ValueError:
-            QtWidgets.QMessageBox.warning(self, "Limit Reached", "All 98 DFPlayer folders are in use.")
+            max_station_folders = 99
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Limit Reached",
+                f"All {max_station_folders} station folders are in use.",
+            )
             return
         self.db.create_basic_station(name.strip(), folder)
         self._refresh_basic_station_list()
@@ -3103,6 +5376,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return item.data(QtCore.Qt.ItemDataRole.UserRole)
 
+    def _warn_basic_station_exceeds_255_tracks(self) -> None:
+        """Warn when a station would exceed 255 tracks (custom firmware); optional 'don't show again'."""
+        if self.db.get_setting("basic_suppress_track_count_over_255_warning", "0") == "1":
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        box.setWindowTitle("Track Count Warning")
+        box.setText(
+            "This station exceeds 255 tracks. Custom software may support this, "
+            "but behavior depends on your target firmware."
+        )
+        cb = QtWidgets.QCheckBox("Don't show again")
+        box.setCheckBox(cb)
+        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+        box.exec()
+        if cb.isChecked():
+            self.db.set_setting("basic_suppress_track_count_over_255_warning", "1")
+
     def _add_tracks_to_basic_station(self) -> None:
         """Browse for audio files from file explorer, import to library, and add to selected station."""
         station_id = self._get_selected_basic_station_id()
@@ -3111,10 +5402,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         current_count = len(self.db.list_basic_station_tracks(station_id))
-        if current_count >= BASIC_MAX_TRACKS_PER_STATION:
+        max_tracks = self._current_max_tracks_per_station()
+        if self._is_track_limit_enforced() and current_count >= max_tracks:
             QtWidgets.QMessageBox.warning(
                 self, "Track Limit",
-                f"This station already has {current_count} tracks (max {BASIC_MAX_TRACKS_PER_STATION} per DFPlayer folder).",
+                f"This station already has {current_count} tracks (max {max_tracks} per folder in this mode).",
             )
             return
 
@@ -3127,14 +5419,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.db.set_setting("basic_last_import_dir", str(Path(files[0]).parent))
 
-        remaining = BASIC_MAX_TRACKS_PER_STATION - current_count
-        if len(files) > remaining:
+        remaining = max_tracks - current_count
+        if self._is_track_limit_enforced() and len(files) > remaining:
             QtWidgets.QMessageBox.warning(
                 self, "Track Limit",
-                f"Only {remaining} more track(s) can be added (max {BASIC_MAX_TRACKS_PER_STATION} per station). "
+                f"Only {remaining} more track(s) can be added (max {max_tracks} per station). "
                 f"Adding the first {remaining}.",
             )
             files = files[:remaining]
+        elif (not self._is_track_limit_enforced()) and (current_count + len(files) > BASIC_MAX_TRACKS_PER_STATION):
+            self._warn_basic_station_exceeds_255_tracks()
 
         song_ids = self.import_files([Path(f) for f in files], silent=True)
         if song_ids:
@@ -3154,22 +5448,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         current_count = len(self.db.list_basic_station_tracks(station_id))
-        remaining = BASIC_MAX_TRACKS_PER_STATION - current_count
-        if remaining <= 0:
+        max_tracks = self._current_max_tracks_per_station()
+        remaining = max_tracks - current_count
+        if self._is_track_limit_enforced() and remaining <= 0:
             QtWidgets.QMessageBox.warning(
                 self, "Track Limit",
-                f"This station already has {current_count} tracks (max {BASIC_MAX_TRACKS_PER_STATION} per DFPlayer folder).",
+                f"This station already has {current_count} tracks (max {max_tracks} per folder in this mode).",
             )
             return
 
         song_ids = self.import_files(paths, silent=True)
         if song_ids:
-            if len(song_ids) > remaining:
+            if self._is_track_limit_enforced() and len(song_ids) > remaining:
                 QtWidgets.QMessageBox.warning(
                     self, "Track Limit",
                     f"Only {remaining} more track(s) can be added. Adding the first {remaining}.",
                 )
                 song_ids = song_ids[:remaining]
+            elif (not self._is_track_limit_enforced()) and (current_count + len(song_ids) > BASIC_MAX_TRACKS_PER_STATION):
+                self._warn_basic_station_exceeds_255_tracks()
             next_order = self.db.next_basic_station_track_order(station_id)
             for sid in song_ids:
                 self.db.add_song_to_basic_station(station_id, sid, next_order)
@@ -3177,6 +5474,211 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_basic_station_tracks(station_id)
             self._refresh_basic_station_list()
             self._update_basic_stations_size()
+
+    def _import_folders_as_basic_stations(self, folders: list[Path]) -> None:
+        """Create one station per dropped folder and import its files as tracks."""
+        if not folders:
+            return
+
+        current_stations = len(self.db.list_basic_stations())
+        max_station_folders = 99 if self._uses_custom_software() else 98
+        free_station_slots = max(0, max_station_folders - current_stations)
+        if free_station_slots <= 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Station Limit",
+                f"All {max_station_folders} station folders are already in use.",
+            )
+            return
+
+        unique_folders: List[Path] = []
+        seen: set[str] = set()
+        for folder in folders:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            key = str(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_folders.append(folder)
+        if not unique_folders:
+            return
+
+        if len(unique_folders) > free_station_slots:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Station Limit",
+                f"Only {free_station_slots} station slot(s) are available. "
+                f"Importing the first {free_station_slots} folder(s).",
+            )
+            unique_folders = unique_folders[:free_station_slots]
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Importing Folders as Stations",
+            func=self._import_folders_as_basic_stations_worker,
+            args=(
+                unique_folders,
+                self.db,
+                self._current_max_tracks_per_station(),
+                self._is_track_limit_enforced(),
+                max_station_folders,
+            ),
+            kwargs={},
+        )
+
+        def on_success(result):
+            created = int(result.get("created", 0))
+            imported_tracks = int(result.get("imported_tracks", 0))
+            skipped_folders = int(result.get("skipped_folders", 0))
+            truncated_stations = int(result.get("truncated_stations", 0))
+            first_created_id = result.get("first_created_id")
+
+            self.refresh_library()
+            self._refresh_basic_station_list()
+            if first_created_id is not None:
+                for row in range(self._basic_station_list.count()):
+                    item = self._basic_station_list.item(row)
+                    if item and item.data(QtCore.Qt.ItemDataRole.UserRole) == first_created_id:
+                        self._basic_station_list.setCurrentRow(row)
+                        break
+            self._update_basic_stations_size()
+
+            details: List[str] = []
+            if skipped_folders:
+                details.append(f"{skipped_folders} folder(s) had no importable files")
+            if truncated_stations:
+                details.append(
+                    f"{truncated_stations} station(s) capped at {self._current_max_tracks_per_station()} tracks"
+                )
+            detail_text = ""
+            if details:
+                detail_text = "\n" + "\n".join(f"- {line}" for line in details)
+            QtWidgets.QMessageBox.information(
+                self,
+                "Stations Imported",
+                f"Created {created} station(s) with {imported_tracks} track(s).{detail_text}",
+            )
+
+        def on_error(msg):
+            self.refresh_library()
+            self._refresh_basic_station_list()
+            self._update_basic_stations_size()
+            QtWidgets.QMessageBox.warning(
+                self, "Station Import Error", f"Error during station import:\n\n{msg}"
+            )
+
+        dlg.on_success = on_success
+        dlg.on_error = on_error
+        dlg.exec()
+
+    @staticmethod
+    def _import_folders_as_basic_stations_worker(
+        folders: List[Path],
+        db: DatabaseManager,
+        max_tracks_per_station: int,
+        enforce_track_limit: bool,
+        max_station_folders: int,
+        progress_callback: Optional[Callable[..., Any]] = None,
+    ) -> Dict[str, Optional[int]]:
+        """Background worker for folder -> station import."""
+        created = 0
+        imported_tracks = 0
+        skipped_folders = 0
+        truncated_stations = 0
+        first_created_id: Optional[int] = None
+
+        total = len(folders)
+        for idx, folder in enumerate(folders, start=1):
+            if progress_callback:
+                progress_callback(
+                    idx - 1,
+                    total,
+                    f"Importing station folder {idx}/{total}: {folder.name}",
+                )
+
+            files = sorted([p for p in folder.rglob("*") if p.is_file()])
+            if not files:
+                skipped_folders += 1
+                continue
+
+            try:
+                folder_number = db.next_basic_station_folder(max_folder=max_station_folders)
+            except ValueError:
+                break
+
+            station_name = folder.name.strip() or f"Station {folder_number:02d}"
+            station_id = db.create_basic_station(station_name, folder_number)
+            song_ids: List[int] = []
+
+            for file_path in files:
+                try:
+                    metadata = extract_metadata(file_path)
+                    file_hash = compute_file_hash(file_path)
+                    existing = db.get_song_by_hash_size(file_hash, metadata["file_size"])
+                    if existing is None:
+                        existing = db.get_song_by_path(metadata["file_path"])
+                    if existing is not None:
+                        old_fp = existing["file_path"]
+                        new_fp = metadata["file_path"]
+                        if new_fp != old_fp and Path(new_fp).exists() and not Path(old_fp).exists():
+                            db.update_song(int(existing["id"]), {"file_path": new_fp})
+                        song_ids.append(int(existing["id"]))
+                        continue
+
+                    song_id = db.add_song(
+                        original_filename=metadata["original_filename"],
+                        file_path=metadata["file_path"],
+                        title=metadata["title"],
+                        artist=metadata["artist"],
+                        duration=metadata["duration"],
+                        file_hash=file_hash,
+                        file_size=metadata["file_size"],
+                        format=metadata["format"],
+                    )
+                    song_ids.append(song_id)
+                except Exception:
+                    continue
+
+            if not song_ids:
+                db.delete_basic_station(station_id)
+                skipped_folders += 1
+                continue
+
+            if enforce_track_limit:
+                limited_song_ids = song_ids[:max_tracks_per_station]
+                if len(song_ids) > max_tracks_per_station:
+                    truncated_stations += 1
+            else:
+                limited_song_ids = song_ids[:max_tracks_per_station]
+
+            next_order = db.next_basic_station_track_order(station_id)
+            for sid in limited_song_ids:
+                db.add_song_to_basic_station(station_id, sid, next_order)
+                next_order += 1
+
+            created += 1
+            imported_tracks += len(limited_song_ids)
+            if first_created_id is None:
+                first_created_id = station_id
+
+            if progress_callback:
+                progress_callback(
+                    idx,
+                    total,
+                    f"Imported {folder.name}: {len(limited_song_ids)} track(s) into station {folder_number:02d}",
+                )
+
+        if progress_callback:
+            progress_callback(total, total, "Station import complete")
+
+        return {
+            "created": created,
+            "imported_tracks": imported_tracks,
+            "skipped_folders": skipped_folders,
+            "truncated_stations": truncated_stations,
+            "first_created_id": first_created_id,
+        }
 
     def _persist_basic_station_track_order(self) -> None:
         """Persist track order after drag-reorder in the station tracks table.
@@ -3287,8 +5789,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._basic_stations_size_label.setText(f"~{total_bytes / (1024 * 1024):.1f} MB")
         else:
             self._basic_stations_size_label.setText(f"~{total_bytes / (1024 * 1024 * 1024):.2f} GB")
-        if self.devices_view_mode == "basic":
-            self._check_basic_sd_sync()
+        if self._is_basic_like_mode():
+            QtCore.QTimer.singleShot(0, self._check_basic_sd_sync)
 
     # ── Basic-mode SD sync ──
 
@@ -3310,8 +5812,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._basic_confirm_different_card(str(sd_root), for_sync=True):
             return
 
-        # Ensure folder 99 flags match what the user sees (combo), not a stale settings row.
-        self._persist_basic_station_end_mode_from_combo()
+        software_source = self._software_source_for_sync()
+        if self._is_advanced_mode() and software_source == "our":
+            pico_mode = self._read_pico_install_mode()
+            if pico_mode == "basic":
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Reflash Required",
+                    "Advanced mode is using our software, but the connected Pico appears to run basic firmware.\n\n"
+                    "Reflash now before syncing?",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.Yes,
+                )
+                if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                    self._on_setup_advanced_device_clicked()
+                    return
 
         force_clean = False
         sync_choice = QtWidgets.QMessageBox(self)
@@ -3320,7 +5835,10 @@ class MainWindow(QtWidgets.QMainWindow):
         sync_choice.setInformativeText(
             "Each station is written to its own DFPlayer folder (01, 02, …).\n\n"
             "Normal sync — copies only new or changed files.\n\n"
-            "Clean install — reformats the card when your computer allows it, then writes every track again."
+            "Clean install — quick-formats or wipes the SD card, then writes every track fresh.\n\n"
+            "Converted MP3s are saved on this computer (user cache) so later syncs can skip "
+            "re-encoding and finish faster. You can delete that cache when choosing clean install "
+            "if you want a full re-encode from source files."
         )
         sync_choice.setIcon(QtWidgets.QMessageBox.Icon.Question)
         btn_normal = sync_choice.addButton(
@@ -3341,29 +5859,66 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if clicked == btn_clean:
             force_clean = True
-
-        if force_clean:
-            try:
-                new_root = self.sd_manager._format_sd_card(sd_root)
-                if new_root != sd_root:
-                    sd_root = new_root
-                    self.sd_root = str(sd_root)
-                    self.db.set_setting("sd_root", self.sd_root)
-                    self._update_sd_root_label()
-            except (RuntimeError, OSError) as e:
-                # OSError covers FileNotFoundError (e.g. missing format helper); avoid crashing sync
-                print(f"SD card reformat skipped or failed: {e}")
+            clean_opts = QtWidgets.QMessageBox(self)
+            clean_opts.setWindowTitle("Clean install — local cache")
+            clean_opts.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            clean_opts.setText(
+                "For this library, Vintage Radio keeps converted MP3s in your user cache folder "
+                "so future syncs can skip re-encoding and run faster."
+            )
+            clean_opts.setInformativeText(
+                "The SD card will still be wiped and every slot rewritten.\n\n"
+                "Optionally delete the local cache first so this sync re-encodes everything from "
+                "your source files (much slower). Leave unchecked to reuse cached conversions "
+                "when possible."
+            )
+            cb_delete_cache = QtWidgets.QCheckBox(
+                "Delete local converted MP3 cache before syncing (full re-encode)"
+            )
+            clean_opts.setCheckBox(cb_delete_cache)
+            btn_continue = clean_opts.addButton(
+                "Continue",
+                QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+            )
+            clean_opts.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+            clean_opts.setDefaultButton(btn_continue)
+            clean_opts.exec()
+            if clean_opts.clickedButton() != btn_continue:
+                return
+            if cb_delete_cache.isChecked():
+                ok_del, err_del = self.sd_manager.clear_basic_sync_mp3_cache_for_library()
+                if not ok_del:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Could not delete conversion cache",
+                        f"The cache folder could not be removed:\n\n{err_del}\n\n"
+                        "Sync will continue; existing cache files may still be reused.",
+                    )
 
         dlg = TaskProgressDialog(
             parent=self,
             title="Sync Stations to SD" + (" (clean)" if force_clean else ""),
             func=self.sd_manager.sync_library_basic,
             args=(sd_root,),
-            kwargs={"force_clean": force_clean},
+            kwargs={
+                "force_clean": force_clean,
+                "conversion_profile": self._selected_conversion_profile(),
+                "dfplayer_eq": self._selected_dfplayer_eq() if software_source == "our" else "normal",
+            },
+            cancelable=True,
+            cancel_callback_kwarg="should_cancel",
         )
 
         def on_success(result):
-            copied, skipped = result
+            if isinstance(result, dict):
+                copied = int(result.get("copied", 0))
+                skipped = int(result.get("skipped", 0))
+                result_sd_root = result.get("sd_root")
+                if result_sd_root:
+                    self.sd_root = str(result_sd_root)
+                    self.db.set_setting("sd_root", self.sd_root)
+            else:
+                copied, skipped = result
             self.statusBar().showMessage(
                 f"Basic sync complete. Copied: {copied}, Skipped: {skipped}", 5000
             )
@@ -3375,11 +5930,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     _w.refresh_library_db_and_now_playing()
             if self.sd_root:
                 try:
-                    if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
-                        self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                    preserved = ""
+                    if isinstance(result, dict):
+                        preserved = str(
+                            result.get("preserved_volume_label") or ""
+                        ).strip()
+                    rename_label = preserved if preserved else None
+                    if self.sd_manager.set_sync_target_volume_label(
+                        Path(self.sd_root), label=rename_label
+                    ):
+                        effective = preserved if preserved else SYNC_TARGET_VOLUME_LABEL
+                        self.db.set_setting("sd_volume_label", effective)
+                        if preserved:
+                            self.sd_label = preserved
+                            self.db.set_setting("sd_label", preserved)
                         # macOS diskutil rename changes the mount path
                         if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
-                            new_path = Path("/Volumes") / SYNC_TARGET_VOLUME_LABEL
+                            new_path = Path("/Volumes") / effective
                             if new_path.is_dir():
                                 self.sd_root = str(new_path)
                                 self.db.set_setting("sd_root", self.sd_root)
@@ -3395,35 +5962,350 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
 
         def on_error(msg):
-            QtWidgets.QMessageBox.critical(self, "Sync Error", f"Error during basic sync:\n\n{msg}")
+            if "Sync cancelled by user" in str(msg):
+                self.statusBar().showMessage("Basic sync cancelled.", 4000)
+                return
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Sync Error",
+                f"Error during basic sync:\n\n{msg}",
+            )
 
         dlg.on_success = on_success
         dlg.on_error = on_error
+        dlg.exec()
+
+    def _on_experimental_sd_disk_image(self) -> None:
+        """Experimental: clean sync via FAT32 image — build image, then write to physical SD (Windows)."""
+        if not self._is_basic_like_mode():
+            return
+        sd_root = self._resolve_sd_root()
+        if not sd_root or not Path(sd_root).is_dir():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No SD folder",
+                "Select an SD card mount point or folder to use as the sync target.",
+            )
+            return
+        stations = self.db.list_basic_stations()
+        if not stations:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No stations",
+                "Create at least one station with tracks before building an SD image.",
+            )
+            return
+
+        missing_pyfatfs = pyfatfs_dependency_message()
+        if missing_pyfatfs:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing dependency",
+                missing_pyfatfs,
+            )
+            return
+
+        sd_p = Path(sd_root)
+
+        if platform.system() != "Windows":
+            intro = QtWidgets.QMessageBox(self)
+            intro.setWindowTitle("Experimental: SD disk image (export only)")
+            intro.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            intro.setText(
+                "Raw disk flashing is only implemented on Windows.\n\n"
+                "You can still save a FAT32 .img built with pyfatfs and flash it with Etcher, "
+                "Pi Imager, or dd on this platform."
+            )
+            intro.setStandardButtons(
+                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel
+            )
+            if intro.exec() != QtWidgets.QMessageBox.StandardButton.Ok:
+                return
+            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save disk image",
+                "",
+                "Disk image (*.img);;All files (*.*)",
+            )
+            if not out_path:
+                return
+            if not out_path.lower().endswith(".img"):
+                out_path = out_path + ".img"
+            out_p = Path(out_path)
+
+            def _worker_export(
+                *,
+                progress_callback: Optional[Callable] = None,
+                should_cancel: Optional[Callable[[], bool]] = None,
+            ) -> dict:
+                ok, err = run_experimental_sd_disk_image_export(
+                    sd_p,
+                    out_p,
+                    progress_callback=progress_callback,
+                    should_cancel=should_cancel,
+                )
+                if not ok:
+                    raise RuntimeError(err or "Disk image export failed.")
+                return {"path": str(out_p)}
+
+            dlg = TaskProgressDialog(
+                parent=self,
+                title="Building SD disk image (experimental)",
+                func=_worker_export,
+                args=(),
+                kwargs={},
+                cancelable=True,
+                cancel_callback_kwarg="should_cancel",
+            )
+
+            def on_ok_export(_result: object) -> None:
+                self.statusBar().showMessage(f"Disk image saved: {out_p}", 8000)
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Disk image",
+                    f"Image saved to:\n{out_p}\n\nFlash it with your preferred tool, then eject safely.",
+                )
+
+            dlg.on_success = on_ok_export
+            dlg.on_error = lambda msg: QtWidgets.QMessageBox.critical(
+                self,
+                "Disk image failed",
+                msg,
+            )
+            dlg.exec()
+            return
+
+        letter = windows_drive_letter_from_path(sd_p)
+        default_disk = windows_disk_number_for_drive_letter(letter) if letter else None
+
+        wiz = SdDiskImageFlashWizardDialog(
+            self,
+            sd_root=sd_p,
+            default_disk_number=default_disk,
+        )
+        if wiz.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        disk_number = wiz.selected_disk_number
+        if disk_number is None:
+            return
+        prepare_on_pc = wiz.prepare_on_pc
+        flash_last = wiz.flash_last_image_only
+        last_img = app_data_dir() / "sd_image_cache" / LAST_CACHED_SD_IMAGE_FILENAME
+
+        if flash_last:
+            try:
+                if not last_img.is_file() or last_img.stat().st_size <= 0:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "No cached image",
+                        f"No reusable disk image at:\n{last_img}\n\n"
+                        "Run a full SD image sync once to build it.",
+                    )
+                    return
+            except OSError:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "No cached image",
+                    f"Could not read cached image:\n{last_img}",
+                )
+                return
+            ds = windows_get_disk_size_bytes(disk_number)
+            if ds is not None and last_img.stat().st_size > ds:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "SD card too small",
+                    f"The cached image is about {format_disk_size(last_img.stat().st_size)}, but the "
+                    f"selected disk is {format_disk_size(ds)}. Use a larger card.",
+                )
+                return
+        else:
+            ds = windows_get_disk_size_bytes(disk_number)
+            if not prepare_on_pc:
+                est = suggest_image_size_bytes(sd_p)
+                if ds is not None and est > ds:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "SD card too small",
+                        f"This library needs about {format_disk_size(est)} for the image, but the selected "
+                        f"disk is {format_disk_size(ds)}. Use a larger card or reduce stations/tracks.",
+                    )
+                    return
+
+        confirm_lines = [
+            f"Write a fresh FAT32 image to PhysicalDrive{disk_number}?",
+            "",
+            f"{'Disk size: ' + format_disk_size(ds) if ds else 'Size: unknown'}",
+            "",
+            "ALL DATA on that physical disk will be permanently erased.",
+        ]
+        if not is_windows_admin():
+            confirm_lines.extend(
+                [
+                    "",
+                    "After the image is built, Windows will show a security prompt (UAC) to allow "
+                    "writing to the card. Approve it to continue. You do not need to restart this "
+                    "app as Administrator.",
+                ]
+            )
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm disk erase",
+            "\n".join(confirm_lines),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        software_source = self._software_source_for_sync()
+        dfplayer_eq = self._selected_dfplayer_eq() if software_source == "our" else "normal"
+        conv_profile = self._selected_conversion_profile()
+
+        def _worker_win(
+            *,
+            progress_callback: Optional[Callable] = None,
+            should_cancel: Optional[Callable[[], bool]] = None,
+        ) -> dict:
+            cache_dir = app_data_dir() / "sd_image_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            staging_root = cache_dir / "staging"
+            used_staging = False
+            img_path = cache_dir / LAST_CACHED_SD_IMAGE_FILENAME
+
+            def _export_cb(_c: int, _t: int, m: str) -> None:
+                if progress_callback:
+                    if _t > 0:
+                        progress_callback(_c, _t, f"Image: {m}")
+                    else:
+                        progress_callback(0, 0, f"Image: {m}")
+
+            try:
+                if flash_last:
+                    if progress_callback:
+                        progress_callback(
+                            0,
+                            0,
+                            "Using cached disk image (skipping prepare and build)…",
+                        )
+                    if not img_path.is_file() or img_path.stat().st_size <= 0:
+                        raise RuntimeError(f"Missing cached image: {img_path}")
+                    ok2, err2 = write_image_to_physical_disk(
+                        img_path,
+                        disk_number,
+                        progress_callback=progress_callback,
+                        should_cancel=should_cancel,
+                    )
+                    if not ok2:
+                        raise RuntimeError(err2 or "Disk write failed.")
+                    return {"disk_number": disk_number}
+
+                if prepare_on_pc:
+                    used_staging = True
+                    if progress_callback:
+                        progress_callback(
+                            0,
+                            0,
+                            "Preparing DFPlayer layout on your PC (not writing files to the SD card)...",
+                        )
+                    shutil.rmtree(staging_root, ignore_errors=True)
+                    staging_root.mkdir(parents=True, exist_ok=True)
+
+                    def _sync_cb(c: int, t: int, m: str) -> None:
+                        if progress_callback:
+                            progress_callback(c, t if t else 0, f"Prepare: {m}")
+
+                    self.sd_manager.sync_library_basic(
+                        staging_root,
+                        force_clean=False,
+                        progress_callback=_sync_cb,
+                        should_cancel=should_cancel,
+                        conversion_profile=conv_profile,
+                        dfplayer_eq=dfplayer_eq,
+                        copy_destination_label="PC staging folder (for disk image)",
+                        sync_log_prefix="Prepare (PC staging)",
+                    )
+                    est2 = suggest_image_size_bytes(staging_root)
+                    ds2 = windows_get_disk_size_bytes(disk_number)
+                    if ds2 is not None and est2 > ds2:
+                        raise RuntimeError(
+                            f"SD card too small: need about {format_disk_size(est2)} for this image, "
+                            f"but the selected disk is {format_disk_size(ds2)}."
+                        )
+                    source_root = staging_root
+                else:
+                    source_root = sd_p
+
+                if progress_callback:
+                    progress_callback(0, 0, "Building FAT32 disk image...")
+                ok, err = run_experimental_sd_disk_image_export(
+                    source_root,
+                    img_path,
+                    progress_callback=_export_cb,
+                    should_cancel=should_cancel,
+                )
+                if not ok:
+                    try:
+                        img_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise RuntimeError(err or "Disk image build failed.")
+
+                ok2, err2 = write_image_to_physical_disk(
+                    img_path,
+                    disk_number,
+                    progress_callback=progress_callback,
+                    should_cancel=should_cancel,
+                )
+                if not ok2:
+                    raise RuntimeError(err2 or "Disk write failed.")
+                return {"disk_number": disk_number}
+            finally:
+                if used_staging:
+                    shutil.rmtree(staging_root, ignore_errors=True)
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="SD image sync (experimental)",
+            func=_worker_win,
+            args=(),
+            kwargs={},
+            cancelable=True,
+            cancel_callback_kwarg="should_cancel",
+        )
+
+        def on_ok_win(_result: object) -> None:
+            self.statusBar().showMessage("SD card image written. Safely remove the card if needed.", 8000)
+            QtWidgets.QMessageBox.information(
+                self,
+                "Done",
+                "The FAT32 image was written to the selected disk.\n\n"
+                "Safely remove the SD card, insert it in the radio, and power on.",
+            )
+
+        dlg.on_success = on_ok_win
+        dlg.on_error = lambda msg: QtWidgets.QMessageBox.critical(
+            self,
+            "SD image sync failed",
+            msg,
+        )
         dlg.exec()
 
     def _on_tab_changed(self, index: int) -> None:
         """Handle tab switches: lazy-load debug widgets, check sync status."""
         # Advanced mode: Device Debug tab lazy-load
         if self._device_debug_tab_index >= 0 and index == self._device_debug_tab_index:
-            if self._device_debug_widget is None:
-                self._device_debug_tab_layout.removeWidget(self._device_debug_placeholder)
-                self._device_debug_placeholder.deleteLater()
-                self._device_debug_widget = DeviceDebugWidget(
-                    db=self.db,
-                    db_getter=lambda: self.db,
-                )
-                self._device_debug_tab_layout.addWidget(self._device_debug_widget)
+            self._ensure_device_debug_widget_loaded()
             self._check_device_tab_sync()
 
         # Basic mode: SD Card tab (index 1) - refresh capacity
-        if self.devices_view_mode == "basic" and index == 1:
+        if self._is_basic_like_mode() and index == 1:
             self._try_rebind_basic_sd_mount()
             self._update_sd_root_label()
             self._refresh_basic_sd_capacity()
             self._check_basic_sd_sync()
 
-        # Advanced mode: Devices tab warning
-        if self.devices_view_mode == "advanced" and index == 3 and hasattr(self, "_check_basic_sd_pico_warning"):
+        # Legacy mode: Devices tab warning
+        if self.devices_view_mode == "legacy" and index == 3 and hasattr(self, "_check_basic_sd_pico_warning"):
             self._check_basic_sd_pico_warning()
 
     def _check_device_tab_sync(self) -> None:
@@ -3644,8 +6526,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._devices_stack = QtWidgets.QStackedWidget()
         self._devices_stack.addWidget(self._build_sd_tab_basic_content())
         self._devices_stack.addWidget(self._build_sd_tab_advanced_content())
-        self._devices_stack.setCurrentIndex(0 if self.devices_view_mode == "basic" else 1)
-        if self.devices_view_mode == "basic":
+        self._devices_stack.setCurrentIndex(0 if self._is_basic_like_mode() else 1)
+        if self._is_basic_like_mode():
             self._check_basic_sd_pico_warning()
         layout.addWidget(self._devices_stack)
 
@@ -4046,46 +6928,6 @@ class MainWindow(QtWidgets.QMainWindow):
             cb_basic.setChecked(checked)
             cb_basic.blockSignals(False)
 
-    def _get_basic_station_end_mode(self) -> str:
-        """Return 'loop', 'advance', or 'none' (mutually exclusive basic-mode end behavior)."""
-        m = (self.db.get_setting("basic_station_end_mode", "") or "").strip()
-        if m in ("loop", "advance", "none"):
-            return m
-        # Legacy single flag before end-mode combo
-        legacy = (self.db.get_setting("basic_loop_stations", "") or "").strip()
-        if legacy == "1":
-            return "loop"
-        if legacy == "0":
-            return "none"
-        # Fresh install / unset: default to advance
-        return "advance"
-
-    def _persist_basic_station_end_mode_from_combo(self) -> None:
-        """Write the SD tab combo box to settings (source of truth right before sync)."""
-        combo = getattr(self, "_basic_end_mode_combo", None)
-        if not _qt_widget_alive(combo):
-            return
-        idx = combo.currentIndex()
-        if idx < 0:
-            return
-        data = combo.itemData(idx)
-        if data is not None:
-            self._set_basic_station_end_mode(str(data))
-
-    def _set_basic_station_end_mode(self, mode: str) -> None:
-        if mode not in ("loop", "advance", "none"):
-            return
-        self.db.set_setting("basic_station_end_mode", mode)
-        self.db.set_setting("basic_loop_stations", "1" if mode == "loop" else "0")
-
-    def _on_basic_station_end_combo_changed(self, index: int) -> None:
-        combo = getattr(self, "_basic_end_mode_combo", None)
-        if not _qt_widget_alive(combo) or index < 0:
-            return
-        data = combo.itemData(index)
-        if data is not None:
-            self._set_basic_station_end_mode(str(data))
-
     def _create_song_table(self, reorderable: bool = False) -> QtWidgets.QTableWidget:
         table: QtWidgets.QTableWidget
         if reorderable:
@@ -4112,7 +6954,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.audio_target = "dfplayer_rp2040"
         self.pi_convert_audio = self.db.get_setting("pi_convert_audio", "1") == "1"
         self.devices_view_mode = self.db.get_setting("view_mode", "basic") or "basic"
-        if self.devices_view_mode not in ("basic", "advanced"):
+        if self.devices_view_mode == "advanced_legacy":
+            self.devices_view_mode = "legacy"
+        if self.devices_view_mode not in ("basic", "advanced", "legacy"):
             self.devices_view_mode = "basic"
         try:
             self._ui_zoom_level = max(80, min(200, int(self.db.get_setting("ui_zoom_level", "100") or "100")))
@@ -4140,7 +6984,7 @@ class MainWindow(QtWidgets.QMainWindow):
         never refreshed — the list kept showing the previous library's stations
         (often empty after switching to a new/empty DB, or stale rows).
         """
-        if self.devices_view_mode != "basic":
+        if not self._is_basic_like_mode():
             return
         if not hasattr(self, "_basic_station_list"):
             return
@@ -4813,20 +7657,82 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_album_combo.blockSignals(False)
         self.sd_playlist_combo.blockSignals(False)
 
+    def _manual_select_sd_root_dialog(
+        self,
+        candidates: List[Tuple[Path, str]],
+        identity: set,
+    ) -> Optional[Tuple[str, str]]:
+        """Basic-mode **Select**: combo dropdown of detected roots (one or many). Cancel returns ``None``."""
+        choices: List[str] = []
+        mapping: Dict[str, str] = {}
+        for path, label in candidates:
+            display = f"{path} ({label})" if label else str(path)
+            choices.append(display)
+            mapping[display] = str(path)
+
+        default_idx = 0
+        if self.sd_root:
+            try:
+                saved = Path(self.sd_root).expanduser().resolve()
+                for i, (path, _label) in enumerate(candidates):
+                    try:
+                        if path.resolve() == saved:
+                            default_idx = i
+                            break
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+        if default_idx == 0 and identity:
+            for i, (path, label) in enumerate(candidates):
+                if self._basic_candidate_matches_identity(path, label, identity):
+                    default_idx = i
+                    break
+
+        dlg_flags = (
+            QtCore.Qt.WindowType.Dialog
+            | QtCore.Qt.WindowType.WindowStaysOnTopHint
+            | QtCore.Qt.WindowType.WindowCloseButtonHint
+        )
+        selection, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Select SD Root",
+            "Choose SD card root:",
+            choices,
+            default_idx,
+            False,
+            dlg_flags,
+        )
+        if not ok or not selection:
+            return None
+        new_root = mapping.get(selection, selection)
+        new_label = ""
+        for path, label in candidates:
+            if str(path) == new_root:
+                new_label = label or ""
+                break
+        return new_root, new_label
+
     def select_sd_root(self, *, manual: bool = False) -> None:
         """Pick SD root from detected removable volumes (dropdown if several).
 
         When *manual* is False (e.g. advanced Devices "Detect"), we may apply the saved
         path or a single identity match without opening a dialog.
 
-        When *manual* is True (basic-mode **Select**), always show the drive list if
-        more than one removable volume exists so the user can pick a different card.
+        When *manual* is True (basic-mode **Select**), show the combo dropdown of detected
+        drives (same control whether there is one or many; stays on top so it is not hidden).
         """
         candidates = self.sd_manager.detect_sd_roots()
         if not candidates:
-            QtWidgets.QMessageBox.information(
-                self, "SD Detect", "No removable drives detected."
+            mb = QtWidgets.QMessageBox(self)
+            mb.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            mb.setWindowTitle("SD card")
+            mb.setText("No removable drives were detected automatically.")
+            mb.setInformativeText(
+                "Use <b>Browse</b> next to Select to choose your SD card folder manually, "
+                "or reconnect the card and click Detect."
             )
+            mb.exec()
             return
 
         if not manual:
@@ -4879,12 +7785,17 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             identity = self._basic_sd_identity_match_set()
 
-        if len(candidates) == 1:
+        if manual:
+            picked = self._manual_select_sd_root_dialog(candidates, identity)
+            if picked is None:
+                return
+            new_root, new_label = picked
+        elif len(candidates) == 1:
             new_root = str(candidates[0][0])
-            new_label = candidates[0][1]
+            new_label = candidates[0][1] or ""
         else:
-            choices = []
-            mapping = {}
+            choices: List[str] = []
+            mapping: Dict[str, str] = {}
             for path, label in candidates:
                 display = f"{path} ({label})" if label else str(path)
                 choices.append(display)
@@ -4909,6 +7820,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         default_idx = i
                         break
 
+            dlg_flags = (
+                QtCore.Qt.WindowType.Dialog
+                | QtCore.Qt.WindowType.WindowStaysOnTopHint
+                | QtCore.Qt.WindowType.WindowCloseButtonHint
+            )
             selection, ok = QtWidgets.QInputDialog.getItem(
                 self,
                 "Select SD Root",
@@ -4916,6 +7832,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 choices,
                 default_idx,
                 False,
+                dlg_flags,
             )
             if not ok or not selection:
                 return
@@ -4923,9 +7840,10 @@ class MainWindow(QtWidgets.QMainWindow):
             new_label = ""
             for path, label in candidates:
                 if str(path) == new_root:
-                    new_label = label
+                    new_label = label or ""
+                    break
         self.sd_root = new_root
-        self.sd_label = new_label
+        self.sd_label = new_label or ""
         self.db.set_setting("sd_root", self.sd_root)
         self.db.set_setting("sd_label", self.sd_label)
         self._update_sd_root_label()
@@ -5056,7 +7974,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if reply == QtWidgets.QMessageBox.StandardButton.No:
             force_clean = True
         
-        effective_audio_target = "dfplayer_rp2040" if self.devices_view_mode == "basic" else self.audio_target
+        effective_audio_target = "dfplayer_rp2040" if self._is_basic_like_mode() else self.audio_target
         dlg = TaskProgressDialog(
             parent=self,
             title="SD Card Sync" + (" (clean install)" if force_clean else ""),
@@ -5116,7 +8034,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.db.set_setting("sd_root", "")
         self.db.set_setting("sd_label", "")
         self._update_sd_root_label()
-        if self.devices_view_mode == "basic":
+        if self._is_basic_like_mode():
             self._refresh_basic_sd_capacity()
             self._check_basic_sd_sync()
 
@@ -5481,9 +8399,9 @@ class MainWindow(QtWidgets.QMainWindow):
         readme_txt.write_text(
             "RP2040 + DFPlayer. Copy main.py, radio_core.py, pin_config_loader.py,\n"
             "sdcard.py, pin_config.json, and components/ to the Pico.\n"
-            "AM sound is on SD card in folder 99/001.wav.\n"
+            "AM sound uses AMradioSound.wav on Pico flash (PWM overlay), not the SD card.\n"
             "SD layout: folders 01/, 02/, ... at SD root with 001.mp3, 002.mp3 inside;\n"
-            "folder 99/001.wav for AM static sound; VintageRadio/ for metadata.\n"
+            "folder 99 is a normal station folder like the rest; radio_metadata.json at SD root (no VintageRadio/ on card).\n"
             "See README_RP2040.md in this folder for full setup.\n",
             encoding="utf-8",
         )
@@ -5636,7 +8554,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
             dlg.exec()
             self.statusBar().showMessage("MicroPython installed. Installing app...", 8000)
-            QtCore.QTimer.singleShot(500, self._install_to_pico_after_firmware)
+            QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, self._install_to_pico_after_firmware)
         else:
             board_name = bp.name if bp else "device"
             msg = (
@@ -5751,6 +8669,9 @@ class MainWindow(QtWidgets.QMainWindow):
         pin_config_json: str = "",
         custom_hw_driver_path: str = "",
         basic_mode: bool = False,
+        install_mode: str = "basic",
+        dfplayer_eq: str = "normal",
+        after_firmware: bool = False,
     ) -> str:
         """Background worker: copy firmware files to Pico via mpremote CLI.
 
@@ -5781,6 +8702,10 @@ class MainWindow(QtWidgets.QMainWindow):
             (main_source, "main.py"),
             ("firmware/radio_core.py", "radio_core.py"),
             ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
+            (
+                "firmware/pico/components/vintage_radio_ipc.py",
+                "components/vintage_radio_ipc.py",
+            ),
             ("firmware/pin_config_loader.py", "pin_config_loader.py"),
             ("firmware/pico/sdcard.py", "sdcard.py"),
         ]
@@ -5793,8 +8718,15 @@ class MainWindow(QtWidgets.QMainWindow):
             ]
             files_to_copy.append((custom_hw_driver_path, "components/dfplayer_hardware.py"))
 
-        # Total steps: mkdir + firmware batch + pin_config + AM WAV + metadata + reboot
-        total = 6
+        write_session_line(
+            "Pico install copy list: {}".format(
+                ", ".join(remote for _src, remote in files_to_copy)
+            ),
+            prefix="INSTALL",
+        )
+
+        # Total steps: mkdir + firmware batch + pin_config + app config + AM WAV + metadata + reboot
+        total = 7
         step = 0
 
         def _report(msg: str):
@@ -5831,15 +8763,33 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         def run_mpremote_with_retry(args: List[str], timeout_sec: int = 30):
-            """Run mpremote; if it fails with 'no device found', wait 3s and retry once (Pico may still be re-enumerating after flash/reboot)."""
+            """Run mpremote; retry on 'no device found' while USB serial is still enumerating after flash/reboot."""
+            import time
+
             r = run_mpremote(args, timeout_sec=timeout_sec)
-            if r.returncode != 0:
+            for attempt in range(5):
+                if r.returncode == 0:
+                    return r
                 err = (r.stderr or "") + (r.stdout or "")
-                if "no device found" in err.lower():
-                    import time
-                    time.sleep(3)
-                    r = run_mpremote(args, timeout_sec=timeout_sec)
+                if "no device found" not in err.lower():
+                    return r
+                time.sleep(min(8.0, 2.0 + attempt * 2.0))
+                r = run_mpremote(args, timeout_sec=timeout_sec)
             return r
+
+        if after_firmware:
+            if not _wait_mpremote_serial_ready(
+                mpremote_cmd,
+                _mpremote_cwd,
+                progress_callback=progress_callback,
+                total_steps=total,
+                creationflags=creation_flags,
+                env=env,
+            ):
+                raise RuntimeError(
+                    "Timed out waiting for the Pico on USB serial after installing MicroPython.\n\n"
+                    "When the new COM port appears, run Setup Device again."
+                )
 
         # ── Create directories (batched: one mpremote call) ──
         _report("Creating directories on Pico...")
@@ -5852,7 +8802,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass  # directories may already exist
 
         # ── Copy firmware files (one mpremote cp per file; batched cp requires dest to be a dir) ──
-        _report("Copying main.py, radio_core.py, dfplayer_hardware.py...")
+        _report("Copying main, radio_core, components (dfplayer + vintage_radio_ipc), …")
         for local, remote in files_to_copy:
             src = root / local
             if src.exists():
@@ -5882,6 +8832,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
+        # ── Write advanced runtime settings used by new advanced mode ──
+        _report("Writing runtime settings...")
+        install_mode = (install_mode or "basic").strip().lower()
+        if install_mode not in {"basic", "advanced", "legacy"}:
+            install_mode = "basic"
+        dfplayer_eq = (dfplayer_eq or "normal").strip().lower()
+        if dfplayer_eq not in {"normal", "pop", "rock", "jazz", "classic", "bass"}:
+            dfplayer_eq = "normal"
+        tmpdir_cfg2 = _tempfile.mkdtemp()
+        try:
+            mode_file = Path(tmpdir_cfg2) / "advanced_runtime.json"
+            mode_file.write_text(
+                json.dumps({"install_mode": install_mode, "dfplayer_eq": dfplayer_eq}),
+                encoding="utf-8",
+            )
+            r = run_mpremote_with_retry(["cp", str(mode_file), ":VintageRadio/advanced_runtime.json"])
+            if r.returncode != 0:
+                print(f"Warning: advanced_runtime.json copy failed: {r.stderr or r.stdout}")
+        except Exception as e:
+            print(f"Warning: Could not copy advanced_runtime.json: {e}")
+        finally:
+            try:
+                shutil.rmtree(tmpdir_cfg2)
+            except Exception:
+                pass
+
         # ── Copy AMradioSound.wav ──
         _report("Copying AM radio sound...")
         from gui.resource_paths import resource_path
@@ -5890,9 +8866,46 @@ class MainWindow(QtWidgets.QMainWindow):
             am_wav_src = root / "AMradioSound.wav"
         if am_wav_src.exists():
             try:
-                r = run_mpremote(["cp", str(am_wav_src), ":VintageRadio/AMradioSound.wav"])
+                r = run_mpremote_with_retry(["cp", str(am_wav_src), ":VintageRadio/AMradioSound.wav"])
                 if r.returncode == 0:
                     print("AMradioSound.wav copied to Pico flash (PWM overlay enabled)")
+                    try:
+                        src_size = am_wav_src.stat().st_size
+                    except OSError:
+                        src_size = -1
+                    verify = run_mpremote_with_retry(
+                        [
+                            "exec",
+                            "import os\n"
+                            "p='VintageRadio/AMradioSound.wav'\n"
+                            "try:\n"
+                            " s=os.stat(p)[6]\n"
+                            " print('AM_WAV_OK', s)\n"
+                            "except Exception as e:\n"
+                            " print('AM_WAV_MISSING', e)\n",
+                        ],
+                        timeout_sec=10,
+                    )
+                    out = (verify.stdout or "") + (verify.stderr or "")
+                    if "AM_WAV_OK" in out:
+                        try:
+                            parts = out.strip().split()
+                            pico_size = int(parts[-1])
+                        except Exception:
+                            pico_size = -1
+                        if src_size > 0 and pico_size == src_size:
+                            print(f"AM WAV verify: OK on Pico ({pico_size} bytes)")
+                        elif pico_size > 0:
+                            print(
+                                f"Warning: AM WAV verify size mismatch (src={src_size}, pico={pico_size})"
+                            )
+                        else:
+                            print("Warning: AM WAV verify returned unreadable size output")
+                    else:
+                        print(
+                            "Warning: AM WAV verify failed; Pico file not readable after copy. "
+                            f"Output: {out.strip()}"
+                        )
                 else:
                     print(f"Warning: Failed to copy AMradioSound.wav: {r.stderr or r.stdout}")
             except Exception as e:
@@ -5900,28 +8913,30 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             print("AMradioSound.wav not found - PWM overlay won't be available")
 
-        # ── Copy radio_metadata.json ──
-        # Always generate fresh metadata from the database so albums/playlists on the Pico
-        # match the current library. Never use SD card's metadata (can be stale). Overwrites
-        # whatever is on the Pico.
-        _report("Copying metadata...")
-        tmpdir = _tempfile.mkdtemp()
-        try:
-            tmp_vintage = Path(tmpdir) / "VintageRadio"
-            tmp_vintage.mkdir(parents=True, exist_ok=True)
-            sd_manager._write_metadata(tmp_vintage)
-            metadata_src = tmp_vintage / "radio_metadata.json"
-            if metadata_src.exists():
-                r = run_mpremote(["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"])
-                if r.returncode != 0:
-                    print(f"Warning: metadata copy failed: {r.stderr or r.stdout}")
-        except Exception as e:
-            print(f"Warning: Could not generate or copy metadata: {e}")
-        finally:
+        # ── Copy radio_metadata.json (legacy install path only) ──
+        # Basic/new-advanced firmware discovers stations directly from DFPlayer folders.
+        # Keep metadata copy for legacy compatibility only.
+        if install_mode == "legacy":
+            _report("Copying metadata...")
+            tmpdir = _tempfile.mkdtemp()
             try:
-                shutil.rmtree(tmpdir)
-            except Exception:
-                pass
+                tmp_vintage = Path(tmpdir) / "VintageRadio"
+                tmp_vintage.mkdir(parents=True, exist_ok=True)
+                sd_manager._write_metadata(tmp_vintage)
+                metadata_src = tmp_vintage / "radio_metadata.json"
+                if metadata_src.exists():
+                    r = run_mpremote(["cp", str(metadata_src), ":VintageRadio/radio_metadata.json"])
+                    if r.returncode != 0:
+                        print(f"Warning: metadata copy failed: {r.stderr or r.stdout}")
+            except Exception as e:
+                print(f"Warning: Could not generate or copy metadata: {e}")
+            finally:
+                try:
+                    shutil.rmtree(tmpdir)
+                except Exception:
+                    pass
+        else:
+            _report("Skipping metadata copy (basic/advanced discovery mode)...")
 
         # Remove stale album_state.txt and reboot. machine.reset() drops connection - timeout expected.
         _report("Rebooting Pico...")
@@ -5952,13 +8967,27 @@ class MainWindow(QtWidgets.QMainWindow):
         """Read pin config and custom driver from the active profile for install/export."""
         profile = self.db.get_active_profile()
         if profile is None:
-            return {"pin_config_json": "", "custom_hw_driver_path": ""}
+            return {
+                "pin_config_json": "",
+                "custom_hw_driver_path": "",
+                "install_mode": "basic",
+                "dfplayer_eq": "normal",
+            }
         return {
             "pin_config_json": profile["pin_config_json"] or "",
             "custom_hw_driver_path": profile["custom_hw_driver_path"] or "",
+            "install_mode": "basic",
+            "dfplayer_eq": "normal",
         }
 
-    def install_to_pico(self, after_firmware: bool = False, basic_mode: bool = False) -> None:
+    def install_to_pico(
+        self,
+        after_firmware: bool = False,
+        basic_mode: bool = False,
+        *,
+        install_mode: str = "basic",
+        dfplayer_eq: str = "normal",
+    ) -> None:
         """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote).
 
         Args:
@@ -5966,7 +8995,7 @@ class MainWindow(QtWidgets.QMainWindow):
             basic_mode: If True, flash main_basic.py as main.py instead of the standard main.py.
         """
         write_session_line(
-            f"install_to_pico entered after_firmware={after_firmware} basic_mode={basic_mode}",
+            f"install_to_pico entered after_firmware={after_firmware} basic_mode={basic_mode} install_mode={install_mode} eq={dfplayer_eq}",
             prefix="INSTALL",
         )
         mpremote_cmd = self._resolve_mpremote_cmd()
@@ -5978,6 +9007,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if getattr(self, "_mpremote_bundle_error", None):
                 msg += "\n\n(Bundled mpremote failed to load:\n" + str(self._mpremote_bundle_error) + ")"
             QtWidgets.QMessageBox.information(self, "Install to Pico", msg)
+            return
+
+        if self._release_serial_if_connected_for_mpremote(log_prefix="INSTALL"):
+            self.statusBar().showMessage(
+                "Serial console disconnected so Install to Pico can use the USB port. "
+                "Click Connect on the Device tab when finished.",
+                12000,
+            )
+
+        if self._is_advanced_mode() and self._uses_custom_software():
+            self._flush_advanced_mcu_notes_and_buttons()
+            self._advanced_sync_custom_path_setting_to_active_source()
+            self.install_custom_software_to_pico()
             return
 
         root = self._project_root()
@@ -5994,6 +9036,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         profile_params = self._get_active_profile_install_params()
         profile_params["basic_mode"] = basic_mode
+        profile_params["install_mode"] = install_mode
+        profile_params["dfplayer_eq"] = dfplayer_eq
+        profile_params["after_firmware"] = after_firmware
         use_inprocess = mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__"
 
         title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
@@ -6023,6 +9068,286 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg.on_success = on_success
             dlg.on_error = on_error
             dlg.exec()
+
+    @staticmethod
+    def _install_custom_software_worker(
+        mpremote_cmd: List[str],
+        source_path: Path,
+        progress_callback: Optional[Callable[..., Any]] = None,
+    ) -> str:
+        import threading
+        if mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__":
+            if threading.current_thread() is not threading.main_thread():
+                fallback = _resolve_system_mpremote_for_worker()
+                if fallback:
+                    mpremote_cmd = list(fallback)
+                else:
+                    raise RuntimeError(
+                        "Custom install runs in a background thread; install mpremote for system Python:\n"
+                        "python3 -m pip install mpremote"
+                    )
+
+        if source_path.is_file():
+            files_to_copy = [(source_path, "main.py")]
+        else:
+            files_to_copy = []
+            for fp in sorted([p for p in source_path.rglob("*") if p.is_file()]):
+                rel = fp.relative_to(source_path).as_posix()
+                if rel.startswith(".git/") or rel.startswith("__pycache__/"):
+                    continue
+                files_to_copy.append((fp, rel))
+        if not files_to_copy:
+            raise RuntimeError("No files found in selected custom software source.")
+
+        total = len(files_to_copy) + 2
+        step = 0
+
+        def _report(msg: str) -> None:
+            nonlocal step
+            if progress_callback:
+                progress_callback(step, total, msg)
+            step += 1
+
+        root = source_path.parent if source_path.is_file() else source_path
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        env = None
+        if getattr(sys, "frozen", False) and mpremote_cmd and mpremote_cmd[0] != "__INPROCESS__":
+            python_exe = mpremote_cmd[0]
+            if "_internal" in str(python_exe):
+                exe_dir = Path(sys.executable).parent
+                internal_dir = exe_dir / "_internal"
+                if internal_dir.exists():
+                    env = os.environ.copy()
+                    env["PATH"] = str(internal_dir) + os.pathsep + env.get("PATH", "")
+            else:
+                from gui.resource_paths import subprocess_env
+
+                env = subprocess_env()
+
+        _mpremote_cwd = str(root)
+        if getattr(sys, "frozen", False) and mpremote_cmd and mpremote_cmd[0] != "__INPROCESS__":
+            exe = str(mpremote_cmd[0]).lower()
+            if "python" in exe or (exe.startswith("/usr") and "mpremote" not in exe):
+                _mpremote_cwd = os.path.expanduser("~")
+
+        if not _wait_mpremote_serial_ready(
+            mpremote_cmd,
+            _mpremote_cwd,
+            progress_callback=progress_callback,
+            total_steps=total,
+            creationflags=creationflags,
+            env=env,
+        ):
+            raise RuntimeError(
+                "Timed out waiting for the Pico on USB serial (mpremote could not open a session).\n\n"
+                "After installing MicroPython the board disconnects and comes back as a COM port; "
+                "that can take 10–30 seconds on some PCs.\n\n"
+                "Unplug/replug the Pico if nothing happens, close other apps using the COM port, "
+                "then try Setup Device again."
+            )
+
+        _report("Preparing Pico directories...")
+        _run_mpremote_connect_auto_with_retry(
+            mpremote_cmd,
+            ["exec", "import os\ntry: os.mkdir('VintageRadio')\nexcept: pass"],
+            cwd=_mpremote_cwd,
+            timeout=15,
+            creationflags=creationflags,
+            env=env,
+        )
+        made_dirs: set[str] = set()
+        for idx, (local_fp, remote_rel) in enumerate(files_to_copy, start=1):
+            remote_rel = remote_rel.replace("\\", "/")
+            parent = str(Path(remote_rel).parent).replace("\\", "/")
+            if parent and parent not in (".", "/") and parent not in made_dirs:
+                _run_mpremote_connect_auto_with_retry(
+                    mpremote_cmd,
+                    ["exec", f"import os\ntry: os.mkdir('{parent}')\nexcept: pass"],
+                    cwd=_mpremote_cwd,
+                    timeout=15,
+                    creationflags=creationflags,
+                    env=env,
+                )
+                made_dirs.add(parent)
+            _report(f"Copying file {idx}/{len(files_to_copy)}: {local_fp.name}")
+            r = _run_mpremote_connect_auto_with_retry(
+                mpremote_cmd,
+                ["cp", str(local_fp), f":{remote_rel}"],
+                cwd=_mpremote_cwd,
+                timeout=30,
+                creationflags=creationflags,
+                env=env,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(
+                    "Failed to copy custom software file:\n"
+                    f"{local_fp}\n\n{r.stderr or r.stdout or ''}"
+                )
+        _report("Rebooting Pico...")
+        try:
+            _run_mpremote_connect_auto_with_retry(
+                mpremote_cmd,
+                ["exec", "import machine\nmachine.reset()"],
+                cwd=_mpremote_cwd,
+                timeout=5,
+                creationflags=creationflags,
+                env=env,
+            )
+        except Exception:
+            pass
+        if progress_callback:
+            progress_callback(total, total, "Done!")
+        return "Custom software installed successfully."
+
+    @staticmethod
+    def _deploy_mcp_support_worker(
+        mpremote_cmd: List[Any],
+        pico_root: Path,
+        include_main: bool,
+        progress_callback: Optional[Callable[..., Any]] = None,
+    ) -> str:
+        """Copy VRTEST IPC (and optionally main loops) from firmware/pico to the Pico flash."""
+        import threading
+
+        if mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__":
+            if threading.current_thread() is not threading.main_thread():
+                fallback = _resolve_system_mpremote_for_worker()
+                if fallback:
+                    mpremote_cmd = list(fallback)
+                else:
+                    raise RuntimeError(
+                        "Deploy runs in a background thread; install mpremote for system Python:\n"
+                        "python -m pip install mpremote"
+                    )
+
+        files_to_copy: List[Tuple[Path, str]] = [
+            (
+                pico_root / "components" / "vintage_radio_ipc.py",
+                "components/vintage_radio_ipc.py",
+            ),
+        ]
+        if include_main:
+            files_to_copy.extend(
+                [
+                    (pico_root / "main.py", "main.py"),
+                    (pico_root / "main_basic.py", "main_basic.py"),
+                ]
+            )
+        for local_fp, _ in files_to_copy:
+            if not local_fp.is_file():
+                raise FileNotFoundError("Missing project file: {}".format(local_fp))
+
+        total = len(files_to_copy) + 2
+        step = 0
+
+        def _report(msg: str) -> None:
+            nonlocal step
+            if progress_callback:
+                progress_callback(step, total, msg)
+            step += 1
+
+        root = pico_root
+        _report("Ensuring components/ on Pico...")
+        _run_mpremote(
+            mpremote_cmd,
+            [
+                "connect",
+                "auto",
+                "exec",
+                "import os\ntry: os.mkdir('components')\nexcept: pass",
+            ],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        made_dirs: set[str] = {"components"}
+        for idx, (local_fp, remote_rel) in enumerate(files_to_copy, start=1):
+            remote_rel = remote_rel.replace("\\", "/")
+            parent = str(Path(remote_rel).parent).replace("\\", "/")
+            if parent and parent not in (".", "/") and parent not in made_dirs:
+                _run_mpremote(
+                    mpremote_cmd,
+                    [
+                        "connect",
+                        "auto",
+                        "exec",
+                        "import os\ntry: os.mkdir('{}')\nexcept: pass".format(parent),
+                    ],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                made_dirs.add(parent)
+            _report("Copying {} ({}/{})...".format(local_fp.name, idx, len(files_to_copy)))
+            r = _run_mpremote(
+                mpremote_cmd,
+                ["connect", "auto", "cp", str(local_fp), ":{}".format(remote_rel)],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(
+                    "Failed to copy:\n{}\n\n{}".format(
+                        local_fp, (r.stderr or r.stdout or "").strip()
+                    )
+                )
+
+        _report("Resetting Pico...")
+        try:
+            _run_mpremote(
+                mpremote_cmd,
+                ["connect", "auto", "exec", "import machine\nmachine.reset()"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+        if progress_callback:
+            progress_callback(total, total, "Done!")
+        return "MCP / VRTEST support deployed. Reconnect serial if needed; watch for VRTEST IPC line on boot."
+
+    def install_custom_software_to_pico(self) -> None:
+        source_raw = (self.db.get_setting("advanced_custom_software_path", "") or "").strip()
+        source_path = Path(source_raw) if source_raw else None
+        if not source_path or not source_path.exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Custom Software",
+                "Choose a valid local custom software folder or file first.",
+            )
+            return
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        if not mpremote_cmd:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Custom Software",
+                "mpremote is not available. Install it with:\n\npip install mpremote",
+            )
+            return
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Install Custom Software",
+            func=self._install_custom_software_worker,
+            args=(mpremote_cmd, source_path),
+            kwargs={},
+        )
+
+        def on_success(msg):
+            self.statusBar().showMessage(str(msg), 5000)
+
+        def on_error(msg):
+            _show_install_error(self, msg, False)
+
+        dlg.on_success = on_success
+        dlg.on_error = on_error
+        dlg.exec()
 
     def deploy_to_pi(self) -> None:
         """Copy application files to Raspberry Pi via SCP (requires SSH access)."""
@@ -6201,7 +9526,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     return path
             except OSError:
                 pass  # volume temporarily unrecognized (e.g. WinError 1005 post-format)
-            if self.devices_view_mode == "basic":
+            if self._is_basic_like_mode():
                 self._try_rebind_basic_sd_mount()
                 if self.sd_root:
                     path2 = Path(self.sd_root)
@@ -6252,6 +9577,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     display = f"{path} ({label})" if label else str(path)
                     choices.append(display)
                     mapping[display] = str(path)
+                _sd_pick_flags = (
+                    QtCore.Qt.WindowType.Dialog
+                    | QtCore.Qt.WindowType.WindowStaysOnTopHint
+                    | QtCore.Qt.WindowType.WindowCloseButtonHint
+                )
                 selection, ok = QtWidgets.QInputDialog.getItem(
                     self,
                     "Select SD Root",
@@ -6259,6 +9589,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     choices,
                     0,
                     False,
+                    _sd_pick_flags,
                 )
                 if ok and selection:
                     self.sd_root = mapping.get(selection, selection)
@@ -6654,6 +9985,109 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.statusBar().showMessage("No session log active", 3000)
 
+    def _reenable_basic_track_count_warning(self) -> None:
+        """Clear suppression so the >255 tracks per station warning can appear again."""
+        key = "basic_suppress_track_count_over_255_warning"
+        was_suppressed = self.db.get_setting(key, "0") == "1"
+        self.db.set_setting(key, "0")
+        if was_suppressed:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Track count warning",
+                "The warning for stations over 255 tracks will be shown again "
+                "the next time it applies.",
+            )
+        else:
+            self.statusBar().showMessage(
+                "Track count warning for 255+ tracks was already enabled.", 5000
+            )
+
+    def _check_for_updates_menu(self) -> None:
+        self._check_for_updates(manual=True)
+
+    def _check_for_updates_on_startup(self) -> None:
+        if not getattr(sys, "frozen", False):
+            return
+        self._check_for_updates(manual=False)
+
+    def _check_for_updates(self, *, manual: bool) -> None:
+        if self._update_check_in_flight:
+            if manual:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Check for Updates",
+                    "An update check is already in progress.",
+                )
+            return
+
+        self._update_check_in_flight = True
+
+        def _worker() -> None:
+            try:
+                info = updater.check_latest_release(user_agent=f"VintageRadio/{__version__}")
+                self.update_check_finished.emit(info, manual, "")
+            except Exception as e:
+                self.update_check_finished.emit(None, manual, str(e))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_update_check_finished(self, info: object, manual: bool, error: str) -> None:
+        self._update_check_in_flight = False
+
+        if error:
+            if manual:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Check for Updates",
+                    f"Could not check for updates:\n{error}",
+                )
+            return
+
+        release = info if isinstance(info, updater.ReleaseInfo) else None
+        if release is None:
+            if manual:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Check for Updates",
+                    "Could not fetch release information from GitHub.\n\n"
+                    "If your connection is fine, the API may be rate-limited or "
+                    "temporarily unavailable. You can open the releases page manually:\n"
+                    f"{updater.GITHUB_RELEASES_URL}",
+                )
+            return
+
+        if updater.is_newer(release.tag_name, __version__):
+            self._show_update_dialog(release)
+            return
+
+        if manual:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Check for Updates",
+                f"You're up to date.\nCurrent version: {__version__}",
+            )
+
+    def _show_update_dialog(self, release: updater.ReleaseInfo) -> None:
+        dlg = UpdateAvailableDialog(release, __version__, self)
+        dlg.exec()
+
+    def _show_about(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "About Vintage Radio",
+            "Vintage Radio Music Manager\n"
+            f"Version: {__version__}\n\n"
+            f"Releases: {updater.GITHUB_RELEASES_URL}",
+        )
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        try:
+            if getattr(self, "_mcp_manager", None) is not None and self._mcp_manager.is_running():
+                self._mcp_manager.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     @staticmethod
     def _format_duration(value: Optional[float]) -> str:
         if value is None:
@@ -6682,13 +10116,35 @@ class MainWindow(QtWidgets.QMainWindow):
         table.setItem(row, column, item)
 
 
+class _VintageRadioTooltipStyle(QtWidgets.QProxyStyle):
+    """Lengthen default tooltip hide delay so longer help text stays readable on hover."""
+
+    def styleHint(  # type: ignore[override]
+        self,
+        hint: QtWidgets.QStyle.StyleHint,
+        option: Optional[QtWidgets.QStyleOption] = None,
+        widget: Optional[QtWidgets.QWidget] = None,
+        returnData: Any = None,
+    ) -> int:
+        if hint == QtWidgets.QStyle.StyleHint.SH_ToolTip_FallAsleepDelay:
+            return 25000
+        if hint == QtWidgets.QStyle.StyleHint.SH_ToolTip_WakeUpDelay:
+            return 400
+        return int(super().styleHint(hint, option, widget, returnData))
+
+
 def run_app() -> None:
     # Initialize session logging BEFORE anything else
-    from .session_log import init_session_logging
-    log_path = init_session_logging(app_version="1.0.0")
+    from .session_log import init_session_logging, install_messagebox_session_logging
+    log_path = init_session_logging(app_version=__version__)
+    install_messagebox_session_logging()
     print(f"Vintage Radio GUI starting...")
 
     app = QtWidgets.QApplication(sys.argv)
+    try:
+        app.setStyle(_VintageRadioTooltipStyle(app.style()))
+    except Exception:
+        pass
 
     # Set application icon (radio icon; taskbar/dock)
     icon_path = resource_path("vintage_radio.png")

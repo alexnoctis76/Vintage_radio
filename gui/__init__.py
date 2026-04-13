@@ -7,7 +7,7 @@ and ``import gui`` alone does not require the full stack.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "v0.2.0-beta"
 
 __all__ = [
     "DatabaseManager",

@@ -334,6 +334,7 @@ class TestInstallToPicoWorker:
             root=project_root,
             sd_root=None,
             sd_manager=mock_sd_manager,
+            install_mode="legacy",
         )
         all_args = [call[0][1] for call in mock_mpremote.call_args_list]
         am_wav_copies = [
@@ -352,6 +353,7 @@ class TestInstallToPicoWorker:
             root=project_root,
             sd_root=None,
             sd_manager=mock_sd_manager,
+            install_mode="legacy",
         )
         all_args = [call[0][1] for call in mock_mpremote.call_args_list]
         metadata_copies = [

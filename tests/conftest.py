@@ -271,10 +271,9 @@ def _make_basic_stations():
 class MockBasicHardware(MockHardwareInterface):
     """MockHardwareInterface for basic mode: has discover_stations, query_files_in_folder."""
 
-    def __init__(self, stations=None, folder_99_count=3):
+    def __init__(self, stations=None):
         super().__init__(albums=[], playlists=[])
         self._stations = stations if stations is not None else _make_basic_stations()
-        self._folder_99_count = folder_99_count
         self._known_tracks = {}
 
     def discover_stations(self):
@@ -285,8 +284,6 @@ class MockBasicHardware(MockHardwareInterface):
         return list(self._stations)
 
     def query_files_in_folder(self, folder_num, suppress_errors=False, timeout_ms=500):
-        if folder_num == 99:
-            return self._folder_99_count
         for station in self._stations:
             if station["tracks"] and station["tracks"][0]["folder"] == folder_num:
                 return len(station["tracks"])
@@ -298,7 +295,7 @@ class MockBasicHardware(MockHardwareInterface):
 
 @pytest.fixture
 def mock_basic_hardware():
-    """MockBasicHardware with 2 stations, folder 99 count=3 (advance mode)."""
+    """MockBasicHardware with default two-folder basic stations."""
     return MockBasicHardware()
 
 

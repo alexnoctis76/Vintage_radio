@@ -1,6 +1,7 @@
 """Path helpers for resources and project root. Works from source and when frozen (PyInstaller)."""
 
 import os
+import shutil
 from pathlib import Path
 import sys
 
@@ -31,15 +32,43 @@ def project_root() -> Path:
 _DATA_DIR_NAME = "data"
 
 
+def _migrate_legacy_frozen_data(new_dir: Path) -> None:
+    """One-time migration from legacy frozen location (next to executable).
+
+    Older Windows/Linux packaged builds stored DBs/libraries next to the exe.
+    New builds use a per-user app data directory; copy once if destination is empty.
+    """
+    old_dir = Path(sys.executable).resolve().parent
+    old_db = old_dir / "radio_manager.db"
+    new_db = new_dir / "radio_manager.db"
+    if not old_db.exists() or new_db.exists():
+        return
+    try:
+        shutil.copy2(old_db, new_db)
+        for suffix in ("-wal", "-shm"):
+            src = old_dir / f"radio_manager.db{suffix}"
+            if src.exists():
+                shutil.copy2(src, new_dir / f"radio_manager.db{suffix}")
+        old_libraries_dir = old_dir / "libraries"
+        if old_libraries_dir.is_dir():
+            new_libraries_dir = new_dir / "libraries"
+            new_libraries_dir.mkdir(parents=True, exist_ok=True)
+            for f in old_libraries_dir.iterdir():
+                if f.is_file() and not (new_libraries_dir / f.name).exists():
+                    shutil.copy2(f, new_libraries_dir / f.name)
+    except OSError:
+        # Best-effort migration; app should still start with a fresh database.
+        pass
+
+
 def app_data_dir() -> Path:
     """Writable directory for db, backups, libraries.
 
     When running from source: project_root() / "data" so all DBs live in one
     directory that can be gitignored. Migrates existing DBs from project root
     into data/ once.
-    When frozen (packaged): on macOS uses ~/Library/Application Support/Vintage Radio/
-    so the app bundle is not written to. On Windows/Linux uses the directory
-    containing the executable.
+    When frozen (packaged): use platformdirs user_data_dir() so user data survives
+    app replacement/build cleanup and never writes inside the app bundle/install dir.
     """
     if not getattr(sys, "frozen", False):
         root = project_root()
@@ -80,12 +109,12 @@ def app_data_dir() -> Path:
                 pass
         return data_dir
     try:
-        import platform
-        if platform.system() == "Darwin":
-            import platformdirs
-            path = Path(platformdirs.user_data_dir(appname="Vintage Radio", roaming=False))
-            path.mkdir(parents=True, exist_ok=True)
-            return path
+        import platformdirs
+
+        path = Path(platformdirs.user_data_dir(appname="Vintage Radio", roaming=False))
+        path.mkdir(parents=True, exist_ok=True)
+        _migrate_legacy_frozen_data(path)
+        return path
     except Exception:
         pass
     return Path(sys.executable).resolve().parent
@@ -113,3 +142,30 @@ def subprocess_env() -> dict:
 def resource_path(*parts: str) -> Path:
     """Path to a file under gui/resources."""
     return gui_dir() / "resources" / "/".join(parts)
+
+
+def resolve_ffmpeg_executable() -> str | None:
+    """Return an ffmpeg executable path if available.
+
+    Priority:
+    1) Explicit env override: VINTAGE_RADIO_FFMPEG_EXE
+    2) Bundled executable from imageio-ffmpeg package
+    3) System PATH lookup ("ffmpeg")
+    """
+    override = os.environ.get("VINTAGE_RADIO_FFMPEG_EXE", "").strip()
+    if override and Path(override).exists():
+        return override
+
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and Path(exe).exists():
+            return exe
+    except Exception:
+        pass
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    return None

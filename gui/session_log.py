@@ -30,6 +30,12 @@ from pathlib import Path
 from typing import Optional
 
 
+def format_session_timestamp(now: Optional[datetime.datetime] = None) -> str:
+    """Wall time with milliseconds: ``HH:MM:SS:mmm`` (colon before ms, no duplicate brackets)."""
+    t = now or datetime.datetime.now()
+    return t.strftime("%H:%M:%S") + f":{t.microsecond // 1000:03d}"
+
+
 # ── Module-level state ──────────────────────────────────────────
 _session_log_path: Optional[Path] = None
 _original_stdout = sys.stdout
@@ -49,6 +55,47 @@ def get_session_log_path() -> Optional[Path]:
     return _session_log_path
 
 
+def log_gui_error(title: str, message: str) -> None:
+    """Log a GUI-visible failure (task dialog, message box) to the session log file."""
+    if not _session_log_path:
+        return
+    ts = format_session_timestamp()
+    block = f"{title}\n{message}"
+    try:
+        with open(_session_log_path, "a", encoding="utf-8", newline="\n") as f:
+            for line in block.splitlines() or [block]:
+                f.write(f"{ts} [GUI-ERROR] {line}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+
+
+def install_messagebox_session_logging() -> None:
+    """Route QMessageBox.critical / .warning through the session log (GUI-ERROR).
+
+    Call once after init_session_logging() so user-visible warnings and errors
+    are always captured even when no TaskProgressDialog is involved.
+    """
+    from PyQt6.QtWidgets import QMessageBox
+
+    _orig_critical = QMessageBox.critical
+    _orig_warning = QMessageBox.warning
+
+    @staticmethod
+    def critical(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _orig_critical(parent, title, text, *args, **kwargs)
+
+    @staticmethod
+    def warning(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _orig_warning(parent, title, text, *args, **kwargs)
+
+    QMessageBox.critical = critical  # type: ignore[assignment]
+    QMessageBox.warning = warning  # type: ignore[assignment]
+
+
 def write_session_line(message: str, *, prefix: str = "SETUP") -> None:
     """Append one line directly to the session log file and flush + fsync.
 
@@ -59,7 +106,7 @@ def write_session_line(message: str, *, prefix: str = "SETUP") -> None:
     if not _session_log_path:
         return
     try:
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        ts = format_session_timestamp()
         line = f"{ts} [{prefix}] {message}\n"
         with open(_session_log_path, "a", encoding="utf-8", newline="\n") as f:
             f.write(line)
@@ -111,8 +158,10 @@ def init_session_logging(app_version: str = "dev") -> Path:
     _file_handler = logging.FileHandler(str(_session_log_path), encoding="utf-8")
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                          datefmt="%H:%M:%S")
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
     )
     root_logger = logging.getLogger()
     root_logger.addHandler(_file_handler)
@@ -124,7 +173,10 @@ def init_session_logging(app_version: str = "dev") -> Path:
         console_handler = logging.StreamHandler(_original_stdout)
         console_handler.setLevel(logging.DEBUG)
         console_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+            logging.Formatter(
+                "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            )
         )
         root_logger.addHandler(console_handler)
         print("Verbose debug logging enabled (VINTAGE_RADIO_VERBOSE)")
