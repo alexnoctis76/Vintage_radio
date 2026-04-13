@@ -31,7 +31,12 @@ except ImportError:
     import json
 
 # Import shared constants and interface from radio_core
-from radio_core import HardwareInterface, FADE_IN_S, DF_BOOT_MS
+from radio_core import (
+    HardwareInterface,
+    FADE_IN_S,
+    DF_BOOT_MS,
+    basic_mode_max_folder_for_station_seed,
+)
 
 try:
     import am_wav_loader
@@ -692,9 +697,10 @@ class DFPlayerHardware(HardwareInterface):
     def discover_stations(self):
         """Lazy discovery: seed folders 01–N without per-folder 0x4E (saves RAM and UART).
 
-        N comes from 0x4F (``query_folder_count``), capped at 99. Many modules report a count
-        that **includes a logical root** entry, so we use ``max(1, count - 1)`` for the
-        highest **numbered** MP3 folder to seed. If 0x4F fails, fall back to 01–99.
+        N comes from 0x4F (``query_folder_count``), capped at 99. The raw count is ambiguous
+        (see ``basic_mode_max_folder_for_station_seed``): we probe folder ``min(99, fc)``
+        with 0x4E when possible so two real folders ``01`` + ``02`` are not collapsed to
+        ``max_folder == 1``. If 0x4F fails, fall back to 01–99.
 
         Track lists are not materialized here (that caused memory allocation failures).
         RadioCore hydrates each station on demand via 0x4E when that folder is visited.
@@ -702,21 +708,29 @@ class DFPlayerHardware(HardwareInterface):
         print("BASIC: Discovering stations from DFPlayer SD card...")
         max_folder = 99
         folder_count = self.query_folder_count()
+        fc_parsed = None
+        hi_probe = None
         if folder_count is not None:
             try:
-                fc = int(folder_count)
+                fc_parsed = int(folder_count)
             except (TypeError, ValueError):
-                fc = 0
-            if fc > 1:
-                # Typical: count includes root; playable folders are 01 .. (fc - 1).
-                max_folder = min(99, fc - 1)
-            elif fc == 1:
-                max_folder = 1
-            else:
-                max_folder = 99
+                fc_parsed = 0
+            if fc_parsed >= 2:
+                hi = min(99, fc_parsed)
+                hi_probe = self.query_files_in_folder(
+                    hi, suppress_errors=True, timeout_ms=520
+                )
+                if hi_probe is None:
+                    qc = getattr(self, "query_files_in_folder_consensus", None)
+                    if callable(qc):
+                        hi_probe = qc(hi, suppress_errors=True)
+            max_folder = basic_mode_max_folder_for_station_seed(fc_parsed, hi_probe)
             print(
-                "BASIC: DFPlayer 0x4F folder count={}; seeding stations 01..{:02d} ({} slot(s)).".format(
+                "BASIC: DFPlayer 0x4F folder count={}; hi_folder={} hi_tracks={}; "
+                "seeding stations 01..{:02d} ({} slot(s)).".format(
                     folder_count,
+                    min(99, fc_parsed) if fc_parsed is not None and fc_parsed >= 2 else "-",
+                    hi_probe if hi_probe is not None else "?",
                     max_folder,
                     max_folder,
                 )

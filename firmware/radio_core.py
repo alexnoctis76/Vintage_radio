@@ -272,6 +272,44 @@ class HardwareInterface:
         """
         return []
 
+
+def basic_mode_max_folder_for_station_seed(fc, hi_probe_result):
+    """Highest DFPlayer MP3 folder index (1..99) to seed for basic-mode lazy station discovery.
+
+    Command 0x4F (folder count) is ambiguous: some modules return *N* for playable folders
+    ``01``..``NN``; others return *N+1* (e.g. logical root + ``01``..``NN``). Treating
+    ``fc - 1`` unconditionally breaks the common case ``fc == 2`` with folders ``01`` and
+    ``02`` (only station 1 was seeded, so station advance modulo 1 never left folder 1).
+
+    ``hi_probe_result`` is the 0x4E file count for folder ``min(99, fc)``, or ``None`` if
+    unavailable after retries.
+
+    Returns:
+        ``max_folder`` such that stations ``01`` through ``{max_folder:02d}`` are seeded.
+    """
+    if fc is None:
+        return 99
+    try:
+        fc = int(fc)
+    except (TypeError, ValueError):
+        return 99
+    if fc <= 0:
+        return 99
+    if fc == 1:
+        return 1
+    hi = min(99, fc)
+    if hi_probe_result is not None:
+        try:
+            n = int(hi_probe_result)
+        except (TypeError, ValueError):
+            n = -1
+        if n > 0:
+            return hi
+        if n == 0:
+            return min(99, fc - 1)
+    return hi
+
+
 # ===========================
 #      CORE STATE MACHINE
 # ===========================
@@ -1035,8 +1073,15 @@ class RadioCore:
     #   TRACK NAVIGATION
     # ===========================
     
-    def _next_track(self):
-        """Move to next track."""
+    def _next_track(self, from_track_end=False):
+        """Move to next track.
+
+        from_track_end: True when advancing because the current track finished playing
+        (hardware / UART end). Used so basic station-shuffle can advance to the next
+        station after the last entry in ``shuffle_tracks`` without treating an explicit
+        ``single_tap`` on the last shuffle step as "station complete" (tap should wrap
+        within the same shuffled station).
+        """
         old_track = self.current_track
         old_album = self.current_album_index
         folder_wrap = False
@@ -1046,6 +1091,26 @@ class RadioCore:
             if n <= 0:
                 self.hw.log("_next_track: No shuffle tracks available")
                 return
+            if (
+                from_track_end
+                and self.basic_mode
+                and self._shuffle_source_type == "station"
+                and n > 0
+                and self.shuffle_index >= n - 1
+            ):
+                if self.advance_next_station:
+                    self.hw.log(
+                        "Track finished: finished shuffled station, advancing to next station"
+                    )
+                    self._next_album(from_auto_advance=True)
+                    return
+                if not self.loop_stations:
+                    self.hw.log(
+                        "Track finished: end of shuffled station (no loop), stopping"
+                    )
+                    self.hw.stop()
+                    self.is_playing = False
+                    return
             self.shuffle_index = (self.shuffle_index + 1) % n
             self.current_track = self.shuffle_index + 1
         elif self.mode == MODE_RADIO:
@@ -1302,24 +1367,9 @@ class RadioCore:
                     self._handle_basic_track_not_found(folder, tn)
                     return
 
-        # Basic mode: end of station shuffle (before sequential branch)
-        if self.basic_mode and self.mode == MODE_SHUFFLE and self._shuffle_entry_count() > 0:
-            n = self._shuffle_entry_count()
-            if n > 0 and self.shuffle_index >= n - 1:
-                if self._shuffle_source_type in ('album', 'playlist', 'station'):
-                    if self.advance_next_station:
-                        self.hw.log(
-                            "Track finished: finished shuffled station, advancing to next station"
-                        )
-                        self._next_album(from_auto_advance=True)
-                        return
-                    if not self.loop_stations:
-                        self.hw.log(
-                            "Track finished: end of shuffled station (no loop), stopping"
-                        )
-                        self.hw.stop()
-                        self.is_playing = False
-                        return
+        # Basic mode: end of station shuffle is handled inside _next_track(from_track_end=True)
+        # so the decision runs with the same shuffle_index state as a manual single_tap
+        # (which calls _next_track(from_track_end=False) and should wrap, not change station).
 
         # Basic mode: end of station in sequential (playlist) mode
         if self.basic_mode and self.mode == MODE_PLAYLIST:
@@ -1338,7 +1388,7 @@ class RadioCore:
                     return
 
         self.hw.log("Track finished, auto-advancing")
-        self._next_track()
+        self._next_track(from_track_end=True)
     
     def _advance_radio_track(self):
         """Advance to next track in radio mode based on virtual time.

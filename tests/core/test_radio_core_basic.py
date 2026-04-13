@@ -314,6 +314,56 @@ class TestBasicStationCycleShuffle:
         assert rc.mode == MODE_SHUFFLE
         assert rc._shuffle_source_type == "station"
 
+    def test_station_shuffle_single_tap_on_last_wraps_same_station(self):
+        """Explicit next (single_tap) at last shuffle step wraps; does not auto-advance station."""
+        tracks = [
+            {"id": i, "title": f"T{i}", "folder": 1, "track_number": i, "duration": 1.0}
+            for i in range(1, 4)
+        ]
+        s1 = {"id": 1, "name": "S1", "tracks": tracks}
+        s2 = {
+            "id": 2,
+            "name": "S2",
+            "tracks": [{"id": 99, "title": "x", "folder": 2, "track_number": 1, "duration": 1.0}],
+        }
+        hw = MockBasicHardware(stations=[s1, s2])
+        rc = RadioCore(hw, basic_mode=True)
+        rc.init(skip_initial_playback=True)
+        rc.playlists = [s1, s2]
+        rc.mode = MODE_SHUFFLE
+        rc._shuffle_source_type = "station"
+        rc.current_album_index = 0
+        rc.shuffle_tracks = list(tracks)
+        rc.shuffle_index = 2
+        rc.current_track = 3
+        rc._single_tap()
+        assert rc.current_album_index == 0
+        assert rc.shuffle_index == 0
+        assert rc.current_track == 1
+
+    def test_station_shuffle_natural_end_stops_when_no_advance_no_loop(self):
+        tracks = [
+            {"id": i, "title": f"T{i}", "folder": 1, "track_number": i, "duration": 1.0}
+            for i in range(1, 3)
+        ]
+        s1 = {"id": 1, "name": "S1", "tracks": tracks}
+        hw = MockBasicHardware(stations=[s1])
+        rc = RadioCore(hw, basic_mode=True)
+        rc.init(skip_initial_playback=True)
+        rc.playlists = [s1]
+        rc.mode = MODE_SHUFFLE
+        rc._shuffle_source_type = "station"
+        rc.current_album_index = 0
+        rc.shuffle_tracks = list(tracks)
+        rc.shuffle_index = 1
+        rc.current_track = 2
+        rc.power_on = True
+        rc.is_playing = True
+        rc.advance_next_station = False
+        rc.loop_stations = False
+        rc.on_track_finished()
+        assert any(c[0] == "stop" for c in hw.calls)
+
     def test_station_shuffle_long_press_starts_new_station_at_folder_track_001(self):
         tracks = [
             {"id": i, "title": f"T{i}", "folder": 1, "track_number": i, "duration": 1.0}

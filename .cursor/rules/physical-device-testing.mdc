@@ -14,6 +14,7 @@ Run **`run_full_acceptance`** via the `vintage_radio_debug_request` MCP tool (me
 ## Cursor agent — physical device is mandatory
 
 - **Always run the full physical-device acceptance** (`run_full_acceptance` / `python agent_workshop/run_full_acceptance.py`) when you change anything that affects the Pico, DFPlayer path, `radio_core`, acceptance harness (`mcp_device_acceptance.py`), or device/MCP wiring — **in the same session**, before you tell the user the work is done.
+- **MCP is mandatory for edge cases, not optional:** after any such change, drive the **Vintage Radio MCP debug server** (TCP `127.0.0.1:8765`) in the same session — at minimum `ping` → `get_connection_state` → `device_connect` (if needed) → **`run_full_acceptance`** (or `run_acceptance_suite` with a profile that covers the touched behavior when you are iterating, then **`run_full_acceptance`** before sign-off). Exercise gestures and modes the diff affects (e.g. station shuffle end-of-station, long_press station advance, revert paths), not only the happy path. **Host `pytest` supplements MCP; it does not replace it.**
 - **Host `pytest` alone is never sufficient** for those changes; it only supplements. If Vintage Radio is not running, MCP is down, or COM is unavailable, **state that explicitly** and treat the task as **blocked** until the suite can run — do not imply verification without it.
 - If the suite **FAIL**s, capture the failed step names and artifacts under `agent_workshop/reports/` (or `full_acceptance_report.json`) in your reply.
 
