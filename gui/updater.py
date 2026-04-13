@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import zipfile
@@ -26,9 +26,13 @@ GITHUB_RELEASES_LATEST_URL = (
     "https://api.github.com/repos/alexnoctis76/Vintage_radio/releases/latest"
 )
 GITHUB_RELEASES_LIST_URL = (
-    "https://api.github.com/repos/alexnoctis76/Vintage_radio/releases?per_page=30"
+    "https://api.github.com/repos/alexnoctis76/Vintage_radio/releases?per_page=100"
 )
 GITHUB_RELEASES_URL = "https://github.com/alexnoctis76/Vintage_radio/releases"
+GITHUB_REPO_SLUG = "alexnoctis76/Vintage_radio"
+# Must match filenames produced by release packaging (see .github/workflows/build-release.yml).
+PREFERRED_WINDOWS_ASSET = "Vintage-Radio-Windows.zip"
+PREFERRED_MACOS_ASSET = "Vintage.Radio.dmg"
 
 
 @dataclass
@@ -111,12 +115,60 @@ def _newest_release_from_list(items: list) -> Optional[ReleaseInfo]:
     return best
 
 
-def check_latest_release(user_agent: str = "VintageRadio") -> Optional[ReleaseInfo]:
-    """Fetch newest published release from GitHub (includes prereleases)."""
+def _newest_release_newer_than(items: list, current_version: str) -> Optional[ReleaseInfo]:
+    """Semantically newest release whose tag is strictly newer than *current_version*."""
+    best: Optional[ReleaseInfo] = None
+    cur = (current_version or "").strip()
+    if not cur:
+        return _newest_release_from_list(items)
+    for item in items:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        info = _release_info_from_api_dict(item)
+        if info is None:
+            continue
+        if not is_newer(info.tag_name, cur):
+            continue
+        if best is None or is_newer(info.tag_name, best.tag_name):
+            best = info
+    return best
+
+
+def check_latest_release(
+    user_agent: str = "VintageRadio",
+    *,
+    current_version: Optional[str] = None,
+) -> Optional[ReleaseInfo]:
+    """Fetch a published GitHub release to offer as an update.
+
+    Uses the **releases list** (``per_page=100``) and semver. When
+    *current_version* is set (recommended), returns only the newest release whose
+    tag is **strictly greater** than that version — not merely the newest tag on
+    the repo (which could equal the running build).
+
+    GitHub's ``/releases/latest`` is used only as a fallback if the list call fails.
+    """
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": user_agent,
     }
+    try:
+        req = Request(GITHUB_RELEASES_LIST_URL, headers=headers)
+        with _urlopen_with_certs(req, timeout=20) as resp:
+            raw = resp.read()
+        items = json.loads(raw.decode("utf-8", errors="replace"))
+        if isinstance(items, list) and items:
+            if (current_version or "").strip():
+                info = _newest_release_newer_than(items, current_version.strip())
+            else:
+                info = _newest_release_from_list(items)
+            if info is not None:
+                return info
+    except HTTPError:
+        pass
+    except Exception:
+        pass
+
     try:
         req = Request(GITHUB_RELEASES_LATEST_URL, headers=headers)
         with _urlopen_with_certs(req, timeout=20) as resp:
@@ -125,6 +177,9 @@ def check_latest_release(user_agent: str = "VintageRadio") -> Optional[ReleaseIn
         if isinstance(data, dict):
             info = _release_info_from_api_dict(data)
             if info is not None:
+                cur = (current_version or "").strip()
+                if cur and not is_newer(info.tag_name, cur):
+                    return None
                 return info
     except HTTPError as e:
         if e.code != 404:
@@ -132,43 +187,107 @@ def check_latest_release(user_agent: str = "VintageRadio") -> Optional[ReleaseIn
     except Exception:
         return None
 
-    try:
-        req = Request(GITHUB_RELEASES_LIST_URL, headers=headers)
-        with _urlopen_with_certs(req, timeout=20) as resp:
-            raw = resp.read()
-        items = json.loads(raw.decode("utf-8", errors="replace"))
-        if not isinstance(items, list):
-            return None
-        return _newest_release_from_list(items)
-    except Exception:
-        return None
+    return None
+
+
+def _platform_matcher() -> Optional[str]:
+    sys_name = platform.system().lower()
+    if "windows" in sys_name:
+        return "windows"
+    if "darwin" in sys_name:
+        return "macos"
+    return None
+
+
+def _preferred_asset_name_for_platform() -> Optional[str]:
+    m = _platform_matcher()
+    if m == "windows":
+        return PREFERRED_WINDOWS_ASSET
+    if m == "macos":
+        return PREFERRED_MACOS_ASSET
+    return None
 
 
 def get_platform_asset(assets: list[dict]) -> Optional[dict]:
-    """Pick the expected release asset for this platform."""
-    sys_name = platform.system().lower()
-    if "windows" in sys_name:
-        matcher = "windows"
-    elif "darwin" in sys_name:
-        matcher = "macos"
-    else:
+    """Pick the expected release asset for this platform.
+
+    Prefer the canonical ``Vintage-Radio-Windows.zip`` / ``Vintage-Radio-macOS.zip``
+    names. A naive substring match (first asset containing "windows") can pick an
+    older or auxiliary zip attached to the same release.
+    """
+    matcher = _platform_matcher()
+    if matcher is None:
         return None
+    preferred = (_preferred_asset_name_for_platform() or "").lower()
+    candidates: list[dict] = []
     for asset in assets:
         name = str(asset.get("name") or "").lower()
-        if matcher in name and name.endswith(".zip"):
-            return asset
-    return None
+        if not name.endswith(".zip"):
+            continue
+        if matcher not in name:
+            continue
+        candidates.append(asset)
+
+    if not candidates:
+        return None
+
+    by_lower = {str(a.get("name") or "").lower(): a for a in candidates}
+    if preferred and preferred in by_lower:
+        return by_lower[preferred]
+
+    vintage = [
+        a
+        for a in candidates
+        if str(a.get("name") or "").lower().startswith("vintage-radio-")
+    ]
+    if vintage:
+        vintage.sort(key=lambda a: len(str(a.get("name") or "")))
+        return vintage[0]
+
+    candidates.sort(key=lambda a: len(str(a.get("name") or "")))
+    return candidates[0]
+
+
+def direct_download_url_for_release(tag_name: str) -> Optional[str]:
+    """URL for the official installer zip **for this exact release tag** only.
+
+    Always uses ``/releases/download/{tag}/{zip}``. Do not use release ``assets``
+    ``browser_download_url`` for installers — those blobs can be mis-ordered or
+    duplicated across releases; the tag in the path is the single source of truth.
+    """
+    preferred = official_installer_zip_basename()
+    if not (preferred and tag_name.strip()):
+        return None
+    t = quote(tag_name.strip(), safe="")
+    f = quote(preferred, safe="")
+    return f"https://github.com/{GITHUB_REPO_SLUG}/releases/download/{t}/{f}"
+
+
+def installer_download_url_for_release(release: ReleaseInfo) -> Optional[str]:
+    """Direct installer download URL tied to *release.tag_name* (Windows / macOS)."""
+    return direct_download_url_for_release(release.tag_name)
+
+
+def official_installer_zip_basename() -> Optional[str]:
+    """Basename of the official release zip for this OS (``Vintage-Radio-*.zip``)."""
+    return _preferred_asset_name_for_platform()
 
 
 def download_update(
     url: str,
     dest_dir: Path,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    *,
+    dest_filename: Optional[str] = None,
 ) -> Path:
-    """Download update zip with optional progress callback."""
+    """Download update zip with optional progress callback.
+
+    *dest_filename* — optional local filename (avoids stale collisions when the URL
+    path is the same across releases, e.g. ``Vintage-Radio-Windows.zip``).
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     parsed = urlparse(url)
-    file_name = Path(parsed.path).name or "vintage-radio-update.zip"
+    file_name = dest_filename or Path(parsed.path).name or "vintage-radio-update.zip"
     target = dest_dir / file_name
     req = Request(url, headers={"User-Agent": "VintageRadio-Updater"})
     with _urlopen_with_certs(req, timeout=60) as resp:
@@ -195,10 +314,16 @@ def _extract_zip(zip_path: Path, extract_dir: Path) -> None:
 
 
 def _find_windows_source_dir(extract_dir: Path) -> Optional[Path]:
-    for p in extract_dir.rglob("Vintage Radio.exe"):
-        if p.is_file():
-            return p.parent
-    return None
+    """Return the folder that contains the *shallowest* ``Vintage Radio.exe``.
+
+    ``rglob`` order is not guaranteed; a malformed zip could contain nested
+    duplicates — the real bundle keeps the exe near the extract root.
+    """
+    hits = [p for p in extract_dir.rglob("Vintage Radio.exe") if p.is_file()]
+    if not hits:
+        return None
+    hits.sort(key=lambda p: (len(p.parts), str(p)))
+    return hits[0].parent
 
 
 def _find_macos_source_app(extract_dir: Path) -> Optional[Path]:

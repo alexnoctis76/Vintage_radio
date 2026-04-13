@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import tempfile
 from pathlib import Path
@@ -33,6 +34,18 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.release_info = release_info
         self.current_version = current_version
         self._asset = updater.get_platform_asset(self.release_info.assets)
+        self._download_url = (
+            str(self._asset.get("browser_download_url") or "").strip()
+            if self._asset
+            else ""
+        )
+        if not self._download_url:
+            self._download_url = (
+                updater.direct_download_url_for_release(self.release_info.tag_name) or ""
+            )
+        base = updater.official_installer_zip_basename() or "update.zip"
+        safe_tag = re.sub(r"[^\w.\-+]+", "_", self.release_info.tag_name.strip()) or "release"
+        self._cache_dest_name = f"{Path(base).stem}-{safe_tag}{Path(base).suffix}"
         self._signals = _DownloadSignals()
         self._signals.progress.connect(self._on_progress)
         self._signals.finished.connect(self._on_download_finished)
@@ -59,7 +72,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.progress.setVisible(False)
 
         self.download_btn = QtWidgets.QPushButton(
-            "Download & Install" if self._asset is not None else "Open Download Page"
+            "Download & Install" if self._download_url else "Open Download Page"
         )
         self.later_btn = QtWidgets.QPushButton("Later")
         self.download_btn.clicked.connect(self._on_download_clicked)
@@ -78,15 +91,12 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         layout.addLayout(btn_row)
 
     def _on_download_clicked(self) -> None:
-        if self._asset is None:
+        if not self._download_url:
             QDesktopServices.openUrl(QUrl(self.release_info.html_url or updater.GITHUB_RELEASES_URL))
             self.accept()
             return
 
-        url = str(self._asset.get("browser_download_url") or "").strip()
-        if not url:
-            QtWidgets.QMessageBox.warning(self, "Updater", "No downloadable asset URL was found.")
-            return
+        url = self._download_url
 
         self.download_btn.setEnabled(False)
         self.later_btn.setEnabled(False)
@@ -101,7 +111,12 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
                 )
                 base = Path(cache_root) if cache_root else Path(tempfile.gettempdir()) / "VintageRadio"
                 cache_dir = base / "update"
-                zip_path = updater.download_update(url, cache_dir, progress_cb=self._signals.progress.emit)
+                zip_path = updater.download_update(
+                    url,
+                    cache_dir,
+                    progress_cb=self._signals.progress.emit,
+                    dest_filename=self._cache_dest_name,
+                )
                 self._signals.finished.emit(str(zip_path))
             except Exception as e:
                 self._signals.failed.emit(str(e))

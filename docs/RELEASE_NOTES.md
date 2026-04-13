@@ -6,55 +6,51 @@ Desktop application for managing your music library and syncing it to a vintage-
 
 # Release summary — **v0.2.1-beta**
 
-> **Note.** [VLC media player](https://www.videolan.org/vlc/) is required for full functionality (conversion to MP3 and best emulator seeking). FFmpeg can be used as a fallback for conversion when VLC is not installed.
+> **Conversion and audio tools.** Release builds ship with **FFmpeg** bundled; the app **prefers FFmpeg** for MP3 conversion when syncing to SD. You **do not need to install VLC** for conversion to work.
 
-## Basic mode (unchanged direction)
+## Your music in the app (library organizer)
 
-**Basic mode** remains the main architecture: `firmware/pico/main_basic.py` and `RadioCore(..., basic_mode=True)` with **stations derived from the DFPlayer / SD folder layout**, not a full desktop-only metadata graph. This release tightens **playback and visit-mode behavior** on the Pico (fewer spurious track advances, clearer DFPlayer folder handling) and improves **host-side** SD workflows below.
+The app gives you a full **library organizer**: import and browse tracks, build **stations** (the folders that become `01`, `02`, … on the SD card), and use **albums** and **playlists** to group and order music on the desktop. You can **drag songs** inside albums and playlists to **reorder** playback order, and drag from **File Explorer** into collections.
 
-### How basic mode differs from advanced mode
+**Bring an existing folder layout in one step:** you can **drag entire folders** (or select many folders at once) from Explorer into the **Stations** area. If your music is already organized on disk—one folder per “station”—open the parent folder, select all of those station folders, and drag them in; the app adds the structure without you recreating it by hand.
 
-| | **Basic mode** | **Advanced mode** |
-|---|----------------|-------------------|
-| **Discovery** | Stations from **UART** to the DFPlayer (**0x4F** folder count, **0x4E** files per folder) in `discover_stations()`, via `_load_data_basic()` in `radio_core.py`. The card’s **folder layout** is the source of truth. | Libraries from **metadata**: `get_albums()` / `get_playlists()` and paths shaped by **JSON / app sync**. |
-| **SD workflow** | Prepare folders `01`…, optional **folder 99** for flags. Swap SD cards without a new firmware build for every library edit; discovery on **cold boot**. | Richer pipeline; card content is expected to match **prepared metadata**. |
-| **UX / features** | **No album mode** in the same sense—station playback, shuffle modes, radio, folder **99** flags. **Folders = stations.** | Full **album + playlist** flows and mode cycling. |
+## How the radio uses the SD card
 
-### Trade-offs (still relevant)
-
-- **Boot / UART / RAM:** Discovery builds per-track state from DFPlayer-reported counts; very large libraries increase time and RAM use.
-- **Filesystem quirks:** Stray files (e.g. `._*` from macOS) can skew counts—use the app’s sync path that strips junk when preparing cards.
-- **SD swap without reboot:** Until a fingerprint/refresh step exists, prefer **cold boot** after swapping cards so discovery matches the new card.
+The recommended device workflow is **basic mode**: the radio discovers **stations from the DFPlayer / SD folder layout** (`01`, `02`, …). The card’s folders are the source of truth on boot. After a big one-time sync, **swap cards** when you like; a **cold boot** after swapping helps the radio match the new card.
 
 ---
 
 ## What’s new in v0.2.1-beta
 
-### Experimental: clean SD disk image (Windows)
+### Experimental: SD image sync (Windows)
 
-- **Build a FAT32 `.img` from your library** (with optional “prepare on this PC” staging) and **flash it to a physical SD card** from the app.
-- **UAC elevation** only for the raw write step (you do not need to run the whole app as Administrator).
-- **Removable media:** Windows cannot “offline” SD/USB the same way as internal disks; the app **locks and dismounts volumes** (`FSCTL_LOCK_VOLUME` / `FSCTL_DISMOUNT_VOLUME`) before writing to `\\.\PhysicalDriveN`, and uses **Win32 `WriteFile`** for reliable raw writes.
-- **Wizard** lists **USB and MMC** disks only (internal NVMe/SATA fixed disks are filtered out), shows **size and volume labels**, and supports **“flash only”** to reuse the last built image for faster retesting.
-- **Progress and errors** are clearer (staging vs image build vs flash); **session log** captures GUI errors including message boxes.
+**Experimental SD image sync** builds a **FAT32 disk image** of your station layout and **writes it straight to the SD card** (after a Windows security prompt for that step only). You can optionally **prepare everything on this PC first**, then flash—so the card stays untouched until you’re ready.
 
-### MCP debug and physical acceptance (host)
+**Why use it**
 
-- **TCP debug server** (optional) for automation: ping, device connect, serial tail, **line-in analysis**, and a **full device acceptance** suite driven against the real Pico (basic mode).
-- **`gui/services/serial_debug`** and scripts under **`scripts/`** (e.g. MCP bridge, physical check helpers) support CI-style checks from the desktop.
+- **Much faster than a “clean everything and copy again” normal sync** when you have a **very large library**. A full normal sync can take **hours**; image sync is aimed at getting a **fresh card** ready in **far less time** for that first big load.
+- After that first pass, use **normal sync** for **small, day-to-day updates**—add or change a few tracks without redoing the whole job.
 
-### Firmware and `radio_core`
+The card is formatted as **one FAT32 volume using the full size of the SD card**, so you keep **room to grow**. Optional **“flash last image only”** skips rebuild when you already have a matching cached image for retests.
 
-- Continued improvements to **`dfplayer_hardware.py`**, **`main_basic.py`**, **`main.py`**, and **`radio_core.py`** for basic-mode station discovery, playback, and visit/shuffle edge cases; IPC components under **`firmware/pico/components/`** (e.g. `vintage_radio_ipc`, AM WAV loader path).
+**Safety and clarity**
 
-### Desktop quality of life
+- The wizard focuses on **USB / memory-card style** drives, shows **sizes and labels**, and explains what you’re about to erase.
+- Progress and messages separate **prepare**, **build image**, and **flash**; problems show in the **session log** as well as on screen.
 
-- **Updater** UI hook for checking GitHub releases (see **Help** / version flows in-app).
-- **`docs/REPO_STRUCTURE.md`** and README tweaks for navigating the repo.
+### Library and sync quality of life
 
-### Tests
+- **Folder drag-and-drop into Stations** — see *Your music in the app* above.
+- **Sync progress** — long syncs report status more clearly so the window doesn’t look stuck.
 
-- Extended coverage for **`radio_core`**, **`sd_manager`**, SD image helpers, MCP, and widgets used in the new flows.
+### Updates from inside the app
+
+- **Check for updates** from the app (see **Help** / version area).
+- **Update notifications** — when a newer release is available, you’ll be **notified after launch** (you can also check manually anytime).
+
+### Radio firmware and playback
+
+- Further fixes and polish for **basic-mode** playback on the Pico (station discovery, DFPlayer handling, and edge cases around track changes and visit/shuffle behavior).
 
 ---
 
@@ -62,66 +58,18 @@ Desktop application for managing your music library and syncing it to a vintage-
 
 ---
 
-## Previous release highlights (v0.2.0-beta and earlier)
-
-## Latest Changes (historical)
-
-### Emulator (formerly Test Mode)
-
-- **Renamed** "Test Mode" to "Emulator" throughout the app for clarity.
-- **Fixed radio button playback** - Mode switches triggered by the radio face button (tap+hold gestures) now correctly play audio. Previously, the 500ms tap-resolution timer caused the mode switch to fire asynchronously, and the pending playback was never executed.
-- **Fixed "Playback failed to start" false alarm** - The emulator's `play_track()` now returns proper status values so RadioCore no longer logs misleading failure messages when playback is queued for AM overlay sequencing.
-
-### Drag-and-Drop Improvements
-
-- **Users can now drag songs in playlists and albums to reorder** - Dragging songs to reorder within an album or playlist now possible. The radio will play them in the order they appear.
-- **Existing library songs can be added to collections** - Dragging folders from the file explorer into an album or playlist now adds songs that already exist in the library, instead of silently skipping them.
-
-### SD Sync & Metadata
-
-- **Accurate sync progress bar** - The sync progress dialog now reports real-time status across three distinct phases (scan, copy/convert, finalize) instead of jumping or stalling.
-- **Reduced metadata size (~67%)** - Removed the legacy `folders` key, `hash`, and `original_file` fields from `radio_metadata.json`. Added the `duration` field. This brings metadata from ~70 KB down to ~23 KB, preventing memory issues on the Pico.
-
-### Device Debug Console
-
-- **Removed "Query Device" button** - It was intrusive (interrupted firmware via Ctrl+C) and redundant with stream parsing.
-- **"Save Session Log"** - Replaced "View Debug Log" (which tried to read from the device) with a button that saves the local PC-side console output to a file.
-- **Fixed serial commands** - Refactored multi-line commands (List Files, Check Firmware Status, Get Status) to single-line MicroPython-compatible commands to prevent serial garbling.
-- **MicroPython compatibility** - Replaced CPython-only APIs (`os.getfree`, `os.path.isfile`, `.title()`) with MicroPython equivalents (`gc.mem_free()`, `os.stat()`, string literals).
-- **Improved text readability** - Changed info label color from unreadable light blue to dark gray.
-
-### Firmware (Pico / Pi)
-
-- **Deduplicated metadata parsing** - Both `dfplayer_hardware.py` and `pi_hardware.py` now parse the new streamlined metadata format and handle errors per-collection instead of failing entirely.
-- **Fixed `.title()` crash on MicroPython** - Replaced `ctype.title()` with a compatible string literal.
-
-### Database
-
-- **Robust schema migration** - Added `_ensure_sort_order_columns()` which runs after all migrations to guarantee the `sort_order` column exists, regardless of stored schema version. This prevents the `no such column: sort_order` startup crash.
-
----
-
-## First Release Highlights
-
-- **Music library** - Import and organize audio files (MP3, FLAC, WAV, OGG, etc.) with metadata (title, artist, duration).
-- **Albums & playlists** - Create and edit albums and playlists with drag-and-drop.
-- **SD card sync** - Sync your library to SD with optional conversion to MP3 for DFPlayer Mini-compatible devices.
-- **Emulator** - Emulate the radio on your PC: dial, volume, power, and playback (album, playlist, shuffle, radio stations).
-- **Radio mode** - Virtual stations with continuous playback and an AM-style tuning experience.
-- **Standalone builds** - No Python install needed: run the included Windows or macOS app from the release assets.
-
 ## Downloads
 
-- **Windows** - Unzip `Vintage-Radio-Windows.zip`, open the `Vintage Radio` folder, and run `Vintage Radio.exe`.
-- **macOS** - Unzip `Vintage-Radio-macOS.zip` and run the app inside the folder.
+- **Windows** — Unzip `Vintage-Radio-Windows.zip`, open the `Vintage Radio` folder, and run `Vintage Radio.exe`.
+- **macOS** — Unzip `Vintage-Radio-macOS.zip` and run the app inside the folder.
 
-## Before You Start
+## Before you start
 
-- **File conversion (non-MP3 to MP3):** For converting FLAC, WAV, OGG, etc. when syncing to SD, you need **one of**: [VLC](https://www.videolan.org/vlc/) (recommended) or [FFmpeg](https://ffmpeg.org/download.html) on your system. Without either, only MP3 files can be synced.
-- **From source:** Python 3.8+, dependencies in `requirements.txt`. See the README for install and run instructions.
+- **MP3 conversion:** In **release builds**, **FFmpeg is included**; you don’t need a separate FFmpeg or VLC install for typical sync-to-SD conversion.
+- **From source:** Use Python 3.8+ and `requirements.txt` as in the README. If you run without the bundled binary, ensure FFmpeg is available on your `PATH` where the app expects it.
 
 ## Documentation
 
-- Main [README](README.md) - Setup, usage, and building from source.
-- [Pi setup](docs/README_Pi.md) - Running on Raspberry Pi.
-- [RP2040](docs/README_RP2040.md) - RP2040 firmware notes.
+- Main [README](README.md) — setup, usage, and building from source.
+- [Pi setup](docs/README_Pi.md) — running on Raspberry Pi.
+- [RP2040](docs/README_RP2040.md) — RP2040 firmware notes.
