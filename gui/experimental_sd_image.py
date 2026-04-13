@@ -241,8 +241,13 @@ def run_experimental_sd_disk_image_export(
     """Create a FAT32 image and copy *sd_root* into it."""
     sd_root = Path(sd_root).resolve()
     nfiles = len([p for p in sd_root.rglob("*") if p.is_file()])
+    content_size = suggest_image_size_bytes(sd_root)
     if size_bytes is None:
-        size_bytes = suggest_image_size_bytes(sd_root)
+        size_bytes = content_size
+    elif size_bytes < content_size:
+        # Caller passed a disk size that is somehow smaller than the content — fall back
+        # to the content-derived size rather than silently producing a truncated image.
+        size_bytes = content_size
     ok, err = create_fat32_image_file(image_path, size_bytes)
     if not ok:
         try:

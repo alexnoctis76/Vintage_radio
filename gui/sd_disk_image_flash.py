@@ -15,11 +15,15 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Chunk size for raw writes (bytes). Must be a multiple of 512 for some APIs.
 _WRITE_CHUNK_BYTES = 1024 * 1024
+
+# Pre-allocated zero block for zero-skip comparison (avoids per-chunk allocation).
+_ZERO_CHUNK = bytes(_WRITE_CHUNK_BYTES)
 
 
 def _win32_write_physical_disk(fd: int, data: bytes) -> None:
@@ -62,6 +66,73 @@ def _write_raw_to_disk_fd(fd: int, data: bytes) -> None:
         _win32_write_physical_disk(fd, data)
     else:
         os.write(fd, data)
+
+
+def _seek_disk_fd_cur(fd: int, offset: int) -> None:
+    """Advance the disk file-descriptor position by *offset* bytes without writing.
+
+    Used by the zero-skip optimisation: full-disk FAT32 images are mostly sparse
+    (empty clusters are zeros); seeking past them instead of writing means we only
+    touch the sectors that actually contain music data and FAT structures.
+
+    On Windows we use ``SetFilePointerEx`` on the Win32 HANDLE so that the position
+    is shared with the subsequent ``WriteFile`` call in ``_win32_write_physical_disk``.
+    On other platforms a plain ``os.lseek`` is sufficient.
+    """
+    if platform.system() == "Windows":
+        import msvcrt
+        from ctypes import c_int64, c_longlong
+
+        h = msvcrt.get_osfhandle(fd)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        new_pos = c_int64(0)
+        FILE_CURRENT = 1
+        if not k32.SetFilePointerEx(h, c_longlong(offset), ctypes.byref(new_pos), FILE_CURRENT):
+            raise ctypes.WinError(ctypes.get_last_error())
+    else:
+        os.lseek(fd, offset, os.SEEK_CUR)
+
+
+def _emit_disk_write_progress(
+    written: int,
+    total: int,
+    message: str,
+    *,
+    progress_callback: Optional[Callable[[int, int, str], None]],
+    progress_file_path: Optional[Path],
+) -> None:
+    """Mirror progress to GUI callback and/or a JSON sidecar (elevated child → parent)."""
+    if progress_callback:
+        progress_callback(written, total, message)
+    if progress_file_path is not None:
+        try:
+            p = Path(progress_file_path)
+            payload = json.dumps(
+                {"written": written, "total": total, "message": message},
+                ensure_ascii=False,
+            )
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(payload + "\n", encoding="utf-8")
+            tmp.replace(p)
+        except OSError:
+            pass
+
+
+def _read_uac_progress_file(path: Path) -> Optional[Tuple[int, int, str]]:
+    """Read JSON written by elevated disk-write process (atomic replace)."""
+    try:
+        if not path.is_file():
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            return None
+        data = json.loads(text)
+        w = int(data.get("written", 0))
+        t = int(data.get("total", 0))
+        msg = str(data.get("message", ""))
+        return w, t, msg
+    except (OSError, ValueError, TypeError):
+        return None
 
 # Cached FAT32 image under ``app_data_dir()/sd_image_cache/`` for reuse / faster flash testing.
 LAST_CACHED_SD_IMAGE_FILENAME = "vintage_radio_sd_last.img"
@@ -527,12 +598,23 @@ def _ps_escape_single_quoted(s: str) -> str:
     return s.replace("'", "''")
 
 
-def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple[bool, str]:
+def _write_image_via_uac_subprocess(
+    image_path: Path,
+    disk_number: int,
+    *,
+    image_size: int,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Tuple[bool, str]:
     """Relaunch the write step with Administrator rights (UAC prompt).
 
     Elevated ``Start-Process`` does *not* inherit the PowerShell session's working
     directory; without ``-WorkingDirectory``, ``python -m gui....`` often runs from
     ``System32`` and fails to import the project (exit code 1, no visible output).
+
+    The elevated helper writes JSON progress to a temp ``*.progress.json`` file;
+    we ``Popen`` the launcher PowerShell and poll that file so the GUI shows bytes
+    written (same as the in-process admin path).
     """
     project_root = Path(__file__).resolve().parent.parent
     launcher = Path(sys.executable).resolve()
@@ -554,23 +636,30 @@ def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple
     # PowerShell reports AmbiguousParameterSet for that combination).
     token = secrets.token_hex(8)
     diag_log = Path(tempfile.gettempdir()) / f"vintage_radio_sd_uac_{token}.log"
+    progress_path = Path(tempfile.gettempdir()) / f"vintage_radio_sd_uac_{token}.progress.json"
     try:
         diag_log.write_text("", encoding="utf-8")
     except OSError:
         pass
+    try:
+        progress_path.unlink(missing_ok=True)
+    except OSError:
+        pass
     lg = _ps_escape_single_quoted(str(diag_log))
+    pg = _ps_escape_single_quoted(str(progress_path))
 
     if frozen:
+        # Single pre-quoted string so CreateProcess gets properly quoted tokens.
         arg_line = (
-            "$p = Start-Process -FilePath $exe -ArgumentList @("
-            "'--vr-write-sd-disk',$img,$disk,$logPath) "
+            "$argStr = '--vr-write-sd-disk \"' + $img + '\" ' + $disk + ' \"' + $logPath + '\" \"' + $progressPath + '\"'\n"
+            "$p = Start-Process -FilePath $exe -ArgumentList $argStr "
             f"-WorkingDirectory '{wd}' "
             "-WindowStyle Hidden -Verb RunAs -Wait -PassThru"
         )
     else:
         arg_line = (
-            "$p = Start-Process -FilePath $exe -ArgumentList @("
-            "'-m','gui.sd_disk_write_helper',$img,$disk,$logPath) "
+            "$argStr = '-m gui.sd_disk_write_helper \"' + $img + '\" ' + $disk + ' \"' + $logPath + '\" \"' + $progressPath + '\"'\n"
+            "$p = Start-Process -FilePath $exe -ArgumentList $argStr "
             f"-WorkingDirectory '{wd}' "
             "-WindowStyle Hidden -Verb RunAs -Wait -PassThru"
         )
@@ -578,6 +667,7 @@ def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple
     script_lines = [
         "$ErrorActionPreference = 'Stop'",
         f"$logPath = '{lg}'",
+        f"$progressPath = '{pg}'",
         f"$exe = '{ex}'",
         f"$img = '{im}'",
         f"$disk = {disk}",
@@ -587,19 +677,55 @@ def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple
     script = "\r\n".join(script_lines) + "\r\n"
 
     fd, ps1_path = tempfile.mkstemp(prefix="vr_sd_uac_", suffix=".ps1")
+    no_window = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    )
     try:
         os.close(fd)
         Path(ps1_path).write_text(script, encoding="utf-8-sig")
-        r = subprocess.run(
+        proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path],
-            capture_output=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=3600 * 6,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            if sys.platform == "win32"
-            else 0,
+            creationflags=no_window,
         )
-        ps_out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+        last_emit: Optional[Tuple[int, int, str]] = None
+        ps_out = ""
+        try:
+            while proc.poll() is None:
+                if should_cancel and should_cancel():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=15)
+                    except (OSError, subprocess.TimeoutExpired):
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                    return False, "Cancelled"
+
+                if progress_callback:
+                    snap = _read_uac_progress_file(progress_path)
+                    if snap is not None:
+                        w, t, msg = snap
+                        cur = (w, t, msg)
+                        if cur != last_emit:
+                            last_emit = cur
+                            if t > 0:
+                                progress_callback(w, t, msg)
+                            else:
+                                progress_callback(0, 0, msg)
+                time.sleep(0.12)
+        finally:
+            stderr = ""
+            try:
+                _stdout, stderr = proc.communicate(timeout=120)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            ps_out = (stderr or "").strip()
+
+        r_code = proc.returncode
 
         child_blob = ""
         try:
@@ -608,14 +734,20 @@ def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple
         except OSError:
             pass
 
-        if r.returncode == 0:
+        if r_code == 0:
+            if progress_callback and image_size > 0:
+                progress_callback(image_size, image_size, "SD card write complete.")
             try:
                 diag_log.unlink(missing_ok=True)
             except OSError:
                 pass
+            try:
+                progress_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return True, ""
 
-        detail_parts = [f"PowerShell exit: {r.returncode}"]
+        detail_parts = [f"PowerShell exit: {r_code}"]
         if ps_out:
             detail_parts.append(f"Launcher: {ps_out}")
         if child_blob:
@@ -628,7 +760,7 @@ def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple
         detail = "\n\n".join(detail_parts)
 
         hint = ""
-        if r.returncode is not None and r.returncode != 0 and not child_blob and not ps_out:
+        if r_code is not None and r_code != 0 and not child_blob and not ps_out:
             hint = (
                 "\n\nIf you cancelled the Windows security prompt, run SD image sync again and approve it."
             )
@@ -636,8 +768,6 @@ def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple
             False,
             "Could not write to the SD card after the Administrator prompt.\n\n" + detail + hint,
         )
-    except subprocess.TimeoutExpired:
-        return False, "Timed out waiting for the elevated disk write to finish."
     except OSError as e:
         return False, f"Could not start the elevated write step: {e}"
     finally:
@@ -647,6 +777,10 @@ def _write_image_via_uac_subprocess(image_path: Path, disk_number: int) -> Tuple
             pass
         try:
             diag_log.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            progress_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -697,7 +831,13 @@ def write_image_to_physical_disk(
                 0,
                 "Requesting Windows permission to write to the SD card (UAC)…",
             )
-        return _write_image_via_uac_subprocess(image_path, disk_number)
+        return _write_image_via_uac_subprocess(
+            image_path,
+            disk_number,
+            image_size=image_size,
+            progress_callback=progress_callback,
+            should_cancel=should_cancel,
+        )
 
     return _write_image_to_physical_disk_impl(
         image_path,
@@ -715,6 +855,7 @@ def _write_image_to_physical_disk_impl(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     try_offline_first: bool = True,
+    progress_file_path: Optional[Path] = None,
 ) -> Tuple[bool, str]:
     """Perform raw write; caller must already hold Administrator rights."""
     image_path = Path(image_path).resolve()
@@ -743,8 +884,17 @@ def _write_image_to_physical_disk_impl(
     if try_offline_first:
         vol_handles, vol_warn = _windows_lock_and_dismount_volumes(disk_number)
 
+    _emit_disk_write_progress(
+        0,
+        image_size,
+        "Preparing to write to SD card (locking volumes)…",
+        progress_callback=progress_callback,
+        progress_file_path=progress_file_path,
+    )
+
     def _write_fd(fd: int) -> Tuple[bool, str]:
         written_from_file = 0
+        skipped_zero_bytes = 0
         try:
             img = open(image_path, "rb")
         except OSError as e:
@@ -757,19 +907,41 @@ def _write_image_to_physical_disk_impl(
                     chunk = img.read(_WRITE_CHUNK_BYTES)
                     if not chunk:
                         break
+
+                    # Zero-skip: FAT32 images sized to the full card are mostly sparse
+                    # (empty clusters = zeros). Seeking past zero chunks writes only the
+                    # FAT structures and actual music data (~2 GB instead of 32 GB),
+                    # keeping write time the same as content-sized images.
+                    # Only skip full-size chunks (final chunk may be a partial read and
+                    # must always be written to land at the exact end of the image).
+                    if len(chunk) == _WRITE_CHUNK_BYTES and chunk == _ZERO_CHUNK:
+                        _seek_disk_fd_cur(fd, _WRITE_CHUNK_BYTES)
+                        written_from_file += len(chunk)
+                        skipped_zero_bytes += len(chunk)
+                        _emit_disk_write_progress(
+                            written_from_file,
+                            image_size,
+                            f"Writing to SD card ({written_from_file // (1024 * 1024)} MiB / "
+                            f"{image_size // (1024 * 1024)} MiB, skipping empty sectors)…",
+                            progress_callback=progress_callback,
+                            progress_file_path=progress_file_path,
+                        )
+                        continue
+
                     to_write = chunk
                     rem = len(to_write) % 512
                     if rem:
                         to_write = to_write + (b"\x00" * (512 - rem))
                     _write_raw_to_disk_fd(fd, to_write)
                     written_from_file += len(chunk)
-                    if progress_callback:
-                        progress_callback(
-                            written_from_file,
-                            image_size,
-                            f"Writing to SD card ({written_from_file // (1024 * 1024)} MiB / "
-                            f"{image_size // (1024 * 1024)} MiB)...",
-                        )
+                    _emit_disk_write_progress(
+                        written_from_file,
+                        image_size,
+                        f"Writing to SD card ({written_from_file // (1024 * 1024)} MiB / "
+                        f"{image_size // (1024 * 1024)} MiB)…",
+                        progress_callback=progress_callback,
+                        progress_file_path=progress_file_path,
+                    )
         except OSError as e:
             parts = [f"Disk write to {device} failed: {e}"]
             winerr = getattr(e, "winerror", None)

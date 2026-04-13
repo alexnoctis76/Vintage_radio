@@ -24,7 +24,16 @@ class _BackgroundWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self):
         try:
-            result = self._fn(*self._args, **self._kwargs)
+            # Never pass a callback that touches TaskProgressDialog (main thread) from here.
+            # Emit only from this QObject (worker's thread) so slots on the dialog get
+            # QueuedConnection delivery — fixes stuck 0/N and "Not Responding" on Windows.
+            kw = dict(self._kwargs)
+
+            def _safe_progress(current: int, total: int, message: str) -> None:
+                self.progress.emit(current, total, message)
+
+            kw["progress_callback"] = _safe_progress
+            result = self._fn(*self._args, **kw)
             self.finished.emit(result)
         except Exception as exc:
             self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
@@ -86,19 +95,16 @@ class TaskProgressDialog(QtWidgets.QDialog):
 
         self._thread = QtCore.QThread()
         kw = dict(kwargs or {})
-        kw["progress_callback"] = self._progress_callback
         if cancel_callback_kwarg:
             kw[cancel_callback_kwarg] = self._cancel_event.is_set
         self._worker = _BackgroundWorker(func, *args, **kw)
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-
-    def _progress_callback(self, current: int, total: int, message: str):
-        self._worker.progress.emit(current, total, message)
+        qc = QtCore.Qt.ConnectionType.QueuedConnection
+        self._worker.progress.connect(self._on_progress, qc)
+        self._worker.finished.connect(self._on_finished, qc)
+        self._worker.error.connect(self._on_error, qc)
 
     @QtCore.pyqtSlot(int, int, str)
     def _on_progress(self, current: int, total: int, message: str):

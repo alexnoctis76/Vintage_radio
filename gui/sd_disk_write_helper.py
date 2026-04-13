@@ -15,9 +15,54 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 _ELEVATED_STDIO_KEEP: object | None = None
+
+
+def parse_sd_disk_write_cli_args(
+    argv: List[str],
+    *,
+    flag: Optional[str] = "--vr-write-sd-disk",
+) -> Optional[Tuple[Path, int, Optional[Path], Optional[Path]]]:
+    r"""Parse elevated raw-disk write CLI arguments robustly.
+
+    **Frozen exe:** ``--vr-write-sd-disk <image> <disk> [<log>] [<progress.json>]``
+
+    **Dev:** ``python -m gui.sd_disk_write_helper <image> <disk> [<log>] [<progress.json>]`` (no flag).
+
+    ``<image>`` may span **multiple** ``argv`` entries when the path contains spaces
+    (e.g. ``...\Vintage Radio\...``) because ``Start-Process / CreateProcess``
+    tokenisation splits on spaces when arguments are not properly quoted.  We parse
+    from the **right**: optional ``*.progress.json``, optional ``*.log``, then a
+    numeric disk index, then join the remainder as the image path.
+    """
+    if flag is not None:
+        if len(argv) < 4 or argv[1] != flag:
+            return None
+        tail = argv[2:]
+    else:
+        if len(argv) < 3:
+            return None
+        tail = argv[1:]
+    if len(tail) < 2:
+        return None
+    progress_path: Optional[Path] = None
+    log_path: Optional[Path] = None
+    if len(tail) >= 2 and tail[-1].lower().endswith(".progress.json"):
+        progress_path = Path(tail[-1])
+        tail = tail[:-1]
+    if len(tail) >= 3 and tail[-1].lower().endswith(".log"):
+        log_path = Path(tail[-1])
+        tail = tail[:-1]
+    if len(tail) < 2:
+        return None
+    disk_str = tail[-1]
+    if not disk_str.isdigit():
+        return None
+    disk = int(disk_str)
+    img = Path(" ".join(tail[:-1]))
+    return img, disk, log_path, progress_path
 
 
 def redirect_stdio_for_elevated_disk_child(log_path: Optional[Path]) -> None:
@@ -48,21 +93,20 @@ def redirect_stdio_for_elevated_disk_child(log_path: Optional[Path]) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) not in (3, 4):
+    parsed = parse_sd_disk_write_cli_args(sys.argv, flag=None)
+    if parsed is None:
         redirect_stdio_for_elevated_disk_child(None)
         print(
             "Usage: python -m gui.sd_disk_write_helper "
-            "<image_path> <disk_number> [<diagnostic_log_path>]",
+            "<image_path> <disk_number> [<diagnostic_log_path> [<progress.json>]]",
             file=sys.stderr,
         )
         return 2
 
-    log_path = Path(sys.argv[3]) if len(sys.argv) == 4 else None
+    img, disk, log_path, progress_path = parsed
     redirect_stdio_for_elevated_disk_child(log_path)
 
     try:
-        img = Path(sys.argv[1])
-        disk = int(sys.argv[2])
         from gui.sd_disk_image_flash import _write_image_to_physical_disk_impl
 
         ok, err = _write_image_to_physical_disk_impl(
@@ -71,13 +115,16 @@ def main() -> int:
             progress_callback=None,
             should_cancel=None,
             try_offline_first=True,
+            progress_file_path=progress_path,
         )
         if not ok:
-            print(err, file=sys.stderr)
+            print(err or "Disk write failed.", file=sys.stderr)
+            sys.stderr.flush()
             return 1
         return 0
     except Exception:
         traceback.print_exc()
+        sys.stderr.flush()
         return 1
 
 

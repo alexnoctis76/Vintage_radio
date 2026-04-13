@@ -36,6 +36,15 @@ SYNC_TARGET_VOLUME_LABEL = "VINTAGERADIO"
 # content mismatches even when two different libraries share folder structure.
 _SYNC_MANIFEST_NAME = ".sync_manifest.json"
 
+
+def _basic_sync_progress_step_interval(total: int, *, large_step: int) -> int:
+    """Emit progress every N completions so small syncs update every file (avoids stuck 0/N UI)."""
+    if total <= 0:
+        return 1
+    if total <= 500:
+        return 1
+    return large_step
+
 # macOS / Windows create these at the volume root when the card is mounted or
 # browsed in Finder/Explorer. We never strip our sync manifest (a file, not
 # in this set). Removing these keeps the card cleaner and avoids extra root
@@ -1827,7 +1836,11 @@ class SDManager:
                         skipped += 1
                         print(f"Failed to convert {src.name}")
 
-                    if progress_callback and (done_convert % 50 == 0 or done_convert == len(convert_jobs)):
+                    _conv_step = _basic_sync_progress_step_interval(len(convert_jobs), large_step=50)
+                    if progress_callback and (
+                        done_convert % _conv_step == 0
+                        or done_convert == len(convert_jobs)
+                    ):
                         elapsed = time.monotonic() - convert_start
                         rate = done_convert / max(0.001, elapsed)
                         remaining = len(convert_jobs) - done_convert
@@ -1905,8 +1918,9 @@ class SDManager:
                             skipped += 1
                         print(f"Copy error: {job_src.name} -> {job_dst}: {e}")
 
+                    _copy_step = _basic_sync_progress_step_interval(total_copies, large_step=100)
                     if progress_callback and (
-                        copies_done % 100 == 0 or copies_done == total_copies
+                        copies_done % _copy_step == 0 or copies_done == total_copies
                     ):
                         elapsed = time.monotonic() - copy_phase_start
                         rate = copies_done / max(0.001, elapsed)

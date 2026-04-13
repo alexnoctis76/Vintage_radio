@@ -4,7 +4,67 @@ Desktop application for managing your music library and syncing it to a vintage-
 
 ---
 
-## Latest Changes
+# Release summary — **v0.2.1-beta**
+
+> **Note.** [VLC media player](https://www.videolan.org/vlc/) is required for full functionality (conversion to MP3 and best emulator seeking). FFmpeg can be used as a fallback for conversion when VLC is not installed.
+
+## Basic mode (unchanged direction)
+
+**Basic mode** remains the main architecture: `firmware/pico/main_basic.py` and `RadioCore(..., basic_mode=True)` with **stations derived from the DFPlayer / SD folder layout**, not a full desktop-only metadata graph. This release tightens **playback and visit-mode behavior** on the Pico (fewer spurious track advances, clearer DFPlayer folder handling) and improves **host-side** SD workflows below.
+
+### How basic mode differs from advanced mode
+
+| | **Basic mode** | **Advanced mode** |
+|---|----------------|-------------------|
+| **Discovery** | Stations from **UART** to the DFPlayer (**0x4F** folder count, **0x4E** files per folder) in `discover_stations()`, via `_load_data_basic()` in `radio_core.py`. The card’s **folder layout** is the source of truth. | Libraries from **metadata**: `get_albums()` / `get_playlists()` and paths shaped by **JSON / app sync**. |
+| **SD workflow** | Prepare folders `01`…, optional **folder 99** for flags. Swap SD cards without a new firmware build for every library edit; discovery on **cold boot**. | Richer pipeline; card content is expected to match **prepared metadata**. |
+| **UX / features** | **No album mode** in the same sense—station playback, shuffle modes, radio, folder **99** flags. **Folders = stations.** | Full **album + playlist** flows and mode cycling. |
+
+### Trade-offs (still relevant)
+
+- **Boot / UART / RAM:** Discovery builds per-track state from DFPlayer-reported counts; very large libraries increase time and RAM use.
+- **Filesystem quirks:** Stray files (e.g. `._*` from macOS) can skew counts—use the app’s sync path that strips junk when preparing cards.
+- **SD swap without reboot:** Until a fingerprint/refresh step exists, prefer **cold boot** after swapping cards so discovery matches the new card.
+
+---
+
+## What’s new in v0.2.1-beta
+
+### Experimental: clean SD disk image (Windows)
+
+- **Build a FAT32 `.img` from your library** (with optional “prepare on this PC” staging) and **flash it to a physical SD card** from the app.
+- **UAC elevation** only for the raw write step (you do not need to run the whole app as Administrator).
+- **Removable media:** Windows cannot “offline” SD/USB the same way as internal disks; the app **locks and dismounts volumes** (`FSCTL_LOCK_VOLUME` / `FSCTL_DISMOUNT_VOLUME`) before writing to `\\.\PhysicalDriveN`, and uses **Win32 `WriteFile`** for reliable raw writes.
+- **Wizard** lists **USB and MMC** disks only (internal NVMe/SATA fixed disks are filtered out), shows **size and volume labels**, and supports **“flash only”** to reuse the last built image for faster retesting.
+- **Progress and errors** are clearer (staging vs image build vs flash); **session log** captures GUI errors including message boxes.
+
+### MCP debug and physical acceptance (host)
+
+- **TCP debug server** (optional) for automation: ping, device connect, serial tail, **line-in analysis**, and a **full device acceptance** suite driven against the real Pico (basic mode).
+- **`gui/services/serial_debug`** and scripts under **`scripts/`** (e.g. MCP bridge, physical check helpers) support CI-style checks from the desktop.
+
+### Firmware and `radio_core`
+
+- Continued improvements to **`dfplayer_hardware.py`**, **`main_basic.py`**, **`main.py`**, and **`radio_core.py`** for basic-mode station discovery, playback, and visit/shuffle edge cases; IPC components under **`firmware/pico/components/`** (e.g. `vintage_radio_ipc`, AM WAV loader path).
+
+### Desktop quality of life
+
+- **Updater** UI hook for checking GitHub releases (see **Help** / version flows in-app).
+- **`docs/REPO_STRUCTURE.md`** and README tweaks for navigating the repo.
+
+### Tests
+
+- Extended coverage for **`radio_core`**, **`sd_manager`**, SD image helpers, MCP, and widgets used in the new flows.
+
+---
+
+**Full Changelog (GitHub):** https://github.com/alexnoctis76/Vintage_radio/compare/v0.2.0-beta...v0.2.1-beta
+
+---
+
+## Previous release highlights (v0.2.0-beta and earlier)
+
+## Latest Changes (historical)
 
 ### Emulator (formerly Test Mode)
 

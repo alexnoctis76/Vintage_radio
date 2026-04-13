@@ -539,26 +539,29 @@ def _run_mpremote(
                     pass
     # When using system Python (py -m mpremote), avoid cwd inside app bundle so it doesn't load app's mpremote
     run_cwd = cwd
-    if (
-        run_cwd
-        and len(mpremote_cmd) >= 3
-        and mpremote_cmd[1] == "-m"
-        and mpremote_cmd[2] == "mpremote"
-        and getattr(sys, "frozen", False)
-    ):
-        run_cwd = os.path.expanduser("~")
+    if run_cwd and getattr(sys, "frozen", False):
+        is_mpremote_subproc = (
+            len(mpremote_cmd) >= 3
+            and mpremote_cmd[1] == "-m"
+            and mpremote_cmd[2] == "mpremote"
+        ) or (len(mpremote_cmd) >= 2 and mpremote_cmd[1] == "--vr-mpremote")
+        if is_mpremote_subproc:
+            run_cwd = os.path.expanduser("~")
     if args and args[0] == "connect":
         write_session_line(
             f"mpremote subprocess: cmd={mpremote_cmd!r} args={args!r} cwd={run_cwd!r}",
             prefix="MPREMOTE",
         )
+    cf = creationflags
+    if cf == 0 and sys.platform == "win32":
+        cf = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.run(
         mpremote_cmd + args,
         cwd=run_cwd,
         capture_output=capture_output,
         text=text,
         timeout=timeout,
-        creationflags=creationflags,
+        creationflags=cf,
         env=env,
     )
 
@@ -6110,12 +6113,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             ds = windows_get_disk_size_bytes(disk_number)
-            if ds is not None and last_img.stat().st_size > ds:
+            _cached_sz = last_img.stat().st_size
+            if ds is not None and _cached_sz > ds:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "SD card too small",
-                    f"The cached image is about {format_disk_size(last_img.stat().st_size)}, but the "
+                    f"The cached image is about {format_disk_size(_cached_sz)}, but the "
                     f"selected disk is {format_disk_size(ds)}. Use a larger card.",
+                )
+                return
+            if ds is not None and _cached_sz < ds:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Rebuild required — card size changed",
+                    f"The cached image ({format_disk_size(_cached_sz)}) is smaller than "
+                    f"the selected card ({format_disk_size(ds)}).\n\n"
+                    "The SD card would not show its full capacity after flashing, "
+                    "preventing normal syncs from using the remaining space.\n\n"
+                    "Uncheck 'Flash cached image only' to rebuild the image for this card size.",
                 )
                 return
         else:
@@ -6225,21 +6240,30 @@ class MainWindow(QtWidgets.QMainWindow):
                         sync_log_prefix="Prepare (PC staging)",
                     )
                     est2 = suggest_image_size_bytes(staging_root)
-                    ds2 = windows_get_disk_size_bytes(disk_number)
-                    if ds2 is not None and est2 > ds2:
+                    _disk_bytes = windows_get_disk_size_bytes(disk_number)
+                    if _disk_bytes is not None and est2 > _disk_bytes:
                         raise RuntimeError(
                             f"SD card too small: need about {format_disk_size(est2)} for this image, "
-                            f"but the selected disk is {format_disk_size(ds2)}."
+                            f"but the selected disk is {format_disk_size(_disk_bytes)}."
                         )
                     source_root = staging_root
                 else:
+                    _disk_bytes = windows_get_disk_size_bytes(disk_number)
                     source_root = sd_p
 
+                disk_size_label = (
+                    format_disk_size(_disk_bytes) if _disk_bytes else "unknown size"
+                )
                 if progress_callback:
-                    progress_callback(0, 0, "Building FAT32 disk image...")
+                    progress_callback(
+                        0,
+                        0,
+                        f"Building FAT32 disk image ({disk_size_label} — full card capacity)...",
+                    )
                 ok, err = run_experimental_sd_disk_image_export(
                     source_root,
                     img_path,
+                    size_bytes=_disk_bytes,
                     progress_callback=_export_cb,
                     should_cancel=should_cancel,
                 )
@@ -8619,14 +8643,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Run in Terminal: python3 -m pip install mpremote"
             )
             return None
-        # Packaged Windows/Linux: use bundled mpremote
-        if getattr(sys, "frozen", False):
+        # Packaged Windows/Linux: subprocess via same bundled exe (see run_vintage_radio --vr-mpremote).
+        # In-process mpremote + pyserial inside the Qt process is unreliable on Windows PyInstaller.
+        if getattr(sys, "frozen", False) and sys.platform != "darwin":
             try:
-                from mpremote.main import main as mpremote_main
-                return ["__INPROCESS__", mpremote_main]
+                from mpremote.main import main as _mpremote_main  # noqa: F401
             except ImportError as e:
                 import traceback
                 setattr(self, "_mpremote_bundle_error", f"{e}\n{traceback.format_exc()}")
+            else:
+                return [str(Path(sys.executable).resolve()), "--vr-mpremote"]
 
         # Standalone mpremote on PATH (e.g. pipx install mpremote)
         cmd = shutil.which("mpremote")
@@ -8938,22 +8964,40 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             _report("Skipping metadata copy (basic/advanced discovery mode)...")
 
-        # Remove stale album_state.txt and reboot. machine.reset() drops connection - timeout expected.
+        # Remove stale album_state.txt and reboot. machine.reset() drops USB serial — mpremote may
+        # exit non-zero (ClearCommError / PermissionError) or subprocess may time out; both OK.
         _report("Rebooting Pico...")
         try:
-            run_mpremote([
-                "exec",
-                "import os\n"
-                "try: os.remove('VintageRadio/album_state.txt')\n"
-                "except: pass\n"
-                "import machine\n"
-                "machine.reset()",
-            ], timeout_sec=5)
-        except (subprocess.TimeoutExpired, Exception) as e:
-            if "timed out" in str(e).lower() or "timeout" in str(e).lower():
-                print("Reboot initiated (connection closed as expected)")
-            else:
-                print(f"Note: Could not trigger reboot: {e}")
+            r = run_mpremote(
+                [
+                    "exec",
+                    "import os\n"
+                    "try: os.remove('VintageRadio/album_state.txt')\n"
+                    "except: pass\n"
+                    "import machine\n"
+                    "machine.reset()",
+                ],
+                timeout_sec=8,
+            )
+            err = ((r.stderr or "") + (r.stdout or "")).strip()
+            if r.returncode != 0:
+                transient = (
+                    "ClearCommError" in err
+                    or "PermissionError" in err
+                    or "does not recognize the command" in err.lower()
+                    or "WinError 22" in err
+                    or "bad file descriptor" in err.lower()
+                )
+                if transient:
+                    print(
+                        "Reboot initiated (serial closed as expected after machine.reset())."
+                    )
+                elif err:
+                    print(f"Note: reboot step exited {r.returncode}: {err[:600]}")
+        except subprocess.TimeoutExpired:
+            print("Reboot initiated (connection closed as expected)")
+        except Exception as e:
+            print(f"Note: Could not trigger reboot: {e}")
 
         if progress_callback:
             progress_callback(total, total, "Done!")
@@ -9185,14 +9229,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
         _report("Rebooting Pico...")
         try:
-            _run_mpremote_connect_auto_with_retry(
+            r = _run_mpremote_connect_auto_with_retry(
                 mpremote_cmd,
                 ["exec", "import machine\nmachine.reset()"],
                 cwd=_mpremote_cwd,
-                timeout=5,
+                timeout=8,
                 creationflags=creationflags,
                 env=env,
             )
+            err = ((r.stderr or "") + (r.stdout or "")).strip()
+            if r.returncode != 0 and err:
+                transient = (
+                    "ClearCommError" in err
+                    or "PermissionError" in err
+                    or "does not recognize the command" in err.lower()
+                    or "WinError 22" in err
+                )
+                if transient:
+                    print(
+                        "Reboot initiated (serial closed as expected after machine.reset())."
+                    )
         except Exception:
             pass
         if progress_callback:

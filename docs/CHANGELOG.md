@@ -1,6 +1,14 @@
 # Complete Change Log
 
-## Summary
+## v0.2.1-beta
+
+- **Version:** `v0.2.1-beta` (see `gui/__init__.py`).
+- **Windows:** Experimental clean SD disk image build + raw flash (UAC helper, volume lock/dismount, Win32 raw write); wizard and cached “flash only” path.
+- **Host tooling:** MCP debug TCP server, device acceptance harness, line-in analysis, serial debug service, scripts under `scripts/`.
+- **Firmware:** `radio_core`, `dfplayer_hardware`, Pico `main_basic` / `main`, IPC components.
+- **Docs:** `docs/RELEASE_NOTES.md`, `docs/REPO_STRUCTURE.md`; extended tests for core, SD, MCP, and GUI widgets.
+
+## Summary (legacy)
 Implemented cross-platform hardware detection and packaging for Vintage Radio to support macOS, Windows, and Linux while maintaining 100% backward compatibility with Windows.
 
 ## Files Modified
