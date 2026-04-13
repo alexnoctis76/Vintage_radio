@@ -28,50 +28,51 @@ try:
     from urandom import randint
 except ImportError:
     from random import randint
+try:
+    import sys as _sys
+    _IS_MICROPYTHON = getattr(getattr(_sys, "implementation", None), "name", "") == "micropython"
+except Exception:
+    _IS_MICROPYTHON = False
+try:
+    import gc as _gc
+except Exception:
+    _gc = None
 
 # ===========================
 #      CONSTANTS
 # ===========================
 
-FADE_IN_S = 2.4
-DF_BOOT_MS = 2000
+FADE_IN_S = 1.0
+DF_BOOT_MS = 0
 LONG_PRESS_MS = 500   # Hold >= 500ms = long press
 TAP_WINDOW_MS = 350   # ms after last release to resolve taps (single-tap next/prev feels snappier; double-tap still detectable)
 BUSY_CONFIRM_MS = 2200
 POST_CMD_GUARD_MS = 120
-# After 0x3D, poll this long for BUSY idle (HIGH) or query_status stopped (0) before
-# advancing.  Startup noise often sends 0x3D while the module is still playing; waiting
-# for hardware to agree avoids skipping ahead without discarding real ends (0x3D usually
-# arrives slightly before BUSY rises).
-DF_UART_STOP_CONFIRM_MS = 320
+# Ignore UART 0x3D "track finished" for this long after play start (duplicate / stale pulses).
+DF_UART_END_GUARD_MS = 450
 MAX_ALBUM_NUM = 99
 
 
-def dfplayer_confirms_playback_stopped(hw, timeout_ms=None):
-    """True if DFPlayer looks idle: BUSY HIGH and/or query_status == 0.
+def _agent_debug_ndjson(hypothesis_id, message, data):
+    # #region agent log
+    try:
+        try:
+            import ujson as _json  # type: ignore
+        except ImportError:
+            import json as _json
+        payload = {
+            "sessionId": "e8231e",
+            "hypothesisId": hypothesis_id,
+            "location": "radio_core",
+            "message": message,
+            "data": data,
+            "timestamp": ticks_ms(),
+        }
+        print("#VRDBG " + _json.dumps(payload))
+    except Exception:
+        pass
+    # #endregion
 
-    Drains UART while polling so late 0x40/0x3D bytes do not confuse the next command.
-    If neither BUSY nor query_status exists, returns True (nothing to verify).
-    """
-    if timeout_ms is None:
-        timeout_ms = DF_UART_STOP_CONFIRM_MS
-    poll = getattr(hw, "_df_read_pending", None)
-    pin_busy = getattr(hw, "pin_busy", None)
-    qstatus = getattr(hw, "query_status", None)
-    if pin_busy is None and qstatus is None:
-        return True
-    t0 = ticks_ms()
-    while ticks_diff(ticks_ms(), t0) <= timeout_ms:
-        if poll:
-            poll()
-        if pin_busy is not None and pin_busy.value() == 1:
-            return True
-        if qstatus is not None:
-            st = qstatus()
-            if st == 0:
-                return True
-        _sleep_ms(12)
-    return False
 
 # ===========================
 #      MODE ENUM
@@ -248,6 +249,10 @@ class HardwareInterface:
         """
         pass
 
+    def set_delay_playback_reason(self, reason):
+        """Optional transition reason for delayed playback/AM sequencing."""
+        pass
+
     def set_current_track_hint(self, track):
         """Hint for emulators / GUIs -- the track dict about to play.
 
@@ -340,12 +345,229 @@ class RadioCore:
         # Set by _next_track when looping same station: last track -> track 1 (DFPlayer quirk)
         self._folder_wrap_play = False
         
-        # Basic mode feature flags (read from DFPlayer folder 99 file count via 0x4E; see _check_feature_flags)
-        # Defaults match desktop app until _check_feature_flags() runs (default: advance).
+        # Basic mode station-end behavior (fixed; folder 99 is normal music, not UART flags).
         self.loop_stations = False
         # When True, after the last track of a station (or one full station shuffle pass),
         # advance to the next station instead of stopping or looping in place.
         self.advance_next_station = True
+        # Basic mode: if saved state is shuffle but shuffle_tracks is empty, rebuild
+        # after DFPlayer comms check (main_basic boot_sequence), not inside _load_state.
+        self._defer_basic_shuffle_rebuild = False
+    def _basic_playlist_track_count(self, playlist: dict) -> int:
+        tracks = playlist.get("tracks", [])
+        if tracks:
+            return len(tracks)
+        # Lazy-seeded basic stations carry placeholder track_count while hydrated=False.
+        # Treat that as unknown until a real 0x4E hydrate runs.
+        if self.basic_mode and not playlist.get("hydrated"):
+            return 0
+        try:
+            return max(0, int(playlist.get("track_count", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _build_basic_track(folder: int, track_num: int) -> dict:
+        return {
+            "id": int(folder) * 1000 + int(track_num),
+            "title": f"Track {int(track_num)}",
+            "artist": "",
+            "duration": 0,
+            "folder": int(folder),
+            "track_number": int(track_num),
+        }
+
+    def _clear_basic_library_virtual(self):
+        """No-op: legacy hook when leaving shuffle (library shuffle removed)."""
+        pass
+
+    def _shuffle_entry_count(self):
+        return len(self.shuffle_tracks)
+
+    def _collect_heap(self, reason: str = "") -> None:
+        """Best-effort heap collection for MicroPython before large list ops."""
+        if _gc is None:
+            return
+        try:
+            _gc.collect()
+            if _IS_MICROPYTHON and hasattr(_gc, "mem_free"):
+                free_b = int(_gc.mem_free())
+                if free_b < 8 * 1024:
+                    self.hw.log(f"BASIC: low heap after GC ({free_b}B) [{reason}]")
+        except Exception:
+            pass
+
+    def _shuffle_index_for_track_number(self, track_num: int) -> int:
+        """Index in ``shuffle_tracks`` whose ``track_number`` matches (default: physical track 1)."""
+        want = int(track_num)
+        for i, tr in enumerate(self.shuffle_tracks):
+            try:
+                if int(tr.get("track_number", 0) or 0) == want:
+                    return int(i)
+            except (TypeError, ValueError):
+                continue
+        return -1
+
+    def _assign_and_shuffle_tracks(self, tracks, reason: str = "") -> bool:
+        """Populate shuffle_tracks with minimal temporary allocations.
+
+        Reuses the existing list buffer when possible to avoid repeated large heap
+        allocations in long-running basic-mode station shuffle.
+        """
+        self._collect_heap(reason)
+        try:
+            if self.shuffle_tracks and len(self.shuffle_tracks) == len(tracks):
+                for i, tr in enumerate(tracks):
+                    self.shuffle_tracks[i] = tr
+            else:
+                self.shuffle_tracks = list(tracks)
+            for i in range(len(self.shuffle_tracks) - 1, 0, -1):
+                j = randint(0, i)
+                self.shuffle_tracks[i], self.shuffle_tracks[j] = self.shuffle_tracks[j], self.shuffle_tracks[i]
+            return True
+        except MemoryError:
+            self._collect_heap(reason + " retry")
+            try:
+                self.shuffle_tracks = list(tracks)
+                for i in range(len(self.shuffle_tracks) - 1, 0, -1):
+                    j = randint(0, i)
+                    self.shuffle_tracks[i], self.shuffle_tracks[j] = self.shuffle_tracks[j], self.shuffle_tracks[i]
+                return True
+            except MemoryError:
+                return False
+
+    def _next_station_index(self) -> int:
+        """Next station index in SD/folder order (basic mode)."""
+        n = len(self.playlists)
+        if n <= 0:
+            return 0
+        return (self.current_album_index + 1) % n
+
+    def _hydrate_basic_station(self, station_index: int, *, allow_assume=False) -> int:
+        """Ensure a basic-mode station has track_count populated.
+
+        DFPlayer UART: vendor examples use ~500 ms serial read timeouts and spacing between
+        commands; we use short drains + bounded retries (still synchronous on MicroPython —
+        not parallel with AM). Track-count queries run before ``start_with_am`` / music play
+        so the bus is not contended during the PWM overlay.
+
+        Returns:
+            >0: playable track count
+             0: confirmed empty station
+            -1: unknown (query did not return a stable answer)
+        """
+        if not self.playlists or station_index < 0 or station_index >= len(self.playlists):
+            return -1
+
+        pl = self.playlists[station_index]
+        # Skip repeat UART storms on folders that already failed probe (long_press
+        # can walk many slots; without this each skip costs ~1s+ DF queries).
+        if pl.get("basic_hydrate_negative"):
+            return -1
+        if pl.get("hydrated"):
+            return self._basic_playlist_track_count(pl)
+        tracks = pl.get("tracks", [])
+        if tracks:
+            count = len(tracks)
+            pl["track_count"] = count
+            pl["hydrated"] = True
+            try:
+                folder = int(pl.get("id", station_index + 1))
+            except (TypeError, ValueError):
+                folder = station_index + 1
+            if count > 0:
+                self.known_tracks[folder] = count
+                if hasattr(self.hw, "_known_tracks"):
+                    self.hw._known_tracks[folder] = count
+            return count
+
+        try:
+            folder = int(pl.get("id", station_index + 1))
+        except (TypeError, ValueError):
+            folder = station_index + 1
+
+        # 0x4E often returns None if UART is busy (playback, track-finished frames,
+        # host VRTEST). Drain and retry with increasing timeouts before treating as empty.
+        drain = getattr(self.hw, "_df_drain_uart_for_query_ms", None)
+        if callable(drain):
+            drain(120)
+        _sleep_ms(50)
+
+        count = None
+        query_single = getattr(self.hw, "query_files_in_folder", None)
+        if callable(query_single):
+            timeouts = (520, 700, 900)
+            for tmo in timeouts:
+                count = query_single(folder, suppress_errors=True, timeout_ms=tmo)
+                if count is not None:
+                    break
+                _sleep_ms(80)
+        if count is None:
+            query_consensus = getattr(self.hw, "query_files_in_folder_consensus", None)
+            if callable(query_consensus):
+                count = query_consensus(folder, suppress_errors=True)
+
+        if count is None:
+            if allow_assume:
+                guessed = int(self.known_tracks.get(folder, 0) or 0)
+                if guessed > 0:
+                    pl["track_count"] = guessed
+                    pl["hydrated"] = True
+                    pl.pop("basic_hydrate_fail_count", None)
+                    pl.pop("basic_hydrate_negative", None)
+                    self.hw.log(
+                        f"BASIC: Station folder {folder:02d} track query unavailable, "
+                        f"using cached count={guessed}"
+                    )
+                    return guessed
+                # No prior data at all — do NOT assume 255.  Including a folder with
+                # an invented count causes the library shuffle to pick non-existent
+                # high-numbered tracks (e.g. track 249 in a folder that only has 30).
+                fails = int(pl.get("basic_hydrate_fail_count", 0) or 0) + 1
+                pl["basic_hydrate_fail_count"] = fails
+                self.hw.log(
+                    f"BASIC: Station folder {folder:02d} track count unavailable "
+                    f"(try {fails}/2); likely UART/DF busy, not necessarily empty SD"
+                )
+                if fails >= 2:
+                    pl["basic_hydrate_negative"] = True
+                return -1
+            fails = int(pl.get("basic_hydrate_fail_count", 0) or 0) + 1
+            pl["basic_hydrate_fail_count"] = fails
+            if fails >= 2:
+                pl["basic_hydrate_negative"] = True
+            return -1
+
+        count = max(0, int(count))
+        pl["track_count"] = count
+        pl["hydrated"] = True
+        pl.pop("basic_hydrate_fail_count", None)
+        pl.pop("basic_hydrate_negative", None)
+        if count > 0:
+            self.known_tracks[folder] = count
+            if hasattr(self.hw, "_known_tracks"):
+                self.hw._known_tracks[folder] = count
+            self.hw.log(f"BASIC: Station folder {folder:02d} hydrated -> {count} track(s)")
+        else:
+            self.hw.log(f"BASIC: Station folder {folder:02d} is empty")
+        return count
+
+    def _ensure_basic_station_ready_for_playback(self) -> bool:
+        """Ensure current basic-mode station is playable (hydrated with tracks > 0)."""
+        if not self.playlists:
+            return False
+        n = len(self.playlists)
+
+        start = self.current_album_index % n
+        for hop in range(n):
+            idx = (start + hop) % n
+            count = self._hydrate_basic_station(idx, allow_assume=(hop == 0))
+            if count > 0:
+                self.current_album_index = idx
+                if self.current_track < 1 or self.current_track > count:
+                    self.current_track = 1
+                return True
+        return False
     
     def init(self, skip_initial_playback=False):
         """Initialize the radio - load state and optionally start playback.
@@ -353,8 +575,6 @@ class RadioCore:
         Used by firmware to match baseline: one start inside AM overlay, no double-start.
         """
         self._load_data()
-        if self.basic_mode:
-            self._check_feature_flags()
         self._load_state()
         if self.power_on and not skip_initial_playback:
             self._start_playback_for_current()
@@ -404,48 +624,19 @@ class RadioCore:
             self.hw._albums = list(self.albums)
         
         self.hw.log(f"Loaded {len(self.albums)} albums, {len(self.playlists)} playlists")
-        for i, playlist in enumerate(self.playlists):
-            self.hw.log(f"[PLAYLIST DEBUG] Playlist {i}: name='{playlist.get('name', 'Unknown')}', tracks={len(playlist.get('tracks', []))}")
-
-    def _check_feature_flags(self):
-        """Read feature flags from DFPlayer folder 99 only (0x4E file count).
-
-        Folder 99 holds ``001.wav`` (AM). Extra tiny MP3 stubs encode end behavior.
-        Many DFPlayer modules **do not count WAV** in 0x4E, so ``002+003`` alone can
-        read as **count==2** (loop) even when the desktop meant **advance**. The SD
-        sync therefore writes **three** stubs (002--004) for advance so count is >=3
-        even when 001.wav is ignored.
-
-          <=1 file  -> stop at end of station / one shuffle pass
-          2 files   -> loop (repeat station or shuffle order)
-          3+ files  -> advance to next station when a station ends
-
-        No separate MCU flash or sidecar text file — the module reports counts over UART.
-        """
-        if not hasattr(self.hw, "query_files_in_folder"):
-            return
-        if hasattr(self.hw, "query_files_in_folder_consensus"):
-            count = self.hw.query_files_in_folder_consensus(
-                99, suppress_errors=True
+        if len(self.playlists) <= 12:
+            for i, playlist in enumerate(self.playlists):
+                self.hw.log(
+                    f"[PLAYLIST DEBUG] Playlist {i}: "
+                    f"name='{playlist.get('name', 'Unknown')}', "
+                    f"tracks={len(playlist.get('tracks', []))}, "
+                    f"track_count={playlist.get('track_count', 0)}"
+                )
+        else:
+            self.hw.log(
+                f"[PLAYLIST DEBUG] Large station set loaded ({len(self.playlists)}); "
+                "per-station debug lines suppressed"
             )
-        else:
-            count = self.hw.query_files_in_folder(99, suppress_errors=True)
-        if count is None:
-            self.hw.log("BASIC: Could not query folder 99 for feature flags, using defaults")
-            return
-        if count <= 1:
-            self.loop_stations = False
-            self.advance_next_station = False
-        elif count == 2:
-            self.loop_stations = True
-            self.advance_next_station = False
-        else:
-            self.loop_stations = False
-            self.advance_next_station = True
-        self.hw.log(
-            "BASIC: Feature flags folder 99: count=%s loop_stations=%s advance_next_station=%s"
-            % (count, self.loop_stations, self.advance_next_station)
-        )
 
     def _load_state(self):
         """Load persisted state."""
@@ -457,12 +648,20 @@ class RadioCore:
             self.mode = loaded_mode
             self.current_album_index = state.get('album_index', 0)
             self.current_track = state.get('track', 1)
-            if self.basic_mode:
-                # In basic mode, use hardware's _known_tracks (set by discover_stations)
-                # rather than potentially stale values from persisted state.
-                self.known_tracks = dict(getattr(self.hw, '_known_tracks', {}))
-            else:
-                self.known_tracks = state.get('known_tracks', {})
+            raw_known = state.get("known_tracks", {}) or {}
+            known = {}
+            if isinstance(raw_known, dict):
+                for k, v in raw_known.items():
+                    try:
+                        kk = int(k)
+                        vv = int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if kk > 0 and vv >= 0:
+                        known[kk] = vv
+            self.known_tracks = known
+            if hasattr(self.hw, "_known_tracks"):
+                self.hw._known_tracks = dict(known)
             # Clamp album/playlist index to valid range (metadata may have changed since state was saved)
             if self.mode == MODE_PLAYLIST and self.playlists:
                 if self.current_album_index >= len(self.playlists):
@@ -473,30 +672,42 @@ class RadioCore:
                     self.hw.log(f"Clamping album index {self.current_album_index} to {len(self.albums) - 1}")
                     self.current_album_index = max(0, len(self.albums) - 1)
             self.current_album_index = max(0, self.current_album_index)
-            # Clamp track to valid range for current album/playlist
-            tracks = self._get_current_tracks()
-            if tracks and self.current_track > len(tracks):
-                self.hw.log(f"Clamping track {self.current_track} to {len(tracks)}")
-                self.current_track = len(tracks)
+            # Clamp track to valid range for current album/playlist.
+            # In basic mode, skip the DFPlayer query entirely: hardware is not
+            # confirmed ready here (comms check runs after core.init() returns).
+            if not self.basic_mode:
+                total_tracks = self._get_track_count()
+                if total_tracks > 0 and self.current_track > total_tracks:
+                    self.hw.log(f"Clamping track {self.current_track} to {total_tracks}")
+                    self.current_track = total_tracks
             self.current_track = max(1, self.current_track)
             self.hw.log(f"Loaded state: mode={self.mode}, album={self.current_album_index}, track={self.current_track}")
             
             # Initialize mode-specific state based on loaded mode
             if self.mode == MODE_RADIO and not self.radio_stations:
                 self._init_radio()
-            elif self.mode == MODE_SHUFFLE and not self.shuffle_tracks:
-                self._init_shuffle()
+            elif self.mode == MODE_SHUFFLE and self._shuffle_entry_count() == 0:
+                if self.basic_mode:
+                    self._defer_basic_shuffle_rebuild = True
+                else:
+                    self._init_shuffle()
     
-    def _save_state(self, reason=""):
-        """Persist current state."""
+    def _save_state(self, reason="", persist=None):
+        """Capture runtime state; persist to flash only when requested.
+
+        By default, persistence is pot-off checkpoint only.
+        """
         state = {
             'mode': self.mode,
             'album_index': self.current_album_index,
             'track': self.current_track,
-            'known_tracks': self.known_tracks,
         }
-        self.hw.save_state(state)
-        self.hw.log(f"Saved state [{reason}]: {state}")
+        if not _IS_MICROPYTHON:
+            state['known_tracks'] = dict(self.known_tracks)
+        self._runtime_state = dict(state)
+        should_persist = (reason == "power off") if persist is None else bool(persist)
+        if should_persist:
+            self.hw.save_state(state)
     
     # ===========================
     #   BUTTON HANDLING
@@ -619,7 +830,8 @@ class RadioCore:
         Gestures:
           Taps only:  1=next, 2=prev, 3+=restart
           Hold only:  next album/playlist/station (in station-shuffle: next station + new shuffle)
-          N taps + hold: 1+hold=toggle mode, 2+hold=shuffle current, 3+hold=shuffle library
+          N taps + hold: 1+hold=exit shuffle to ordered station (basic); 2+hold=shuffle current station;
+                         3+hold=same as 2+hold (reshuffle); non-basic 3+: reshuffle current source
         """
         had_hold = getattr(self, '_pending_long_press', False)
         tap_count = self.tap_count
@@ -657,27 +869,17 @@ class RadioCore:
         """Triple tap - restart from the beginning of the current source.
 
         In ordered station/playlist/album mode: track 1 of that list.
-        In shuffle (station, album, playlist, or library): first entry in the
-        current ``shuffle_tracks`` order (same random order as when shuffle
-        started; does not re-shuffle). Single/double tap already move within
-        that list via ``shuffle_index``.
+        In shuffle: first entry in ``shuffle_tracks`` (same order as when shuffle
+        started). Single/double tap move within that list via ``shuffle_index``.
         """
         self.hw.log("Triple tap: restart")
         if self.mode == MODE_SHUFFLE:
-            if not self.shuffle_tracks:
+            if self._shuffle_entry_count() <= 0:
                 self.hw.log("Triple tap: no shuffle tracks to restart")
                 return
             self.shuffle_index = 0
             self.current_track = 1
-            st = self._shuffle_source_type
-            if st in ("album", "playlist", "station"):
-                self.hw.log(
-                    "Triple tap: restart at first track in current source shuffle order"
-                )
-            else:
-                self.hw.log(
-                    "Triple tap: restart at first track in library shuffle order"
-                )
+            self.hw.log("Triple tap: restart at first track in shuffle order")
         else:
             # Ordered playlist/station/album, or radio: first track index
             self.current_track = 1
@@ -690,15 +892,18 @@ class RadioCore:
         
         Behaviour depends on how many taps preceded the hold:
           0 taps + hold = Next album/playlist/station (in station-shuffle: next station, reshuffled)
-          1 tap  + hold = Toggle Album/Playlist mode (basic: exit shuffle to station order)
+          1 tap  + hold = Non-basic: cycle mode; basic: exit shuffle to ordered station
           2 taps + hold = Shuffle current album/playlist/station (again = new random order)
-          3+ taps + hold = Shuffle entire library
+          3+ taps + hold = Same as 2 taps (triple+hold matches double+hold in basic mode)
         """
         self.hw.log(f"_handle_long_press_with_taps: tap_count={tap_count}")
         
         if tap_count >= 3:
-            self._init_library_shuffle()
-            self.hw.log("Mode: Shuffle (Library)")
+            self._init_current_shuffle()
+            if not self.basic_mode:
+                self.hw.log(
+                    f"{tap_count}-tap+hold: shuffling current source (library shuffle removed)"
+                )
         elif tap_count == 2:
             self._init_current_shuffle()
         elif tap_count == 1:
@@ -729,20 +934,38 @@ class RadioCore:
             else:
                 self.switch_mode(MODE_ALBUM)
     
-    def _init_current_shuffle(self):
+    def _init_current_shuffle(self, _retried=False):
         """Initialize shuffle mode for current album/playlist/station."""
+        self._clear_basic_library_virtual()
         tracks = []
         source_name = 'Unknown'
         
         if self.basic_mode:
-            # In basic mode, always shuffle the current station (playlist) regardless of
-            # the current mode.  This prevents the fallback-to-library behaviour when
-            # calling shuffle-station from inside library-shuffle mode (where
-            # self.mode == MODE_SHUFFLE and _shuffle_source_type is None).
+            # Always shuffle the current station (playlist) regardless of mode.
+            if self.playlists and self.current_album_index < len(self.playlists):
+                self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+                station = self.playlists[self.current_album_index]
+                tracks = station.get('tracks', [])
+                if not tracks:
+                    count = self._basic_playlist_track_count(station)
+                    try:
+                        folder = int(station.get("id", self.current_album_index + 1))
+                    except (TypeError, ValueError):
+                        folder = self.current_album_index + 1
+                    if count > 0:
+                        tracks = [self._build_basic_track(folder, i) for i in range(1, count + 1)]
+                source_name = station.get('name', 'Station')
+                self._shuffle_source_type = 'station'
+        elif self.mode == MODE_SHUFFLE and not self._shuffle_source_type and not self.basic_mode:
+            # Persisted state does not record shuffle source; prefer playlist then album.
             if self.playlists and self.current_album_index < len(self.playlists):
                 tracks = self.playlists[self.current_album_index].get('tracks', [])
-                source_name = self.playlists[self.current_album_index].get('name', 'Station')
-                self._shuffle_source_type = 'station'
+                source_name = self.playlists[self.current_album_index].get('name', 'Playlist')
+                self._shuffle_source_type = 'playlist'
+            if not tracks and self.albums and self.current_album_index < len(self.albums):
+                tracks = self.albums[self.current_album_index].get('tracks', [])
+                source_name = self.albums[self.current_album_index].get('name', 'Album')
+                self._shuffle_source_type = 'album'
         elif self.mode == MODE_SHUFFLE and self._shuffle_source_type:
             if self._shuffle_source_type in ('playlist', 'station'):
                 if self.playlists and self.current_album_index < len(self.playlists):
@@ -764,27 +987,19 @@ class RadioCore:
                 self._shuffle_source_type = 'album'
         
         if not tracks:
-            if self.basic_mode:
-                for pl in self.playlists:
-                    tracks.extend(pl.get('tracks', []))
-            else:
-                tracks = list(self.hw.get_all_tracks() or [])
-            source_name = 'Library'
-            self._shuffle_source_type = None
-            self.hw.log("Warning: No current source found, shuffling library instead")
-        
-        if not tracks:
+            if self.basic_mode and not _retried and self.playlists:
+                self.hw.log(
+                    "BASIC: No tracks for shuffle at current station; retrying station 1"
+                )
+                self.current_album_index = 0
+                return self._init_current_shuffle(_retried=True)
             self.hw.log("Error: No tracks available to shuffle")
             return
         
-        # Create a fresh copy of tracks and shuffle them
-        self.shuffle_tracks = list(tracks)
-        
-        # Fisher-Yates shuffle - always create a new random order
-        # Shuffle from the end to the beginning
-        for i in range(len(self.shuffle_tracks) - 1, 0, -1):
-            j = randint(0, i)
-            self.shuffle_tracks[i], self.shuffle_tracks[j] = self.shuffle_tracks[j], self.shuffle_tracks[i]
+        # Build shuffle list with minimal temporary allocations.
+        if not self._assign_and_shuffle_tracks(tracks, reason="init_current_shuffle"):
+            self.hw.log("Shuffle: low-memory while preparing shuffle; keeping current mode")
+            return
         
         # Log the first few tracks to verify shuffle is working
         if len(self.shuffle_tracks) > 0:
@@ -794,8 +1009,8 @@ class RadioCore:
         self.shuffle_index = 0
         self.current_track = 1
         
-        # Save shuffle configuration before calling switch_mode (which will overwrite it)
-        saved_shuffle_tracks = list(self.shuffle_tracks) if self.shuffle_tracks else list(tracks)
+        # Save shuffle source before switch; track list stays intact because switch_mode
+        # only initializes shuffle when current list is empty.
         if self._shuffle_source_type:
             saved_shuffle_source = self._shuffle_source_type
         elif self.basic_mode:
@@ -808,59 +1023,13 @@ class RadioCore:
         # Use switch_mode to properly initialize shuffle mode
         self.switch_mode(MODE_SHUFFLE)
         
-        # Restore our specific shuffle configuration (switch_mode calls _init_shuffle which overwrites)
-        self.shuffle_tracks = saved_shuffle_tracks
+        # Preserve the selected shuffle source kind.
         self._shuffle_source_type = saved_shuffle_source
         
-        self.hw.log(f"Mode: Shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
+        self.hw.log(f"Mode: Track shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
         self._save_state("shuffle current")
-        
-        # Start playback (will be delayed if delay_playback is True)
-        self._start_playback_for_current()
-    
-    def _init_library_shuffle(self):
-        """Initialize shuffle mode for entire library.
-        In basic mode, gathers all tracks from discovered stations (playlists)
-        rather than calling hw.get_all_tracks() which may hit metadata.
-        """
-        if self.basic_mode:
-            all_tracks = []
-            for pl in self.playlists:
-                all_tracks.extend(pl.get('tracks', []))
-        else:
-            all_tracks = self.hw.get_all_tracks() or []
-        self.shuffle_tracks = list(all_tracks)
-        
-        # Fisher-Yates shuffle - always create a new random order
-        for i in range(len(self.shuffle_tracks) - 1, 0, -1):
-            j = randint(0, i)
-            self.shuffle_tracks[i], self.shuffle_tracks[j] = self.shuffle_tracks[j], self.shuffle_tracks[i]
-        
-        # Log the first few tracks to verify shuffle is working
-        if len(self.shuffle_tracks) > 0:
-            first_track = self.shuffle_tracks[0].get('title', 'Unknown') if self.shuffle_tracks[0] else 'Unknown'
-            self.hw.log(f"Shuffled library order starts with: {first_track}")
-        
-        self.shuffle_index = 0
-        self.current_track = 1
-        
-        # Save shuffle configuration before calling switch_mode (which will overwrite it)
-        saved_shuffle_tracks = list(self.shuffle_tracks)
-        
-        if self.mode == MODE_SHUFFLE:
-            self._arm_am_overlay_before_next_play("library shuffle (from station/album shuffle)")
-        else:
-            self.switch_mode(MODE_SHUFFLE)
-        
-        # Restore our library shuffle configuration (switch_mode calls _init_shuffle which overwrites)
-        self.shuffle_tracks = saved_shuffle_tracks
-        self._shuffle_source_type = None  # Library shuffle has no specific source
-        
-        self.hw.log(f"Mode: Shuffle (Library, {len(self.shuffle_tracks)} tracks)")
-        self._save_state("shuffle library")
-        
-        # Start playback (switch_mode already stopped playback and set delay_playback)
-        self._start_playback_for_current()
+        # switch_mode() already calls _start_playback_for_current(); do not call again
+        # or the firmware runs two AM sequences and double delay_playback.
     
     # ===========================
     #   TRACK NAVIGATION
@@ -873,10 +1042,11 @@ class RadioCore:
         folder_wrap = False
         
         if self.mode == MODE_SHUFFLE:
-            if not self.shuffle_tracks:
+            n = self._shuffle_entry_count()
+            if n <= 0:
                 self.hw.log("_next_track: No shuffle tracks available")
                 return
-            self.shuffle_index = (self.shuffle_index + 1) % len(self.shuffle_tracks)
+            self.shuffle_index = (self.shuffle_index + 1) % n
             self.current_track = self.shuffle_index + 1
         elif self.mode == MODE_RADIO:
             # In radio mode, don't manually advance (virtual time handles it)
@@ -886,6 +1056,25 @@ class RadioCore:
             total = self._get_track_count()
             if total == 0:
                 self.hw.log("_next_track: No tracks available")
+                # #region agent log
+                try:
+                    pl = None
+                    if self.playlists and 0 <= self.current_album_index < len(self.playlists):
+                        pl = self.playlists[self.current_album_index]
+                    _agent_debug_ndjson(
+                        "TRK2",
+                        "next_track_no_tracks",
+                        {
+                            "album_idx": int(self.current_album_index),
+                            "basic": bool(self.basic_mode),
+                            "hydrated": bool(pl.get("hydrated")) if pl else None,
+                            "track_count_field": int(pl.get("track_count") or 0) if pl else None,
+                            "n_list": len(pl.get("tracks") or []) if pl else None,
+                        },
+                    )
+                except Exception:
+                    pass
+                # #endregion
                 return
             if self.current_track >= total:
                 self.current_track = 1
@@ -895,10 +1084,7 @@ class RadioCore:
         
         # Get track info for logging
         new_tr = self._get_current_track()
-        new_title = new_tr.get('title', 'Unknown') if new_tr else 'Unknown'
-        new_artist = new_tr.get('artist', 'Unknown') if new_tr else 'Unknown'
         self.hw.log(f"_next_track: album {old_album+1} track {old_track} -> album {self.current_album_index+1} track {self.current_track}")
-        self.hw.log(f"_next_track: Will play '{new_title}' by {new_artist}")
         self._folder_wrap_play = folder_wrap
         self._save_state("next track")
         self._start_playback_for_current()
@@ -909,10 +1095,11 @@ class RadioCore:
         old_album = self.current_album_index
         
         if self.mode == MODE_SHUFFLE:
-            if not self.shuffle_tracks:
+            n = self._shuffle_entry_count()
+            if n <= 0:
                 self.hw.log("_prev_track: No shuffle tracks available")
                 return
-            self.shuffle_index = (self.shuffle_index - 1) % len(self.shuffle_tracks)
+            self.shuffle_index = (self.shuffle_index - 1) % n
             self.current_track = self.shuffle_index + 1
         elif self.mode == MODE_RADIO:
             # In radio mode, don't manually advance (virtual time handles it)
@@ -948,6 +1135,7 @@ class RadioCore:
             # In shuffle mode: advance to next source and rebuild shuffle_tracks (fixes
             # basic-mode 'station' shuffle, which was falling through to the album branch
             # and leaving stale shuffle_tracks from the previous folder).
+            prev_album_index = self.current_album_index
             if self._shuffle_source_type == 'album':
                 if self.albums:
                     self.current_album_index = (self.current_album_index + 1) % len(self.albums)
@@ -959,63 +1147,137 @@ class RadioCore:
                     return
             else:
                 # playlist (GUI) or station (basic mode) — both use self.playlists
-                if self.playlists:
+                if not self.playlists:
+                    return
+                if self.basic_mode and self._shuffle_source_type == "station":
+                    self.current_album_index = self._next_station_index()
+                else:
                     self.current_album_index = (self.current_album_index + 1) % len(self.playlists)
+
+                n_playlists = len(self.playlists)
+                default_name = (
+                    "Station" if self._shuffle_source_type == "station" else "Playlist"
+                )
+                kind = (
+                    "station"
+                    if self._shuffle_source_type == "station"
+                    else "playlist"
+                )
+                tracks = []
+                new_source = self.playlists[self.current_album_index]
+                for _attempt in range(n_playlists):
                     new_source = self.playlists[self.current_album_index]
-                    tracks = new_source.get('tracks', [])
-                    default_name = (
-                        'Station' if self._shuffle_source_type == 'station' else 'Playlist'
+                    if self.basic_mode and self._shuffle_source_type == "station":
+                        self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+                    tracks = new_source.get("tracks", [])
+                    if self.basic_mode and self._shuffle_source_type == "station" and not tracks:
+                        count = self._basic_playlist_track_count(new_source)
+                        try:
+                            folder = int(new_source.get("id", self.current_album_index + 1))
+                        except (TypeError, ValueError):
+                            folder = self.current_album_index + 1
+                        if count > 0:
+                            tracks = [
+                                self._build_basic_track(folder, i)
+                                for i in range(1, count + 1)
+                            ]
+                    if tracks:
+                        break
+                    if not (self.basic_mode and self._shuffle_source_type == "station"):
+                        break
+                    self.hw.log(
+                        f"Shuffle: station idx={self.current_album_index} has no usable tracks, skipping"
                     )
-                    source_name = new_source.get('name', default_name)
-                    kind = (
-                        'station'
-                        if self._shuffle_source_type == 'station'
-                        else 'playlist'
-                    )
+                    self.current_album_index = self._next_station_index()
+
+                source_name = new_source.get("name", default_name)
+                if tracks:
                     self.hw.log(
                         f"Shuffle: advancing to next {kind} '{source_name}' (idx={self.current_album_index})"
                     )
-                else:
-                    return
-            
+
             if not tracks:
-                self.hw.log("Shuffle: next source has no tracks")
+                if self.basic_mode and self._shuffle_source_type == "station":
+                    self.hw.log(
+                        "Shuffle: no playable station when advancing; reverting to previous station"
+                    )
+                    self.current_album_index = prev_album_index
+                else:
+                    self.hw.log("Shuffle: next source has no tracks")
                 return
             
-            # Reshuffle the new source's tracks
-            self.shuffle_tracks = list(tracks)
-            for i in range(len(self.shuffle_tracks) - 1, 0, -1):
-                j = randint(0, i)
-                self.shuffle_tracks[i], self.shuffle_tracks[j] = self.shuffle_tracks[j], self.shuffle_tracks[i]
+            # Reshuffle the new source's tracks. If heap is too fragmented, fall back
+            # to ordered station mode instead of hard-failing the firmware loop.
+            if not self._assign_and_shuffle_tracks(tracks, reason="next_album_shuffle"):
+                self.hw.log(
+                    "Shuffle: low-memory while advancing station; "
+                    "falling back to ordered station mode"
+                )
+                self.mode = MODE_PLAYLIST
+                self._shuffle_source_type = None
+                self.shuffle_tracks = []
+                self.shuffle_index = 0
+                self.current_track = 1
+                # Roll back only if the new source is not playable.
+                if self.playlists and 0 <= self.current_album_index < len(self.playlists):
+                    cur_pl = self.playlists[self.current_album_index]
+                    if not cur_pl.get("tracks") and self._basic_playlist_track_count(cur_pl) <= 0:
+                        self.current_album_index = prev_album_index
+                self._maybe_schedule_station_change_am()
+                self._start_playback_for_current()
+                return
             self.shuffle_index = 0
             self.current_track = 1
-            self.hw.log(f"Mode: Shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
+            if self.basic_mode and self._shuffle_source_type == "station":
+                si = self._shuffle_index_for_track_number(1)
+                if si >= 0:
+                    self.shuffle_index = si
+                    self.current_track = si + 1
+                    self.hw.log(
+                        "Shuffle: new station starts at folder track 001 (then continues shuffled order)"
+                    )
+            self.hw.log(f"Mode: Track shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
             self._save_state("shuffle next album")
             
-            # Set delay_playback so firmware can play AM overlay
-            if hasattr(self.hw, 'set_delay_playback'):
-                self.hw.set_delay_playback(True)
+            # AM overlay between stations unless we want handoff like _next_track (station shuffle).
+            self._maybe_schedule_station_change_am()
             self._start_playback_for_current()
         elif self.mode == MODE_PLAYLIST:
-            self.current_album_index = (self.current_album_index + 1) % max(len(self.playlists), 1)
+            if self.basic_mode:
+                self.current_album_index = self._next_station_index()
+            else:
+                self.current_album_index = (self.current_album_index + 1) % max(len(self.playlists), 1)
             self.current_track = 1
             self._save_state("next playlist")
-            if hasattr(self.hw, 'set_delay_playback'):
-                self.hw.set_delay_playback(True)
+            self._maybe_schedule_station_change_am()
             self._start_playback_for_current()
         else:
             # Album mode (or shuffle library — just advance album)
             self.current_album_index = (self.current_album_index + 1) % max(len(self.albums), 1)
             self.current_track = 1
             self._save_state("next album")
-            if hasattr(self.hw, 'set_delay_playback'):
-                self.hw.set_delay_playback(True)
+            self._schedule_delayed_playback("station_change")
             self._start_playback_for_current()
     
     def on_track_finished(self):
         """Called when current track finishes playing."""
         if not self.power_on:
             return
+        # #region agent log
+        try:
+            _agent_debug_ndjson(
+                "TRK1",
+                "on_track_finished",
+                {
+                    "mode": self.mode,
+                    "track": int(self.current_track),
+                    "album_idx": int(self.current_album_index),
+                    "basic": bool(self.basic_mode),
+                },
+            )
+        except Exception:
+            pass
+        # #endregion
         
         if self.mode == MODE_RADIO:
             self.hw.log("Track finished, auto-advancing (radio)")
@@ -1029,17 +1291,20 @@ class RadioCore:
         # is sitting in hw._last_error_code.  Trim the station now so the device
         # doesn't keep trying phantom tracks.
         if self.basic_mode and getattr(self.hw, '_last_error_code', None) == 6:
-            tracks = self._get_current_tracks()
-            if tracks and 0 < self.current_track <= len(tracks):
-                folder = tracks[self.current_track - 1].get('folder')
+            cur = self._get_current_track()
+            if cur is not None:
+                folder = cur.get('folder')
+                tn = cur.get('track_number', self.current_track)
                 if folder is not None:
-                    self.hw.log(f"BASIC: Async file-not-found for folder {folder} track {self.current_track}, correcting station")
-                    self._handle_basic_track_not_found(folder, self.current_track)
+                    self.hw.log(
+                        f"BASIC: Async file-not-found for folder {folder} track {tn}, correcting station"
+                    )
+                    self._handle_basic_track_not_found(folder, tn)
                     return
 
-        # Basic mode: end of station shuffle / library shuffle (before sequential branch)
-        if self.basic_mode and self.mode == MODE_SHUFFLE and self.shuffle_tracks:
-            n = len(self.shuffle_tracks)
+        # Basic mode: end of station shuffle (before sequential branch)
+        if self.basic_mode and self.mode == MODE_SHUFFLE and self._shuffle_entry_count() > 0:
+            n = self._shuffle_entry_count()
             if n > 0 and self.shuffle_index >= n - 1:
                 if self._shuffle_source_type in ('album', 'playlist', 'station'):
                     if self.advance_next_station:
@@ -1051,15 +1316,6 @@ class RadioCore:
                     if not self.loop_stations:
                         self.hw.log(
                             "Track finished: end of shuffled station (no loop), stopping"
-                        )
-                        self.hw.stop()
-                        self.is_playing = False
-                        return
-                elif self._shuffle_source_type is None:
-                    # Library shuffle (all tracks): one full pass then stop if not looping
-                    if not self.loop_stations:
-                        self.hw.log(
-                            "Track finished: end of library shuffle pass, stopping"
                         )
                         self.hw.stop()
                         self.is_playing = False
@@ -1161,10 +1417,35 @@ class RadioCore:
         """
         self.hw.stop()
         self.is_playing = False
-        if hasattr(self.hw, 'set_delay_playback'):
-            self.hw.set_delay_playback(True)
+        self._schedule_delayed_playback("mode_change")
         if reason:
             self.hw.log(f"[MODE] AM overlay: {reason}")
+
+    def _schedule_delayed_playback(self, reason):
+        """Request exactly one AM transition before the next track start."""
+        if hasattr(self.hw, "set_delay_playback_reason"):
+            try:
+                self.hw.set_delay_playback_reason(reason)
+            except Exception:
+                pass
+        if hasattr(self.hw, "set_delay_playback"):
+            self.hw.set_delay_playback(True)
+
+    def _should_skip_station_change_am_overlay(self) -> bool:
+        """True when advancing to another station should start audio like in-track advance."""
+        if not self.basic_mode:
+            return False
+        if self.mode == MODE_SHUFFLE and self._shuffle_source_type == "station":
+            return True
+        return False
+
+    def _maybe_schedule_station_change_am(self) -> None:
+        if self._should_skip_station_change_am_overlay():
+            self.hw.log(
+                "BASIC: station advance — skipping AM overlay (direct play, same as track advance)"
+            )
+            return
+        self._schedule_delayed_playback("station_change")
     
     def switch_mode(self, new_mode):
         """Switch to a new mode."""
@@ -1188,22 +1469,19 @@ class RadioCore:
         # Clear shuffle source type when leaving shuffle mode
         if self.mode == MODE_SHUFFLE and new_mode != MODE_SHUFFLE:
             self._shuffle_source_type = None
-        
+            self._clear_basic_library_virtual()
+
         self.mode = new_mode
         
         # Stop current playback before switching modes
         self.hw.stop()
         self.is_playing = False
         
-        # Enable playback delay so GUI can sequence AM overlay before track
-        if hasattr(self.hw, 'set_delay_playback'):
-            self.hw.set_delay_playback(True)
-        
-        # Note: AM overlay is played by GUI layer to ensure proper sequencing
+        self._schedule_delayed_playback("mode_change")
         
         if new_mode == MODE_SHUFFLE:
-            # Only initialize if shuffle_tracks is empty (don't overwrite existing shuffle)
-            if not self.shuffle_tracks:
+            # Only initialize if shuffle list is empty (don't overwrite existing shuffle)
+            if self._shuffle_entry_count() == 0:
                 self._init_shuffle()
         elif new_mode == MODE_RADIO:
             if not self.radio_stations or self.radio_mode_start_ms is None:
@@ -1233,9 +1511,14 @@ class RadioCore:
         self._save_state("mode switch")
         self._start_playback_for_current()
     
-    def _init_shuffle(self):
-        """Initialize shuffle mode (defaults to library shuffle when called from switch_mode)."""
-        self._init_library_shuffle()
+    def _init_shuffle(self, start_playback=True):
+        """Build shuffle tracks when entering shuffle with an empty list (mode cycle / boot)."""
+        _ = start_playback  # API compat with firmware boot_sequence; playback is outer-owned
+        self._init_current_shuffle()
+        if self.mode == MODE_SHUFFLE and len(self.shuffle_tracks) == 0:
+            self.hw.log("[MODE] Shuffle unavailable (no tracks); returning to playlist order")
+            self.mode = MODE_PLAYLIST
+            self._shuffle_source_type = None
     
     def _init_radio(self):
         """Initialize radio mode with stations.
@@ -1434,7 +1717,7 @@ class RadioCore:
         
         self.hw.log("Power off")
         self.power_on = False
-        
+
         # Save resume state
         self.resume_state = {
             'mode': self.mode,
@@ -1457,20 +1740,36 @@ class RadioCore:
         # Stop any current playback (in case power was toggled quickly)
         self.hw.stop()
         self.is_playing = False
-        
+
+        # Basic mode: SD card may have been swapped while the pot was off. Rediscover
+        # stations like boot and drop stale per-folder counts so hydration re-queries
+        # the DFPlayer (avoids playing phantom tracks from the previous card).
+        if self.basic_mode:
+            self.known_tracks = {}
+            if hasattr(self.hw, "_known_tracks"):
+                self.hw._known_tracks = {}
+            self._load_data_basic()
+
         # Enable playback delay so firmware can sequence AM overlay before track
-        if hasattr(self.hw, 'set_delay_playback'):
-            self.hw.set_delay_playback(True)
+        self._schedule_delayed_playback("power_on")
         
         # Restore only mode and album from saved state (track/position ignored; we start from track 1)
         if self.resume_state:
             self.mode = self.resume_state.get('mode', MODE_ALBUM)
             self.current_album_index = self.resume_state.get('album_index', 0)
             self.resume_state = None
+
+        if self.basic_mode and self.playlists:
+            if self.current_album_index >= len(self.playlists):
+                self.hw.log(
+                    "Clamping album index %d after SD rediscover (have %d stations)"
+                    % (self.current_album_index, len(self.playlists))
+                )
+                self.current_album_index = max(0, len(self.playlists) - 1)
         
         # Always start from track 1 on power-on
         self.current_track = 1
-        if self.mode == MODE_SHUFFLE and self.shuffle_tracks:
+        if self.mode == MODE_SHUFFLE and self._shuffle_entry_count() > 0:
             self.shuffle_index = 0
         elif self.mode == MODE_RADIO and self.radio_stations:
             self.radio_station_index = 0
@@ -1489,7 +1788,19 @@ class RadioCore:
             return []
         elif self.mode == MODE_PLAYLIST:
             if self.playlists and self.current_album_index < len(self.playlists):
-                tracks = self.playlists[self.current_album_index].get('tracks', [])
+                playlist = self.playlists[self.current_album_index]
+                tracks = playlist.get('tracks', [])
+                if self.basic_mode and not tracks:
+                    # Lazy-discovery path: hydrate current station on first access.
+                    if not playlist.get("hydrated"):
+                        self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+                    try:
+                        folder = int(playlist.get("id", self.current_album_index + 1))
+                    except (TypeError, ValueError):
+                        folder = self.current_album_index + 1
+                    n = self._basic_playlist_track_count(playlist)
+                    if n > 0:
+                        return [self._build_basic_track(folder, i) for i in range(1, n + 1)]
                 # Don't log here - causes recursion when called from get_status() during logging
                 return tracks
             # Don't log here - causes recursion when called from get_status() during logging
@@ -1501,6 +1812,15 @@ class RadioCore:
     
     def _get_track_count(self):
         """Get total track count for current mode."""
+        if self.basic_mode and self.mode == MODE_PLAYLIST:
+            if self.playlists and self.current_album_index < len(self.playlists):
+                playlist = self.playlists[self.current_album_index]
+                if not playlist.get("tracks") and not playlist.get("hydrated"):
+                    self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+                return self._basic_playlist_track_count(playlist)
+            return 0
+        if self.mode == MODE_SHUFFLE:
+            return self._shuffle_entry_count()
         tracks = self._get_current_tracks()
         count = len(tracks)
         # Don't log here - can cause recursion when called from get_status() during logging
@@ -1509,16 +1829,37 @@ class RadioCore:
     
     def _get_current_track(self):
         """Get the current track dict."""
+        if self.basic_mode and self.mode == MODE_PLAYLIST:
+            if self.playlists and self.current_album_index < len(self.playlists):
+                playlist = self.playlists[self.current_album_index]
+                tracks = playlist.get("tracks", [])
+                if tracks:
+                    idx = max(self.current_track - 1, 0)
+                    if idx >= len(tracks):
+                        return tracks[0] if tracks else None
+                    return tracks[idx]
+                count = self._basic_playlist_track_count(playlist)
+                if count <= 0:
+                    return None
+                tnum = self.current_track
+                if tnum < 1 or tnum > count:
+                    tnum = 1
+                try:
+                    folder = int(playlist.get("id", self.current_album_index + 1))
+                except (TypeError, ValueError):
+                    folder = self.current_album_index + 1
+                return self._build_basic_track(folder, tnum)
+            return None
         tracks = self._get_current_tracks()
         if not tracks:
             return None
-        
+
         # In shuffle mode, use shuffle_index directly
         if self.mode == MODE_SHUFFLE:
             idx = max(self.shuffle_index, 0)
         else:
             idx = max(self.current_track - 1, 0)
-        
+
         if idx >= len(tracks):
             return tracks[0] if tracks else None
         return tracks[idx]
@@ -1530,6 +1871,13 @@ class RadioCore:
             if not self.playlists:
                 self.hw.log("_start_playback_for_current: No playlists available")
                 return
+            if self.basic_mode:
+                if not self._ensure_basic_station_ready_for_playback():
+                    self.hw.log(
+                        "_start_playback_for_current: No playable stations "
+                        "(all empty or query unavailable)"
+                    )
+                    return
             if self.current_album_index >= len(self.playlists):
                 self.hw.log(f"_start_playback_for_current: Invalid playlist index {self.current_album_index} (have {len(self.playlists)} playlists), resetting to 0")
                 self.current_album_index = 0
@@ -1552,7 +1900,7 @@ class RadioCore:
                 else:
                     source_name = "Unknown Playlist"
             elif self._shuffle_source_type == 'station':
-                shuffle_type = "station"
+                shuffle_type = "station_tracks"
                 if self.playlists and self.current_album_index < len(self.playlists):
                     source_name = self.playlists[self.current_album_index].get('name', 'Station')
                 else:
@@ -1564,8 +1912,8 @@ class RadioCore:
                 else:
                     source_name = "Unknown Album"
             else:
-                shuffle_type = "library"
-                source_name = "Library"
+                shuffle_type = ""
+                source_name = "Shuffle"
         elif self.mode == MODE_PLAYLIST:
             if self.playlists and self.current_album_index < len(self.playlists):
                 source_name = self.playlists[self.current_album_index].get('name', 'Unknown Playlist')
@@ -1582,9 +1930,11 @@ class RadioCore:
             # In basic mode, report "station" instead of "playlist" so the GUI
             # displays "Station" not "Playlist".
             mode_label = "station" if (self.basic_mode and self.mode == MODE_PLAYLIST) else self.mode
-            # Single combined log line so GUI parser can extract everything at once
-            self.hw.log(f"_start_playback_for_current: mode={mode_label}, source={source_name}, shuffle_type={shuffle_type}, album_idx={self.current_album_index}, track_idx={self.current_track}, folder={folder}, track={track_num}")
-            self.hw.log(f"_start_playback_for_current: Playing '{title}' by {artist}")
+            # Combined log line — GUI parser extracts mode/source/shuffle_type/album_idx.
+            self.hw.log(
+                f"_start_playback_for_current: mode={mode_label}, source={source_name}, "
+                f"shuffle_type={shuffle_type}, album_idx={self.current_album_index}"
+            )
             self._start_playback_for_track(track, start_ms=start_ms)
         else:
             self.hw.log(f"_start_playback_for_current: No track available (mode={self.mode}, album_idx={self.current_album_index}, track={self.current_track})")
@@ -1613,10 +1963,27 @@ class RadioCore:
         # run it (avoids extra glitches and wrong UX when station should change).
         if self.basic_mode and not self.loop_stations:
             folder_wrap = False
-        result = self.hw.play_track(
+        result = self._hw_play_track(
             folder, track_num, start_ms=start_ms, folder_wrap=folder_wrap
         )
         if result:
+            # play_track returns True when DFPlayer gates the command (delay_playback /
+            # AM overlay active). Do not mark logical playback until the real start runs.
+            deferred = bool(getattr(self.hw, "_delay_playback", False))
+            get_oc = getattr(self.hw, "get_last_start_outcome", None)
+            if callable(get_oc):
+                try:
+                    oc = get_oc() or {}
+                    if oc.get("status") == "delayed":
+                        deferred = True
+                except Exception:
+                    pass
+            if deferred:
+                self.is_playing = False
+                self.hw.log(
+                    "Playback deferred (overlay/delay gate); firmware will start after AM"
+                )
+                return
             self.is_playing = True
             self.hw.log(f"Playback started successfully: '{title}' by {artist}")
         else:
@@ -1626,15 +1993,33 @@ class RadioCore:
             # is not proof the file is missing (short MP3s, clone quirks, wiring).
             if self.basic_mode and getattr(self.hw, "_last_error_code", None) == 6:
                 self._handle_basic_track_not_found(folder, track_num)
+                return
+            deferred = bool(getattr(self.hw, "_delay_playback", False))
+            get_oc = getattr(self.hw, "get_last_start_outcome", None)
+            if callable(get_oc):
+                try:
+                    oc = get_oc() or {}
+                    if oc.get("status") == "delayed":
+                        deferred = True
+                except Exception:
+                    pass
+    def _hw_play_track(self, folder, track_num, *, start_ms=0, folder_wrap=False, **kwargs):
+        try:
+            return self.hw.play_track(
+                folder, track_num, start_ms=start_ms, folder_wrap=folder_wrap, **kwargs
+            )
+        except TypeError:
+            return self.hw.play_track(
+                folder, track_num, start_ms=start_ms, folder_wrap=folder_wrap
+            )
 
     def _handle_basic_track_not_found(self, folder, failed_track_num):
         """Called when a play attempt returns 'file not found' in basic mode.
 
         Trims the station's track list to the last known-good count so future
         _get_track_count() calls return the correct value, then restarts playback.
-        Library shuffle uses ``shuffle_tracks`` / ``shuffle_index`` (not
-        ``current_track`` alone); stale entries must be pruned or recovery loops
-        forever and can hit maximum recursion depth.
+        In shuffle mode, ``shuffle_tracks`` must be pruned of entries past the
+        corrected per-folder max or recovery can loop.
         """
         self._basic_not_found_recovery_depth = (
             getattr(self, "_basic_not_found_recovery_depth", 0) + 1
@@ -1669,8 +2054,10 @@ class RadioCore:
                     continue
                 matched = True
                 tracks = pl.get("tracks", [])
-                if actual_count < len(tracks):
+                prev_count = self._basic_playlist_track_count(pl)
+                if actual_count < prev_count:
                     pl["tracks"] = tracks[:actual_count]
+                    pl["track_count"] = actual_count
                     if hasattr(self.hw, "_known_tracks"):
                         self.hw._known_tracks[folder] = actual_count
                     self.known_tracks[folder] = actual_count
@@ -1679,8 +2066,8 @@ class RadioCore:
                     )
                 break
 
-            # Shuffle mode keeps a separate list of track dicts; trimming ``playlists``
-            # does not remove references to missing files from ``shuffle_tracks``.
+            # Shuffle mode keeps separate order state; trimming ``playlists`` does
+            # not automatically remove references to missing files from that state.
             if self.mode == MODE_SHUFFLE and self.shuffle_tracks:
 
                 def _shuffle_entry_valid(t: dict) -> bool:
@@ -1708,10 +2095,11 @@ class RadioCore:
                     )
 
             if self.mode == MODE_SHUFFLE:
-                if not self.shuffle_tracks:
+                if self._shuffle_entry_count() <= 0:
                     self.hw.log("BASIC: No shuffle tracks left after not-found recovery")
                     return
-                self.shuffle_index = min(self.shuffle_index, len(self.shuffle_tracks) - 1)
+                n = self._shuffle_entry_count()
+                self.shuffle_index = min(self.shuffle_index, n - 1)
                 self.shuffle_index = max(0, self.shuffle_index)
                 self.current_track = self.shuffle_index + 1
             else:
@@ -1751,15 +2139,19 @@ class RadioCore:
                 if self.playlists and self.current_album_index < len(self.playlists):
                     source_name = self.playlists[self.current_album_index].get('name', 'Playlist')
                 else:
-                    source_name = "Library Shuffle"
+                    source_name = "Shuffle"
             elif self._shuffle_source_type == 'album':
                 if self.albums and self.current_album_index < len(self.albums):
                     source_name = self.albums[self.current_album_index].get('name', 'Album')
                 else:
-                    source_name = "Library Shuffle"
+                    source_name = "Shuffle"
+            elif self._shuffle_source_type == 'station':
+                if self.playlists and self.current_album_index < len(self.playlists):
+                    source_name = self.playlists[self.current_album_index].get('name', 'Station')
+                else:
+                    source_name = "Shuffle"
             else:
-                # No specific source type means library shuffle
-                source_name = "Library Shuffle"
+                source_name = "Shuffle"
         elif self.mode == MODE_RADIO:
             if self.radio_stations and self.radio_station_index < len(self.radio_stations):
                 source_name = f"Radio: {self.radio_stations[self.radio_station_index].name}"
@@ -1786,5 +2178,6 @@ class RadioCore:
             'is_playing': self.is_playing,
             'power_on': self.power_on,
             'volume': self.volume,
+            'station_cycle_shuffle_active': False,
         }
 

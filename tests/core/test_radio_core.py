@@ -79,7 +79,7 @@ class TestTripleTap:
         core.current_track = 3
         core._triple_tap()
         assert core.current_track == 1
-        assert any(c[0] == "save_state" for c in mock_hardware.calls)
+        assert not any(c[0] == "save_state" for c in mock_hardware.calls)
 
 
 class TestLongPress:
@@ -345,13 +345,13 @@ class TestGetStatus:
 
 class TestShuffleNavigation:
     def test_next_in_shuffle(self, core, mock_hardware):
-        core._init_library_shuffle()
+        core._init_current_shuffle()
         old_idx = core.shuffle_index
         core._next_track()
         assert core.shuffle_index == (old_idx + 1) % len(core.shuffle_tracks)
 
     def test_prev_in_shuffle(self, core, mock_hardware):
-        core._init_library_shuffle()
+        core._init_current_shuffle()
         core.shuffle_index = 0
         core._prev_track()
         assert core.shuffle_index == len(core.shuffle_tracks) - 1
@@ -400,14 +400,13 @@ class TestGestureEdgeCases:
         assert core.mode == "shuffle"
         assert len(core.shuffle_tracks) > 0
 
-    def test_three_taps_hold_shuffles_library(self, core):
+    def test_three_taps_hold_shuffles_current_source_like_two(self, core):
         core._pending_long_press = True
         core.tap_count = 3
         core._resolve_input()
         assert core.mode == "shuffle"
-        # Library shuffle includes all tracks from all albums
-        total_tracks = sum(len(a["tracks"]) for a in core.albums)
-        assert len(core.shuffle_tracks) == total_tracks
+        expected = len(core.albums[core.current_album_index]["tracks"])
+        assert len(core.shuffle_tracks) == expected
 
     def test_resolve_resets_tap_count(self, core):
         core.tap_count = 2
@@ -469,12 +468,17 @@ class TestStatePersistence:
         core.current_album_index = 1
         core.current_track = 2
         core.mode = "playlist"
-        core._save_state("test")
+        core._save_state("test", persist=True)
         saved = mock_hardware._state
         assert saved["album_index"] == 1
         assert saved["track"] == 2
         assert saved["mode"] == "playlist"
         assert "known_tracks" in saved
+
+    def test_next_track_does_not_persist_state(self, core, mock_hardware):
+        mock_hardware.calls.clear()
+        core._next_track()
+        assert not any(c[0] == "save_state" for c in mock_hardware.calls)
 
     def test_load_state_restores_album_track_mode(self, core, mock_hardware):
         mock_hardware._state = {
@@ -533,18 +537,6 @@ class TestStatePersistence:
 # ---------------------------------------------------------------------------
 
 class TestShuffleBehaviour:
-    def test_library_shuffle_contains_all_tracks(self, core):
-        core._init_library_shuffle()
-        total = sum(len(a["tracks"]) for a in core.albums)
-        assert len(core.shuffle_tracks) == total
-
-    def test_library_shuffle_is_permutation(self, core):
-        """Same tracks appear, possibly in different order."""
-        all_ids = {t["id"] for a in core.albums for t in a["tracks"]}
-        core._init_library_shuffle()
-        shuffle_ids = {t["id"] for t in core.shuffle_tracks}
-        assert shuffle_ids == all_ids
-
     def test_current_shuffle_uses_current_album_only(self, core):
         core.current_album_index = 0
         core._init_current_shuffle()
@@ -553,13 +545,13 @@ class TestShuffleBehaviour:
         assert shuffle_ids == album_track_ids
 
     def test_on_track_finished_in_shuffle_advances_index(self, core):
-        core._init_library_shuffle()
+        core._init_current_shuffle()
         core.shuffle_index = 0
         core.on_track_finished()
         assert core.shuffle_index == 1
 
     def test_shuffle_wrap_at_end_of_list(self, core):
-        core._init_library_shuffle()
+        core._init_current_shuffle()
         core.shuffle_index = len(core.shuffle_tracks) - 1
         core.on_track_finished()
         assert core.shuffle_index == 0
@@ -597,7 +589,7 @@ class TestVolume:
 
 class TestPowerCycle:
     def test_power_off_in_shuffle_saves_mode(self, core, mock_hardware):
-        core._init_library_shuffle()
+        core._init_current_shuffle()
         core.power_off()
         saved = mock_hardware._state
         assert saved["mode"] == "shuffle"
@@ -638,7 +630,7 @@ class TestGetStatusAccuracy:
         assert status["track_count"] == len(core.playlists[0]["tracks"])
 
     def test_status_in_shuffle_mode(self, core):
-        core._init_library_shuffle()
+        core._init_current_shuffle()
         status = core.get_status()
         assert status["mode"] == "shuffle"
         assert status["track_count"] == len(core.shuffle_tracks)

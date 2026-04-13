@@ -202,8 +202,8 @@ SM_SDINEW = 0x0800
 
 ALBUM_FILE = "VintageRadio/album_state.txt"
 METADATA_PATHS = [
-    "/sd/VintageRadio/radio_metadata.json",
     "/sd/radio_metadata.json",
+    "/sd/VintageRadio/radio_metadata.json",
     "VintageRadio/radio_metadata.json",
     "radio_metadata.json",
 ]

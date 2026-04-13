@@ -33,7 +33,7 @@ class TestRadioCoreStatePersistence:
         rc.current_track = 2
         rc.mode = MODE_PLAYLIST
         rc.known_tracks = {1: 3, 2: 5}
-        rc._save_state("test")
+        rc._save_state("test", persist=True)
 
         # New RadioCore loading from same hardware state
         rc2 = RadioCore(hw)
@@ -46,7 +46,7 @@ class TestRadioCoreStatePersistence:
         assert rc2.mode == MODE_PLAYLIST
         assert rc2.known_tracks == {1: 3, 2: 5}
 
-    def test_save_state_called_on_next_track(self):
+    def test_save_state_not_persisted_on_next_track(self):
         hw = MockHardwareInterface(
             albums=_make_test_albums(),
             playlists=_make_test_playlists(),
@@ -55,9 +55,9 @@ class TestRadioCoreStatePersistence:
         rc.init(skip_initial_playback=True)
         hw.calls.clear()
         rc._next_track()
-        assert any(c[0] == "save_state" for c in hw.calls)
+        assert not any(c[0] == "save_state" for c in hw.calls)
 
-    def test_save_state_called_on_mode_switch(self):
+    def test_save_state_not_persisted_on_mode_switch(self):
         hw = MockHardwareInterface(
             albums=_make_test_albums(),
             playlists=_make_test_playlists(),
@@ -66,7 +66,7 @@ class TestRadioCoreStatePersistence:
         rc.init(skip_initial_playback=True)
         hw.calls.clear()
         rc.switch_mode(MODE_PLAYLIST)
-        assert any(c[0] == "save_state" for c in hw.calls)
+        assert not any(c[0] == "save_state" for c in hw.calls)
 
     def test_load_state_with_none_does_not_crash(self):
         hw = MockHardwareInterface(albums=_make_test_albums(), playlists=_make_test_playlists())
@@ -114,7 +114,7 @@ class TestRadioCoreStatePersistence:
         rc = RadioCore(hw)
         rc.init(skip_initial_playback=True)
         rc.known_tracks = {3: 7, 5: 2}
-        rc._save_state("known_tracks_test")
+        rc._save_state("known_tracks_test", persist=True)
 
         rc2 = RadioCore(hw)
         rc2.albums = _make_test_albums()

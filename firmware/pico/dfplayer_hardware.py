@@ -9,9 +9,12 @@ This allows the firmware to run the exact same logic as the GUI emulator.
 
 from machine import Pin, PWM, Timer, UART
 import neopixel
-import ustruct
 import time
 import os
+try:
+    import gc
+except Exception:
+    gc = None
 
 # Try to import SD card support
 try:
@@ -29,6 +32,11 @@ except ImportError:
 
 # Import shared constants and interface from radio_core
 from radio_core import HardwareInterface, FADE_IN_S, DF_BOOT_MS
+
+try:
+    import am_wav_loader
+except ImportError:
+    from components import am_wav_loader
 
 # Import pin configuration (reads pin_config.json, falls back to defaults)
 from pin_config_loader import load_pin_config, get_spi_config, get_dfplayer_config
@@ -58,9 +66,10 @@ VOLUME_SCALE    = 1.0
 WAV_FILE        = "VintageRadio/AMradioSound.wav"
 PWM_CARRIER     = 125_000
 ALBUM_FILE      = "VintageRadio/album_state.txt"
-METADATA_FILE   = "VintageRadio/radio_metadata.json"
+# On DFPlayer SD, metadata lives at SD root as radio_metadata.json (see _load_metadata).
+METADATA_FILE   = "radio_metadata.json"
 
-BUSY_CONFIRM_MS = 2200
+BUSY_CONFIRM_MS = 5000
 POST_CMD_GUARD_MS = 120
 # After stop, wait for BUSY HIGH so rapid auto-advance does not outrun the module
 BUSY_IDLE_WAIT_MS = 700
@@ -94,34 +103,6 @@ DF_ERROR_MSGS = {
 
 MID = 32768
 
-# ===========================
-#      WAV LOADER
-# ===========================
-
-def load_wav_u8(path):
-    """Load a WAV file and return (data, samplerate)."""
-    with open(path, "rb") as f:
-        if f.read(4) != b"RIFF":
-            raise ValueError("Not RIFF")
-        f.read(4)
-        if f.read(4) != b"WAVE":
-            raise ValueError("Not WAVE")
-        samplerate = 8000
-        while True:
-            cid = f.read(4)
-            if not cid:
-                raise ValueError("No data chunk")
-            clen = ustruct.unpack("<I", f.read(4))[0]
-            if cid == b"fmt ":
-                fmt = f.read(clen)
-                samplerate = ustruct.unpack("<I", fmt[4:8])[0]
-            elif cid == b"data":
-                data = f.read(clen)
-                break
-            else:
-                f.seek(clen, 1)
-    return data, samplerate
-
 
 class DFPlayerHardware(HardwareInterface):
     """
@@ -129,8 +110,7 @@ class DFPlayerHardware(HardwareInterface):
     
     This class handles:
     - UART commands to DFPlayer
-    - AM static sound via PWM overlay on GPIO 3 (preferred, requires AMradioSound.wav on Pico flash)
-    - AM static sound via DFPlayer SD card folder 99 (fallback if WAV not on Pico)
+    - AM static via PWM on GPIO 3 only (AMradioSound.wav on Pico flash). No AM from DFPlayer SD.
     - NeoPixel status indicator
     - State persistence to SD card
     - Loading album/playlist metadata
@@ -164,6 +144,7 @@ class DFPlayerHardware(HardwareInterface):
         self._query_file_count_result = None
         self._query_folder_count_result = None
         self._query_folder_files_result = None
+        self._last_start_outcome = {}
         
         # GPIO 3 (PIN_AUDIO) is used for PWM AM overlay only.
         # Start it as high-impedance input so it doesn't inject noise
@@ -171,26 +152,29 @@ class DFPlayerHardware(HardwareInterface):
         Pin(PIN_AUDIO, Pin.IN)
         self.pwm = None
         self.tim = None
-        
+
+        # Load AM WAV before DFPlayer UART traffic fills the RX buffer / fragments heap.
+        # Loading later caused MemoryError → compact-load retries → ~6k samples @ ~1.3kHz (very muddy).
+        self.wav_data = None
+        self.wav_sr = 8000
+        self.lut = None
+        if gc is not None:
+            gc.collect()
+        self._load_wav()
+
         # Give DFPlayer time to power up before first UART (avoids missed ACKs / no play)
         time.sleep_ms(400)
         # Reset DFPlayer to ensure it's in a known state
         self._df_reset()
-        
+
         # Volume — matches original baseline: fixed at DFPLAYER_VOL (28)
         # The potentiometer controls power on/off via GP14, not volume.
         self._volume = 100
         self._df_volume = DFPLAYER_VOL
         self._df_set_vol(self._df_volume)
-        
+
         # Ignore BUSY edges after manual skips
         self.ignore_busy_until = 0
-        
-        # Load WAV data for PWM-based AM overlay (plays through GPIO 3)
-        self.wav_data = None
-        self.wav_sr = 8000
-        self.lut = None
-        self._load_wav()
         
         # Cached metadata
         self._albums = []
@@ -198,16 +182,12 @@ class DFPlayerHardware(HardwareInterface):
         self._all_tracks = []
         self._known_tracks = {}
         
-        # AM sound DFPlayer folder/track (loaded from metadata)
-        self._am_folder = 99
-        self._am_track = 1
-        self._am_duration_ms = 3000
-        
         # Flag to prevent duplicate playback when AM overlay is playing
         self._am_overlay_active = False
         
         # When True, play_track() no-ops so firmware can play AM overlay first (mode switch / power-on)
         self._delay_playback = False
+        self._delay_playback_reason = ""
         # Dedupe noisy duplicate 0x3D logs (same TF index back-to-back)
         self._last_3d_uart_log_tick = 0
         self._last_3d_uart_log_num = None
@@ -215,6 +195,15 @@ class DFPlayerHardware(HardwareInterface):
     def set_delay_playback(self, delay):
         """When True, play_track() will no-op so the firmware can run start_with_am() first."""
         self._delay_playback = bool(delay)
+        if not self._delay_playback:
+            self._delay_playback_reason = ""
+
+    def set_delay_playback_reason(self, reason):
+        if reason:
+            self._delay_playback_reason = str(reason)
+
+    def get_delay_playback_reason(self):
+        return getattr(self, "_delay_playback_reason", "") or ""
     
     def _try_mount_sd(self):
         """Try to mount SD card if available. Returns True if mounted."""
@@ -278,27 +267,11 @@ class DFPlayerHardware(HardwareInterface):
             return False
     
     def _load_wav(self):
-        """Try to load AM radio WAV file into Pico memory for PWM overlay.
-        
-        If loaded, the AM static can play through GPIO 3 simultaneously with
-        DFPlayer music (true overlay). If not found, we fall back to playing
-        the AM sound through the DFPlayer itself (sequential, not overlaid).
-        """
-        paths_to_try = [
-            "/VintageRadio/AMradioSound.wav",
-            WAV_FILE,
-            "/" + WAV_FILE,
-            "AMradioSound.wav",
-        ]
-        
-        for path in paths_to_try:
-            try:
-                self.wav_data, self.wav_sr = load_wav_u8(path)
-                print(f"AM WAV loaded from Pico flash: {path} -> PWM overlay enabled")
-                break
-            except Exception:
-                continue
-        
+        """Attach AM WAV from am_wav_loader cache (preload from main before radio_core for RAM)."""
+        data, sr, _path = am_wav_loader.load_am_wav_cache()
+        self.wav_data = data
+        self.wav_sr = sr
+
         if self.wav_data is not None:
             self.lut = [0] * 256
             scale = int(256 * VOLUME_SCALE)
@@ -308,8 +281,20 @@ class DFPlayerHardware(HardwareInterface):
                 self.lut[i] = d
             print(f"AM WAV: {len(self.wav_data)} samples, {self.wav_sr}Hz — overlay will play through GPIO {PIN_AUDIO}")
         else:
-            print("AM WAV not on Pico flash — will use DFPlayer SD card for AM sound (sequential, not overlaid)")
-            print("  For overlay: copy AMradioSound.wav to Pico flash via 'Install to Pico'")
+            print("AM WAV not on Pico flash — AM static disabled (install AMradioSound.wav on Pico for PWM)")
+
+    def _set_last_start_outcome(self, status, reason, folder=None, track=None, attempt=None):
+        self._last_start_outcome = {
+            "status": status,
+            "reason": reason,
+            "folder": folder,
+            "track": track,
+            "attempt": attempt,
+            "tick_ms": time.ticks_ms(),
+        }
+
+    def get_last_start_outcome(self):
+        return dict(self._last_start_outcome)
     
     # ===========================
     #   DFPLAYER COMMANDS
@@ -359,6 +344,10 @@ class DFPlayerHardware(HardwareInterface):
         - Parameter 1: Folder number (1-99, maps to folders "01" to "99" on SD card)
         - Parameter 2: Track number (1-999, maps to files "001.mp3" to "999.mp3" in folder)
         """
+        # Track the last-requested folder/track for external state queries (e.g. IPC get_state)
+        self._playing_folder = folder
+        self._playing_track = track
+
         # Validate folder/track numbers
         if folder < 1 or folder > 99:
             print(f"ERROR: Invalid folder number {folder} (must be 1-99)")
@@ -701,79 +690,58 @@ class DFPlayerHardware(HardwareInterface):
         return last
 
     def discover_stations(self):
-        """Discover stations from DFPlayer SD card folder structure via UART queries.
+        """Lazy discovery: seed folders 01–N without per-folder 0x4E (saves RAM and UART).
 
-        For each folder 01..98, queries file count with command 0x4E using a short
-        consensus pass (no play commands). Hidden macOS ``._*`` files double the
-        0x4E count; use **Sync to SD** in the desktop app, which strips those files
-        after each sync. Playback failures from a volume-0 discovery probe were
-        observed on real hardware, so we avoid probing during discovery.
+        N comes from 0x4F (``query_folder_count``), capped at 99. Many modules report a count
+        that **includes a logical root** entry, so we use ``max(1, count - 1)`` for the
+        highest **numbered** MP3 folder to seed. If 0x4F fails, fall back to 01–99.
 
-        Returns:
-            List of station dicts.
+        Track lists are not materialized here (that caused memory allocation failures).
+        RadioCore hydrates each station on demand via 0x4E when that folder is visited.
         """
         print("BASIC: Discovering stations from DFPlayer SD card...")
-
+        max_folder = 99
         folder_count = self.query_folder_count()
-        if folder_count is None:
-            print("BASIC: Failed to query folder count (0x4F returned None)")
-            return []
-        print(f"BASIC: DFPlayer reports {folder_count} total folders (including root)")
-
-        stations = []
-        station_num = 0
-        consecutive_empty = 0
-        MAX_CONSECUTIVE_EMPTY = 3
-
-        for folder in range(1, 99):
-            file_count = self.query_files_in_folder_consensus(folder, suppress_errors=True)
-
-            if file_count is None or file_count == 0:
-                consecutive_empty += 1
-                if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
-                    print(
-                        "BASIC: {} consecutive empty folders, stopping scan "
-                        "at folder {:02d}".format(MAX_CONSECUTIVE_EMPTY, folder)
-                    )
-                    break
-                continue
-
-            consecutive_empty = 0
-            station_num += 1
-
-            tracks = []
-            for track_idx in range(1, file_count + 1):
-                tracks.append({
-                    "id": folder * 1000 + track_idx,
-                    "title": f"Track {track_idx}",
-                    "artist": "",
-                    "duration": 0,
-                    "folder": folder,
-                    "track_number": track_idx,
-                })
-
-            station = {
-                "id": folder,
-                "name": f"Station {station_num}",
-                "tracks": tracks,
-            }
-            stations.append(station)
-            self._known_tracks[folder] = file_count
+        if folder_count is not None:
+            try:
+                fc = int(folder_count)
+            except (TypeError, ValueError):
+                fc = 0
+            if fc > 1:
+                # Typical: count includes root; playable folders are 01 .. (fc - 1).
+                max_folder = min(99, fc - 1)
+            elif fc == 1:
+                max_folder = 1
+            else:
+                max_folder = 99
             print(
-                "BASIC: Station {} -> folder {:02d}, {} tracks (0x4E)".format(
-                    station_num, folder, file_count
+                "BASIC: DFPlayer 0x4F folder count={}; seeding stations 01..{:02d} ({} slot(s)).".format(
+                    folder_count,
+                    max_folder,
+                    max_folder,
                 )
             )
-            time.sleep_ms(80)
+        else:
+            print(
+                "BASIC: Failed to query folder count (0x4F returned None), "
+                "using fallback folder range (01-99)"
+            )
 
-        self._df_stop()
-        time.sleep_ms(POST_CMD_GUARD_MS)
-        self._wait_for_busy_high(BUSY_IDLE_WAIT_MS + 400)
-        self._df_set_vol(self._df_volume)
-        self._df_drain_uart_for_query_ms(150)
+        stations = []
+        for folder in range(1, max_folder + 1):
+            stations.append(
+                {
+                    "id": folder,
+                    "name": "Station {}".format(folder),
+                    "tracks": [],
+                    "track_count": 0,
+                    "hydrated": False,
+                }
+            )
+        self._df_drain_uart_for_query_ms(80)
         if self._track_finished_via_uart:
             self.consume_track_finished_uart()
-        print(f"BASIC: Discovered {len(stations)} stations")
+        print("BASIC: Seeded {} station slot(s) for lazy hydration".format(len(stations)))
         return stations
 
     def get_last_error_code(self):
@@ -827,23 +795,28 @@ class DFPlayerHardware(HardwareInterface):
     #   HardwareInterface IMPLEMENTATION
     # ===========================
     
-    def play_track(self, folder, track, start_ms=0, folder_wrap=False):
+    def play_track(self, folder, track, start_ms=0, folder_wrap=False, fast_fail=False):
         """Play a track with optional seeking to start_ms position."""
         # If AM overlay is active, skip this call (start_with_am already started the track)
         if self._am_overlay_active:
+            self._set_last_start_outcome("delayed", "am_overlay_active", folder, track, 0)
             print(f"AM overlay active, skipping play_track (folder={folder}, track={track})")
             return True
         # Delay playback until firmware runs start_with_am() (mode switch / power-on)
         if self._delay_playback:
+            self._set_last_start_outcome("delayed", "delay_playback_gate", folder, track, 0)
             print(f"Delay playback set, skipping play_track (folder={folder}, track={track})")
             return True
         
         print(f"play_track: Starting folder={folder}, track={track}, start_ms={start_ms}")
+        self._set_last_start_outcome("pending", "start_requested", folder, track, 0)
         self._uart_track_end_armed = False
         if folder_wrap and track == 1:
             self._df_folder_wrap_preplay(folder)
 
-        for attempt in range(2):
+        max_attempts = 1 if fast_fail else 2
+        confirm_ms = 1200 if fast_fail else BUSY_CONFIRM_MS
+        for attempt in range(max_attempts):
             if attempt > 0:
                 print(f"DF: play settle+retry (folder={folder}, track={track})")
                 time.sleep_ms(POST_CMD_GUARD_MS * 2)
@@ -860,6 +833,12 @@ class DFPlayerHardware(HardwareInterface):
                 if attempt == 0
                 else BUSY_IDLE_WAIT_MS + 200
             )
+            if attempt == 0:
+                # Give the DFPlayer internal state machine time to reach idle
+                # after BUSY goes HIGH.  Without this the play command arrives
+                # while the module is still transitioning, causing it to accept
+                # the command slowly (adding ~800 ms to the gap).
+                time.sleep_ms(200)
             self._df_set_vol(self._df_volume)
             time.sleep_ms(POST_CMD_GUARD_MS)
             stale_ms = 100 if attempt == 0 else 120
@@ -872,13 +851,14 @@ class DFPlayerHardware(HardwareInterface):
 
             confirmed = False
             poll_start = time.ticks_ms()
-            while time.ticks_diff(time.ticks_ms(), poll_start) < BUSY_CONFIRM_MS:
+            while time.ticks_diff(time.ticks_ms(), poll_start) < confirm_ms:
                 self._df_read_pending()
                 if self._track_finished_via_uart:
                     self.consume_track_finished_uart()
                 if self._last_error_code is not None:
                     err_msg = DF_ERROR_MSGS.get(self._last_error_code, f"Unknown 0x{self._last_error_code:02X}")
                     print(f"DF: play rejected (0x{self._last_error_code:02X}): {err_msg}")
+                    self._set_last_start_outcome("explicit_error", "uart_error_0x{:02X}".format(self._last_error_code), folder, track, attempt + 1)
                     self.ignore_busy_until = time.ticks_add(time.ticks_ms(), BUSY_IGNORE_MS_LONG)
                     return False
                 if self.pin_busy.value() == 0:
@@ -894,6 +874,13 @@ class DFPlayerHardware(HardwareInterface):
 
             if confirmed:
                 self._note_track_learned(folder, track)
+                self._set_last_start_outcome(
+                    "confirmed",
+                    "busy_low" if self.pin_busy.value() == 0 else "query_status_playing",
+                    folder,
+                    track,
+                    attempt + 1,
+                )
                 self.ignore_busy_until = time.ticks_add(
                     time.ticks_ms(), BUSY_IGNORE_MS_AFTER_PLAY_OK
                 )
@@ -906,7 +893,8 @@ class DFPlayerHardware(HardwareInterface):
                 return True
 
             # No UART error: worth one retry (clone timing / BUSY not idle yet)
-            if attempt == 0 and self._last_error_code is None:
+            if attempt == 0 and self._last_error_code is None and max_attempts > 1:
+                self._set_last_start_outcome("pending", "retry_after_unconfirmed_start", folder, track, attempt + 1)
                 continue
 
         print(f"DF: playback not confirmed (folder={folder}, track={track})")
@@ -914,9 +902,11 @@ class DFPlayerHardware(HardwareInterface):
         if self._last_error_code is not None:
             err_msg = DF_ERROR_MSGS.get(self._last_error_code, f"Unknown 0x{self._last_error_code:02X}")
             print(f"DF: UART error received: 0x{self._last_error_code:02X} ({err_msg})")
+            self._set_last_start_outcome("explicit_error", "uart_error_0x{:02X}".format(self._last_error_code), folder, track, 2)
         else:
             print("DF: No UART error received; BUSY stayed HIGH (DFPlayer may not have responded)")
             print("DF: Tip: If UART errors never appear, ensure DFPlayer TX is wired to Pico GP1 (UART RX)")
+            self._set_last_start_outcome("timeout", "busy_never_low", folder, track, 2)
         self.ignore_busy_until = time.ticks_add(time.ticks_ms(), BUSY_IGNORE_MS_LONG)
         return False
     
@@ -938,45 +928,49 @@ class DFPlayerHardware(HardwareInterface):
     
     def _play_am_and_fade(self, folder=None, track=None):
         """
-        Play AM static sound overlaid on the music track fade-in.
-        
-        Two modes depending on whether the AM WAV is on Pico flash:
-        
-        MODE A — PWM overlay (wav_data loaded from Pico flash):
-          Plays AM static through GPIO 3 PWM while simultaneously starting
-          the music track on DFPlayer at low volume and fading it in.
-          This gives a true "tuning in" effect where static and music overlap.
-          
-        MODE B — DFPlayer sequential (wav_data not available):
-          Plays AM static from DFPlayer SD card (folder 99), then switches
-          to the music track with a volume fade-in. Not a true overlay, but
-          still provides the AM-then-music transition effect.
+        AM transition before music: PWM static on GPIO 3 + DFPlayer fade-in when WAV is
+        on Pico flash; otherwise music-only with volume fade-in (no AM from DFPlayer SD).
         """
         self._am_overlay_active = True
-        
-        self.np[0] = (0, 10, 0)
-        self.np.write()
-        
-        # Match original baseline: set volume to 0 before AM overlay
-        # (original start_sequence_synced and play_album_change_with_am both
-        # call df_set_vol(0) before play_am_and_fade_df_confirming)
-        self._df_set_vol(0)
-        
-        if self.wav_data is not None:
-            confirmed = self._play_am_overlay_pwm(folder, track)
-        else:
-            confirmed = self._play_am_dfplayer_sequential(folder, track)
-        
-        self.np[0] = (0, 0, 0)
-        self.np.write()
-        
-        self._am_overlay_active = False
-        self._delay_playback = False
-        # Music already playing under overlay; only brief BUSY debounce after PWM teardown.
-        self.ignore_busy_until = time.ticks_add(
-            time.ticks_ms(), BUSY_IGNORE_MS_AFTER_PLAY_OK
-        )
-        
+        confirmed = False
+        try:
+            self.np[0] = (0, 10, 0)
+            self.np.write()
+
+            # Match original baseline: set volume to 0 before AM overlay
+            # (original start_sequence_synced and play_album_change_with_am both
+            # call df_set_vol(0) before play_am_and_fade_df_confirming)
+            self._df_set_vol(0)
+
+            if self.wav_data is not None:
+                confirmed = self._play_am_overlay_pwm(folder, track)
+            else:
+                confirmed = self._play_music_only_fade_after_stop(folder, track)
+
+            try:
+                self.np[0] = (0, 0, 0)
+                self.np.write()
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                print("AM overlay failed:", e)
+            except Exception:
+                pass
+            confirmed = False
+        finally:
+            # Always release gates so play_track / buttons work after any fault.
+            self._am_overlay_active = False
+            self._delay_playback = False
+            self._delay_playback_reason = ""
+            try:
+                # Music already playing under overlay; brief BUSY debounce after PWM teardown.
+                self.ignore_busy_until = time.ticks_add(
+                    time.ticks_ms(), BUSY_IGNORE_MS_AFTER_PLAY_OK
+                )
+            except Exception:
+                pass
+
         return confirmed
     
     def _play_am_overlay_pwm(self, folder=None, track=None):
@@ -1003,6 +997,7 @@ class DFPlayerHardware(HardwareInterface):
         # Matches original: df_stop() → POST_CMD_GUARD_MS → df_play_folder_track()
         confirmed = False
         if folder is not None and track is not None:
+            self._set_last_start_outcome("pending", "am_pwm_start_requested", folder, track, 1)
             self._df_stop()
             time.sleep_ms(POST_CMD_GUARD_MS)
             print(f"AM: Starting music at volume 0 (folder={folder}, track={track})")
@@ -1142,80 +1137,54 @@ class DFPlayerHardware(HardwareInterface):
                 print("AM: Retry confirmed (BUSY LOW)")
                 # New play command: always reset UART end window from this point.
                 self._arm_dfplayer_track_end_detection()
+        if folder is not None and track is not None:
+            if confirmed:
+                self._set_last_start_outcome("confirmed", "am_pwm_busy_low", folder, track, 1)
+            else:
+                self._set_last_start_outcome("timeout", "am_pwm_busy_never_low", folder, track, 1)
         return confirmed
     
-    def _play_am_dfplayer_sequential(self, folder=None, track=None):
-        """MODE B: Fallback — play AM from DFPlayer SD card, then switch to music.
-        
-        Volume already set to 0 by _play_am_and_fade() caller.
-        Plays AM sound at current volume, then switches to music with fade-in.
-        """
-        print("AM: DFPlayer sequential mode (folder 99 on SD card)")
-        
-        # Play AM sound at full volume so it's audible
+    def _play_music_only_fade_after_stop(self, folder=None, track=None):
+        """No AM WAV on Pico: start target track from volume 0 with fade-in (no folder-99 AM)."""
+        print("AM: No PWM WAV — music only with volume fade-in")
+        if folder is None or track is None:
+            self._df_stop()
+            self._set_last_start_outcome("timeout", "music_only_missing_target", folder, track, 0)
+            return False
         self._df_stop()
         time.sleep_ms(POST_CMD_GUARD_MS)
+        self._df_set_vol(0)
+        time.sleep_ms(POST_CMD_GUARD_MS)
+        print("AM: Starting music (folder={}, track={})".format(folder, track))
+        self._df_play_folder_track(folder, track)
+        confirmed = self._wait_for_busy_low()
+        if confirmed:
+            print("AM: Music started (BUSY confirmed)")
+            self._set_last_start_outcome("confirmed", "music_only_busy_low", folder, track, 1)
+            self._arm_dfplayer_track_end_detection()
+        else:
+            self._set_last_start_outcome("timeout", "music_only_busy_never_low", folder, track, 1)
+        fade_steps = 15
+        fade_delay = int((FADE_IN_S * 1000) / fade_steps)
+        if fade_delay < 40:
+            fade_delay = 40
+        for step in range(1, fade_steps + 1):
+            vol = int((step / fade_steps) * self._df_volume)
+            self._df_set_vol(vol)
+            time.sleep_ms(fade_delay)
         self._df_set_vol(self._df_volume)
-        
-        print(f"AM: Playing static sound (folder={self._am_folder}, track={self._am_track})")
-        self._df_play_folder_track(self._am_folder, self._am_track)
-        
-        am_started = self._wait_for_busy_low()
-        if am_started:
-            print("AM: Static sound playing (BUSY confirmed)")
-        else:
-            print("AM: Static sound not confirmed (BUSY didn't go LOW)")
-        
-        time.sleep_ms(self._am_duration_ms)
-        
-        confirmed = False
-        if folder is not None and track is not None:
-            self._df_stop()
-            time.sleep_ms(POST_CMD_GUARD_MS)
-            
-            # Start music at volume 0, then fade up (matches original approach)
-            self._df_set_vol(0)
-            time.sleep_ms(POST_CMD_GUARD_MS)
-            
-            print(f"AM: Switching to music (folder={folder}, track={track})")
-            self._df_play_folder_track(folder, track)
-            
-            confirmed = self._wait_for_busy_low()
-            if confirmed:
-                print("AM: Music started (BUSY confirmed)")
-                # Arm when music starts, not after fade (avoids resetting _playback_start_tick late).
-                self._arm_dfplayer_track_end_detection()
-            
-            # Fade from 0 to DFPLAYER_VOL
-            fade_steps = 15
-            fade_delay = int((FADE_IN_S * 1000) / fade_steps)
-            if fade_delay < 40:
-                fade_delay = 40
-            
-            for step in range(1, fade_steps + 1):
-                vol = int((step / fade_steps) * self._df_volume)
-                self._df_set_vol(vol)
-                time.sleep_ms(fade_delay)
-            
-            self._df_set_vol(self._df_volume)
-            print(f"AM: Sequential complete, vol={self._df_volume}")
-        else:
-            self._df_stop()
-        
+        print("AM: Music fade-in complete, vol={}".format(self._df_volume))
         return confirmed
     
     def save_state(self, state_dict):
-        """Persist state to SD card."""
+        """Persist state to SD card (station, track, mode only)."""
         try:
-            # Format compatible with old album_state.txt; optional ;mode= for shuffle/playlist/radio
             album_idx = state_dict.get('album_index', 0) + 1  # 1-based for DFPlayer folders
             track = state_dict.get('track', 1)
-            known = state_dict.get('known_tracks', {})
             mode = state_dict.get('mode', 'album')
-            
-            track_str = ",".join("%d:%d" % (a, c) for a, c in sorted(known.items()))
-            payload = f"{album_idx},{track};tracks={track_str};mode={mode}"
-            
+            # known_tracks intentionally excluded: populated lazily each session,
+            # not persisted to avoid growing flash writes.
+            payload = f"{album_idx},{track};mode={mode}"
             with open(ALBUM_FILE, "w") as f:
                 f.write(payload)
             print(f"Saved state: album={album_idx} (idx={album_idx-1}), track={track}, mode={mode}")
@@ -1240,29 +1209,20 @@ class DFPlayerHardware(HardwareInterface):
             album_idx = int(a_str) - 1  # Convert to 0-based
             track = int(t_str)
             
-            known_tracks = {}
             mode = 'album'
             for i in range(1, len(parts)):
-                if parts[i].startswith("tracks="):
-                    track_part = parts[i][7:]
-                    if track_part:
-                        for pair in track_part.split(","):
-                            if not pair:
-                                continue
-                            a, c = pair.split(":")
-                            known_tracks[int(a)] = int(c)
-                elif parts[i].startswith("mode="):
+                if parts[i].startswith("mode="):
                     mode = parts[i][5:].strip().lower()
                     if mode not in ('album', 'playlist', 'shuffle', 'radio'):
                         mode = 'album'
-            
+                # tracks= field is intentionally ignored (known_tracks not persisted)
+
             state = {
                 'mode': mode,
                 'album_index': album_idx,
                 'track': track,
-                'known_tracks': known_tracks,
             }
-            print(f"Loaded state: album_idx={album_idx} (folder={album_idx+1}), track={track}, mode={mode}, known_tracks={len(known_tracks)}")
+            print(f"Loaded state: album_idx={album_idx} (folder={album_idx+1}), track={track}, mode={mode}")
             
         except Exception as e:
             print("No valid album_state.txt:", e)
@@ -1270,7 +1230,6 @@ class DFPlayerHardware(HardwareInterface):
                 'mode': 'album',
                 'album_index': 0,
                 'track': 1,
-                'known_tracks': self._known_tracks,
             }
         
         return state
@@ -1287,8 +1246,8 @@ class DFPlayerHardware(HardwareInterface):
         
         # Try multiple paths: SD card first (where it should be), then Pico flash
         metadata_paths = [
-            "/sd/VintageRadio/radio_metadata.json",  # SD card (preferred)
-            "/sd/radio_metadata.json",  # SD root (fallback)
+            "/sd/radio_metadata.json",  # SD root (preferred; no VintageRadio/ on card)
+            "/sd/VintageRadio/radio_metadata.json",  # legacy SD layout
             "VintageRadio/radio_metadata.json",  # Pico flash VintageRadio folder
             "radio_metadata.json",  # Pico flash root (fallback)
         ]
@@ -1320,19 +1279,14 @@ class DFPlayerHardware(HardwareInterface):
             for path in metadata_paths:
                 print(f"  - {path}")
             print("\nPlease ensure:")
-            print("  1. SD card is inserted and contains VintageRadio/radio_metadata.json")
+            print("  1. SD card is inserted and contains /sd/radio_metadata.json (or legacy /sd/VintageRadio/)")
             print("  2. Or copy radio_metadata.json to Pico flash memory")
             return
         
         try:
-            # Load AM sound location from metadata
             am_sound = data.get("am_sound")
             if am_sound:
-                self._am_folder = am_sound.get("folder", 99)
-                self._am_track = am_sound.get("track", 1)
-                print(f"AM sound: folder={self._am_folder:02d}, track={self._am_track:03d}")
-            else:
-                print("AM sound: not in metadata, using default folder=99, track=1")
+                print("AM sound: metadata am_sound ignored (PWM from Pico flash only)")
 
             songs = data.get("songs", {})
             self._albums = []
@@ -1477,10 +1431,11 @@ class DFPlayerHardware(HardwareInterface):
         return self.button.value() == 0
     
     def reset_dfplayer(self):
-        """Reset DFPlayer and wait for boot."""
+        """Reset DFPlayer and optionally wait for boot (``DF_BOOT_MS`` in radio_core)."""
         self._df_reset()
-        print("Waiting for DFPlayer boot:", DF_BOOT_MS, "ms")
-        time.sleep_ms(DF_BOOT_MS)
+        if DF_BOOT_MS > 0:
+            print("Waiting for DFPlayer boot:", DF_BOOT_MS, "ms")
+            time.sleep_ms(DF_BOOT_MS)
     
     def test_play_track(self, folder, track):
         """Test playing a specific folder/track. Use from debug console: test_play_track(1, 1)"""
@@ -1666,13 +1621,7 @@ class DFPlayerHardware(HardwareInterface):
         return results
     
     def start_with_am(self, folder, track):
-        """Start playback with AM static sound overlay and volume fade-in.
-        
-        If AMradioSound.wav is loaded on Pico flash: true overlay via PWM on
-        GPIO 3 playing simultaneously with DFPlayer music fade-in.
-        
-        If not loaded: sequential fallback via DFPlayer SD card (folder 99).
-        """
+        """PWM AM overlay when WAV is on Pico flash; otherwise music-only fade-in."""
         return self._play_am_and_fade(folder, track)
     
     def check_busy_edge(self):

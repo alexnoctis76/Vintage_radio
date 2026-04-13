@@ -7,17 +7,54 @@
 
 from machine import Pin
 import time
+import builtins
+
+_print_orig = builtins.print
+
+
+def _firmware_log_clock():
+    """Monotonic-ish wall segment for serial: ``HH:MM:SS.mmm`` (dot before ms, not a third host stamp)."""
+    try:
+        lt = time.localtime()
+        ms = time.ticks_ms() % 1000
+        return f"{lt[3]:02d}:{lt[4]:02d}:{lt[5]:02d}.{ms:03d}"
+    except Exception:
+        return "00:00:00.000"
+
+
+def print(*args, **kwargs):  # noqa: A001 — replace global print for serial timestamps
+    prefix = f"[{_firmware_log_clock()}]"
+    if args:
+        args = (prefix,) + args
+    else:
+        args = (prefix,)
+    return _print_orig(*args, **kwargs)
+
+
+builtins.print = print
 
 from radio_core import (
     RadioCore,
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
     FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
-    dfplayer_confirms_playback_stopped,
+    DF_UART_END_GUARD_MS,
     ticks_ms, ticks_diff,
 )
 
+import gc
+
+gc.collect()
+try:
+    from components import am_wav_loader
+except ImportError:
+    import am_wav_loader
+
+am_wav_loader.load_am_wav_cache()
+gc.collect()
+
 from components.dfplayer_hardware import DFPlayerHardware
+from components.vintage_radio_ipc import poll_ipc
 
 
 class VintageRadioFirmware:
@@ -39,13 +76,27 @@ class VintageRadioFirmware:
         self._last_stuck_query_ms = 0
         # Guard against false "stopped" reads that can cause mid-track artifacts/skips.
         self._stuck_status_zero_count = 0
+        # Start recovery escalation counters:
+        # - explicit errors (UART 0x40) escalate faster than ambiguous starts.
+        self._start_unconfirmed_streak = 0
+        self._start_explicit_error_streak = 0
+        self._reset_after_unconfirmed = 3
+        self._reset_after_explicit = 2
+        self._last_uart_decision_track = None
+        self._last_uart_decision_reason = ""
+        self._last_uart_decision_tick = 0
+        # Power sense debounce (noisy/floating pin or USB reconnect glitches)
+        self._pwr_db_raw = None
+        self._pwr_db_count = 0
 
     def wait_for_power(self):
         skip_power_check = self._check_skip_power_sense()
         if skip_power_check:
             print("Power sense check DISABLED (configured via debug mode)")
             self.rail2_on = True
-            self.last_sense = 1
+            # Match real GPIO so handle_power_change() does not see a bogus HIGH->LOW edge
+            # (would immediately call power_off() while the pot is still physically off).
+            self.last_sense = 1 if self.hw.is_power_on() else 0
             return
 
         print("Waiting for power sense HIGH...")
@@ -85,18 +136,15 @@ class VintageRadioFirmware:
             num_stations = len(self.core.playlists)
             if num_stations > 0:
                 first = self.core.playlists[0]
-                folder = first.get("folder", first.get("id", 1))
-                print(f"  Test play: folder={folder}, track=1")
-                self.hw._df_play_folder_track(folder, 1)
-                time.sleep_ms(500)
-                busy_after = self.hw.pin_busy.value()
-                self.hw._df_read_pending()
-                err = getattr(self.hw, "_last_error_code", None)
-                print(f"  Result: BUSY={busy_after}, error={err}")
-                self.hw._df_stop()
-                time.sleep_ms(100)
-                if hasattr(self.hw, "_last_error_code"):
-                    self.hw._last_error_code = None
+                folder = int(first.get("id", first.get("folder", 1)))
+                # Never send an audible probe play here: it is heard before the boot AM
+                # sequence and fights UART timing. TF count + optional 0x4E is enough.
+                qf = getattr(self.hw, "query_files_in_folder", None)
+                if callable(qf):
+                    fc = qf(folder, suppress_errors=True, timeout_ms=700)
+                    print(f"  Folder {folder:02d} file count probe (no play): {fc}")
+                else:
+                    print(f"  Skipping folder probe (no query_files_in_folder); first station={folder}")
         print("--- End DFPlayer check ---")
 
     def boot_sequence(self):
@@ -106,11 +154,25 @@ class VintageRadioFirmware:
                 reset()
             self.core.init(skip_initial_playback=True)
             self._check_hw_comms()
-            self.core.current_track = 1
-            if self.core.mode == "shuffle" and self.core.shuffle_tracks:
-                self.core.shuffle_index = 0
-            elif self.core.mode == "radio" and self.core.radio_stations:
-                self.core.radio_station_index = 0
+            # Shuffle rebuild is deferred past init (see _load_state) so it runs after
+            # DFPlayer comms check and does not fight the diagnostic probe play.
+            if getattr(self.core, "_defer_basic_shuffle_rebuild", False):
+                self.core._defer_basic_shuffle_rebuild = False
+                # Build shuffle list only; _start_with_am_and_recovery owns first play.
+                self.core._init_shuffle(start_playback=False)
+                self.core.current_track = 1
+                if self.core.mode == MODE_SHUFFLE and self.core.shuffle_tracks:
+                    self.core.shuffle_index = 0
+                elif self.core.mode == MODE_RADIO and self.core.radio_stations:
+                    self.core.radio_station_index = 0
+            else:
+                # Do not clobber album_state / load_state track for playlist or album mode.
+                if self.core.mode == MODE_SHUFFLE and self.core.shuffle_tracks:
+                    self.core.shuffle_index = 0
+                    self.core.current_track = 1
+                elif self.core.mode == MODE_RADIO and self.core.radio_stations:
+                    self.core.radio_station_index = 0
+                    self.core.current_track = 1
             wav_data = getattr(self.hw, "wav_data", None)
             if wav_data is not None:
                 am_path = getattr(self.hw, "_am_wav_path", None)
@@ -121,9 +183,7 @@ class VintageRadioFirmware:
                 else:
                     print("AM sound: overlay ENABLED")
             else:
-                am_f = getattr(self.hw, "_am_folder", 99)
-                am_t = getattr(self.hw, "_am_track", 1)
-                print(f"AM sound: overlay disabled or N/A (fallback folder={am_f}, track={am_t})")
+                print("AM sound: MCU overlay disabled (install AMradioSound.wav on Pico flash)")
         except Exception as e:
             print(f"Boot init error: {e}")
             self.core.current_album_index = 0
@@ -131,6 +191,8 @@ class VintageRadioFirmware:
         self._start_with_am_and_recovery("Boot")
 
     def handle_button(self):
+        if getattr(self, "_ipc_synthetic_active", False):
+            return
         curr = 0 if self.hw.is_button_pressed() else 1
         now = ticks_ms()
         if self.last_button == 1 and curr == 0:
@@ -177,11 +239,109 @@ class VintageRadioFirmware:
 
         self.prev_busy = 1
         self._busy_high_since = 0
-        if confirmed or self.hw.is_playing():
+        started = bool(confirmed or self.hw.is_playing())
+        outcome = {}
+        get_start_outcome = getattr(self.hw, "get_last_start_outcome", None)
+        if callable(get_start_outcome):
+            try:
+                outcome = get_start_outcome() or {}
+            except Exception:
+                outcome = {}
+
+        status = outcome.get("status", "unknown")
+        reason = outcome.get("reason", "unknown")
+        outcome_tick = int(outcome.get("tick_ms", 0) or 0)
+        outcome_folder = outcome.get("folder")
+        outcome_track = outcome.get("track")
+        fresh = (
+            outcome_tick > 0
+            and ticks_diff(ticks_ms(), outcome_tick) <= 9000
+            and outcome_folder == folder
+            and outcome_track == track
+        )
+        if not fresh:
+            status = "unknown"
+            reason = "no_fresh_start_outcome"
+        # A fresh "pending" outcome means the play command was issued but BUSY
+        # is slow to confirm (typical after AM sequence / first folder access).
+        # Treat as started — the main-loop BUSY/UART fallback will detect the
+        # track. Firing a second-chance stop+replay here would interrupt a track
+        # that is very likely already playing.
+        if not started and fresh and status == "pending":
+            started = True
+            print(
+                f"{context} pending start assumed (fresh outcome: reason={reason}) "
+                "- leaving main-loop to confirm"
+            )
+        if started:
+            self.core.is_playing = True
             self._was_playing = True
-        if not confirmed:
-            print(f"{context} playback not confirmed - second chance")
+            self._start_unconfirmed_streak = 0
+            self._start_explicit_error_streak = 0
+        else:
+            explicit = (status == "explicit_error")
+            if explicit:
+                self._start_explicit_error_streak += 1
+                self._start_unconfirmed_streak = 0
+            else:
+                self._start_unconfirmed_streak += 1
+                self._start_explicit_error_streak = 0
+
+            print(
+                f"{context} playback not confirmed "
+                f"(start_confirm={status}, reason={reason}) - second chance"
+            )
+            play_track = getattr(self.hw, "play_track", None)
+            if callable(play_track):
+                time.sleep_ms(120)
+                if play_track(folder, track, start_ms=0, folder_wrap=False):
+                    print(f"{context} second-chance confirmed (play_track)")
+                    self._was_playing = True
+                    self._start_unconfirmed_streak = 0
+                    self._start_explicit_error_streak = 0
+                    return
+                if self.hw.is_playing():
+                    print(f"{context} second-chance confirmed (is_playing)")
+                    self._was_playing = True
+                    self._start_unconfirmed_streak = 0
+                    self._start_explicit_error_streak = 0
+                    return
+
+            refreshed = {}
+            if callable(get_start_outcome):
+                try:
+                    refreshed = get_start_outcome() or {}
+                except Exception:
+                    refreshed = {}
+            refreshed_status = refreshed.get("status", status)
+            refreshed_reason = refreshed.get("reason", reason)
+            explicit = (refreshed_status == "explicit_error")
+            if explicit:
+                self._start_explicit_error_streak = max(
+                    self._start_explicit_error_streak, 1
+                )
+                self._start_unconfirmed_streak = 0
+
+            should_reset = False
+            if explicit and self._start_explicit_error_streak >= self._reset_after_explicit:
+                should_reset = True
+            if (not explicit) and self._start_unconfirmed_streak >= self._reset_after_unconfirmed:
+                should_reset = True
+
+            if not should_reset:
+                print(
+                    f"{context} reset deferred "
+                    f"(start_confirm={refreshed_status}, reason={refreshed_reason}, "
+                    f"unconfirmed_streak={self._start_unconfirmed_streak}, "
+                    f"explicit_streak={self._start_explicit_error_streak})"
+                )
+                return
+
             if hasattr(self.hw, "_df_reset"):
+                print(
+                    f"{context} escalating to DF reset "
+                    f"(start_confirm={refreshed_status}, reason={refreshed_reason})"
+                )
                 self.hw._df_reset()
                 time.sleep_ms(DF_BOOT_MS)
                 self.hw._df_set_vol(getattr(self.hw, "_df_volume", 28))
@@ -191,6 +351,8 @@ class VintageRadioFirmware:
                 if getattr(self.hw, "_wait_for_busy_low", lambda _: False)(1500):
                     print(f"{context} second-chance confirmed (BUSY LOW)")
                     getattr(self.hw, "_note_track_learned", lambda _f, _t: None)(folder, track)
+                    self._start_unconfirmed_streak = 0
+                    self._start_explicit_error_streak = 0
                 else:
                     print(f"{context} second-chance still not confirmed")
             else:
@@ -198,23 +360,44 @@ class VintageRadioFirmware:
                 time.sleep_ms(800)
                 if self.hw.is_playing():
                     print(f"{context} second-chance confirmed (is_playing)")
+                    self._start_unconfirmed_streak = 0
+                    self._start_explicit_error_streak = 0
                 else:
                     print(f"{context} second-chance still not confirmed")
 
     def _play_am_for_change(self):
-        self._start_with_am_and_recovery("Mode change")
+        reason = "mode_change"
+        get_reason = getattr(self.hw, "get_delay_playback_reason", None)
+        if callable(get_reason):
+            try:
+                reason = get_reason() or "mode_change"
+            except Exception:
+                reason = "mode_change"
+        if reason == "station_change":
+            ctx = "Station change"
+        elif reason == "power_on":
+            ctx = "Power-on"
+        else:
+            ctx = "Mode change"
+        self._start_with_am_and_recovery(ctx)
 
     def _fire_track_finished(self):
+        self._was_playing = False
         old_tr = self.core._get_current_track()
         old_title = old_tr.get('title', 'Unknown') if old_tr else 'Unknown'
         old_album = self.core.current_album_index
         old_track = self.core.current_track
         self.core.on_track_finished()
+        # If the new track's play command was sent (even if unconfirmed / still seeking),
+        # end-detection will be armed.  Keep _was_playing=True so the BUSY LOW→HIGH edge
+        # is still usable as a fallback when the slow-seeking track eventually plays.
+        if getattr(self.hw, "_uart_track_end_armed", False):
+            self._was_playing = True
         new_tr = self.core._get_current_track()
         new_title = new_tr.get('title', 'Unknown') if new_tr else 'Unknown'
         new_album = self.core.current_album_index
         new_track = self.core.current_track
-        print(f"Track finished: '{old_title}' -> '{new_title}' (station {old_album+1} track {old_track} -> station {new_album+1} track {new_track})")
+        print(f"Auto-advanced: '{old_title}' -> '{new_title}' (station {old_album+1} track {old_track} -> station {new_album+1} track {new_track})")
 
     def handle_track_finished(self):
         if not self.rail2_on:
@@ -222,21 +405,32 @@ class VintageRadioFirmware:
 
         if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
             armed = getattr(self.hw, "_uart_track_end_armed", False)
-            if armed and not dfplayer_confirms_playback_stopped(self.hw):
+            finished_num = getattr(self.hw, "_track_finished_track_num", None)
+            now = ticks_ms()
+            start_tick = getattr(self.hw, "_playback_start_tick", 0)
+            if armed and start_tick:
+                age_ms = ticks_diff(now, start_tick)
+                if age_ms < DF_UART_END_GUARD_MS:
+                    getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                    self._log_uart_decision("discard:stale", finished_num, extra="age={}ms".format(age_ms))
+                    return
+            pin_busy = getattr(self.hw, "pin_busy", None)
+            if armed and pin_busy is not None and pin_busy.value() == 0:
                 getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-                print("DF: UART track-finished discarded (module still playing)")
+                self._log_uart_decision("discard:busy_low", finished_num)
                 return
 
-            getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+            consumed_num = getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+            consumed_num = consumed_num if consumed_num is not None else finished_num
             if armed:
                 self.hw._uart_track_end_armed = False
-                print("Track finished (UART)")
+                self._log_uart_decision("accept", consumed_num)
                 pin_busy = getattr(self.hw, "pin_busy", None)
                 if pin_busy is not None:
                     self.prev_busy = pin_busy.value()
                 self._fire_track_finished()
-            # Spurious 0x3D before playback is armed: discard without touching prev_busy
-            # so the BUSY LOW->HIGH edge is still detectable.
+            else:
+                self._log_uart_decision("discard:unarmed", consumed_num)
             return
 
         pin_busy = getattr(self.hw, "pin_busy", None)
@@ -250,6 +444,12 @@ class VintageRadioFirmware:
             return
         # Short debounce only: old 5000ms forced ~5s between every track.
         BUSY_DEBOUNCE_MS = 400
+        # Minimum elapsed time since track start before a BUSY HIGH edge is treated as
+        # track-end. Prevents a loose/intermittent BUSY wire from triggering a false
+        # track-finished within the first few seconds of playback (and the cascade of
+        # DFPlayer-busy-state failures that follows). UART 0x3D handles genuine short
+        # tracks that end before this window.
+        BUSY_MIN_PLAY_MS = 3000
         # Keep status query as a rare last-resort path (not part of normal playback loop):
         # frequent 0x42 polling can cause audible pulsing/chop on some DFPlayer clones.
         STUCK_BUSY_QUERY_MIN_MS = 6000
@@ -257,6 +457,7 @@ class VintageRadioFirmware:
         STUCK_QUERY_REQUIRED_ZEROES = 2
         b = pin_busy.value()
         now = ticks_ms()
+        track_expected = bool(self.core.is_playing or self._was_playing)
         ignore_until = getattr(self.hw, "ignore_busy_until", 0)
         start_tick = getattr(self.hw, "_playback_start_tick", 0)
 
@@ -265,6 +466,7 @@ class VintageRadioFirmware:
         # cleanly. Sending 0x42 mid-track causes audible pulsing on many DFPlayer clones.
         if (
             b == 0
+            and track_expected
             and not getattr(self.hw, "_uart_track_end_armed", False)
             and getattr(self.hw, "query_status", None)
             and ticks_diff(now, ignore_until) >= 0
@@ -292,20 +494,58 @@ class VintageRadioFirmware:
                     self._stuck_status_zero_count = 0
 
         if b == 0:
+            if self.core.is_playing:
+                self._was_playing = True
             self._busy_high_since = 0
         elif b == 1 and self.prev_busy == 0:
-            self._busy_high_since = now
+            # Only arm the debounce timer if enough time has passed since track start.
+            # A BUSY HIGH within BUSY_MIN_PLAY_MS is almost certainly a loose-wire
+            # glitch; let UART 0x3D handle any genuine track end that short.
+            early = start_tick and ticks_diff(now, start_tick) < BUSY_MIN_PLAY_MS
+            if track_expected and not early:
+                self._busy_high_since = now
+            else:
+                self._busy_high_since = 0
             self._stuck_status_zero_count = 0
         if b == 1 and self._busy_high_since > 0:
-            if ticks_diff(now, self._busy_high_since) >= BUSY_DEBOUNCE_MS:
-                if ticks_diff(now, ignore_until) >= 0:
+            past_min = not start_tick or ticks_diff(now, start_tick) >= BUSY_MIN_PLAY_MS
+            if ticks_diff(now, self._busy_high_since) >= BUSY_DEBOUNCE_MS and track_expected:
+                if not past_min:
+                    # _busy_high_since was armed before this track started playing;
+                    # discard it to prevent a stale debounce from firing immediately.
+                    self._busy_high_since = 0
+                elif ticks_diff(now, ignore_until) >= 0:
                     print("Track finished (BUSY fallback)")
                     self._busy_high_since = 0
                     self._fire_track_finished()
         self.prev_busy = b
 
+    def _log_uart_decision(self, reason: str, track_num, extra: str = ""):
+        now = ticks_ms()
+        if (
+            track_num == self._last_uart_decision_track
+            and reason == self._last_uart_decision_reason
+            and ticks_diff(now, self._last_uart_decision_tick) < 300
+        ):
+            return
+        self._last_uart_decision_track = track_num
+        self._last_uart_decision_reason = reason
+        self._last_uart_decision_tick = now
+        if extra:
+            print("DF: UART track-finished {} track={} {}".format(reason, track_num, extra))
+        else:
+            print("DF: UART track-finished {} track={}".format(reason, track_num))
+
     def handle_power_change(self):
-        sense = 1 if self.hw.is_power_on() else 0
+        raw = 1 if self.hw.is_power_on() else 0
+        if raw != self._pwr_db_raw:
+            self._pwr_db_raw = raw
+            self._pwr_db_count = 1
+            return
+        self._pwr_db_count += 1
+        if self._pwr_db_count < 8:
+            return
+        sense = raw
         if sense != self.last_sense:
             if sense == 0:
                 print("Power sense LOW - Rail 2 power OFF (pot turned OFF)")
@@ -326,10 +566,10 @@ class VintageRadioFirmware:
         print("  tap = next track")
         print("  double-tap = previous track")
         print("  triple-tap = restart station")
-        print("  hold = next station (in station shuffle: next station, still shuffled)")
-        print("  tap + hold = exit shuffle to normal station order")
-        print("  double-tap + hold = shuffle current station (repeat = reshuffle same station)")
-        print("  triple-tap + hold = shuffle library")
+        print("  hold = next station")
+        print("  tap + hold = exit track shuffle to ordered station mode")
+        print("  double-tap + hold = track shuffle in current station (repeat = reshuffle)")
+        print("  triple-tap + hold = same as double-tap + hold (reshuffle station tracks)")
 
         while True:
             try:
@@ -341,6 +581,7 @@ class VintageRadioFirmware:
                 if getattr(self.hw, '_df_read_pending', None):
                     self.hw._df_read_pending()
 
+                poll_ipc(self)
                 self.handle_button()
 
                 old_track_idx = self.core.current_track
