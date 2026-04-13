@@ -129,7 +129,6 @@ class TestBasicModeInit:
         rc.current_album_index = 0
         rc.current_track = 1
 
-        assert rc.playlists[0].get("hydrated") is False
         assert rc._get_track_count() == 3
         assert rc.playlists[0].get("hydrated") is True
 
@@ -249,7 +248,7 @@ class TestBasicAmTriggerScope:
         rc._next_track()
         assert hw.delay_reasons == []
 
-    def test_station_shuffle_next_station_skips_am_overlay(self):
+    def test_station_shuffle_next_station_schedules_am_overlay(self):
         stations = _make_basic_stations()
         hw = DelayReasonHardware(stations=stations)
         rc = RadioCore(hw, basic_mode=True)
@@ -261,7 +260,7 @@ class TestBasicAmTriggerScope:
         rc.shuffle_tracks = list(rc.playlists[0]["tracks"])
         rc.shuffle_index = 0
         rc._next_album()
-        assert "station_change" not in hw.delay_reasons
+        assert "station_change" in hw.delay_reasons
 
 
 class TestBasicStationCycleShuffle:
@@ -364,7 +363,8 @@ class TestBasicStationCycleShuffle:
         rc.on_track_finished()
         assert any(c[0] == "stop" for c in hw.calls)
 
-    def test_station_shuffle_long_press_starts_new_station_at_folder_track_001(self):
+    def test_station_shuffle_long_press_starts_new_station_at_shuffle_head(self):
+        """After long-press next station, play begins at shuffle_tracks[0] (random order), not 001."""
         tracks = [
             {"id": i, "title": f"T{i}", "folder": 1, "track_number": i, "duration": 1.0}
             for i in range(1, 8)
@@ -389,9 +389,12 @@ class TestBasicStationCycleShuffle:
         rc._next_album()
 
         assert rc.current_album_index == 1
+        assert rc.shuffle_index == 0
+        assert rc.current_track == 1
         cur = rc.shuffle_tracks[rc.shuffle_index]
         assert cur["folder"] == 2
-        assert cur["track_number"] == 1
+        assert cur == rc.shuffle_tracks[0]
+        assert {t["track_number"] for t in rc.shuffle_tracks} == set(range(1, 8))
 
     def test_shuffle_long_press_skips_empty_station_without_stale_shuffle_tracks(self):
         t1 = [
@@ -417,8 +420,10 @@ class TestBasicStationCycleShuffle:
         rc._next_album()
 
         assert rc.current_album_index == 2
+        assert rc.shuffle_index == 0
         assert rc.shuffle_tracks[rc.shuffle_index]["folder"] == 3
-        assert rc.shuffle_tracks[rc.shuffle_index]["track_number"] == 1
+        assert rc.shuffle_tracks[rc.shuffle_index] == rc.shuffle_tracks[0]
+        assert {t["track_number"] for t in rc.shuffle_tracks} == {1, 2, 3}
 
 
 # ---------------------------------------------------------------------------

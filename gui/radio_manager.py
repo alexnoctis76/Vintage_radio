@@ -5913,9 +5913,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         def on_success(result):
+            conversion_failures: List[Dict[str, Any]] = []
             if isinstance(result, dict):
                 copied = int(result.get("copied", 0))
                 skipped = int(result.get("skipped", 0))
+                raw_cf = result.get("conversion_failures")
+                if isinstance(raw_cf, list):
+                    conversion_failures = [x for x in raw_cf if isinstance(x, dict)]
                 result_sd_root = result.get("sd_root")
                 if result_sd_root:
                     self.sd_root = str(result_sd_root)
@@ -5925,6 +5929,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 f"Basic sync complete. Copied: {copied}, Skipped: {skipped}", 5000
             )
+            if conversion_failures:
+                show_n = min(15, len(conversion_failures))
+                detail_lines = []
+                for item in conversion_failures[:show_n]:
+                    name = str(item.get("name") or Path(str(item.get("path", ""))).name)
+                    err = str(item.get("error") or "unknown error").strip()
+                    if len(err) > 200:
+                        err = err[:200] + "…"
+                    detail_lines.append(f"{name}\n  {err}")
+                tail = ""
+                if len(conversion_failures) > show_n:
+                    tail = f"\n\n… and {len(conversion_failures) - show_n} more (full paths in log)."
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Some files failed to convert",
+                    "These library files could not be converted to MP3 and were not copied "
+                    "to the SD card. Fix or remove the bad files and sync again.\n\n"
+                    + "\n\n".join(detail_lines)
+                    + tail,
+                )
+            else:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Sync complete",
+                    f"Library synced to the SD card.\n\nCopied: {copied}\nSkipped: {skipped}",
+                )
             for _w in (
                 getattr(self, "_basic_debug_widget", None),
                 getattr(self, "_device_debug_widget", None),

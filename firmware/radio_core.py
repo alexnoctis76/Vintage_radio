@@ -48,8 +48,6 @@ LONG_PRESS_MS = 500   # Hold >= 500ms = long press
 TAP_WINDOW_MS = 350   # ms after last release to resolve taps (single-tap next/prev feels snappier; double-tap still detectable)
 BUSY_CONFIRM_MS = 2200
 POST_CMD_GUARD_MS = 120
-# Ignore UART 0x3D "track finished" for this long after play start (duplicate / stale pulses).
-DF_UART_END_GUARD_MS = 450
 MAX_ALBUM_NUM = 99
 
 
@@ -84,6 +82,33 @@ MODE_SHUFFLE = "shuffle"
 MODE_RADIO = "radio"
 
 ALL_MODES = [MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO]
+
+# Persisted on Pico flash (alongside album_state.txt).
+# Tuple: (DFPlayer folder_count from 0x4F or -1, number of discovered stations).
+BASIC_SD_SIG_FILE = "VintageRadio/basic_sd_sig.txt"
+
+
+def _parse_basic_sd_sig_line(text):
+    """Parse basic_sd_sig.txt contents; return (folder_count, n_stations) or None."""
+    line = (text or "").strip()
+    if not line:
+        return None
+    parts = line.split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        return (int(parts[0].strip()), int(parts[1].strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_basic_sd_sig(sig):
+    """Serialize signature for basic_sd_sig.txt."""
+    if sig is None:
+        return ""
+    fc, n = sig
+    return "{},{}".format(int(fc), int(n))
+
 
 # ===========================
 #      RADIO STATION
@@ -391,6 +416,9 @@ class RadioCore:
         # Basic mode: if saved state is shuffle but shuffle_tracks is empty, rebuild
         # after DFPlayer comms check (main_basic boot_sequence), not inside _load_state.
         self._defer_basic_shuffle_rebuild = False
+        # (0x4F folder count or -1 if unknown, number of seeded station slots). Used to
+        # detect SD swaps while power is off and trigger soft reset + fresh boot.
+        self._basic_sd_signature = None
     def _basic_playlist_track_count(self, playlist: dict) -> int:
         tracks = playlist.get("tracks", [])
         if tracks:
@@ -434,17 +462,6 @@ class RadioCore:
                     self.hw.log(f"BASIC: low heap after GC ({free_b}B) [{reason}]")
         except Exception:
             pass
-
-    def _shuffle_index_for_track_number(self, track_num: int) -> int:
-        """Index in ``shuffle_tracks`` whose ``track_number`` matches (default: physical track 1)."""
-        want = int(track_num)
-        for i, tr in enumerate(self.shuffle_tracks):
-            try:
-                if int(tr.get("track_number", 0) or 0) == want:
-                    return int(i)
-            except (TypeError, ValueError):
-                continue
-        return -1
 
     def _assign_and_shuffle_tracks(self, tracks, reason: str = "") -> bool:
         """Populate shuffle_tracks with minimal temporary allocations.
@@ -606,6 +623,43 @@ class RadioCore:
                     self.current_track = 1
                 return True
         return False
+
+    def _basic_read_sd_signature_file(self):
+        if not _IS_MICROPYTHON:
+            return None
+        try:
+            with open(BASIC_SD_SIG_FILE, "r") as f:
+                return _parse_basic_sd_sig_line(f.read())
+        except OSError:
+            return None
+
+    def _basic_write_sd_signature_file(self):
+        if not _IS_MICROPYTHON:
+            return
+        sig = getattr(self, "_basic_sd_signature", None)
+        if sig is None:
+            return
+        try:
+            with open(BASIC_SD_SIG_FILE, "w") as f:
+                f.write(_format_basic_sd_sig(sig))
+        except OSError as e:
+            self.hw.log("BASIC: could not persist SD signature: %s" % (e,))
+
+    def _basic_maybe_reset_persisted_state_if_sd_changed(self):
+        """If SD layout differs from last boot, clear album_state.txt before _load_state."""
+        if not self.basic_mode or not _IS_MICROPYTHON:
+            return
+        new_sig = getattr(self, "_basic_sd_signature", None)
+        if new_sig is None:
+            return
+        prev = self._basic_read_sd_signature_file()
+        if prev is not None and prev != new_sig:
+            self.hw.log(
+                "BASIC: SD layout changed since last boot; clearing saved playback state"
+            )
+            reset = getattr(self.hw, "reset_saved_playback_state_to_defaults", None)
+            if callable(reset):
+                reset()
     
     def init(self, skip_initial_playback=False):
         """Initialize the radio - load state and optionally start playback.
@@ -613,7 +667,12 @@ class RadioCore:
         Used by firmware to match baseline: one start inside AM overlay, no double-start.
         """
         self._load_data()
+        if self.basic_mode:
+            self._basic_maybe_reset_persisted_state_if_sd_changed()
         self._load_state()
+        self._basic_reconcile_after_load()
+        if self.basic_mode:
+            self._basic_write_sd_signature_file()
         if self.power_on and not skip_initial_playback:
             self._start_playback_for_current()
     
@@ -675,6 +734,52 @@ class RadioCore:
                 f"[PLAYLIST DEBUG] Large station set loaded ({len(self.playlists)}); "
                 "per-station debug lines suppressed"
             )
+
+        qfc = getattr(self.hw, "query_folder_count", None)
+        fc = None
+        if callable(qfc):
+            try:
+                fc = qfc()
+            except Exception:
+                fc = None
+        self._basic_sd_signature = (fc if fc is not None else -1, len(self.playlists))
+
+    def _basic_rebuild_station_shuffle_tracks(self, reason=""):
+        """Rebuild shuffle_tracks for current station (after SD swap, power-on, or state load)."""
+        if not self.playlists or self.current_album_index >= len(self.playlists):
+            return False
+        self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+        st = self.playlists[self.current_album_index]
+        tracks = st.get("tracks", [])
+        if not tracks:
+            count = self._basic_playlist_track_count(st)
+            if count <= 0:
+                return False
+            try:
+                folder = int(st.get("id", self.current_album_index + 1))
+            except (TypeError, ValueError):
+                folder = self.current_album_index + 1
+            tracks = [self._build_basic_track(folder, i) for i in range(1, count + 1)]
+        if not self._assign_and_shuffle_tracks(tracks, reason=reason or "basic_rebuild_shuffle"):
+            self.shuffle_tracks = []
+            return False
+        self.shuffle_index = 0
+        self.current_track = 1
+        return True
+
+    def _basic_reconcile_after_load(self):
+        """Clamp saved track index to real folder size (SD may have changed)."""
+        if not self.basic_mode or self.mode != MODE_PLAYLIST:
+            return
+        if self.playlists and self.current_album_index < len(self.playlists):
+            self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+            n = self._basic_playlist_track_count(self.playlists[self.current_album_index])
+            if n > 0 and self.current_track > n:
+                self.hw.log(
+                    "BASIC: Clamping loaded track %d to station size %d (SD changed?)"
+                    % (self.current_track, n)
+                )
+                self.current_track = 1
 
     def _load_state(self):
         """Load persisted state."""
@@ -1291,16 +1396,16 @@ class RadioCore:
                 self._maybe_schedule_station_change_am()
                 self._start_playback_for_current()
                 return
+            # Start at first slot in the new permutation (random), same as _init_current_shuffle.
+            # Do not remap to physical track 001 — that would make every station begin on Track 1.
             self.shuffle_index = 0
             self.current_track = 1
-            if self.basic_mode and self._shuffle_source_type == "station":
-                si = self._shuffle_index_for_track_number(1)
-                if si >= 0:
-                    self.shuffle_index = si
-                    self.current_track = si + 1
-                    self.hw.log(
-                        "Shuffle: new station starts at folder track 001 (then continues shuffled order)"
-                    )
+            if self.shuffle_tracks:
+                first_title = self.shuffle_tracks[0].get("title", "Unknown")
+                self.hw.log(
+                    "Shuffle: new station starts with %s (shuffled order)"
+                    % (first_title,)
+                )
             self.hw.log(f"Mode: Track shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
             self._save_state("shuffle next album")
             
@@ -1481,20 +1586,8 @@ class RadioCore:
         if hasattr(self.hw, "set_delay_playback"):
             self.hw.set_delay_playback(True)
 
-    def _should_skip_station_change_am_overlay(self) -> bool:
-        """True when advancing to another station should start audio like in-track advance."""
-        if not self.basic_mode:
-            return False
-        if self.mode == MODE_SHUFFLE and self._shuffle_source_type == "station":
-            return True
-        return False
-
     def _maybe_schedule_station_change_am(self) -> None:
-        if self._should_skip_station_change_am_overlay():
-            self.hw.log(
-                "BASIC: station advance — skipping AM overlay (direct play, same as track advance)"
-            )
-            return
+        """Play AMradioSound.wav before the next track after a station change."""
         self._schedule_delayed_playback("station_change")
     
     def switch_mode(self, new_mode):
@@ -1795,10 +1888,25 @@ class RadioCore:
         # stations like boot and drop stale per-folder counts so hydration re-queries
         # the DFPlayer (avoids playing phantom tracks from the previous card).
         if self.basic_mode:
+            prev_sig = getattr(self, "_basic_sd_signature", None)
             self.known_tracks = {}
             if hasattr(self.hw, "_known_tracks"):
                 self.hw._known_tracks = {}
             self._load_data_basic()
+            new_sig = getattr(self, "_basic_sd_signature", None)
+            if prev_sig is not None and new_sig is not None and prev_sig != new_sig:
+                self.hw.log(
+                    "BASIC: SD layout changed while power was off; restarting firmware"
+                )
+                reset = getattr(self.hw, "reset_saved_playback_state_to_defaults", None)
+                if callable(reset):
+                    reset()
+                try:
+                    import machine
+
+                    machine.soft_reset()
+                except Exception:
+                    pass
 
         # Enable playback delay so firmware can sequence AM overlay before track
         self._schedule_delayed_playback("power_on")
@@ -1816,6 +1924,14 @@ class RadioCore:
                     % (self.current_album_index, len(self.playlists))
                 )
                 self.current_album_index = max(0, len(self.playlists) - 1)
+
+        if (
+            self.basic_mode
+            and self.mode == MODE_SHUFFLE
+            and self._shuffle_source_type == "station"
+        ):
+            if self._basic_rebuild_station_shuffle_tracks(reason="power_on"):
+                self.hw.log("BASIC: Rebuilt station shuffle after power-on (fresh SD order)")
         
         # Always start from track 1 on power-on
         self.current_track = 1

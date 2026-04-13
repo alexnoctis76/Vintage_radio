@@ -37,7 +37,6 @@ from radio_core import (
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
     FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
-    DF_UART_END_GUARD_MS,
     ticks_ms, ticks_diff,
 )
 
@@ -363,38 +362,8 @@ class VintageRadioFirmware:
         print(f"Track finished: '{old_title}' -> '{new_title}' (album {old_album+1} track {old_track} -> album {new_album+1} track {new_track})")
     
     def handle_track_finished(self):
-        """Detect track finished: prefer UART when available, else BUSY pin or is_playing() (VS1053)."""
+        """BUSY pin first; UART 0x3D only when BUSY is idle (playback stopped)."""
         if not self.rail2_on:
-            return
-
-        if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
-            armed = getattr(self.hw, "_uart_track_end_armed", False)
-            finished_num = getattr(self.hw, "_track_finished_track_num", None)
-            now = ticks_ms()
-            start_tick = getattr(self.hw, "_playback_start_tick", 0)
-            if armed and start_tick:
-                age_ms = ticks_diff(now, start_tick)
-                if age_ms < DF_UART_END_GUARD_MS:
-                    getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-                    self._log_uart_decision("discard:stale", finished_num, extra="age={}ms".format(age_ms))
-                    return
-            pin_busy = getattr(self.hw, "pin_busy", None)
-            if armed and pin_busy is not None and pin_busy.value() == 0:
-                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-                self._log_uart_decision("discard:busy_low", finished_num)
-                return
-
-            consumed_num = getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-            consumed_num = consumed_num if consumed_num is not None else finished_num
-            if armed:
-                self.hw._uart_track_end_armed = False
-                self._log_uart_decision("accept", consumed_num)
-                pin_busy = getattr(self.hw, "pin_busy", None)
-                if pin_busy is not None:
-                    self.prev_busy = pin_busy.value()
-                self._fire_track_finished()
-            else:
-                self._log_uart_decision("discard:unarmed", consumed_num)
             return
 
         pin_busy = getattr(self.hw, "pin_busy", None)
@@ -443,6 +412,7 @@ class VintageRadioFirmware:
                         self._busy_high_since = 0
                         self.prev_busy = 1
                         self._fire_track_finished()
+                        self.prev_busy = pin_busy.value()
                         return
                 else:
                     # Any non-zero/None response cancels this fallback window.
@@ -459,7 +429,28 @@ class VintageRadioFirmware:
                     print("Track finished (BUSY fallback)")
                     self._busy_high_since = 0
                     self._fire_track_finished()
+                    self.prev_busy = pin_busy.value()
+                    return
         self.prev_busy = b
+
+        if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
+            armed = getattr(self.hw, "_uart_track_end_armed", False)
+            finished_num = getattr(self.hw, "_track_finished_track_num", None)
+            if not armed:
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                self._log_uart_decision("discard:unarmed", finished_num)
+                return
+            if pin_busy.value() == 0:
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                self._log_uart_decision("discard:busy_low", finished_num)
+                return
+
+            consumed_num = getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+            consumed_num = consumed_num if consumed_num is not None else finished_num
+            self.hw._uart_track_end_armed = False
+            self._log_uart_decision("accept", consumed_num)
+            self.prev_busy = pin_busy.value()
+            self._fire_track_finished()
 
     def _log_uart_decision(self, reason: str, track_num, extra: str = ""):
         now = ticks_ms()

@@ -1542,7 +1542,12 @@ class SDManager:
                     f"Basic SD sync: removed {n} hidden/junk item(s) "
                     "(macOS ._*, .DS_Store, __MACOSX, etc.)"
                 )
-            out: Dict[str, object] = {"copied": 0, "skipped": 0, "sd_root": str(sd_root)}
+            out: Dict[str, object] = {
+                "copied": 0,
+                "skipped": 0,
+                "sd_root": str(sd_root),
+                "conversion_failures": [],
+            }
             if preserved_volume_label:
                 out["preserved_volume_label"] = preserved_volume_label
             return out
@@ -1586,6 +1591,7 @@ class SDManager:
         cache_copied = 0
         direct_mp3_copied = 0
         processed_tracks = 0
+        conversion_failures: List[Dict[str, str]] = []
         sync_start = time.monotonic()
         last_progress_emit = 0.0
 
@@ -1822,10 +1828,12 @@ class SDManager:
                     src, cache_mp3, target, cache_key = futures[future]
                     done_convert += 1
                     ok = False
+                    convert_exc: Optional[Exception] = None
                     try:
                         ok = bool(future.result())
-                    except Exception:
+                    except Exception as e:
                         ok = False
+                        convert_exc = e
                     if ok:
                         converted += 1
                         # Actual SD copy job enters queue only after local conversion succeeds.
@@ -1834,7 +1842,19 @@ class SDManager:
                     else:
                         failed_cache_paths.add(cache_mp3)
                         skipped += 1
-                        print(f"Failed to convert {src.name}")
+                        err_text = (
+                            str(convert_exc).strip()
+                            if convert_exc is not None
+                            else "conversion failed (see log for details)"
+                        )
+                        conversion_failures.append(
+                            {
+                                "path": str(src),
+                                "name": src.name,
+                                "error": err_text[:800],
+                            }
+                        )
+                        print(f"Failed to convert {src.name}: {err_text}")
 
                     _conv_step = _basic_sync_progress_step_interval(len(convert_jobs), large_step=50)
                     if progress_callback and (
@@ -1965,7 +1985,7 @@ class SDManager:
             progress_callback(
                 _tb,
                 _tb,
-                f"{sync_log_prefix} sync finished — continuing with next step…",
+                f"{sync_log_prefix} sync complete.",
             )
         self._remove_legacy_vintage_radio_folder_on_dfplayer_sd(sd_root)
         n = self.remove_hidden_junk_from_sd(sd_root)
@@ -1989,6 +2009,7 @@ class SDManager:
             "copied": copied,
             "skipped": skipped,
             "sd_root": str(sd_root),
+            "conversion_failures": conversion_failures,
         }
         if preserved_volume_label:
             out_end["preserved_volume_label"] = preserved_volume_label

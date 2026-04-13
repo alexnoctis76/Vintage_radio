@@ -38,7 +38,6 @@ from radio_core import (
     HardwareInterface,
     MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO,
     FADE_IN_S, DF_BOOT_MS, BUSY_CONFIRM_MS, POST_CMD_GUARD_MS,
-    DF_UART_END_GUARD_MS,
     ticks_ms, ticks_diff,
 )
 
@@ -400,37 +399,13 @@ class VintageRadioFirmware:
         print(f"Auto-advanced: '{old_title}' -> '{new_title}' (station {old_album+1} track {old_track} -> station {new_album+1} track {new_track})")
 
     def handle_track_finished(self):
+        """Detect end of track: BUSY pin first (DFPlayer hardware truth), then UART 0x3D.
+
+        UART 0x3D is unreliable (global track index, queued duplicates). We only treat it
+        as track-end when the BUSY pin already reads idle (HIGH), i.e. playback has stopped.
+        There is no millisecond stale-age window; that discarded real short-track ends.
+        """
         if not self.rail2_on:
-            return
-
-        if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
-            armed = getattr(self.hw, "_uart_track_end_armed", False)
-            finished_num = getattr(self.hw, "_track_finished_track_num", None)
-            now = ticks_ms()
-            start_tick = getattr(self.hw, "_playback_start_tick", 0)
-            if armed and start_tick:
-                age_ms = ticks_diff(now, start_tick)
-                if age_ms < DF_UART_END_GUARD_MS:
-                    getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-                    self._log_uart_decision("discard:stale", finished_num, extra="age={}ms".format(age_ms))
-                    return
-            pin_busy = getattr(self.hw, "pin_busy", None)
-            if armed and pin_busy is not None and pin_busy.value() == 0:
-                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-                self._log_uart_decision("discard:busy_low", finished_num)
-                return
-
-            consumed_num = getattr(self.hw, "consume_track_finished_uart", lambda: None)()
-            consumed_num = consumed_num if consumed_num is not None else finished_num
-            if armed:
-                self.hw._uart_track_end_armed = False
-                self._log_uart_decision("accept", consumed_num)
-                pin_busy = getattr(self.hw, "pin_busy", None)
-                if pin_busy is not None:
-                    self.prev_busy = pin_busy.value()
-                self._fire_track_finished()
-            else:
-                self._log_uart_decision("discard:unarmed", consumed_num)
             return
 
         pin_busy = getattr(self.hw, "pin_busy", None)
@@ -442,16 +417,9 @@ class VintageRadioFirmware:
             elif self.hw.is_playing():
                 self._was_playing = True
             return
-        # Short debounce only: old 5000ms forced ~5s between every track.
+
+        # --- Primary: BUSY LOW while playing -> HIGH when idle (classic DFPlayer). ---
         BUSY_DEBOUNCE_MS = 400
-        # Minimum elapsed time since track start before a BUSY HIGH edge is treated as
-        # track-end. Prevents a loose/intermittent BUSY wire from triggering a false
-        # track-finished within the first few seconds of playback (and the cascade of
-        # DFPlayer-busy-state failures that follows). UART 0x3D handles genuine short
-        # tracks that end before this window.
-        BUSY_MIN_PLAY_MS = 3000
-        # Keep status query as a rare last-resort path (not part of normal playback loop):
-        # frequent 0x42 polling can cause audible pulsing/chop on some DFPlayer clones.
         STUCK_BUSY_QUERY_MIN_MS = 6000
         STUCK_QUERY_INTERVAL_MS = 2500
         STUCK_QUERY_REQUIRED_ZEROES = 2
@@ -461,9 +429,6 @@ class VintageRadioFirmware:
         ignore_until = getattr(self.hw, "ignore_busy_until", 0)
         start_tick = getattr(self.hw, "_playback_start_tick", 0)
 
-        # BUSY stuck LOW but module reports stopped (some bad MP3s / clones).
-        # Guard: skip when UART track-end detection is armed — 0x3D will handle end-of-track
-        # cleanly. Sending 0x42 mid-track causes audible pulsing on many DFPlayer clones.
         if (
             b == 0
             and track_expected
@@ -488,9 +453,9 @@ class VintageRadioFirmware:
                         self._busy_high_since = 0
                         self.prev_busy = 1
                         self._fire_track_finished()
+                        self.prev_busy = pin_busy.value()
                         return
                 else:
-                    # Any non-zero/None response cancels this fallback window.
                     self._stuck_status_zero_count = 0
 
         if b == 0:
@@ -498,27 +463,40 @@ class VintageRadioFirmware:
                 self._was_playing = True
             self._busy_high_since = 0
         elif b == 1 and self.prev_busy == 0:
-            # Only arm the debounce timer if enough time has passed since track start.
-            # A BUSY HIGH within BUSY_MIN_PLAY_MS is almost certainly a loose-wire
-            # glitch; let UART 0x3D handle any genuine track end that short.
-            early = start_tick and ticks_diff(now, start_tick) < BUSY_MIN_PLAY_MS
-            if track_expected and not early:
+            if track_expected:
                 self._busy_high_since = now
             else:
                 self._busy_high_since = 0
             self._stuck_status_zero_count = 0
         if b == 1 and self._busy_high_since > 0:
-            past_min = not start_tick or ticks_diff(now, start_tick) >= BUSY_MIN_PLAY_MS
             if ticks_diff(now, self._busy_high_since) >= BUSY_DEBOUNCE_MS and track_expected:
-                if not past_min:
-                    # _busy_high_since was armed before this track started playing;
-                    # discard it to prevent a stale debounce from firing immediately.
-                    self._busy_high_since = 0
-                elif ticks_diff(now, ignore_until) >= 0:
-                    print("Track finished (BUSY fallback)")
+                if ticks_diff(now, ignore_until) >= 0:
+                    print("Track finished (BUSY)")
                     self._busy_high_since = 0
                     self._fire_track_finished()
+                    self.prev_busy = pin_busy.value()
+                    return
         self.prev_busy = b
+
+        # --- Secondary: UART 0x3D only when BUSY says idle (avoids bogus advances). ---
+        if getattr(self.hw, "check_track_finished_uart", None) and self.hw.check_track_finished_uart():
+            armed = getattr(self.hw, "_uart_track_end_armed", False)
+            finished_num = getattr(self.hw, "_track_finished_track_num", None)
+            if not armed:
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                self._log_uart_decision("discard:unarmed", finished_num)
+                return
+            if pin_busy.value() == 0:
+                getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+                self._log_uart_decision("discard:busy_low", finished_num)
+                return
+
+            consumed_num = getattr(self.hw, "consume_track_finished_uart", lambda: None)()
+            consumed_num = consumed_num if consumed_num is not None else finished_num
+            self.hw._uart_track_end_armed = False
+            self._log_uart_decision("accept", consumed_num)
+            self.prev_busy = pin_busy.value()
+            self._fire_track_finished()
 
     def _log_uart_decision(self, reason: str, track_num, extra: str = ""):
         now = ticks_ms()

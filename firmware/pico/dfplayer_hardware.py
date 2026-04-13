@@ -1077,8 +1077,30 @@ class DFPlayerHardware(HardwareInterface):
                 duty = raw_duty
             self.pwm.duty_u16(duty)
             state["idx"] = idx + 1
-        
-        self.tim.init(freq=self.wav_sr, mode=Timer.PERIODIC, callback=isr_cb)
+
+        # 8 kHz Timer callbacks are soft IRQs. GC pauses (e.g. after building a large
+        # shuffle list on playlist->shuffle) delay callbacks and stretch the AM WAV.
+        _gc_disabled = False
+        if gc is not None:
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            try:
+                gc.disable()
+                _gc_disabled = True
+            except Exception:
+                pass
+
+        try:
+            self.tim.init(freq=self.wav_sr, mode=Timer.PERIODIC, callback=isr_cb)
+        except Exception:
+            if gc is not None and _gc_disabled:
+                try:
+                    gc.enable()
+                except Exception:
+                    pass
+            raise
         
         # Fade in DFPlayer volume while AM static plays
         # Matches original: df_set_vol(int((step / fade_steps) * DFPLAYER_VOL))
@@ -1136,6 +1158,11 @@ class DFPlayerHardware(HardwareInterface):
                 Pin(PIN_AUDIO, Pin.IN)
             except:
                 pass
+            if gc is not None and _gc_disabled:
+                try:
+                    gc.enable()
+                except Exception:
+                    pass
         
         # Ensure volume is at target after fade
         self._df_set_vol(self._df_volume)
@@ -1204,6 +1231,22 @@ class DFPlayerHardware(HardwareInterface):
             print(f"Saved state: album={album_idx} (idx={album_idx-1}), track={track}, mode={mode}")
         except Exception as e:
             print(f"State save error: {e}")
+
+    def reset_saved_playback_state_to_defaults(self):
+        """Overwrite album_state.txt on Pico flash so the next load_state starts at station 1 / track 1.
+
+        Used when the SD card layout changes: soft_reset clears RAM but this file survives;
+        without resetting it, playback would resume the previous folder index (e.g. 09).
+        """
+        try:
+            payload = "1,1;mode=playlist"
+            with open(ALBUM_FILE, "w") as f:
+                f.write(payload)
+            print(
+                "Reset saved playback state to defaults (playlist, folder 01, track 1)"
+            )
+        except Exception as e:
+            print(f"Reset playback state error: {e}")
     
     def load_state(self):
         """Load state from SD card."""

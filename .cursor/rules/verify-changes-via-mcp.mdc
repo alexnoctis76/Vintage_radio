@@ -1,0 +1,17 @@
+---
+description: After device/audio/debug changes, verify with Vintage Radio MCP (not host-only).
+alwaysApply: true
+---
+
+# Verify changes via MCP
+
+When a change can affect the Pico, DFPlayer path, serial, AM overlay, line-in acceptance, or the debug TCP server:
+
+1. **Start Vintage Radio with MCP** if `ping` / TCP to `127.0.0.1:8765` fails:  
+   `python run_vintage_radio.py --enable-mcp-debug --mcp-autostart` (use `.venv\Scripts\python.exe` when present).
+
+2. **Run a minimal check** appropriate to the diff — not only `ping`: e.g. `device_connect` (COM as needed), `start_streaming`, `invoke_action` / `physical_gesture` for the behavior you touched, `get_device_stream_tail` (large limit), and when audio matters, `line_in_analyze` with the correct input device.
+
+3. **Do not** treat “code looks right” or host-only `pytest` as sufficient sign-off when the rules already require hardware or MCP evidence for that class of change.
+
+This saves rework for both the user and the agent.
