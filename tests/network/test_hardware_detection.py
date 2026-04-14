@@ -6,6 +6,7 @@ serial.tools.list_ports so tests run without physical hardware attached.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -37,6 +38,10 @@ class TestSDDetection:
             roots = SDManager.detect_sd_roots()
         assert isinstance(roots, list)
 
+    @pytest.mark.skipif(
+        sys.platform == "darwin",
+        reason="macOS detect_sd_roots also scans /Volumes; not governed by psutil alone",
+    )
     def test_no_partitions_returns_empty(self):
         from gui.sd_manager import SDManager
         with mock.patch("psutil.disk_partitions", return_value=[]):

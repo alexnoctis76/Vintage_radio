@@ -1,7 +1,9 @@
 """Path helpers for resources and project root. Works from source and when frozen (PyInstaller)."""
 
 import os
+import platform
 import shutil
+import stat
 from pathlib import Path
 import sys
 
@@ -144,13 +146,82 @@ def resource_path(*parts: str) -> Path:
     return gui_dir() / "resources" / "/".join(parts)
 
 
+def _bundle_imageio_ffmpeg_binary() -> Path | None:
+    """Find imageio-ffmpeg static build under PyInstaller ``_MEIPASS``.
+
+    ``imageio_ffmpeg.get_ffmpeg_exe()`` uses ``importlib.resources`` paths that do
+    not reliably match where PyInstaller extracts ``collect_all('imageio_ffmpeg')``
+    data (especially inside a macOS ``.app``).
+    """
+    root = _frozen_base()
+    if root is None or not root.is_dir():
+        return None
+
+    ordered_names: list[str] = []
+    try:
+        import imageio_ffmpeg._definitions as defs
+
+        plat = defs.get_platform()
+        primary = defs.FNAME_PER_PLATFORM.get(plat)
+        if primary:
+            ordered_names.append(primary)
+        for n in dict.fromkeys(defs.FNAME_PER_PLATFORM.values()):
+            if n and n not in ordered_names:
+                ordered_names.append(n)
+    except Exception:
+        if platform.system() == "Darwin":
+            ordered_names = [
+                "ffmpeg-macos-aarch64-v7.1",
+                "ffmpeg-macos-x86_64-v7.1",
+            ]
+        elif platform.system() == "Windows":
+            ordered_names = [
+                "ffmpeg-win-x86_64-v7.1.exe",
+                "ffmpeg-win32-v4.2.2.exe",
+            ]
+        else:
+            ordered_names = [
+                "ffmpeg-linux-x86_64-v7.0.2",
+                "ffmpeg-linux-aarch64-v7.0.2",
+            ]
+
+    def _platform_ffmpeg_ok(p: Path) -> bool:
+        n = p.name.lower()
+        if platform.system() == "Darwin":
+            return "macos" in n
+        if platform.system() == "Windows":
+            return p.suffix.lower() == ".exe" or "win" in n
+        if platform.system() == "Linux":
+            return "linux" in n
+        return True
+
+    for name in ordered_names:
+        direct = root / "imageio_ffmpeg" / "binaries" / name
+        if direct.is_file() and _platform_ffmpeg_ok(direct):
+            return direct
+        for p in root.rglob(name):
+            if p.is_file() and _platform_ffmpeg_ok(p):
+                return p
+    return None
+
+
+def _ensure_executable(p: Path) -> None:
+    try:
+        mode = p.stat().st_mode
+        if mode & stat.S_IXUSR == 0:
+            p.chmod(mode | stat.S_IRWXU)
+    except OSError:
+        pass
+
+
 def resolve_ffmpeg_executable() -> str | None:
     """Return an ffmpeg executable path if available.
 
     Priority:
     1) Explicit env override: VINTAGE_RADIO_FFMPEG_EXE
-    2) Bundled executable from imageio-ffmpeg package
-    3) System PATH lookup ("ffmpeg")
+    2) Bundled executable from imageio-ffmpeg package (``get_ffmpeg_exe()``)
+    3) When **frozen**: search ``_MEIPASS`` for the static binary shipped with imageio-ffmpeg
+    4) System PATH lookup (``ffmpeg``)
     """
     override = os.environ.get("VINTAGE_RADIO_FFMPEG_EXE", "").strip()
     if override and Path(override).exists():
@@ -164,6 +235,12 @@ def resolve_ffmpeg_executable() -> str | None:
             return exe
     except Exception:
         pass
+
+    bundled = _bundle_imageio_ffmpeg_binary()
+    if bundled is not None:
+        _ensure_executable(bundled)
+        if bundled.is_file():
+            return str(bundled)
 
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:

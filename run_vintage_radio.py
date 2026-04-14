@@ -43,6 +43,42 @@ for arg in list(sys.argv):
         sys.argv.remove(arg)
 
 
+def _try_sd_darwin_disk_write_cli() -> int | None:
+    """If argv is --vr-write-sd-darwin <img> <bsd_disk> <log> <progress>, elevated write and exit."""
+    if len(sys.argv) < 6 or sys.argv[1] != "--vr-write-sd-darwin":
+        return None
+    import traceback
+    from pathlib import Path
+
+    from gui.sd_disk_image_flash import _write_image_to_darwin_disk_impl
+    from gui.sd_disk_write_helper import redirect_stdio_for_elevated_disk_child
+
+    img = Path(sys.argv[2])
+    bsd = sys.argv[3]
+    log_path = Path(sys.argv[4])
+    progress_path = Path(sys.argv[5])
+
+    redirect_stdio_for_elevated_disk_child(log_path)
+
+    try:
+        ok, err = _write_image_to_darwin_disk_impl(
+            img,
+            bsd,
+            progress_callback=None,
+            should_cancel=None,
+            progress_file_path=progress_path,
+        )
+        if not ok:
+            print(err or "Disk write failed.", file=sys.stderr)
+            sys.stderr.flush()
+            return 1
+        return 0
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        return 1
+
+
 def _try_sd_disk_write_cli() -> int | None:
     """If argv is --vr-write-sd-disk <img> <disk> [<log>], perform elevated write and exit."""
     if len(sys.argv) < 4:
@@ -151,6 +187,9 @@ if getattr(sys, "frozen", False):
         pass
 
 if __name__ == "__main__":
+    code = _try_sd_darwin_disk_write_cli()
+    if code is not None:
+        raise SystemExit(code)
     code = _try_sd_disk_write_cli()
     if code is not None:
         raise SystemExit(code)

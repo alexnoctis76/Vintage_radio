@@ -45,3 +45,26 @@ def test_task_progress_dialog_runs_background_callable(qapp):
         dlg.close()
         dlg.deleteLater()
         parent.deleteLater()
+
+
+def test_format_bytes_short(qapp):
+    assert TaskProgressDialog._format_bytes_short(0) == "0 B"
+    assert TaskProgressDialog._format_bytes_short(2048) == "2 KiB"
+    assert "GiB" in TaskProgressDialog._format_bytes_short(31 * (1 << 30))
+
+
+def test_progress_bar_scales_past_qt_int32(qapp):
+    """Totals > ~2 GiB overflow QProgressBar's int range; dialog scales to 0..10000."""
+    parent = QtWidgets.QWidget()
+    dlg = TaskProgressDialog(parent=parent, title="t", func=lambda **kw: None)
+    try:
+        total = 35 * (1 << 30)
+        cur = total // 2
+        dlg._on_progress(cur, total, "writing")
+        assert dlg._progress_bar.maximum() == 10_000
+        assert dlg._progress_bar.value() == 5_000
+        assert "GiB" in dlg._detail_label.text()
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        parent.deleteLater()

@@ -38,12 +38,16 @@ from .experimental_sd_image import (
 )
 from .sd_disk_image_flash import (
     LAST_CACHED_SD_IMAGE_FILENAME,
+    darwin_default_bsd_disk_from_volume_path,
+    darwin_get_disk_size_bytes,
     format_disk_size,
     is_windows_admin,
     windows_disk_number_for_drive_letter,
     windows_drive_letter_from_path,
     windows_get_disk_size_bytes,
     write_image_to_physical_disk,
+    write_image_to_physical_disk_darwin,
+    DARWIN_FDA_REQUIRED_MARKER,
 )
 from .widgets.sd_disk_image_wizard_dialog import SdDiskImageFlashWizardDialog
 from .session_log import write_session_line, get_session_log_path
@@ -6009,7 +6013,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def _on_experimental_sd_disk_image(self) -> None:
-        """Experimental: clean sync via FAT32 image — build image, then write to physical SD (Windows)."""
+        """Experimental: clean sync via FAT32 image — build image, then write to physical SD."""
         if not self._is_basic_like_mode():
             return
         sd_root = self._resolve_sd_root()
@@ -6040,12 +6044,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         sd_p = Path(sd_root)
 
-        if platform.system() != "Windows":
+        if platform.system() not in ("Windows", "Darwin"):
             intro = QtWidgets.QMessageBox(self)
             intro.setWindowTitle("Experimental: SD disk image (export only)")
             intro.setIcon(QtWidgets.QMessageBox.Icon.Information)
             intro.setText(
-                "Raw disk flashing is only implemented on Windows.\n\n"
+                "Raw disk flashing from this app is only implemented on Windows and macOS.\n\n"
                 "You can still save a FAT32 .img built with pyfatfs and flash it with Etcher, "
                 "Pi Imager, or dd on this platform."
             )
@@ -6108,19 +6112,43 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg.exec()
             return
 
-        letter = windows_drive_letter_from_path(sd_p)
-        default_disk = windows_disk_number_for_drive_letter(letter) if letter else None
-
-        wiz = SdDiskImageFlashWizardDialog(
-            self,
-            sd_root=sd_p,
-            default_disk_number=default_disk,
-        )
+        use_darwin = platform.system() == "Darwin"
+        if use_darwin:
+            default_bsd = darwin_default_bsd_disk_from_volume_path(sd_p)
+            wiz = SdDiskImageFlashWizardDialog(
+                self,
+                sd_root=sd_p,
+                default_disk_number=None,
+                default_darwin_bsd_disk=default_bsd,
+            )
+        else:
+            letter = windows_drive_letter_from_path(sd_p)
+            default_disk = windows_disk_number_for_drive_letter(letter) if letter else None
+            wiz = SdDiskImageFlashWizardDialog(
+                self,
+                sd_root=sd_p,
+                default_disk_number=default_disk,
+                default_darwin_bsd_disk=None,
+            )
         if wiz.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
-        disk_number = wiz.selected_disk_number
-        if disk_number is None:
-            return
+
+        disk_number: Optional[int] = None
+        bsd_disk: Optional[str] = None
+        if use_darwin:
+            bsd_disk = wiz.selected_darwin_bsd_disk
+            if not bsd_disk:
+                return
+        else:
+            disk_number = wiz.selected_disk_number
+            if disk_number is None:
+                return
+
+        def _selected_disk_size_bytes() -> Optional[int]:
+            if use_darwin:
+                return darwin_get_disk_size_bytes(bsd_disk) if bsd_disk else None
+            return windows_get_disk_size_bytes(disk_number) if disk_number is not None else None
+
         prepare_on_pc = wiz.prepare_on_pc
         flash_last = wiz.flash_last_image_only
         last_img = app_data_dir() / "sd_image_cache" / LAST_CACHED_SD_IMAGE_FILENAME
@@ -6142,16 +6170,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Could not read cached image:\n{last_img}",
                 )
                 return
-            ds = windows_get_disk_size_bytes(disk_number)
+            ds = _selected_disk_size_bytes()
             _cached_sz = last_img.stat().st_size
             if ds is not None and _cached_sz > ds:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "SD card too small",
-                    f"The cached image is about {format_disk_size(_cached_sz)}, but the "
-                    f"selected disk is {format_disk_size(ds)}. Use a larger card.",
-                )
-                return
+                _overage = _cached_sz - ds
+                _tolerance = max(256 * 1024 * 1024, int(ds * 0.02))
+                if _overage > _tolerance:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "SD card too small",
+                        f"The cached image is about {format_disk_size(_cached_sz)}, but the "
+                        f"selected disk is {format_disk_size(ds)}. The difference "
+                        f"({format_disk_size(_overage)}) is too large to trim safely. "
+                        "Use a larger card, or uncheck 'Flash cached image only' to rebuild.",
+                    )
+                    return
+                # Small overage (≤ 256 MiB / 2%) — same-nominal-size card with slightly
+                # different actual capacity.  The write will be capped at the disk boundary;
+                # the last few MB of empty FAT32 space will not be written (safe for DFPlayer).
             if ds is not None and _cached_sz < ds:
                 QtWidgets.QMessageBox.warning(
                     self,
@@ -6164,7 +6200,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
         else:
-            ds = windows_get_disk_size_bytes(disk_number)
+            ds = _selected_disk_size_bytes()
             if not prepare_on_pc:
                 est = suggest_image_size_bytes(sd_p)
                 if ds is not None and est > ds:
@@ -6176,14 +6212,28 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     return
 
+        if use_darwin and bsd_disk:
+            target_label = f"whole disk {bsd_disk} (raw /dev/r{bsd_disk})"
+        else:
+            target_label = f"PhysicalDrive{disk_number}"
         confirm_lines = [
-            f"Write a fresh FAT32 image to PhysicalDrive{disk_number}?",
+            f"Write a fresh FAT32 image to {target_label}?",
             "",
             f"{'Disk size: ' + format_disk_size(ds) if ds else 'Size: unknown'}",
             "",
             "ALL DATA on that physical disk will be permanently erased.",
         ]
-        if not is_windows_admin():
+        if use_darwin:
+            euid = os.geteuid() if hasattr(os, "geteuid") else 0
+            if euid != 0:
+                confirm_lines.extend(
+                    [
+                        "",
+                        "After the image is built, macOS will ask for your password or Touch ID to allow "
+                        "writing to the raw SD device.",
+                    ]
+                )
+        elif not is_windows_admin():
             confirm_lines.extend(
                 [
                     "",
@@ -6206,7 +6256,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dfplayer_eq = self._selected_dfplayer_eq() if software_source == "our" else "normal"
         conv_profile = self._selected_conversion_profile()
 
-        def _worker_win(
+        def _worker_sd_image(
             *,
             progress_callback: Optional[Callable] = None,
             should_cancel: Optional[Callable[[], bool]] = None,
@@ -6234,15 +6284,25 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
                     if not img_path.is_file() or img_path.stat().st_size <= 0:
                         raise RuntimeError(f"Missing cached image: {img_path}")
-                    ok2, err2 = write_image_to_physical_disk(
-                        img_path,
-                        disk_number,
-                        progress_callback=progress_callback,
-                        should_cancel=should_cancel,
-                    )
+                    if use_darwin:
+                        assert bsd_disk is not None
+                        ok2, err2 = write_image_to_physical_disk_darwin(
+                            img_path,
+                            bsd_disk,
+                            progress_callback=progress_callback,
+                            should_cancel=should_cancel,
+                        )
+                    else:
+                        assert disk_number is not None
+                        ok2, err2 = write_image_to_physical_disk(
+                            img_path,
+                            disk_number,
+                            progress_callback=progress_callback,
+                            should_cancel=should_cancel,
+                        )
                     if not ok2:
                         raise RuntimeError(err2 or "Disk write failed.")
-                    return {"disk_number": disk_number}
+                    return {"ok": True}
 
                 if prepare_on_pc:
                     used_staging = True
@@ -6270,7 +6330,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         sync_log_prefix="Prepare (PC staging)",
                     )
                     est2 = suggest_image_size_bytes(staging_root)
-                    _disk_bytes = windows_get_disk_size_bytes(disk_number)
+                    _disk_bytes = _selected_disk_size_bytes()
                     if _disk_bytes is not None and est2 > _disk_bytes:
                         raise RuntimeError(
                             f"SD card too small: need about {format_disk_size(est2)} for this image, "
@@ -6278,7 +6338,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
                     source_root = staging_root
                 else:
-                    _disk_bytes = windows_get_disk_size_bytes(disk_number)
+                    _disk_bytes = _selected_disk_size_bytes()
                     source_root = sd_p
 
                 disk_size_label = (
@@ -6304,15 +6364,25 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
                     raise RuntimeError(err or "Disk image build failed.")
 
-                ok2, err2 = write_image_to_physical_disk(
-                    img_path,
-                    disk_number,
-                    progress_callback=progress_callback,
-                    should_cancel=should_cancel,
-                )
+                if use_darwin:
+                    assert bsd_disk is not None
+                    ok2, err2 = write_image_to_physical_disk_darwin(
+                        img_path,
+                        bsd_disk,
+                        progress_callback=progress_callback,
+                        should_cancel=should_cancel,
+                    )
+                else:
+                    assert disk_number is not None
+                    ok2, err2 = write_image_to_physical_disk(
+                        img_path,
+                        disk_number,
+                        progress_callback=progress_callback,
+                        should_cancel=should_cancel,
+                    )
                 if not ok2:
                     raise RuntimeError(err2 or "Disk write failed.")
-                return {"disk_number": disk_number}
+                return {"ok": True}
             finally:
                 if used_staging:
                     shutil.rmtree(staging_root, ignore_errors=True)
@@ -6320,14 +6390,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = TaskProgressDialog(
             parent=self,
             title="SD image sync (experimental)",
-            func=_worker_win,
+            func=_worker_sd_image,
             args=(),
             kwargs={},
             cancelable=True,
             cancel_callback_kwarg="should_cancel",
         )
 
-        def on_ok_win(_result: object) -> None:
+        def on_ok_sd(_result: object) -> None:
             self.statusBar().showMessage("SD card image written. Safely remove the card if needed.", 8000)
             QtWidgets.QMessageBox.information(
                 self,
@@ -6336,12 +6406,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Safely remove the SD card, insert it in the radio, and power on.",
             )
 
-        dlg.on_success = on_ok_win
-        dlg.on_error = lambda msg: QtWidgets.QMessageBox.critical(
-            self,
-            "SD image sync failed",
-            msg,
-        )
+        def on_error_sd(msg: str) -> None:
+            if use_darwin and DARWIN_FDA_REQUIRED_MARKER in msg:
+                display_msg = msg.replace(DARWIN_FDA_REQUIRED_MARKER + "\n", "")
+                dlg_fda = QtWidgets.QMessageBox(self)
+                dlg_fda.setWindowTitle("Full Disk Access Required")
+                dlg_fda.setText(display_msg)
+                dlg_fda.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+                open_btn = dlg_fda.addButton(
+                    "Open System Settings", QtWidgets.QMessageBox.ButtonRole.ActionRole
+                )
+                dlg_fda.addButton(QtWidgets.QMessageBox.StandardButton.Ok)
+                dlg_fda.exec()
+                if dlg_fda.clickedButton() is open_btn:
+                    import subprocess as _sp
+                    _sp.Popen(
+                        [
+                            "open",
+                            "x-apple.systempreferences:com.apple.preference.security"
+                            "?Privacy_AllFiles",
+                        ]
+                    )
+            else:
+                QtWidgets.QMessageBox.critical(self, "SD image sync failed", msg)
+
+        dlg.on_success = on_ok_sd
+        dlg.on_error = on_error_sd
         dlg.exec()
 
     def _on_tab_changed(self, index: int) -> None:
@@ -8761,6 +8851,10 @@ class MainWindow(QtWidgets.QMainWindow):
             (
                 "firmware/pico/components/vintage_radio_ipc.py",
                 "components/vintage_radio_ipc.py",
+            ),
+            (
+                "firmware/pico/components/am_wav_loader.py",
+                "components/am_wav_loader.py",
             ),
             ("firmware/pin_config_loader.py", "pin_config_loader.py"),
             ("firmware/pico/sdcard.py", "sdcard.py"),

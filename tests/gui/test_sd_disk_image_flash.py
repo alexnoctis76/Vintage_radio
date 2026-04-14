@@ -2,7 +2,12 @@
 
 from pathlib import Path
 
-from gui.sd_disk_image_flash import format_disk_size
+from gui.sd_disk_image_flash import (
+    darwin_normalize_bsd_whole_disk,
+    darwin_rdisk_path,
+    dd_stderr_records_out_bytes,
+    format_disk_size,
+)
 from gui.sd_disk_write_helper import parse_sd_disk_write_cli_args
 
 
@@ -85,3 +90,34 @@ def test_parse_helper_module_argv() -> None:
     assert disk == 1
     assert log is None
     assert prog is None
+
+
+def test_darwin_normalize_bsd_whole_disk() -> None:
+    assert darwin_normalize_bsd_whole_disk("disk4") == "disk4"
+    assert darwin_normalize_bsd_whole_disk("  /dev/disk12 ") == "disk12"
+    assert darwin_normalize_bsd_whole_disk("/dev/rdisk3") == "disk3"
+    assert darwin_normalize_bsd_whole_disk("disk4s1") is None
+    assert darwin_normalize_bsd_whole_disk("") is None
+
+
+def test_darwin_rdisk_path() -> None:
+    assert darwin_rdisk_path("disk4") == "/dev/rdisk4"
+
+
+def test_dd_stderr_records_out_bytes_parses_last_line() -> None:
+    mib = 1024 * 1024
+    stderr = (
+        "21751+0 records in\n"
+        "21750+0 records out\n"
+        "22806528000 bytes transferred in 3647.3 secs\n"
+    )
+    assert dd_stderr_records_out_bytes(stderr) == 21750 * mib
+
+
+def test_dd_stderr_records_out_bytes_last_match_wins() -> None:
+    mib = 1024 * 1024
+    assert dd_stderr_records_out_bytes("1+0 records out\n2+0 records out\n") == 2 * mib
+
+
+def test_dd_stderr_records_out_bytes_none_when_missing() -> None:
+    assert dd_stderr_records_out_bytes("no stats here\n") is None

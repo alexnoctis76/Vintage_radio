@@ -24,6 +24,7 @@ block_cipher = None
 # Project root (parent of build/ which contains this spec)
 project_dir = Path(SPECPATH).parent
 
+
 # Windows: try to stop running instances; COLLECT uses staging (see CONF['distpath'] below).
 if platform.system() == "Windows":
     _kill_helper = project_dir / "build" / "kill_vintage_radio_build_locks.py"
@@ -82,12 +83,38 @@ except Exception:
     mpremote_hidden = []
 
 # Bundle imageio-ffmpeg so ffmpeg executable is available in packaged app.
+# collect_all puts the static ffmpeg binary under imageio_ffmpeg/binaries/ in datas.
+# A runtime hook (pyi_rthook_fix_ffmpeg.py) sets the executable bit at launch.
+ffmpeg_hidden = []
 try:
     ffmpeg_datas, ffmpeg_binaries, ffmpeg_hidden = collect_all('imageio_ffmpeg')
     datas += ffmpeg_datas
     mpremote_binaries += ffmpeg_binaries
 except Exception:
-    ffmpeg_hidden = []
+    pass
+
+# certifi: hiddenimport alone does not ship cacert.pem — HTTPS (GitHub updater) fails on macOS frozen builds.
+try:
+    _certifi_datas, _certifi_bins, _certifi_ch = collect_all('certifi')
+    datas += _certifi_datas
+    mpremote_binaries += _certifi_bins
+    mpremote_hidden += _certifi_ch
+except Exception:
+    pass
+
+# pyfatfs: SD image export feature. fs (pyfilesystem2) dependency uses pkg_resources
+# which setuptools 82+ removed; a runtime hook provides the stub.
+try:
+    _pyfatfs_datas, _pyfatfs_bins, _pyfatfs_hidden = collect_all('pyfatfs')
+    datas += _pyfatfs_datas
+    mpremote_binaries += _pyfatfs_bins
+    mpremote_hidden += _pyfatfs_hidden
+    _fs_datas, _fs_bins, _fs_hidden = collect_all('fs')
+    datas += _fs_datas
+    mpremote_binaries += _fs_bins
+    mpremote_hidden += _fs_hidden
+except Exception:
+    pass
 
 # Force-include stdlib packages needed by mpremote.mip (urllib -> email, http)
 def _collect_stdlib(pkg):
@@ -150,6 +177,13 @@ a = Analysis(
         'platformdirs',
         'importlib_metadata',
         'certifi',
+        'pyfatfs',
+        'pyfatfs.PyFatFS',
+        'fs',
+        'fs.base',
+        'fs.errors',
+        'fs.info',
+        'fs.path',
         # urllib.request and its full dependency chain (required by mpremote.mip)
         'urllib',
         'urllib.request',
@@ -167,7 +201,10 @@ a = Analysis(
     ] + mpremote_hidden + ffmpeg_hidden + collect_submodules('mpremote'),
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[
+        str(project_dir / 'build' / 'pyi_rthook_pkg_resources_stub.py'),
+        str(project_dir / 'build' / 'pyi_rthook_fix_ffmpeg.py'),
+    ],
     excludes=[],  # Do not exclude stdlib - mpremote/urllib need email, http, etc.
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -185,7 +222,8 @@ exe = EXE(
     name='Vintage Radio',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=(platform.system() == "Darwin"),
+    # Stripping macOS onedir payloads can break bundled Mach-O (imageio-ffmpeg).
+    strip=False,
     upx=True,
     console=False,
     disable_windowed_traceback=False,
@@ -201,9 +239,16 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=(platform.system() == "Darwin"),
+    strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=[
+        "ffmpeg-macos-aarch64-v7.1",
+        "ffmpeg-macos-x86_64-v7.1",
+        "ffmpeg-linux-aarch64-v7.0.2",
+        "ffmpeg-linux-x86_64-v7.0.2",
+        "ffmpeg-win-x86_64-v7.1.exe",
+        "ffmpeg-win32-v4.2.2.exe",
+    ],
     name='Vintage Radio',
 )
 

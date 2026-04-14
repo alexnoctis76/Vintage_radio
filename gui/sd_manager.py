@@ -727,8 +727,18 @@ class SDManager:
                 _add(path, label or _get_volume_label(path))
 
         elif system == "Darwin":
-            # macOS: Scan /Volumes for mounted external drives
-            # Exclude system volumes, recovery, installer, and temporary volumes
+            # macOS: Scan /Volumes for mounted external drives.
+            # Use psutil to restrict to FAT/exFAT/msdos filesystems (SD cards, USB
+            # sticks) and volumes flagged as removable, so large external HDDs and
+            # internal volumes are not offered as SD card targets.
+            try:
+                partition_map: dict = {}
+                for part in psutil.disk_partitions(all=True):
+                    if part.mountpoint:
+                        partition_map[part.mountpoint] = part
+            except Exception:
+                partition_map = {}
+
             system_volume_keywords = {
                 "Macintosh HD", "System", "Recovery", "Install", "Installer",
                 ".localized", ".disabled", "MobileBackups", "Update", "TimeMachine",
@@ -739,19 +749,29 @@ class SDManager:
             if volumes_path.exists():
                 try:
                     for item in volumes_path.iterdir():
-                        # Skip system volume names and hidden volumes
                         name = item.name
-
-                        # Skip if name matches system patterns
                         if name.startswith("."):
                             continue
                         if any(keyword.lower() in name.lower() for keyword in system_volume_keywords):
                             continue
+                        if not item.is_dir() or not os.access(item, os.R_OK):
+                            continue
 
-                        # Verify it's actually a mount point and accessible
-                        if item.is_dir() and os.access(item, os.R_OK):
-                            label = item.name
-                            roots.append((item, label))
+                        # Check filesystem type via psutil if available; prefer
+                        # FAT/exFAT volumes. If psutil has no record (some virtual
+                        # mounts) fall back to allowing it.
+                        part = partition_map.get(str(item))
+                        if part is not None:
+                            fstype = part.fstype.lower()
+                            opts = part.opts.lower()
+                            is_fat = fstype in {"msdos", "fat", "fat32", "exfat", "vfat"}
+                            is_removable = "removable" in opts or "external" in opts
+                            # Exclude clearly non-removable, non-FAT volumes
+                            # (internal HFS+/APFS, large HDDs, etc.)
+                            if not is_fat and not is_removable:
+                                continue
+
+                        roots.append((item, name))
                 except (OSError, PermissionError):
                     pass
 
@@ -3489,6 +3509,15 @@ def _resolve_mount_volume_name(sd_root: Path, db_hint: str = "") -> str:
         v = (_get_volume_label(sd_root) or "").strip()
         if v:
             return v
+        # Bare drive roots (``E:\\``) have ``.name == "E:"`` — not a useful label; prefer *db_hint*.
+        try:
+            nm = (sd_root.name or "").strip()
+            if len(nm) == 2 and nm[1] == ":" and nm[0].isalpha():
+                hint = (db_hint or "").strip()
+                if hint:
+                    return hint
+        except (OSError, ValueError):
+            pass
     try:
         name = (sd_root.name or "").strip()
         if name and name not in (".", "/"):

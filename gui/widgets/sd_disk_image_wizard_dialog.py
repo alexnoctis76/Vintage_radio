@@ -1,7 +1,9 @@
-"""Wizard dialog for experimental SD disk image build + raw flash (Windows)."""
+"""Wizard dialog for experimental SD disk image build + raw flash (Windows / macOS)."""
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -10,6 +12,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from ..resource_paths import app_data_dir
 from ..sd_disk_image_flash import (
     LAST_CACHED_SD_IMAGE_FILENAME,
+    darwin_list_external_physical_disks,
     format_disk_size,
     is_windows_admin,
     windows_list_non_system_disks,
@@ -25,6 +28,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         *,
         sd_root: Path,
         default_disk_number: Optional[int],
+        default_darwin_bsd_disk: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Experimental: SD image (clean install)")
@@ -33,15 +37,22 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
 
         self._sd_root = sd_root
         self._disk_number: Optional[int] = None
+        self._darwin_bsd_disk: Optional[str] = None
 
         layout = QtWidgets.QVBoxLayout(self)
 
         warn = QtWidgets.QLabel(
             "This will erase the entire target SD card / USB drive and replace it with a fresh "
             "FAT32 image built from your library. All other data on that disk will be destroyed.\n\n"
-            "The write goes only to the PhysicalDrive number you pick below. The list hides typical "
-            "internal fixed disks (NVMe/SATA), but USB covers external drives too — confirm the size "
-            "and volume labels match your SD card before you continue."
+            + (
+                "The write goes only to the disk identifier you pick below. On macOS, only external "
+                "physical disks from diskutil are listed — still verify size and volume names match "
+                "your SD card."
+                if sys.platform == "darwin"
+                else "The write goes only to the PhysicalDrive number you pick below. The list hides typical "
+                "internal fixed disks (NVMe/SATA), but USB covers external drives too — confirm the size "
+                "and volume labels match your SD card before you continue."
+            )
         )
         warn.setWordWrap(True)
         warn.setStyleSheet("font-weight: bold; color: #a33;")
@@ -52,7 +63,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         layout.addWidget(self._admin_label)
 
         src = QtWidgets.QLabel(
-            f"Selected SD path (used to pick the default USB disk and for 'use existing' mode):\n{sd_root}\n\n"
+            f"Selected SD path (used to pick the default disk and for 'use existing' mode):\n{sd_root}\n\n"
             "When preparing for an image, tracks are copied to a temporary folder on this PC "
             "(not onto the SD card), then a single .img is built and flashed."
         )
@@ -76,20 +87,32 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         self._refresh_flash_last_available()
         layout.addWidget(self._flash_last_cb)
 
-        layout.addWidget(QtWidgets.QLabel("Target physical disk (Windows):"))
+        disk_title = (
+            "Target physical disk (macOS — external):" if sys.platform == "darwin" else "Target physical disk (Windows):"
+        )
+        layout.addWidget(QtWidgets.QLabel(disk_title))
         self._disk_combo = QtWidgets.QComboBox()
         self._disk_combo.setMinimumWidth(480)
         layout.addWidget(self._disk_combo)
 
-        self._populate_disks(default_disk_number)
+        self._populate_disks(default_disk_number, default_darwin_bsd_disk)
 
-        hint = QtWidgets.QLabel(
-            "Only USB and MMC (SD slot) disks are listed; internal NVMe/SATA system drives are filtered "
-            "out. Drive letters and volume labels shown are what Windows reports for each disk — use them "
-            "to confirm you are not selecting a USB hard drive or the wrong stick.\n\n"
-            "Uncheck 'Prepare library on this PC' only if this folder already has a full DFPlayer sync; "
-            "then no track copy runs and the image is built from that folder alone."
-        )
+        if sys.platform == "darwin":
+            hint_txt = (
+                "Disks come from `diskutil list external physical`. Confirm the capacity and "
+                "volume names match your SD reader before continuing.\n\n"
+                "Uncheck 'Prepare library on this PC' only if this folder already has a full DFPlayer sync; "
+                "then no track copy runs and the image is built from that folder alone."
+            )
+        else:
+            hint_txt = (
+                "Only USB and MMC (SD slot) disks are listed; internal NVMe/SATA system drives are filtered "
+                "out. Drive letters and volume labels shown are what Windows reports for each disk — use them "
+                "to confirm you are not selecting a USB hard drive or the wrong stick.\n\n"
+                "Uncheck 'Prepare library on this PC' only if this folder already has a full DFPlayer sync; "
+                "then no track copy runs and the image is built from that folder alone."
+            )
+        hint = QtWidgets.QLabel(hint_txt)
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(hint)
@@ -125,7 +148,18 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
             self._prepare_on_pc_cb.setEnabled(True)
 
     def _refresh_admin(self) -> None:
-        if is_windows_admin():
+        if sys.platform == "darwin":
+            euid = os.geteuid() if hasattr(os, "geteuid") else 0
+            if euid == 0:
+                self._admin_label.setText("")
+                self._admin_label.hide()
+            else:
+                self._admin_label.setText(
+                    "The final write step will ask for your macOS password or Touch ID so the app can "
+                    "write to the raw SD device."
+                )
+                self._admin_label.show()
+        elif is_windows_admin():
             self._admin_label.setText("")
             self._admin_label.hide()
         else:
@@ -135,9 +169,41 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
             )
             self._admin_label.show()
 
-    def _populate_disks(self, default_disk_number: Optional[int]) -> None:
+    def _populate_disks(
+        self,
+        default_disk_number: Optional[int],
+        default_darwin_bsd_disk: Optional[str],
+    ) -> None:
         self._disk_combo.clear()
-        rows: List[Tuple[int, str]] = []
+        rows: List[Tuple[object, str]] = []
+
+        if sys.platform == "darwin":
+            for d in darwin_list_external_physical_disks():
+                bsd = str(d.get("BSDName") or "")
+                if not bsd:
+                    continue
+                try:
+                    size = int(d.get("Size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                vol = str(d.get("VolumeSummary") or "").strip()
+                label = f"{bsd} — {format_disk_size(size)}"
+                if vol:
+                    label += f" — {vol}"
+                else:
+                    label += " — (no mounted volumes / no label)"
+                rows.append((bsd, label))
+            if not rows:
+                self._disk_combo.addItem("(No external physical disks found)", None)
+                return
+            default_idx = 0
+            for i, (bsd, label) in enumerate(rows):
+                self._disk_combo.addItem(label, bsd)
+                if default_darwin_bsd_disk and bsd == default_darwin_bsd_disk:
+                    default_idx = i
+            self._disk_combo.setCurrentIndex(default_idx)
+            return
+
         for d in windows_list_non_system_disks():
             try:
                 num = int(d["Number"])
@@ -187,11 +253,17 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
 
     @property
     def selected_disk_number(self) -> Optional[int]:
+        """Windows physical drive index; always *None* on macOS."""
         return self._disk_number
 
+    @property
+    def selected_darwin_bsd_disk(self) -> Optional[str]:
+        """Whole-disk BSD name (e.g. ``disk4``) on macOS; *None* on Windows."""
+        return self._darwin_bsd_disk
+
     def _on_accept(self) -> None:
-        num = self._disk_combo.currentData()
-        if num is None:
+        data = self._disk_combo.currentData()
+        if data is None:
             QtWidgets.QMessageBox.warning(
                 self,
                 "No disk",
@@ -211,5 +283,10 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
                     "Run a full SD image sync once to build it.",
                 )
                 return
-        self._disk_number = int(num)
+        if sys.platform == "darwin":
+            self._darwin_bsd_disk = str(data)
+            self._disk_number = None
+        else:
+            self._disk_number = int(data)
+            self._darwin_bsd_disk = None
         self.accept()

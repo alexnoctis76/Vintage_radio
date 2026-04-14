@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -30,6 +32,21 @@ GITHUB_RELEASES_LIST_URL = (
 )
 GITHUB_RELEASES_URL = "https://github.com/alexnoctis76/Vintage_radio/releases"
 GITHUB_REPO_SLUG = "alexnoctis76/Vintage_radio"
+
+_LOG = logging.getLogger(__name__)
+
+
+def _log_updater(message: str) -> None:
+    """Append to session log when available; always emit at INFO for loggers."""
+    _LOG.info("[UPDATER] %s", message)
+    try:
+        from gui.session_log import write_session_line
+
+        write_session_line(message, prefix="UPDATER")
+    except Exception:
+        pass
+
+
 # Must match filenames produced by release packaging (see .github/workflows/build-release.yml).
 PREFERRED_WINDOWS_ASSET = "Vintage-Radio-Windows.zip"
 PREFERRED_MACOS_ASSET = "Vintage.Radio.dmg"
@@ -49,14 +66,27 @@ class ReleaseInfo:
     assets: list[dict]
 
 
-def _urlopen_with_certs(req: Request, timeout: int):
+def _https_ssl_context() -> ssl.SSLContext:
+    """Build TLS context for GitHub / HTTPS in frozen apps.
+
+    PyInstaller includes the ``certifi`` module but not ``cacert.pem`` unless the
+    spec bundles certifi data (``collect_all('certifi')``). Without the PEM,
+    ``certifi.where()`` can point at a missing path and verification fails.
+    """
     try:
         import certifi
 
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        return urlopen(req, timeout=timeout, context=ctx)
+        cafile = certifi.where()
+        if cafile and os.path.isfile(cafile):
+            return ssl.create_default_context(cafile=cafile)
     except Exception:
-        return urlopen(req, timeout=timeout)
+        pass
+    return ssl.create_default_context()
+
+
+def _urlopen_with_certs(req: Request, timeout: int):
+    ctx = _https_ssl_context()
+    return urlopen(req, timeout=timeout, context=ctx)
 
 
 def _parse_version_tag(tag: str) -> tuple[int, int, int, Optional[str]]:
@@ -91,6 +121,55 @@ def is_newer(latest_tag: str, current_tag: str) -> bool:
     if current_suffix is None:
         return True
     return latest_suffix > current_suffix
+
+
+def _fetch_release_assets_for_tag(tag: str) -> list[dict]:
+    """GET ``/releases/tags/{tag}`` so we have the full ``assets`` list and URLs.
+
+    The releases *list* payload can omit or slim assets in some cases; the tag
+    endpoint matches what the GitHub UI uses for download links.
+    """
+    t = quote((tag or "").strip(), safe="")
+    if not t:
+        return []
+    url = f"https://api.github.com/repos/{GITHUB_REPO_SLUG}/releases/tags/{t}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "VintageRadio-Updater",
+    }
+    try:
+        req = Request(url, headers=headers)
+        with _urlopen_with_certs(req, timeout=25) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            assets = list(data.get("assets") or [])
+            _log_updater(f"GET {url} -> {len(assets)} asset(s)")
+            return assets
+    except HTTPError as e:
+        _log_updater(f"GET releases/tags/{t}: HTTP {e.code} {e.reason!r}")
+    except Exception as e:
+        _log_updater(f"GET releases/tags/{t}: {type(e).__name__}: {e}")
+    return []
+
+
+def _merge_release_assets(primary: list[dict], extra: list[dict]) -> list[dict]:
+    """Union by GitHub asset ``id`` when present; else append unknowns."""
+    seen: set[int] = set()
+    out: list[dict] = []
+    for a in primary:
+        aid = a.get("id")
+        if isinstance(aid, int):
+            seen.add(aid)
+        out.append(a)
+    for a in extra:
+        aid = a.get("id")
+        if isinstance(aid, int):
+            if aid in seen:
+                continue
+            seen.add(aid)
+        out.append(a)
+    return out
 
 
 def _release_info_from_api_dict(data: dict) -> Optional[ReleaseInfo]:
@@ -164,8 +243,9 @@ def check_latest_release(
             raw = resp.read()
         items = json.loads(raw.decode("utf-8", errors="replace"))
         if isinstance(items, list) and items:
-            if (current_version or "").strip():
-                info = _newest_release_newer_than(items, current_version.strip())
+            cur_ver = (current_version or "").strip()
+            if cur_ver:
+                info = _newest_release_newer_than(items, cur_ver)
             else:
                 info = _newest_release_from_list(items)
             if info is not None:
@@ -265,20 +345,29 @@ def get_platform_asset(assets: list[dict]) -> Optional[dict]:
     return _get_macos_release_asset(assets)
 
 
+def _releases_download_url(tag_name: str, basename: str) -> Optional[str]:
+    """``/releases/download/{tag}/{basename}`` (basename must match upload exactly)."""
+    tag = (tag_name or "").strip()
+    base = (basename or "").strip()
+    if not tag or not base:
+        return None
+    t = quote(tag, safe="")
+    f = quote(base, safe="")
+    return f"https://github.com/{GITHUB_REPO_SLUG}/releases/download/{t}/{f}"
+
+
 def direct_download_url_for_release(tag_name: str) -> Optional[str]:
     """URL for the official installer **for this exact release tag** only.
 
-    Always uses ``/releases/download/{tag}/{filename}``. Do not use release
-    ``assets`` ``browser_download_url`` for installers — those blobs can be
-    mis-ordered or duplicated across releases; the tag in the path is the single
-    source of truth.
+    Uses ``/releases/download/{tag}/{filename}``. Filename must match the file
+    attached to that tag; if it differs (e.g. ``Vintage Radio.dmg`` vs
+    ``Vintage.Radio.dmg``), use :func:`installer_download_urls_for_release` which
+    tries several sources.
     """
     preferred = official_installer_zip_basename()
-    if not (preferred and tag_name.strip()):
+    if not preferred:
         return None
-    t = quote(tag_name.strip(), safe="")
-    f = quote(preferred, safe="")
-    return f"https://github.com/{GITHUB_REPO_SLUG}/releases/download/{t}/{f}"
+    return _releases_download_url(tag_name, preferred)
 
 
 def installer_download_url_for_release(release: ReleaseInfo) -> Optional[str]:
@@ -289,6 +378,124 @@ def installer_download_url_for_release(release: ReleaseInfo) -> Optional[str]:
 def official_installer_zip_basename() -> Optional[str]:
     """Basename of the official installer for this OS (zip on Windows, DMG on macOS)."""
     return _preferred_asset_name_for_platform()
+
+
+def installer_download_urls_for_release(release: ReleaseInfo) -> list[str]:
+    """Ordered HTTPS URLs to try for the packaged installer (handles filename mismatches)."""
+    tag = (release.tag_name or "").strip()
+    if not tag:
+        _log_updater("installer_download_urls: empty tag_name, no URLs")
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(u: Optional[str]) -> None:
+        u = (u or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    sys_name = platform.system().lower()
+    assets = list(release.assets or [])
+    tag_assets = _fetch_release_assets_for_tag(tag)
+    if tag_assets:
+        before = len(assets)
+        assets = _merge_release_assets(assets, tag_assets)
+        _log_updater(
+            f"release {tag!r}: merged API tag assets ({before} -> {len(assets)} rows)"
+        )
+
+    if "windows" in sys_name:
+        a = get_platform_asset(assets)
+        if a:
+            add(str(a.get("browser_download_url") or ""))
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            if name.endswith(".zip") and "windows" in name:
+                add(str(asset.get("browser_download_url") or ""))
+        add(direct_download_url_for_release(tag))
+        return out
+
+    if "darwin" in sys_name:
+        a = get_platform_asset(assets)
+        if a:
+            add(str(a.get("browser_download_url") or ""))
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            if not name.endswith(".dmg"):
+                continue
+            if _VINTAGE_RADIO_DMG_RE.search(name):
+                add(str(asset.get("browser_download_url") or ""))
+                continue
+            if "vintage" in name and "radio" in name:
+                add(str(asset.get("browser_download_url") or ""))
+                continue
+            if "macos" in name:
+                add(str(asset.get("browser_download_url") or ""))
+        add(direct_download_url_for_release(tag))
+        add(_releases_download_url(tag, "Vintage Radio.dmg"))
+        add(_releases_download_url(tag, "Vintage-Radio-macOS.zip"))
+        _log_updater(
+            f"release {tag!r}: {len(assets)} API asset(s), built {len(out)} download URL(s)"
+        )
+        for i, u in enumerate(out, 1):
+            _log_updater(f"  URL[{i}/{len(out)}]: {u}")
+        return out
+
+    _log_updater(f"release {tag!r}: non-macOS/Windows, no installer URLs")
+    return out
+
+
+def download_update_try_urls(
+    urls: list[str],
+    dest_dir: Path,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    *,
+    dest_filename: Optional[str] = None,
+) -> Path:
+    """Try each URL in order; on HTTP 404 only, try the next. Re-raises last error."""
+    last_err: Optional[BaseException] = None
+    seen: set[str] = set()
+    attempted: list[str] = []
+    _log_updater(
+        f"download_try_urls: cache_dir={dest_dir!s} dest_filename={dest_filename!r} "
+        f"candidates={len(urls)}"
+    )
+    for url in urls:
+        u = (url or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        attempted.append(u)
+        _log_updater(f"GET {u}")
+        try:
+            path = download_update(u, dest_dir, progress_cb, dest_filename=dest_filename)
+            _log_updater(f"download OK -> {path}")
+            return path
+        except HTTPError as e:
+            last_err = e
+            _log_updater(f"HTTP {e.code} {e.reason!r} for {u}")
+            if e.code != 404:
+                raise
+            parsed = urlparse(u)
+            stale = dest_dir / (
+                dest_filename or Path(parsed.path).name or "vintage-radio-update.zip"
+            )
+            if stale.exists():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+            continue
+    if last_err is not None:
+        summary = "\n".join(f"  - {a}" for a in attempted) if attempted else "  (none)"
+        if isinstance(last_err, HTTPError):
+            raise RuntimeError(
+                f"{last_err}\nTried {len(attempted)} URL(s):\n{summary}"
+            ) from last_err
+        raise last_err
+    raise RuntimeError("No download URLs to try.")
 
 
 def _get_macos_release_asset(assets: list[dict]) -> Optional[dict]:
@@ -335,6 +542,7 @@ def download_update(
     file_name = dest_filename or Path(parsed.path).name or "vintage-radio-update.zip"
     target = dest_dir / file_name
     req = Request(url, headers={"User-Agent": "VintageRadio-Updater"})
+    _log_updater(f"download_update: writing {target!s} (from URL path {file_name!r})")
     with _urlopen_with_certs(req, timeout=60) as resp:
         total = int(resp.headers.get("Content-Length", "0") or "0")
         done = 0
@@ -405,6 +613,7 @@ def _pick_macos_app_bundle_from_root(root: Path) -> Optional[Path]:
 
 def _stage_macos_app_from_dmg(dmg_path: Path, work_dir: Path) -> Path:
     """Mount DMG, copy the app bundle to work_dir, detach. Returns path to copied .app."""
+    _log_updater(f"DMG stage: dmg={dmg_path!s} work_dir={work_dir!s}")
     work_dir.mkdir(parents=True, exist_ok=True)
     mount = work_dir / "_dmg_mount"
     if mount.exists():
@@ -425,6 +634,7 @@ def _stage_macos_app_from_dmg(dmg_path: Path, work_dir: Path) -> Path:
     )
     if attach.returncode != 0:
         msg = (attach.stderr or attach.stdout or "").strip()
+        _log_updater(f"hdiutil attach failed rc={attach.returncode}: {msg[:500]}")
         raise RuntimeError(
             "Could not mount the downloaded disk image.\n"
             + (msg or "hdiutil attach failed.")
@@ -439,6 +649,7 @@ def _stage_macos_app_from_dmg(dmg_path: Path, work_dir: Path) -> Path:
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(source, dest, symlinks=True)
+        _log_updater(f"DMG stage OK: copied {source!s} -> {dest!s}")
         return dest
     finally:
         subprocess.run(
@@ -469,21 +680,76 @@ endlocal
     subprocess.Popen(["cmd", "/c", str(script)], start_new_session=True)
 
 
+def _macos_bundle_main_executable(bundle: Path) -> Path:
+    """PyInstaller one-folder bundle: ``Name.app/Contents/MacOS/Name``."""
+    return bundle / "Contents" / "MacOS" / bundle.stem
+
+
 def _launch_macos_apply_script(source_app: Path, target_app: Path, pid: int) -> None:
     script = source_app.parent / "apply_update.sh"
+    log = source_app.parent / "apply_update.log"
+    src_q = shlex.quote(str(source_app))
+    tgt_q = shlex.quote(str(target_app))
+    inner_q = shlex.quote(str(_macos_bundle_main_executable(target_app)))
+    log_q = shlex.quote(str(log))
     content = f"""#!/bin/bash
-set -e
-PID={pid}
+# Not using set -e: launch failures must not abort the script.
+PID={int(pid)}
+SOURCE={src_q}
+TARGET={tgt_q}
+INNER={inner_q}
+LOG={log_q}
+exec >>"$LOG" 2>&1
+echo "apply_update start $(date -u +%Y-%m-%dT%H:%M:%SZ) pid=$PID"
+
+# Wait for old process to exit
 while kill -0 "$PID" 2>/dev/null; do
   sleep 1
 done
-rm -rf "{target_app}"
-cp -R "{source_app}" "{target_app}"
-open "{target_app}"
+echo "installer: old process exited; replacing bundle"
+
+# Replace the bundle (abort on copy failure — nothing to launch if this breaks)
+rm -rf "$TARGET"
+if command -v ditto >/dev/null 2>&1; then
+  ditto "$SOURCE" "$TARGET" || {{ echo "installer: ditto failed, exit $?"; exit 1; }}
+else
+  cp -R "$SOURCE" "$TARGET" || {{ echo "installer: cp failed, exit $?"; exit 1; }}
+fi
+
+# Clear quarantine flags — required for unsigned apps; open silently fails otherwise
+xattr -cr "$TARGET" 2>/dev/null || true
+xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+
+# Ensure inner executable is runnable
+chmod u+x "$INNER" 2>/dev/null || true
+
+sleep 1
+echo "installer: launching updated app TARGET=$TARGET INNER=$INNER"
+
+# Try open -n (new instance) first
+if open -n "$TARGET" 2>/dev/null; then
+  echo "installer: launched via open -n"
+else
+  echo "installer: open -n failed (exit $?), trying open"
+  if open "$TARGET" 2>/dev/null; then
+    echo "installer: launched via open"
+  else
+    echo "installer: open failed, trying direct exec via nohup"
+    if [[ -x "$INNER" ]]; then
+      nohup "$INNER" >/dev/null 2>&1 &
+      echo "installer: launched via nohup pid $!"
+    else
+      echo "installer: ERROR: $INNER is not executable or missing"
+    fi
+  fi
+fi
+
+echo "apply_update done $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 """
     script.write_text(content, encoding="utf-8")
     script.chmod(0o755)
     subprocess.Popen(["/bin/bash", str(script)], start_new_session=True)
+    _log_updater(f"scheduled apply_update.sh log={log!s} target={target_app!s}")
 
 
 def apply_update(archive_path: Path) -> None:
@@ -491,6 +757,10 @@ def apply_update(archive_path: Path) -> None:
     if not getattr(sys, "frozen", False):
         raise RuntimeError("Automatic updates are only supported for packaged builds.")
 
+    _log_updater(
+        f"apply_update: path={archive_path!s} suffix={archive_path.suffix!r} "
+        f"exists={archive_path.is_file()}"
+    )
     platform_name = platform.system()
     work_dir = archive_path.parent
     extract_dir = work_dir / "extracted"

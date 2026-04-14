@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -452,6 +453,8 @@ def test_sanitize_fat_volume_label_strips_and_truncates():
     assert _sanitize_fat_volume_label("   ") == ""
 
 
+@pytest.mark.windows_only
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Path + volume label semantics")
 def test_resolve_mount_volume_name_windows_prefers_get_volume_label():
     p = Path("E:/")
     with mock.patch("gui.sd_manager.os.name", "nt"):
@@ -459,6 +462,8 @@ def test_resolve_mount_volume_name_windows_prefers_get_volume_label():
             assert _resolve_mount_volume_name(p, "HINT") == "CANON"
 
 
+@pytest.mark.windows_only
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Path + volume label semantics")
 def test_resolve_mount_volume_name_falls_back_to_db_hint_on_windows():
     p = Path("E:/")
     with mock.patch("gui.sd_manager.os.name", "nt"):

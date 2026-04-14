@@ -10,6 +10,8 @@ import pytest
 from gui import updater
 
 
+@pytest.mark.windows_only
+@pytest.mark.skipif(sys.platform != "win32", reason="get_platform_asset Windows branch")
 def test_get_platform_asset_prefers_canonical_windows_zip():
     assets = [
         {"name": "Old-Windows-portable.zip", "browser_download_url": "https://x/old.zip"},
@@ -23,6 +25,8 @@ def test_get_platform_asset_prefers_canonical_windows_zip():
     assert picked["browser_download_url"] == "https://x/good.zip"
 
 
+@pytest.mark.windows_only
+@pytest.mark.skipif(sys.platform != "win32", reason="get_platform_asset Windows branch")
 def test_get_platform_asset_prefers_vintage_radio_prefix_over_random_windows():
     assets = [
         {"name": "something-windows-extra.zip", "browser_download_url": "https://x/bad.zip"},
@@ -33,6 +37,8 @@ def test_get_platform_asset_prefers_vintage_radio_prefix_over_random_windows():
     assert picked["name"] == "Vintage-Radio-Windows-nightly.zip"
 
 
+@pytest.mark.windows_only
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer basename")
 def test_direct_download_url_for_release_windows():
     with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
         url = updater.direct_download_url_for_release("v0.2.1-beta")

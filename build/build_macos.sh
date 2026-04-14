@@ -20,13 +20,14 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 cd "$PROJECT_ROOT"
 
-# Use project venv if it exists (ensures same Python/packages as when running from terminal)
-if [ -d "$PROJECT_ROOT/venv" ]; then
-    source "$PROJECT_ROOT/venv/bin/activate"
-    echo "Using venv Python: $(which python3)"
-elif [ -d "$PROJECT_ROOT/.venv" ]; then
+# Prefer .venv (common for local dev / Cursor) so builds match what you test with;
+# fall back to venv if only that exists.
+if [ -d "$PROJECT_ROOT/.venv" ]; then
     source "$PROJECT_ROOT/.venv/bin/activate"
     echo "Using .venv Python: $(which python3)"
+elif [ -d "$PROJECT_ROOT/venv" ]; then
+    source "$PROJECT_ROOT/venv/bin/activate"
+    echo "Using venv Python: $(which python3)"
 fi
 
 APP_NAME="Vintage Radio"
@@ -86,8 +87,8 @@ if ! python3 -c "from mpremote.main import main" 2>/dev/null; then
     echo "  With venv activated, run: pip install mpremote"
     echo "  Then run this build script again."
     echo ""
-    echo "If you don't see 'Using venv Python' above, create a venv first:"
-    echo "  python3 -m venv venv && source venv/bin/activate && pip install mpremote"
+    echo "If no venv was activated above, create one and install deps, e.g.:"
+    echo "  python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt mpremote"
     exit 1
 fi
 echo "mpremote: OK (will be bundled)"
@@ -104,38 +105,49 @@ if [ -f "$SVG_ICON" ]; then
     rm -rf "$ICONSET_DIR"
     mkdir -p "$ICONSET_DIR"
 
-    # Render SVG to a high-res PNG using Python + PyQt6
+    # Render SVG using the exact filenames required by iconutil.
+    # Valid iconset names follow the pattern icon_{logical}x{logical}[@2x].png
+    # where logical sizes are: 16, 32, 128, 256, 512.
     python3 -c "
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtGui import QImage, QPainter
 from PyQt6.QtCore import QSize, Qt
 renderer = QSvgRenderer('$SVG_ICON')
-for size in [16, 32, 64, 128, 256, 512, 1024]:
-    img = QImage(QSize(size, size), QImage.Format.Format_ARGB32)
+entries = [
+    ('icon_16x16.png',      16),
+    ('icon_16x16@2x.png',   32),
+    ('icon_32x32.png',      32),
+    ('icon_32x32@2x.png',   64),
+    ('icon_128x128.png',   128),
+    ('icon_128x128@2x.png',256),
+    ('icon_256x256.png',   256),
+    ('icon_256x256@2x.png',512),
+    ('icon_512x512.png',   512),
+    ('icon_512x512@2x.png',1024),
+]
+for name, px in entries:
+    img = QImage(QSize(px, px), QImage.Format.Format_ARGB32)
     img.fill(Qt.GlobalColor.transparent)
     p = QPainter(img)
     renderer.render(p)
     p.end()
-    if size <= 512:
-        img.save('$ICONSET_DIR/icon_{}x{}.png'.format(size, size))
-    if size >= 32:
-        half = size // 2
-        img.save('$ICONSET_DIR/icon_{}x{}@2x.png'.format(half, half))
-"
+    img.save('$ICONSET_DIR/' + name)
+" 2>/dev/null || true
 
     # Also save a 512px PNG for fallback use
-    if [ ! -f "$PNG_ICON" ]; then
+    if [ ! -f "$PNG_ICON" ] && [ -f "$ICONSET_DIR/icon_512x512.png" ]; then
         cp "$ICONSET_DIR/icon_512x512.png" "$PNG_ICON"
     fi
 
-    iconutil -c icns "$ICONSET_DIR" -o "$ICNS_ICON"
-    rm -rf "$ICONSET_DIR"
-
-    if [ -f "$ICNS_ICON" ]; then
+    # iconutil failure is non-fatal: existing .icns (if present) will be used
+    if iconutil -c icns "$ICONSET_DIR" -o "$ICNS_ICON" 2>/dev/null; then
         echo "Icon generated: $ICNS_ICON"
+    elif [ -f "$ICNS_ICON" ]; then
+        echo "Warning: iconutil failed; using existing $ICNS_ICON"
     else
-        echo "Warning: iconutil failed to create .icns; build will continue without custom icon"
+        echo "Warning: iconutil failed and no .icns found; build will continue without custom icon"
     fi
+    rm -rf "$ICONSET_DIR"
 else
     echo "Warning: SVG icon not found at $SVG_ICON; skipping .icns generation"
 fi

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import tempfile
 from pathlib import Path
@@ -33,16 +34,8 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.release_info = release_info
         self.current_version = current_version
-        self._asset = updater.get_platform_asset(self.release_info.assets)
-        self._download_url = (
-            str(self._asset.get("browser_download_url") or "").strip()
-            if self._asset
-            else ""
-        )
-        if not self._download_url:
-            self._download_url = (
-                updater.direct_download_url_for_release(self.release_info.tag_name) or ""
-            )
+        self._download_urls = updater.installer_download_urls_for_release(release_info)
+        self._download_url = self._download_urls[0] if self._download_urls else ""
         base = updater.official_installer_zip_basename() or "update.zip"
         safe_tag = re.sub(r"[^\w.\-+]+", "_", self.release_info.tag_name.strip()) or "release"
         self._cache_dest_name = f"{Path(base).stem}-{safe_tag}{Path(base).suffix}"
@@ -96,8 +89,6 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.accept()
             return
 
-        url = self._download_url
-
         self.download_btn.setEnabled(False)
         self.later_btn.setEnabled(False)
         self.progress.setVisible(True)
@@ -111,8 +102,8 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
                 )
                 base = Path(cache_root) if cache_root else Path(tempfile.gettempdir()) / "VintageRadio"
                 cache_dir = base / "update"
-                zip_path = updater.download_update(
-                    url,
+                zip_path = updater.download_update_try_urls(
+                    self._download_urls,
                     cache_dir,
                     progress_cb=self._signals.progress.emit,
                     dest_filename=self._cache_dest_name,
@@ -137,11 +128,17 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         except Exception as e:
             self._on_download_failed(str(e))
             return
-        QtWidgets.QMessageBox.information(
-            self,
-            "Updater",
-            "Update downloaded. The app will now close to complete installation.",
-        )
+        msg = "Update downloaded. The app will now close to complete installation."
+        if sys.platform == "darwin":
+            msg += (
+                "\n\nThe updated app should reopen automatically in a few seconds.\n\n"
+                "If it does not appear, open it manually from the same location "
+                "(e.g. Applications). If something went wrong, see apply_update.log "
+                "next to the update download in your VintageRadio cache folder."
+            )
+        elif sys.platform == "win32":
+            msg += "\n\nThe updater will restart Vintage Radio when this window closes."
+        QtWidgets.QMessageBox.information(self, "Updater", msg)
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.quit()
