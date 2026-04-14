@@ -367,10 +367,10 @@ class TestModeWidget(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel()
         self.status_label.setWordWrap(True)
         
-        # SD card sync warning label (red text if out of sync)
+        # SD card sync warning label (shown when library and SD card differ)
         self.sd_sync_warning = QtWidgets.QLabel()
         self.sd_sync_warning.setWordWrap(True)
-        self.sd_sync_warning.setStyleSheet("color: red; font-weight: bold;")
+        self.sd_sync_warning.setStyleSheet("color: #b07800; font-weight: bold;")
         self.sd_sync_warning.setVisible(False)
         
         self.log = QtWidgets.QTextEdit()
@@ -610,18 +610,19 @@ class TestModeWidget(QtWidgets.QWidget):
             warning_parts = []
             if source_missing:
                 warning_parts.append(
-                    f"{len(source_missing)} song(s) have missing source files (paths from another PC?) — re-import in Library or fix paths, then Sync to SD"
+                    f"{len(source_missing)} track(s) have broken file paths — "
+                    "update or remove them in the Library before syncing"
                 )
             if results.get("missing_sd_path"):
-                warning_parts.append(f"{len(results['missing_sd_path'])} missing SD paths")
+                warning_parts.append(f"{len(results['missing_sd_path'])} tracks not yet on the SD card")
             if results.get("missing_file"):
-                warning_parts.append(f"{len(results['missing_file'])} missing files on SD")
+                warning_parts.append(f"{len(results['missing_file'])} files missing from SD card")
             if actual_size_mismatches:
-                warning_parts.append(f"{len(actual_size_mismatches)} size mismatches")
+                warning_parts.append(f"{len(actual_size_mismatches)} files differ in size")
             if results.get("hash_mismatch"):
-                warning_parts.append(f"{len(results['hash_mismatch'])} hash mismatches")
-            
-            warning_text = "⚠️ Library out of sync with SD card: " + ". ".join(warning_parts)
+                warning_parts.append(f"{len(results['hash_mismatch'])} files changed since last sync")
+
+            warning_text = "Your SD card differs from your library: " + ". ".join(warning_parts)
             self.sd_sync_warning.setText(warning_text)
             self.sd_sync_warning.setVisible(True)
         else:

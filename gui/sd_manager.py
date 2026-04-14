@@ -1474,6 +1474,39 @@ class SDManager:
         # Default: more threads than before; cap to reduce FAT/USB contention on weak readers.
         return max(2, min(12, total_jobs, max(4, (os.cpu_count() or 4))))
 
+    def get_basic_broken_source_paths(self) -> List[Dict[str, str]]:
+        """Return tracks whose source file no longer exists at the stored path.
+
+        Each entry: ``{"title": ..., "path": ..., "station": ...}``.
+        Used to warn the user before syncing so they can fix or remove tracks.
+        """
+        broken: List[Dict[str, str]] = []
+        try:
+            stations = self.db.list_basic_stations()
+        except Exception:
+            return broken
+        for station in stations:
+            station_name = (station["name"] or "").strip() or f"Station {station['folder_number']}"
+            try:
+                tracks = self.db.list_basic_station_songs(station["id"])
+            except Exception:
+                continue
+            for song in tracks:
+                fp_raw = (song["file_path"] or "").strip()
+                if not fp_raw:
+                    continue
+                try:
+                    if not Path(fp_raw).exists():
+                        title = (
+                            (song["title"] or "").strip()
+                            or (song["original_filename"] or "").strip()
+                            or Path(fp_raw).name
+                        )
+                        broken.append({"title": title, "path": fp_raw, "station": station_name})
+                except (OSError, ValueError):
+                    pass
+        return broken
+
     def _cache_key_for_song(self, song: Any, file_path: Path) -> Optional[Tuple[str, int]]:
         """Return a stable cache key for one source track."""
         try:
@@ -1622,6 +1655,7 @@ class SDManager:
         direct_mp3_copied = 0
         processed_tracks = 0
         conversion_failures: List[Dict[str, str]] = []
+        missing_source_paths: List[Dict[str, str]] = []
         sync_start = time.monotonic()
         last_progress_emit = 0.0
 
@@ -1684,7 +1718,13 @@ class SDManager:
                 _emit_prep_progress(f"Preparing {folder_key}: {title}")
 
                 if not file_path.exists():
+                    title_for_log = song["title"] or song["original_filename"] or file_path.name
                     print(f"Source file missing, skipping: {file_path}")
+                    missing_source_paths.append({
+                        "title": title_for_log,
+                        "path": str(file_path),
+                        "station": station_name,
+                    })
                     skipped += 1
                     station_skipped += 1
                     processed_tracks += 1
@@ -2040,6 +2080,7 @@ class SDManager:
             "skipped": skipped,
             "sd_root": str(sd_root),
             "conversion_failures": conversion_failures,
+            "missing_source_paths": missing_source_paths,
         }
         if preserved_volume_label:
             out_end["preserved_volume_label"] = preserved_volume_label

@@ -7,8 +7,6 @@ and ``import gui`` alone does not require the full stack.
 
 from __future__ import annotations
 
-__version__ = "v0.2.4-beta"
-
 __all__ = [
     "DatabaseManager",
     "SDManager",
@@ -21,6 +19,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    if name == "__version__":
+        from project_version import PROJECT_VERSION
+
+        return PROJECT_VERSION
     if name in {"MainWindow", "run_app"}:
         from . import radio_manager
 

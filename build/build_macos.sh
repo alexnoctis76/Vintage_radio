@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build script for Vintage Radio application on macOS
-# Usage: bash build_macos.sh [--sign] [--notarize]
+# Usage: bash build_macos.sh [--set-version v0.2.5-beta] [--sign] [--notarize] [--no-dmg]
 #
 # Options:
 #   --sign         Code sign the app with entitlements (requires Apple Developer ID)
@@ -56,9 +56,17 @@ while [[ $# -gt 0 ]]; do
             BUILD_DMG=false
             shift
             ;;
+        --set-version)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --set-version requires a tag, e.g. v0.2.5-beta"
+                exit 1
+            fi
+            python3 "$PROJECT_ROOT/scripts/set_app_version.py" "$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: bash build_macos.sh [--sign] [--notarize] [--no-dmg]"
+            echo "Usage: bash build_macos.sh [--set-version v0.2.5-beta] [--sign] [--notarize] [--no-dmg]"
             exit 1
             ;;
     esac

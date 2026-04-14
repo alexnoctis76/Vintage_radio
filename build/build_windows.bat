@@ -1,6 +1,7 @@
 @echo off
 REM Build script for Vintage Radio application on Windows
-REM Usage: build_windows.bat [--no-clean]
+REM Usage: build_windows.bat [--set-version v0.2.5-beta] [--no-clean]
+REM        Sets gui/__init__.py __version__ before PyInstaller when --set-version is passed.
 REM
 REM Prerequisites:
 REM   - Python 3.8+ with venv
@@ -35,6 +36,7 @@ if errorlevel 1 (
 
 REM Parse command-line arguments
 set CLEAN=true
+set SET_VERSION=
 :parse_args
 if "%~1"=="" goto done_parsing
 if "%~1"=="--no-clean" (
@@ -42,10 +44,27 @@ if "%~1"=="--no-clean" (
     shift
     goto parse_args
 )
-shift
-goto parse_args
+if "%~1"=="--set-version" (
+    if "%~2"=="" (
+        echo Error: --set-version requires a tag, e.g. v0.2.5-beta
+        exit /b 1
+    )
+    set SET_VERSION=%~2
+    shift
+    shift
+    goto parse_args
+)
+echo Unknown argument: %~1
+echo Usage: build_windows.bat [--set-version v0.2.5-beta] [--no-clean]
+exit /b 1
 
 :done_parsing
+
+if defined SET_VERSION (
+    echo Setting app version: !SET_VERSION!
+    python "%PROJECT_ROOT%\scripts\set_app_version.py" "!SET_VERSION!"
+    if errorlevel 1 exit /b 1
+)
 
 REM Force-stop Vintage Radio (process tree + retries) so dist\Vintage Radio can be deleted
 echo Force-stopping Vintage Radio (unlocks dist folder^)...

@@ -49,7 +49,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.resize(680, 500)
 
         title = QtWidgets.QLabel(
-            f"A new version is available: {self.release_info.tag_name}\n"
+            f"A new version is available: {self.release_info.advertised_version()}\n"
             f"Current version: {self.current_version}"
         )
         title.setWordWrap(True)

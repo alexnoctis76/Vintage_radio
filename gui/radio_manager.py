@@ -14,9 +14,10 @@ import threading
 import traceback
 import unicodedata
 from collections import deque
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, cast
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QUrl
@@ -3600,6 +3601,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._capture_serial_debug_session_for_rebuild()
         old_central = self.centralWidget()
         self._device_debug_widget = None
+        self._sd_card_tab_enter_refresh_done = False
         self._build_tabs()
         if old_central is not None:
             old_central.deleteLater()
@@ -3717,34 +3719,51 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
             return
-        self.db.close()
-        self._lib_registry.delete_library(slug)
-        new_slug = self._lib_registry.active_library()
-        self.db = DatabaseManager(db_path=self._lib_registry.db_path_for(new_slug))
-        self._propagate_db()
-        self._populate_lib_combo()
-        self._apply_saved_settings()
-        self._refresh_all()
-        self._update_window_title()
-        if hasattr(self, "test_mode_widget") and self.test_mode_widget:
-            self.test_mode_widget.refresh_from_db()
+        with self._wait_cursor_scope():
+            self.db.close()
+            self._lib_registry.delete_library(slug)
+            new_slug = self._lib_registry.active_library()
+            self.db = DatabaseManager(db_path=self._lib_registry.db_path_for(new_slug))
+            self._propagate_db()
+            self._populate_lib_combo()
+            self._apply_saved_settings()
+            self._refresh_all()
+            self._update_window_title()
+            if hasattr(self, "test_mode_widget") and self.test_mode_widget:
+                self.test_mode_widget.refresh_from_db()
+            self._sd_card_tab_enter_refresh_done = False
+
+    @contextmanager
+    def _wait_cursor_scope(self) -> Iterator[None]:
+        """Show the busy cursor while a potentially slow UI-blocking operation runs."""
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.WaitCursor))
+            app.processEvents()
+        try:
+            yield
+        finally:
+            if app is not None:
+                app.restoreOverrideCursor()
 
     def _switch_library(self, slug: str) -> None:
         """Close the current DB, open the one for *slug*, and refresh everything."""
         if slug == self._lib_registry.active_library():
             return
-        self.db.close()
-        self._lib_registry.set_active(slug)
-        self.db = DatabaseManager(db_path=self._lib_registry.db_path_for(slug))
-        self._propagate_db()
-        self._populate_lib_combo()
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-        self._apply_saved_settings()
-        self._refresh_all()
-        self._update_window_title()
-        if hasattr(self, "test_mode_widget") and self.test_mode_widget:
-            self.test_mode_widget.refresh_from_db()
+        with self._wait_cursor_scope():
+            self.db.close()
+            self._lib_registry.set_active(slug)
+            self.db = DatabaseManager(db_path=self._lib_registry.db_path_for(slug))
+            self._propagate_db()
+            self._populate_lib_combo()
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self._apply_saved_settings()
+            self._refresh_all()
+            self._update_window_title()
+            if hasattr(self, "test_mode_widget") and self.test_mode_widget:
+                self.test_mode_widget.refresh_from_db()
+            self._sd_card_tab_enter_refresh_done = False
 
     def _propagate_db(self) -> None:
         """Push the current self.db to all sub-components that hold a reference."""
@@ -3803,7 +3822,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(container)
         self.device_sync_warning = QtWidgets.QLabel()
         self.device_sync_warning.setWordWrap(True)
-        self.device_sync_warning.setStyleSheet("color: #c00; font-weight: bold;")
+        self.device_sync_warning.setStyleSheet("color: #b07800; font-weight: bold;")
         self.device_sync_warning.setVisible(False)
         layout.addWidget(self.device_sync_warning)
         self._device_debug_placeholder = QtWidgets.QLabel("Loading Device Debug...")
@@ -4685,7 +4704,7 @@ class MainWindow(QtWidgets.QMainWindow):
         is_different_card = trusted and self._basic_should_warn_different_card(self.sd_root)
 
         if is_different_card:
-            warn.setText("Selected volume does not match your previously synced SD card.")
+            warn.setText("This looks like a different SD card from your last sync.")
             warn.setVisible(True)
             return
 
@@ -4700,10 +4719,14 @@ class MainWindow(QtWidgets.QMainWindow):
         n = len(msgs)
         if n > 30:
             warn.setText(
-                f"SD card may be out of sync: over 30 differences found. A full sync is recommended."
+                "Your SD card looks different from your library (many changes detected). "
+                "A sync will bring it up to date."
             )
         else:
-            warn.setText(f"SD card may be out of sync ({n} issue{'s' if n != 1 else ''} found).")
+            warn.setText(
+                f"Your SD card looks different from your library "
+                f"({n} difference{'s' if n != 1 else ''} found)."
+            )
         warn.setVisible(True)
         if _qt_widget_alive(details_btn):
             details_btn.setVisible(True)
@@ -4714,15 +4737,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not msgs:
             return
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("SD Card Sync Details")
+        dlg.setWindowTitle("SD Card Differences")
         dlg.resize(560, 380)
         layout = QtWidgets.QVBoxLayout(dlg)
         text = QtWidgets.QTextEdit()
         text.setReadOnly(True)
         if len(msgs) > 30:
             text.setPlainText(
-                "Over 30 differences found between your library and this SD card.\n"
-                "A full sync is recommended.\n\n"
+                "Your SD card differs from your library in many places "
+                "(first 30 shown below).\nSyncing will bring the card up to date.\n\n"
                 + "\n".join(f"  - {m}" for m in msgs[:30])
                 + f"\n  ... and {len(msgs) - 30} more."
             )
@@ -5079,7 +5102,7 @@ class MainWindow(QtWidgets.QMainWindow):
         warn_row = QtWidgets.QHBoxLayout()
         self._basic_sd_sync_warning = QtWidgets.QLabel()
         self._basic_sd_sync_warning.setWordWrap(True)
-        self._basic_sd_sync_warning.setStyleSheet("color: #c00; font-weight: bold;")
+        self._basic_sd_sync_warning.setStyleSheet("color: #b07800; font-weight: bold;")
         self._basic_sd_sync_warning.setVisible(False)
         warn_row.addWidget(self._basic_sd_sync_warning, 1)
         self._basic_sd_sync_details_btn = QtWidgets.QPushButton("Details...")
@@ -5366,6 +5389,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Store song id for reorder; store bst_id (track row id) in UserRole+1 for removal
             title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song["id"])
             title_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, song["bst_id"])
+            self._decorate_track_title_item_source_health(title_item, song)
             table.setItem(row_idx, 0, title_item)
             table.setItem(row_idx, 1, QtWidgets.QTableWidgetItem(song["artist"] or ""))
             dur = song["duration"]
@@ -5830,6 +5854,19 @@ class MainWindow(QtWidgets.QMainWindow):
         add_act.triggered.connect(self._add_tracks_to_basic_station)
         if item:
             menu.addSeparator()
+            row = item.row()
+            title_item = table.item(row, 0)
+            sid = (
+                int(title_item.data(QtCore.Qt.ItemDataRole.UserRole))
+                if title_item
+                and title_item.data(QtCore.Qt.ItemDataRole.UserRole) is not None
+                else None
+            )
+            if sid is not None:
+                replace_act = menu.addAction("Replace source file…")
+                replace_act.triggered.connect(
+                    lambda checked=False, _sid=sid: self._replace_song_source_path(_sid)
+                )
             remove_act = menu.addAction("Remove Selected")
             remove_act.triggered.connect(self._remove_songs_from_basic_station)
         menu.exec(table.viewport().mapToGlobal(pos))
@@ -5878,6 +5915,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not self._basic_confirm_different_card(str(sd_root), for_sync=True):
             return
+
+        broken = self.sd_manager.get_basic_broken_source_paths()
+        # Re-stat every source path before any sync dialog so fixes outside the app
+        # (e.g. file restored in Explorer) clear warning icons even when ``broken`` is now empty.
+        self._refresh_library_source_health_ui()
+        if broken:
+            n = len(broken)
+            path_phrase = "its stored path" if n == 1 else "their stored paths"
+            headline = (
+                f"{n} track{'s' if n != 1 else ''} in your library can't be found at {path_phrase}."
+            )
+            explanation = (
+                "These tracks will be skipped during sync. To include them, fix the paths "
+                "(right-click a track in the station list and choose Replace source file…), "
+                "or remove the tracks, then sync again.\n\n"
+                "Full list:"
+            )
+            if not self._show_scrollable_broken_paths_dialog(
+                window_title="Broken file paths detected",
+                headline=headline,
+                explanation=explanation,
+                entries=broken,
+                line_fmt=lambda e: f"{e['title']}  ({e['station']})\n{e['path']}",
+                proceed_text="Sync anyway (skip missing tracks)",
+                cancel_text="Cancel",
+            ):
+                self._refresh_library_source_health_ui()
+                return
 
         software_source = self._software_source_for_sync()
         if self._is_advanced_mode() and software_source == "our":
@@ -5978,12 +6043,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def on_success(result):
             conversion_failures: List[Dict[str, Any]] = []
+            missing_paths: List[Dict[str, str]] = []
             if isinstance(result, dict):
                 copied = int(result.get("copied", 0))
                 skipped = int(result.get("skipped", 0))
                 raw_cf = result.get("conversion_failures")
                 if isinstance(raw_cf, list):
                     conversion_failures = [x for x in raw_cf if isinstance(x, dict)]
+                raw_mp = result.get("missing_source_paths")
+                if isinstance(raw_mp, list):
+                    missing_paths = [x for x in raw_mp if isinstance(x, dict)]
                 result_sd_root = result.get("sd_root")
                 if result_sd_root:
                     self.sd_root = str(result_sd_root)
@@ -5993,6 +6062,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 f"Basic sync complete. Copied: {copied}, Skipped: {skipped}", 5000
             )
+            if missing_paths:
+                n_mp = len(missing_paths)
+                self._show_scrollable_broken_paths_dialog(
+                    window_title="Some tracks were skipped",
+                    headline=(
+                        f"{n_mp} track{'s' if n_mp != 1 else ''} could not be found and "
+                        "were not copied to the SD card."
+                    ),
+                    explanation=(
+                        "Update the file path (Library or station track list: right-click → "
+                        "Replace source file…) or remove the tracks, then sync again.\n\n"
+                        "Full list:"
+                    ),
+                    entries=missing_paths,
+                    line_fmt=lambda e: (
+                        f"{e.get('title', '?')}  ({e.get('station', '?')})\n{e.get('path', '?')}"
+                    ),
+                    proceed_text=None,
+                )
             if conversion_failures:
                 show_n = min(15, len(conversion_failures))
                 detail_lines = []
@@ -6019,6 +6107,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Sync complete",
                     f"Library synced to the SD card.\n\nCopied: {copied}\nSkipped: {skipped}",
                 )
+            self._refresh_library_source_health_ui()
             for _w in (
                 getattr(self, "_basic_debug_widget", None),
                 getattr(self, "_device_debug_widget", None),
@@ -6494,6 +6583,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.on_error = on_error_sd
         dlg.exec()
 
+    def _refresh_basic_sd_tab_on_select(self) -> None:
+        """SD Card tab selected: rebind mount, capacity, sync banner, source-health icons."""
+        self._try_rebind_basic_sd_mount()
+        self._update_sd_root_label()
+        self._refresh_basic_sd_capacity()
+        self._check_basic_sd_sync()
+        self._refresh_library_source_health_ui()
+
     def _on_tab_changed(self, index: int) -> None:
         """Handle tab switches: lazy-load debug widgets, check sync status."""
         # Advanced mode: Device Debug tab lazy-load
@@ -6501,12 +6598,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ensure_device_debug_widget_loaded()
             self._check_device_tab_sync()
 
-        # Basic mode: SD Card tab (index 1) - refresh capacity
+        # Basic mode: SD Card tab (index 1) — full refresh + wait cursor only on first visit
+        # per session (reset on library switch / tab rebuild). Later visits skip to avoid
+        # re-scanning the whole library on every tab click.
         if self._is_basic_like_mode() and index == 1:
-            self._try_rebind_basic_sd_mount()
-            self._update_sd_root_label()
-            self._refresh_basic_sd_capacity()
-            self._check_basic_sd_sync()
+            if not getattr(self, "_sd_card_tab_enter_refresh_done", False):
+                self._sd_card_tab_enter_refresh_done = True
+                with self._wait_cursor_scope():
+                    self._refresh_basic_sd_tab_on_select()
 
         # Legacy mode: Devices tab warning
         if self.devices_view_mode == "legacy" and index == 3 and hasattr(self, "_check_basic_sd_pico_warning"):
@@ -6538,21 +6637,22 @@ class MainWindow(QtWidgets.QMainWindow):
             parts = []
             if source_missing:
                 parts.append(
-                    f"{len(source_missing)} song(s) have missing source files (paths from another PC?) — re-import in Library or fix paths, then Sync to SD"
+                    f"{len(source_missing)} track(s) have broken file paths — "
+                    "update or remove them in the Library before syncing"
                 )
             n = len(results.get("missing_sd_path", []))
             if n:
-                parts.append(f"{n} missing SD paths")
+                parts.append(f"{n} tracks not yet on the SD card")
             n = len(results.get("missing_file", []))
             if n:
-                parts.append(f"{n} missing files on SD")
+                parts.append(f"{n} files missing from SD card")
             if actual_size_mismatches:
-                parts.append(f"{len(actual_size_mismatches)} size mismatches")
+                parts.append(f"{len(actual_size_mismatches)} files differ in size")
             n = len(results.get("hash_mismatch", []))
             if n:
-                parts.append(f"{n} hash mismatches")
+                parts.append(f"{n} files changed since last sync")
             self.device_sync_warning.setText(
-                "⚠️ Library and SD card may be out of sync: " + ". ".join(parts)
+                "Your SD card differs from your library: " + ". ".join(parts)
             )
             self.device_sync_warning.setVisible(True)
         else:
@@ -7197,6 +7297,183 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_basic_station_list(preserve_selection=False)
         self._update_basic_stations_size()
 
+    def _refresh_library_source_health_ui(self) -> None:
+        """Re-read the DB and refresh broken-path icons/tooltips on every track table.
+
+        Intentionally does **not** call ``_update_basic_stations_size`` (that schedules
+        ``_check_basic_sd_sync`` again); pair with that call separately when needed.
+        """
+        if _qt_widget_alive(getattr(self, "library_table", None)):
+            self.refresh_library()
+        self.refresh_album_songs()
+        self.refresh_playlist_songs()
+        station_id = self._get_selected_basic_station_id()
+        if station_id is not None:
+            self._refresh_basic_station_tracks(station_id)
+
+    @staticmethod
+    def _song_source_path_missing(song: Any) -> bool:
+        """True when the library has no usable path or the file is not on disk."""
+        try:
+            fp = (song["file_path"] or "").strip()
+        except (TypeError, KeyError, IndexError):
+            return True
+        if not fp:
+            return True
+        try:
+            return not Path(fp).is_file()
+        except OSError:
+            return True
+
+    def _broken_source_file_tooltip(self, song: Any) -> str:
+        try:
+            p = (song["file_path"] or "").strip() or "(no path stored)"
+        except (TypeError, KeyError, IndexError):
+            p = "(no path stored)"
+        return (
+            f"Source file not found:\n{p}\n\n"
+            "Right-click this track and choose Replace source file…, "
+            "or remove it from the list."
+        )
+
+    def _decorate_track_title_item_source_health(
+        self, title_item: QtWidgets.QTableWidgetItem, song: Any
+    ) -> None:
+        """Show a warning icon + tooltip when the stored source path is broken."""
+        if self._song_source_path_missing(song):
+            title_item.setIcon(
+                self.style().standardIcon(
+                    QtWidgets.QStyle.StandardPixmap.SP_MessageBoxWarning
+                )
+            )
+            title_item.setToolTip(self._broken_source_file_tooltip(song))
+        else:
+            title_item.setIcon(QIcon())
+            title_item.setToolTip("")
+
+    def _show_scrollable_broken_paths_dialog(
+        self,
+        *,
+        window_title: str,
+        headline: str,
+        explanation: str,
+        entries: List[Dict[str, str]],
+        line_fmt: Callable[[Dict[str, str]], str],
+        proceed_text: Optional[str] = None,
+        cancel_text: str = "Cancel",
+    ) -> bool:
+        """List every broken entry in a scrollable view. Return True if user proceeds (or OK-only)."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(window_title)
+        dlg.resize(560, 420)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        head_lbl = QtWidgets.QLabel(headline)
+        head_lbl.setWordWrap(True)
+        layout.addWidget(head_lbl)
+        intro_lbl = QtWidgets.QLabel(explanation)
+        intro_lbl.setWordWrap(True)
+        layout.addWidget(intro_lbl)
+        body = QtWidgets.QPlainTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText("\n\n".join(line_fmt(e) for e in entries))
+        body.setMinimumHeight(200)
+        body.setMaximumHeight(320)
+        mono = QtGui.QFont("Consolas") if sys.platform == "win32" else QtGui.QFontDatabase.systemFont(
+            QtGui.QFontDatabase.SystemFont.FixedFont
+        )
+        body.setFont(mono)
+        layout.addWidget(body, 1)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        accepted = {"ok": False}
+        if proceed_text:
+            btn_proceed = QtWidgets.QPushButton(proceed_text)
+            btn_proceed.setDefault(True)
+            btn_cancel = QtWidgets.QPushButton(cancel_text)
+
+            def _do_proceed() -> None:
+                accepted["ok"] = True
+                dlg.accept()
+
+            def _do_cancel() -> None:
+                accepted["ok"] = False
+                dlg.reject()
+
+            btn_proceed.clicked.connect(_do_proceed)
+            btn_cancel.clicked.connect(_do_cancel)
+            btn_row.addWidget(btn_proceed)
+            btn_row.addWidget(btn_cancel)
+        else:
+            btn_ok = QtWidgets.QPushButton("OK")
+            btn_ok.setDefault(True)
+
+            def _do_ok() -> None:
+                accepted["ok"] = True
+                dlg.accept()
+
+            btn_ok.clicked.connect(_do_ok)
+            btn_row.addWidget(btn_ok)
+        layout.addLayout(btn_row)
+        dlg.exec()
+        return bool(accepted["ok"])
+
+    def _replace_song_source_path(self, song_id: int) -> None:
+        """Point an existing library track at a new audio file on disk."""
+        row = self.db.get_song_by_id(song_id)
+        if row is None:
+            return
+        prev_path = (row["file_path"] or "").strip()
+        start_dir = str(Path(prev_path).parent) if prev_path else str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Replace source file",
+            start_dir,
+            "Audio Files (*.*)",
+        )
+        if not path:
+            return
+        file_path = Path(path)
+        if not file_path.is_file():
+            return
+        try:
+            metadata = extract_metadata(file_path)
+            file_hash = compute_file_hash(file_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Could not read file", str(e) or "Unknown error reading audio file."
+            )
+            return
+        new_path = metadata["file_path"]
+        conflict = self.db.get_song_by_path(new_path)
+        if conflict is not None and int(conflict["id"]) != song_id:
+            t = conflict["title"] or conflict["original_filename"] or new_path
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Already in library",
+                "This file is already linked to another track:\n\n"
+                f"{t}\n\n"
+                "Remove or update that track first, or pick a different file.",
+            )
+            return
+        self.db.update_song(
+            song_id,
+            {
+                "file_path": new_path,
+                "original_filename": metadata["original_filename"],
+                "title": metadata["title"],
+                "artist": metadata["artist"],
+                "duration": metadata["duration"],
+                "file_hash": file_hash,
+                "file_size": metadata["file_size"],
+                "format": metadata["format"],
+                "sd_path": "",
+            },
+        )
+        self._refresh_library_source_health_ui()
+        self._update_basic_stations_size()
+        QtCore.QTimer.singleShot(0, self._check_basic_sd_sync)
+        self.statusBar().showMessage("Source file updated.", 5000)
+
     def refresh_library(self) -> None:
         rows = self.db.list_songs()
         filter_text = self.library_search.text().strip().lower()
@@ -7218,13 +7495,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.library_table.setSortingEnabled(False)
         self.library_table.setRowCount(len(rows))
         for row_idx, song in enumerate(rows):
-            self._set_table_item(
-                self.library_table,
-                row_idx,
-                0,
-                song["title"],
-                editable=True,
+            title_item = QtWidgets.QTableWidgetItem(song["title"] or "")
+            title_item.setFlags(
+                title_item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable
             )
+            self._decorate_track_title_item_source_health(title_item, song)
+            self.library_table.setItem(row_idx, 0, title_item)
             self._set_table_item(
                 self.library_table,
                 row_idx,
@@ -7236,9 +7512,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_table_item(self.library_table, row_idx, 2, duration)
             self._set_table_item(self.library_table, row_idx, 3, song["format"])
             self._set_table_item(self.library_table, row_idx, 4, song["file_path"])
-            self.library_table.item(row_idx, 0).setData(
-                QtCore.Qt.ItemDataRole.UserRole, song["id"]
-            )
+            title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song["id"])
         self.library_table.setSortingEnabled(True)
         self._loading_library = False
 
@@ -7263,16 +7537,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_sd_combos()
 
     def refresh_album_songs(self) -> None:
+        if not _qt_widget_alive(getattr(self, "album_songs_table", None)):
+            return
         self._update_album_details()
-        self._populate_association_table(
-            self.album_list.currentItem(), self.album_songs_table, is_album=True
+        cur = (
+            self.album_list.currentItem()
+            if _qt_widget_alive(getattr(self, "album_list", None))
+            else None
         )
+        self._populate_association_table(cur, self.album_songs_table, is_album=True)
 
     def refresh_playlist_songs(self) -> None:
+        if not _qt_widget_alive(getattr(self, "playlist_songs_table", None)):
+            return
         self._update_playlist_details()
-        self._populate_association_table(
-            self.playlist_list.currentItem(), self.playlist_songs_table, is_album=False
+        cur = (
+            self.playlist_list.currentItem()
+            if _qt_widget_alive(getattr(self, "playlist_list", None))
+            else None
         )
+        self._populate_association_table(cur, self.playlist_songs_table, is_album=False)
 
     def _populate_association_table(
         self,
@@ -7292,14 +7576,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         table.setRowCount(len(songs))
         for row_idx, song in enumerate(songs):
-            self._set_table_item(table, row_idx, 0, song["title"])
+            title_item = QtWidgets.QTableWidgetItem(song["title"] or "")
+            self._decorate_track_title_item_source_health(title_item, song)
+            table.setItem(row_idx, 0, title_item)
             self._set_table_item(table, row_idx, 1, song["artist"])
             duration = self._format_duration(song["duration"])
             self._set_table_item(table, row_idx, 2, duration)
             self._set_table_item(table, row_idx, 3, song["format"])
-            table.item(row_idx, 0).setData(
-                QtCore.Qt.ItemDataRole.UserRole, song["id"]
-            )
+            title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song["id"])
 
     def open_import_dialog(self) -> None:
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -9958,6 +10242,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.db.update_playlist_order(self._list_widget_ids(self.playlist_list))
 
     def _update_album_details(self) -> None:
+        if not _qt_widget_alive(getattr(self, "album_details", None)):
+            return
+        if not _qt_widget_alive(getattr(self, "album_list", None)):
+            return
         item = self.album_list.currentItem()
         if item is None:
             self.album_details.setText("Select an album to view details.")
@@ -9972,6 +10260,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _update_playlist_details(self) -> None:
+        if not _qt_widget_alive(getattr(self, "playlist_details", None)):
+            return
+        if not _qt_widget_alive(getattr(self, "playlist_list", None)):
+            return
         item = self.playlist_list.currentItem()
         if item is None:
             self.playlist_details.setText("Select a playlist to view details.")
@@ -10025,6 +10317,10 @@ class MainWindow(QtWidgets.QMainWindow):
         edit_action = menu.addAction("Edit Selected")
         remove_action = menu.addAction("Remove Selected")
         open_action = menu.addAction("Open in Explorer")
+        sel_ids = self._selected_library_song_ids()
+        replace_action = None
+        if len(sel_ids) == 1:
+            replace_action = menu.addAction("Replace source file…")
         menu.addSeparator()
         add_album_menu = menu.addMenu("Add to Album")
         add_playlist_menu = menu.addMenu("Add to Playlist")
@@ -10060,6 +10356,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.delete_selected_songs()
         elif action == open_action:
             self.open_selected_in_explorer()
+        elif replace_action is not None and action == replace_action and len(sel_ids) == 1:
+            self._replace_song_source_path(sel_ids[0])
 
     def open_selected_in_explorer(self) -> None:
         song_ids = self._selected_library_song_ids()
@@ -10074,17 +10372,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def show_album_table_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
+        sel_ids = self._selected_table_song_ids(self.album_songs_table)
+        replace_action = None
+        if len(sel_ids) == 1:
+            replace_action = menu.addAction("Replace source file…")
         remove_action = menu.addAction("Remove Selected")
         action = menu.exec(self.album_songs_table.viewport().mapToGlobal(pos))
         if action == remove_action:
             self.remove_selected_from_album()
+        elif replace_action is not None and action == replace_action and len(sel_ids) == 1:
+            self._replace_song_source_path(sel_ids[0])
 
     def show_playlist_table_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
+        sel_ids = self._selected_table_song_ids(self.playlist_songs_table)
+        replace_action = None
+        if len(sel_ids) == 1:
+            replace_action = menu.addAction("Replace source file…")
         remove_action = menu.addAction("Remove Selected")
         action = menu.exec(self.playlist_songs_table.viewport().mapToGlobal(pos))
         if action == remove_action:
             self.remove_selected_from_playlist()
+        elif replace_action is not None and action == replace_action and len(sel_ids) == 1:
+            self._replace_song_source_path(sel_ids[0])
 
     def add_selected_to_album_id(self, album_id: int) -> None:
         song_ids = self._selected_library_song_ids()
@@ -10272,7 +10582,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def _worker() -> None:
             try:
-                info = updater.check_latest_release(user_agent=f"VintageRadio/{__version__}")
+                info = updater.check_latest_release(
+                    user_agent=f"VintageRadio/{__version__}",
+                    current_version=__version__,
+                )
                 self.update_check_finished.emit(info, manual, "")
             except Exception as e:
                 self.update_check_finished.emit(None, manual, str(e))
@@ -10304,7 +10617,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             return
 
-        if updater.is_newer(release.tag_name, __version__):
+        if updater.is_newer(release.advertised_version(), __version__):
             self._show_update_dialog(release)
             return
 

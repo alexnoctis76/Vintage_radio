@@ -109,6 +109,22 @@ jobs:
           zip -r ../../Vintage-Radio-macOS.zip "Vintage Radio.app"
           cd ../..
 
+      # Per-OS semver the in-app updater compares against (may match tag_name; for manual
+      # releases you can edit before upload so Windows/Mac can differ from the tag).
+      - name: Write release-versions.json
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+
+          tag = os.environ["RELEASE_TAG"].strip()
+          with open("release-versions.json", "w", encoding="utf-8") as f:
+              json.dump({"windows": tag, "macos": tag}, f, indent=2)
+          PY
+
       - name: Create Release and upload binaries
         uses: softprops/action-gh-release@v2
         with:
@@ -118,5 +134,6 @@ jobs:
           files: |
             Vintage-Radio-Windows.zip
             Vintage-Radio-macOS.zip
+            release-versions.json
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

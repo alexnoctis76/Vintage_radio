@@ -2,7 +2,7 @@
 
 ## v0.2.1-beta
 
-- **Version:** `v0.2.1-beta` (see `gui/__init__.py`).
+- **Version:** `v0.2.1-beta` (canonical string: `project_version.py`).
 - **Windows:** Experimental clean SD disk image build + raw flash (UAC helper, volume lock/dismount, Win32 raw write); wizard and cached “flash only” path.
 - **Host tooling:** MCP debug TCP server, device acceptance harness, line-in analysis, serial debug service, scripts under `scripts/`.
 - **Firmware:** `radio_core`, `dfplayer_hardware`, Pico `main_basic` / `main`, IPC components.

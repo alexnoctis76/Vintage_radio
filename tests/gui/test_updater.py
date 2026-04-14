@@ -80,3 +80,83 @@ def test_newest_release_from_list_uses_semver_not_list_order():
 )
 def test_is_newer(latest: str, current: str, expected: bool):
     assert updater.is_newer(latest, current) is expected
+
+
+def test_effective_platform_version_falls_back_to_tag_without_manifest():
+    info = updater.ReleaseInfo(
+        tag_name="v0.2.4-beta",
+        html_url="https://example/u",
+        body="",
+        assets=[
+            {
+                "name": "Vintage-Radio-Windows.zip",
+                "browser_download_url": "https://example/z.zip",
+            }
+        ],
+    )
+    assert updater._effective_platform_version(info) == "v0.2.4-beta"
+
+
+def test_effective_platform_version_reads_manifest_on_windows():
+    info = updater.ReleaseInfo(
+        tag_name="v0.2.4-beta",
+        html_url="https://example/u",
+        body="",
+        assets=[
+            {
+                "name": "release-versions.json",
+                "browser_download_url": "https://example/manifest.json",
+            },
+            {
+                "name": "Vintage-Radio-Windows.zip",
+                "browser_download_url": "https://example/z.zip",
+            },
+        ],
+    )
+    with mock.patch.object(
+        updater,
+        "_fetch_release_versions_manifest_dict",
+        return_value={"windows": "v0.2.3-beta"},
+    ):
+        with mock.patch.object(updater, "_platform_matcher", return_value="windows"):
+            assert updater._effective_platform_version(info) == "v0.2.3-beta"
+
+
+def test_best_release_newer_than_for_platform_respects_manifest_not_tag():
+    items = [
+        {
+            "tag_name": "v0.2.4-beta",
+            "draft": False,
+            "html_url": "https://example/u",
+            "body": "",
+            "assets": [
+                {
+                    "name": "release-versions.json",
+                    "browser_download_url": "https://example/manifest.json",
+                },
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/z.zip",
+                },
+            ],
+        }
+    ]
+    with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+        with mock.patch.object(
+            updater,
+            "_fetch_release_versions_manifest_dict",
+            return_value={"windows": "v0.2.3-beta"},
+        ):
+            rel = updater._best_release_newer_than_for_platform(items, "v0.2.2-beta")
+    assert rel is not None
+    assert rel.tag_name == "v0.2.4-beta"
+    assert rel.platform_version == "v0.2.3-beta"
+
+    with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+        with mock.patch.object(
+            updater,
+            "_fetch_release_versions_manifest_dict",
+            return_value={"windows": "v0.2.3-beta"},
+        ):
+            rel2 = updater._best_release_newer_than_for_platform(items, "v0.2.3-beta")
+    assert rel2 is None

@@ -50,6 +50,8 @@ def _log_updater(message: str) -> None:
 # Must match filenames produced by release packaging (see .github/workflows/build-release.yml).
 PREFERRED_WINDOWS_ASSET = "Vintage-Radio-Windows.zip"
 PREFERRED_MACOS_ASSET = "Vintage.Radio.dmg"
+# Optional small JSON attached to each release; per-OS shipped semver may differ from tag_name.
+RELEASE_VERSIONS_MANIFEST = "release-versions.json"
 
 # GitHub may show the volume name with a dot instead of a space, e.g. "Vintage.Radio.dmg".
 _VINTAGE_RADIO_DMG_RE = re.compile(
@@ -64,6 +66,13 @@ class ReleaseInfo:
     html_url: str
     body: str
     assets: list[dict]
+    # Semver string shown to the user and used for update checks; from release-versions.json
+    # when present, otherwise equal to tag_name.
+    platform_version: str = ""
+
+    def advertised_version(self) -> str:
+        v = (self.platform_version or "").strip()
+        return v if v else self.tag_name
 
 
 def _https_ssl_context() -> ssl.SSLContext:
@@ -172,6 +181,71 @@ def _merge_release_assets(primary: list[dict], extra: list[dict]) -> list[dict]:
     return out
 
 
+def _version_equal(a: str, b: str) -> bool:
+    return not is_newer(a, b) and not is_newer(b, a)
+
+
+def _manifest_versions_asset(assets: list[dict]) -> Optional[dict]:
+    want = RELEASE_VERSIONS_MANIFEST.lower()
+    for asset in assets:
+        name = str(asset.get("name") or "").strip().lower()
+        if name == want:
+            return asset
+    return None
+
+
+def _fetch_release_versions_manifest_dict(browser_download_url: str) -> Optional[dict]:
+    url = (browser_download_url or "").strip()
+    if not url:
+        return None
+    try:
+        req = Request(url, headers={"User-Agent": "VintageRadio-Updater"})
+        with _urlopen_with_certs(req, timeout=15) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _manifest_value_for_platform(data: dict) -> Optional[str]:
+    pm = _platform_matcher()
+    keys: list[str]
+    if pm == "windows":
+        keys = ["windows"]
+    elif pm == "macos":
+        keys = ["macos", "mac", "darwin"]
+    else:
+        return None
+    for ck in keys:
+        raw = data.get(ck)
+        if raw is None:
+            lk = ck.lower()
+            for dk, dv in data.items():
+                if str(dk).strip().lower() == lk:
+                    raw = dv
+                    break
+        if raw is not None:
+            s = str(raw).strip()
+            if s:
+                return s
+    return None
+
+
+def _effective_platform_version(info: ReleaseInfo) -> str:
+    """Shipped semver for this OS (from release-versions.json when present, else tag_name)."""
+    man = _manifest_versions_asset(list(info.assets or []))
+    if man is not None:
+        parsed = _fetch_release_versions_manifest_dict(
+            str(man.get("browser_download_url") or "")
+        )
+        if parsed is not None:
+            v = _manifest_value_for_platform(parsed)
+            if v:
+                return v
+    return str(info.tag_name or "").strip()
+
+
 def _release_info_from_api_dict(data: dict) -> Optional[ReleaseInfo]:
     tag = str(data.get("tag_name") or "").strip()
     if not tag:
@@ -197,26 +271,16 @@ def _newest_release_from_list(items: list) -> Optional[ReleaseInfo]:
     for c in candidates:
         if best is None or is_newer(c.tag_name, best.tag_name):
             best = c
-    return best
-
-
-def _newest_release_newer_than(items: list, current_version: str) -> Optional[ReleaseInfo]:
-    """Semantically newest release whose tag is strictly newer than *current_version*."""
-    best: Optional[ReleaseInfo] = None
-    cur = (current_version or "").strip()
-    if not cur:
-        return _newest_release_from_list(items)
-    for item in items:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
-        info = _release_info_from_api_dict(item)
-        if info is None:
-            continue
-        if not is_newer(info.tag_name, cur):
-            continue
-        if best is None or is_newer(info.tag_name, best.tag_name):
-            best = info
-    return best
+    if best is None:
+        return None
+    eff = _effective_platform_version(best)
+    return ReleaseInfo(
+        tag_name=best.tag_name,
+        html_url=best.html_url,
+        body=best.body,
+        assets=best.assets,
+        platform_version=eff,
+    )
 
 
 def check_latest_release(
@@ -227,9 +291,10 @@ def check_latest_release(
     """Fetch a published GitHub release to offer as an update.
 
     Uses the **releases list** (``per_page=100``) and semver. When
-    *current_version* is set (recommended), returns only the newest release whose
-    tag is **strictly greater** than that version — not merely the newest tag on
-    the repo (which could equal the running build).
+    *current_version* is set (recommended), returns the best release for this OS
+    whose **platform version** (from optional ``release-versions.json`` on the release,
+    else the GitHub tag) is strictly greater than *current_version*, and that has
+    an installer asset for the current platform.
 
     GitHub's ``/releases/latest`` is used only as a fallback if the list call fails.
     """
@@ -245,7 +310,7 @@ def check_latest_release(
         if isinstance(items, list) and items:
             cur_ver = (current_version or "").strip()
             if cur_ver:
-                info = _newest_release_newer_than(items, cur_ver)
+                info = _best_release_newer_than_for_platform(items, cur_ver)
             else:
                 info = _newest_release_from_list(items)
             if info is not None:
@@ -263,10 +328,19 @@ def check_latest_release(
         if isinstance(data, dict):
             info = _release_info_from_api_dict(data)
             if info is not None:
-                cur = (current_version or "").strip()
-                if cur and not is_newer(info.tag_name, cur):
+                if get_platform_asset(info.assets) is None:
                     return None
-                return info
+                eff = _effective_platform_version(info)
+                cur = (current_version or "").strip()
+                if cur and not is_newer(eff, cur):
+                    return None
+                return ReleaseInfo(
+                    tag_name=info.tag_name,
+                    html_url=info.html_url,
+                    body=info.body,
+                    assets=info.assets,
+                    platform_version=eff,
+                )
     except HTTPError as e:
         if e.code != 404:
             return None
@@ -354,6 +428,53 @@ def _releases_download_url(tag_name: str, basename: str) -> Optional[str]:
     t = quote(tag, safe="")
     f = quote(base, safe="")
     return f"https://github.com/{GITHUB_REPO_SLUG}/releases/download/{t}/{f}"
+
+
+def _best_release_newer_than_for_platform(
+    items: list, current_version: str
+) -> Optional[ReleaseInfo]:
+    """Newest updatable release for this OS: semver(platform deliverable) > current."""
+    cur = (current_version or "").strip()
+    if not cur:
+        return None
+    best_info: Optional[ReleaseInfo] = None
+    best_eff: Optional[str] = None
+    best_tag: Optional[str] = None
+    for item in items:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        info = _release_info_from_api_dict(item)
+        if info is None:
+            continue
+        if get_platform_asset(info.assets) is None:
+            continue
+        eff = _effective_platform_version(info)
+        if not is_newer(eff, cur):
+            continue
+        if best_info is None:
+            best_info = info
+            best_eff = eff
+            best_tag = info.tag_name
+            continue
+        assert best_eff is not None and best_tag is not None
+        replace = False
+        if is_newer(eff, best_eff):
+            replace = True
+        elif _version_equal(eff, best_eff) and is_newer(info.tag_name, best_tag):
+            replace = True
+        if replace:
+            best_info = info
+            best_eff = eff
+            best_tag = info.tag_name
+    if best_info is None or best_eff is None:
+        return None
+    return ReleaseInfo(
+        tag_name=best_info.tag_name,
+        html_url=best_info.html_url,
+        body=best_info.body,
+        assets=best_info.assets,
+        platform_version=best_eff,
+    )
 
 
 def direct_download_url_for_release(tag_name: str) -> Optional[str]:

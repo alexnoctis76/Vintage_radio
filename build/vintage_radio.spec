@@ -163,6 +163,7 @@ a = Analysis(
     binaries=mpremote_binaries,
     datas=datas,
     hiddenimports=[
+        'project_version',
         'PyQt6.QtCore',
         'PyQt6.QtGui',
         'PyQt6.QtWidgets',

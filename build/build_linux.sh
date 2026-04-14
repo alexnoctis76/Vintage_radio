@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build script for Vintage Radio application on Linux
-# Usage: bash build_linux.sh [--no-clean]
+# Usage: bash build_linux.sh [--set-version v0.2.5-beta] [--no-clean]
 #
 # Prerequisites:
 #   - Python 3.8+ with venv
@@ -27,9 +27,17 @@ while [[ $# -gt 0 ]]; do
             CLEAN=false
             shift
             ;;
+        --set-version)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --set-version requires a tag, e.g. v0.2.5-beta"
+                exit 1
+            fi
+            python3 "$PROJECT_ROOT/scripts/set_app_version.py" "$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: bash build_linux.sh [--no-clean]"
+            echo "Usage: bash build_linux.sh [--set-version v0.2.5-beta] [--no-clean]"
             exit 1
             ;;
     esac
