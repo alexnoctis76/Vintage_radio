@@ -814,6 +814,16 @@ class SDManager:
             for _path, label in SDManager.detect_sd_roots():
                 if label and label.strip().upper() == "RPI-RP2":
                     return True
+            # macOS: UF2 volume is always FAT, but psutil filters can omit rare mounts; check /Volumes.
+            if platform.system() == "Darwin":
+                vols = Path("/Volumes")
+                if vols.is_dir():
+                    for item in vols.iterdir():
+                        try:
+                            if item.is_dir() and item.name.upper().startswith("RPI-RP2"):
+                                return True
+                        except OSError:
+                            continue
         except Exception:
             pass
         return False

@@ -70,6 +70,13 @@ datas = [
     (str(project_dir / 'firmware' / 'pin_config_loader.py'), 'firmware'),
     (str(project_dir / 'docs' / 'CUSTOM_DRIVER.md'), 'docs'),
 ]
+# main_basic.py / main.py import these from components/; without them mpremote install silently skipped
+# missing sources (see radio_manager._install_to_pico_worker) and firmware dies at ImportError.
+_pico_components = project_dir / 'firmware' / 'pico' / 'components'
+for _fn in ('am_wav_loader.py', 'vintage_radio_ipc.py'):
+    _comp = _pico_components / _fn
+    if _comp.exists():
+        datas.append((str(_comp), 'firmware/pico/components'))
 _vs1053 = project_dir / 'firmware' / 'pico' / 'vs1053_hardware.py'
 if _vs1053.exists():
     datas.append((str(_vs1053), 'firmware/pico'))

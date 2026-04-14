@@ -577,6 +577,21 @@ def _mpremote_failure_is_transient_no_device(result: Any) -> bool:
     return "no device found" in err or "could not open" in err
 
 
+# REPL snippet for mpremote ``exec``: must print ``micropython`` so we do not treat a bare
+# USB CDC session (or CircuitPython, etc.) as Vintage Radio–compatible MicroPython.
+_MPREMOTE_MICROPYTHON_PROBE = (
+    "import sys;n=getattr(sys.implementation,'name',None);print(n if n else '')"
+)
+
+
+def _mpremote_result_indicates_micropython(result: Any) -> bool:
+    """True if mpremote exited OK and device output identifies MicroPython on the REPL."""
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    combined = ((getattr(result, "stdout", None) or "") + (getattr(result, "stderr", None) or "")).lower()
+    return "micropython" in combined
+
+
 def _wait_mpremote_serial_ready(
     mpremote_cmd: List[str],
     cwd: Optional[str],
@@ -588,7 +603,7 @@ def _wait_mpremote_serial_ready(
     deadline_s: float = 78.0,
     poll_s: float = 2.0,
 ) -> bool:
-    """Poll until ``connect auto exec print(1)`` succeeds (Pico back on USB after UF2 / reboot)."""
+    """Poll until MicroPython answers on USB serial (Pico back after UF2 / reboot)."""
     import time
 
     t0 = time.monotonic()
@@ -604,7 +619,7 @@ def _wait_mpremote_serial_ready(
             )
         r = _run_mpremote(
             mpremote_cmd,
-            ["connect", "auto", "exec", "print(1)"],
+            ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -612,7 +627,7 @@ def _wait_mpremote_serial_ready(
             creationflags=creationflags,
             env=env,
         )
-        if r.returncode == 0:
+        if _mpremote_result_indicates_micropython(r):
             return True
         time.sleep(poll_s)
     return False
@@ -4815,13 +4830,14 @@ class MainWindow(QtWidgets.QMainWindow):
             install_now = install_callback or (lambda: self.install_to_pico(basic_mode=True))
 
             # Prefer explicit RP2040 ports first to avoid grabbing unrelated serial devices (e.g. Bluetooth COM).
+            rp_ports: List[Any] = []
             try:
                 import serial.tools.list_ports as list_ports
 
                 ports = list(list_ports.comports())
                 write_session_line(f"Serial ports discovered: {len(ports)}", prefix="SETUP")
                 print(f"[Setup Basic Device] Serial ports discovered: {len(ports)}")
-                rp_ports = []
+                rp_ports.clear()
                 for port_info in ports:
                     port_dev = getattr(port_info, "device", None) or str(port_info)
                     hwid = getattr(port_info, "hwid", "") or ""
@@ -4844,7 +4860,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     print(f"[Setup Basic Device] Trying mpremote explicit connect: {port_dev}")
                     r = _run_mpremote(
                         mpremote_cmd,
-                        ["connect", port_dev, "exec", "print(1)"],
+                        ["connect", port_dev, "exec", _MPREMOTE_MICROPYTHON_PROBE],
                         cwd=str(root),
                         capture_output=True,
                         text=True,
@@ -4858,11 +4874,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
                         print(f"[Setup Basic Device] explicit connect output ({port_dev}): {out[:600]}")
                     write_session_line(
-                        f"explicit connect rc ({port_dev}) = {r.returncode}",
+                        f"explicit connect rc ({port_dev}) = {r.returncode} micropython="
+                        f"{_mpremote_result_indicates_micropython(r)}",
                         prefix="SETUP",
                     )
-                    print(f"[Setup Basic Device] explicit connect rc ({port_dev}) = {r.returncode}")
-                    if r.returncode == 0:
+                    print(
+                        f"[Setup Basic Device] explicit connect rc ({port_dev}) = {r.returncode} "
+                        f"micropython_ok={_mpremote_result_indicates_micropython(r)}"
+                    )
+                    if _mpremote_result_indicates_micropython(r):
                         write_session_line(
                             f"explicit connect OK on {port_dev}, calling install_to_pico(basic_mode=True)",
                             prefix="SETUP",
@@ -4884,16 +4904,22 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 r = _run_mpremote(
                     mpremote_cmd,
-                    ["connect", "auto", "exec", "print(1)"],
+                    ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
                     cwd=str(root), capture_output=True, text=True, timeout=10,
                 )
                 out = ((r.stdout or "") + (r.stderr or "")).strip()
                 if out:
                     write_session_line(f"auto connect output: {out[:800]}", prefix="SETUP")
                     print(f"[Setup Basic Device] auto connect output: {out[:600]}")
-                write_session_line(f"auto connect rc = {r.returncode}", prefix="SETUP")
-                print(f"[Setup Basic Device] auto connect rc = {r.returncode}")
-                if r.returncode == 0:
+                write_session_line(
+                    f"auto connect rc = {r.returncode} micropython={_mpremote_result_indicates_micropython(r)}",
+                    prefix="SETUP",
+                )
+                print(
+                    f"[Setup Basic Device] auto connect rc = {r.returncode} "
+                    f"micropython_ok={_mpremote_result_indicates_micropython(r)}"
+                )
+                if _mpremote_result_indicates_micropython(r):
                     write_session_line("auto connect OK, calling install_to_pico(basic_mode=True)", prefix="SETUP")
                     print("[Setup Basic Device] auto connect succeeded, installing firmware")
                     install_now()
@@ -4917,6 +4943,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 dlg.exec()
                 self.statusBar().showMessage(f"MicroPython installed. Installing {install_label}...", 8000)
                 QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
+                return
+
+            if rp_ports:
+                write_session_line(
+                    "RP2040 USB serial seen but MicroPython not verified — prompt for UF2 install",
+                    prefix="SETUP",
+                )
+                print("[Setup Basic Device] RP2040 port(s) present without verified MicroPython")
+                msg = QtWidgets.QMessageBox(self)
+                msg.setIcon(QtWidgets.QMessageBox.Icon.Information)
+                msg.setWindowTitle("Setup Device — MicroPython required")
+                msg.setText(
+                    "A Raspberry Pi Pico USB serial port was found, but MicroPython did not respond.\n\n"
+                    "On a new or erased board you must install MicroPython before Vintage Radio can "
+                    "copy firmware.\n\n"
+                    "1. Hold BOOTSEL and plug the Pico into USB (it should show up as RPI-RP2 "
+                    "like a thumb drive).\n"
+                    "2. Click Install MicroPython… and copy the .uf2 file to that drive.\n"
+                    "3. When the Pico reboots, run Setup Device again.\n\n"
+                    "If MicroPython is already installed, close other apps using the serial port and retry."
+                )
+                install_btn = msg.addButton(
+                    "Install MicroPython…", QtWidgets.QMessageBox.ButtonRole.ActionRole
+                )
+                msg.addButton("Close", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                if msg.clickedButton() == install_btn:
+                    dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
+                    dlg.exec()
+                    self.statusBar().showMessage(
+                        f"When MicroPython is running, click Setup Device again to install {install_label}.",
+                        12000,
+                    )
+                    QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
                 return
 
             write_session_line("No compatible Pico detected (user message)", prefix="SETUP")
@@ -8598,13 +8658,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             r = _run_mpremote(
                 mpremote_cmd,
-                ["connect", "auto", "exec", "print(1)"],
+                ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
                 cwd=str(root),
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-            if r.returncode == 0:
+            if _mpremote_result_indicates_micropython(r):
                 self.install_to_pico()
                 return
             conn_err = (r.stderr or "") + (r.stdout or "")
@@ -8618,13 +8678,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     if "2E8A" in hwid or "2E8A" in str(port_info):  # Raspberry Pi Pico VID
                         r2 = _run_mpremote(
                             mpremote_cmd,
-                            ["connect", port_dev, "exec", "print(1)"],
+                            ["connect", port_dev, "exec", _MPREMOTE_MICROPYTHON_PROBE],
                             cwd=str(root),
                             capture_output=True,
                             text=True,
                             timeout=10,
                         )
-                        if r2.returncode == 0:
+                        if _mpremote_result_indicates_micropython(r2):
                             self.install_to_pico()
                             return
                         conn_err += f"\n[Port {port_dev}]: {(r2.stderr or '') + (r2.stdout or '')}"
@@ -8651,7 +8711,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         continue
                     try:
                         r3 = subprocess.run(
-                            [py_exe, "-m", "mpremote", "connect", "auto", "exec", "print(1)"],
+                            [py_exe, "-m", "mpremote", "connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
                             cwd=_safe_cwd,
                             capture_output=True,
                             text=True,
@@ -8659,7 +8719,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             env=sp_env,
                             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                         )
-                        if r3.returncode == 0:
+                        if _mpremote_result_indicates_micropython(r3):
                             self._mpremote_system_cmd = [py_exe, "-m", "mpremote"]
                             self.install_to_pico()
                             return
@@ -8672,7 +8732,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                 hwid = getattr(port_info, "hwid", "") or ""
                                 if "2E8A" in hwid or "2E8A" in str(port_info):
                                     r4 = subprocess.run(
-                                        [py_exe, "-m", "mpremote", "connect", port_dev, "exec", "print(1)"],
+                                        [py_exe, "-m", "mpremote", "connect", port_dev, "exec", _MPREMOTE_MICROPYTHON_PROBE],
                                         cwd=_safe_cwd,
                                         capture_output=True,
                                         text=True,
@@ -8680,7 +8740,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                         env=sp_env,
                                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                                     )
-                                    if r4.returncode == 0:
+                                    if _mpremote_result_indicates_micropython(r4):
                                         self._mpremote_system_cmd = [py_exe, "-m", "mpremote"]
                                         self.install_to_pico()
                                         return
@@ -8955,14 +9015,22 @@ class MainWindow(QtWidgets.QMainWindow):
         _report("Copying main, radio_core, components (dfplayer + vintage_radio_ipc), …")
         for local, remote in files_to_copy:
             src = root / local
-            if src.exists():
-                r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
-                if r.returncode != 0:
-                    raise RuntimeError(
-                        "Failed to copy firmware files.\n\n"
-                        "Ensure the Pico is connected via USB and running MicroPython.\n\n"
-                        f"{r.stderr or r.stdout or ''}"
-                    )
+            if not src.exists():
+                raise RuntimeError(
+                    "Firmware file is missing from the application bundle — cannot push to the Pico.\n\n"
+                    f"Missing source: {local}\n"
+                    f"Resolved path: {src}\n\n"
+                    "If you are running a packaged build, reinstall from a build that includes "
+                    "firmware/pico/components (e.g. am_wav_loader.py). "
+                    "From source, ensure the repo firmware tree is intact."
+                )
+            r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
+            if r.returncode != 0:
+                raise RuntimeError(
+                    "Failed to copy firmware files.\n\n"
+                    "Ensure the Pico is connected via USB and running MicroPython.\n\n"
+                    f"{r.stderr or r.stdout or ''}"
+                )
 
         # ── Write pin_config.json from active profile ──
         _report("Writing pin configuration...")

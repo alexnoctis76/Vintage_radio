@@ -67,11 +67,13 @@ class TestRunMpremoteInProcess:
             captured_argv.extend(sys.argv)
             return 0
 
+        from gui.radio_manager import _MPREMOTE_MICROPYTHON_PROBE
+
         _run_mpremote(
             ["__INPROCESS__", fake_main],
-            ["connect", "auto", "exec", "print(1)"],
+            ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
         )
-        assert captured_argv == ["mpremote", "connect", "auto", "exec", "print(1)"]
+        assert captured_argv == ["mpremote", "connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE]
 
     def test_restores_sys_argv(self):
         _run_mpremote = self._import_run_mpremote()
@@ -145,12 +147,14 @@ class TestRunMpremoteSubprocess:
 
     @mock.patch("subprocess.run")
     def test_passes_args_to_subprocess(self, mock_run):
+        from gui.radio_manager import _MPREMOTE_MICROPYTHON_PROBE
+
         _run_mpremote = self._import_run_mpremote()
         mock_run.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
 
         result = _run_mpremote(
             ["/usr/bin/python3", "-m", "mpremote"],
-            ["connect", "auto", "exec", "print(1)"],
+            ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
             cwd="/some/path",
             capture_output=True,
             text=True,
@@ -158,7 +162,15 @@ class TestRunMpremoteSubprocess:
         )
         mock_run.assert_called_once()
         call_args = mock_run.call_args
-        assert call_args[0][0] == ["/usr/bin/python3", "-m", "mpremote", "connect", "auto", "exec", "print(1)"]
+        assert call_args[0][0] == [
+            "/usr/bin/python3",
+            "-m",
+            "mpremote",
+            "connect",
+            "auto",
+            "exec",
+            _MPREMOTE_MICROPYTHON_PROBE,
+        ]
         assert result.returncode == 0
 
     @mock.patch("subprocess.run")
@@ -242,9 +254,16 @@ class TestInstallToPicoWorker:
         fw.mkdir()
         pico = fw / "pico"
         pico.mkdir()
+        comp = pico / "components"
+        comp.mkdir()
         (pico / "main.py").write_text("# main firmware")
+        (pico / "main_basic.py").write_text("# main basic firmware")
         (fw / "radio_core.py").write_text("# radio core")
         (pico / "dfplayer_hardware.py").write_text("# dfplayer")
+        (comp / "am_wav_loader.py").write_text("# am wav")
+        (comp / "vintage_radio_ipc.py").write_text("# ipc")
+        (fw / "pin_config_loader.py").write_text("# pins")
+        (pico / "sdcard.py").write_text("# sdcard")
         (root / "AMradioSound.wav").write_bytes(b"\x00" * 100)
         return root
 
@@ -458,9 +477,16 @@ class TestRunMpremoteWithRetry:
         fw.mkdir()
         pico = fw / "pico"
         pico.mkdir()
+        comp = pico / "components"
+        comp.mkdir()
         (pico / "main.py").write_text("# main")
+        (pico / "main_basic.py").write_text("# main basic")
         (fw / "radio_core.py").write_text("# core")
         (pico / "dfplayer_hardware.py").write_text("# dfplayer")
+        (comp / "am_wav_loader.py").write_text("# am wav")
+        (comp / "vintage_radio_ipc.py").write_text("# ipc")
+        (fw / "pin_config_loader.py").write_text("# pins")
+        (pico / "sdcard.py").write_text("# sdcard")
 
         call_count = 0
         def side_effect(cmd, args, **kwargs):
