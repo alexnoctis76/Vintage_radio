@@ -27,14 +27,14 @@ All checks run against **basic mode** (DFPlayer folder-based station discovery, 
    - Each track must start (busy_pin=0) within **8 seconds** of the tap gesture.
    - Each track must still be playing **4 seconds** after it started (**suite intentionally waits** this long to verify sustained play — long log gaps are often harness time, not the radio stalling between tracks).
    - **Phase 1a — natural auto-advance (no taps):** serial timing **≤ ~1.55 s** host-measured from `Track finished, auto-advancing` → next `DF: BUSY went LOW -> playback started`, **2 samples**; busy_pin fallback **≤ 1 s** if serial path cannot complete.
-   - **Phase 1b — gestures:** `double_tap` (previous track) must change track or station index; `triple_tap` must land on **track 1**; serial should show double/triple tap handling.
+   - **Phase 1b — gestures:** `double_tap` (previous track) must change track or station index; `triple_tap` must land on **track 1**; serial should show double/triple tap handling. (Firmware also exposes `four_tap` / `five_tap` for previous station and first station; the default full suite does not require them unless a change targets that behavior.)
    - Audio output on line-in must be audible (`rms_dbfs > -55 dB`; host capture device is auto-selected, prefer **Vintage Radio Line In** if renamed in Windows).
    - **DFPlayer must be actively playing** during line-in capture; the suite ensures `busy_pin=0` before recording (or issues `single_tap` first).
    - No `Traceback`, `MemoryError`, or `FATAL:` lines in serial after the phase.
 3. **Station advance — 3 stations via long_press**
    - Each station must change `current_album_index` (station index) and settle into playback.
 4. **Shuffle-station mode (double_tap_long_press)** — **Phase 3a natural auto-advance** (same **2-sample** serial **≤ ~1.55 s** / busy rules), then **5 tracks** via `single_tap` (same timing/audio/error rules as #2).
-5. **triple_tap_long_press** — **Phase 4** verifies the device stays in **station shuffle** (`shuffle_source_type=station`). Full-library shuffle is **removed**; triple+hold matches double+hold (reshuffle current station).
+5. **triple_tap_long_press** — **Phase 4** verifies **station 1** track shuffle (`shuffle_source_type=station`, `current_album_index=0`). Full-library shuffle is **removed**; double+hold still reshuffles the **current** station.
 6. **Revert (tap_long_press)** — IPC mode must return to `playlist` (ordered station) and 2 tracks must play.
 7. **Final serial error scan** — no hard errors in the full tail after all phases.
 
@@ -67,10 +67,12 @@ The `vintage_radio_debug_request` tool must be reachable (MCP TCP on **127.0.0.1
 | `single_tap` | Next track |
 | `double_tap` | Previous track |
 | `triple_tap` | Restart station at track 1 |
+| `four_tap` | Previous station (or previous source in station shuffle) |
+| `five_tap` | First station (exits track shuffle); advanced: first album/playlist |
 | `long_press` | Next station |
 | `tap_long_press` | Exit shuffle → playlist mode |
 | `double_tap_long_press` | Shuffle current station |
-| `triple_tap_long_press` | Shuffle current station (same as double+hold; library shuffle removed) |
+| `triple_tap_long_press` | First station + track shuffle (stays in shuffle) |
 
 ## After firmware changes
 

@@ -18,6 +18,8 @@ Quick suite (run_acceptance_suite):
   - Single tap -> track advances (next track)
   - Double tap -> track retreats (prev track)
   - Triple tap -> track restarts at 1 (full profile)
+  - Four tap -> previous station (full profile when exercised)
+  - Five tap -> first station (full profile when exercised)
   - Long press -> station advances (full profile)
   - Serial log: button press lines visible
   - AM audio: line_in_analyze vs AMradioSound.wav reference (optional)
@@ -29,10 +31,11 @@ Full comprehensive suite (run_device_acceptance_full):
     audio on line-in above threshold when measured, no errors
   - Station advance: 3 long_press advances each settle into playback
   - Shuffle-station mode: double_tap_long_press + 5 tracks (same checks)
-  - triple_tap_long_press: same as double_tap_long_press (reshuffle tracks in the current station)
+  - triple_tap_long_press: first station + track shuffle (stays in shuffle; double+hold reshuffles current)
   - **Natural auto-advance** (no taps) in ordered station and shuffle-station:
     ~5 s test tracks; serial log timing **≤ ~1.55 s** (or busy_pin **≤ 1.0 s** if serial unavailable)
-  - Full suite also verifies **double_tap** (previous track) and **triple_tap** (restart station at 1)
+  - Full suite also verifies **double_tap** (previous track) and **triple_tap** (restart station at 1);
+    **four_tap** / **five_tap** are available on firmware for prev station / first station
   - Revert: tap_long_press exits shuffle to ordered station mode (IPC mode=playlist), 2 tracks
   - Final serial error scan after all phases
 """
@@ -1009,7 +1012,7 @@ def run_device_acceptance_full(
          ``_MIN_PLAY_DURATION_S`` s (the latter is mostly **test harness** wait time).
       3. Three station advances (long_press) each settle into playback.
       4. Five consecutive tracks in **shuffle-station** mode (same checks).
-      5. ``triple_tap_long_press`` while in shuffle-station mode reshuffles (same as double+hold).
+      5. ``triple_tap_long_press`` while in shuffle-station mode jumps to **station 1** + reshuffle.
       6. Revert to ordered station mode (IPC ``mode=playlist``) via tap_long_press and
          confirm 2 tracks play correctly.
       7. Audio output via line-in must exceed ``_LINE_IN_RMS_MIN_DB`` for
@@ -1669,13 +1672,22 @@ def run_device_acceptance_full(
             add_step(name, False, {"skipped": True, "reason": "shuffle-station mode switch failed"})
 
     # =========================================================================
-    # Phase 4: triple_tap_long_press — same as double+hold (reshuffle station tracks)
+    # Phase 4: triple_tap_long_press — first station + track shuffle (stay in shuffle)
     # =========================================================================
     if ok_ss_switch:
-        log("\n=== Phase 4: triple_tap_long_press (reshuffle station tracks) ===")
+        log("\n=== Phase 4: triple_tap_long_press (first station + shuffle) ===")
+        st_align = get_state()
+        idx_align = (st_align or {}).get("current_album_index")
+        if idx_align == 0:
+            log(
+                "  Station index is 0; long_press once so jump-to-station-1 is observable "
+                "(skipped if device has only one station)."
+            )
+            run_gesture("long_press", 0.5)
+            poll_until_playing(_MODE_SWITCH_MAX_S)
         st_pre_t3 = get_state()
         album_pre_t3 = (st_pre_t3 or {}).get("current_album_index")
-        log("  Sending triple_tap_long_press (expect stay in shuffle-station, track 1)...")
+        log("  Sending triple_tap_long_press (expect shuffle-station on station 1, track 1)...")
         run_gesture("triple_tap_long_press", 0.5)
         ok_t3, _, st_t3 = poll_until_playing(_MODE_SWITCH_MAX_S)
         mode_t3 = (st_t3 or {}).get("mode")
@@ -1689,8 +1701,7 @@ def run_device_acceptance_full(
             and mode_t3 == "shuffle"
             and type_t3 == "station"
             and track_t3 == 1
-            and album_pre_t3 is not None
-            and album_t3 == album_pre_t3
+            and album_t3 == 0
         )
         log(
             "  State after gesture: mode={} shuffle_source_type={} station_cycle_shuffle_active={} "
@@ -1698,7 +1709,7 @@ def run_device_acceptance_full(
                 mode_t3, type_t3, cycle_t3, album_pre_t3, album_t3, track_t3, ok_t3
             )
         )
-        add_step("triple_hold_reshuffles_station_shuffle", ok_t3_switch, {
+        add_step("triple_hold_first_station_shuffle", ok_t3_switch, {
             "mode": mode_t3,
             "shuffle_source_type": type_t3,
             "station_cycle_shuffle_active": cycle_t3,
@@ -1706,11 +1717,11 @@ def run_device_acceptance_full(
             "album_after": album_t3,
             "current_track_after": track_t3,
             "playing": ok_t3,
-            "note": "triple+hold matches double+hold: reshuffle tracks on current station",
+            "note": "triple+hold: first station + reshuffle (stays in shuffle)",
         })
     else:
         add_step(
-            "triple_hold_reshuffles_station_shuffle",
+            "triple_hold_first_station_shuffle",
             False,
             {"skipped": True, "reason": "shuffle-station (Phase 3) not active"},
         )
@@ -1719,7 +1730,7 @@ def run_device_acceptance_full(
         log_fn=log,
         target=target,
         limit=80,
-        heading="Pico serial after Phase 4 (triple tap + hold reshuffle)",
+        heading="Pico serial after Phase 4 (triple tap + hold, first station)",
     )
 
     # =========================================================================
@@ -1813,7 +1824,7 @@ def run_device_acceptance_full(
         "4. Three `long_press` station changes with playback settling.",
         "5. Shuffle-station (`double_tap_long_press`): mode + **natural auto-advance** + "
         f"{_TRACKS_PER_MODE} taps + line-in + error scan.",
-        "6. `triple_tap_long_press` while in shuffle-station mode reshuffles (same as double+hold).",
+        "6. `triple_tap_long_press` in shuffle-station mode jumps to station 1 + reshuffle.",
         f"   (Auto-advance where measured: serial log gap ≤ {_SHUFFLE_AUTO_ADVANCE_MAX_GAP_SERIAL_S:.2f}s; "
         f"busy_pin fallback ≤ {_SHUFFLE_AUTO_ADVANCE_MAX_GAP_S}s.)",
         "7. `tap_long_press` back to ordered station (IPC `mode=playlist`) + 2 tracks.",

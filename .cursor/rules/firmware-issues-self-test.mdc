@@ -81,7 +81,7 @@ Use **`invoke_action`** with the `action` names below (same as internal MCP wiri
 | `soft_reset` | Soft reset (REPL-oriented path in UI) |
 | `list_files` | List files on device |
 | `send_command` | `params.command` + optional `timeout` (uses Ctrl+C / REPL — stops `main`; use sparingly vs `restart_firmware`) |
-| `physical_gesture` | VRTEST: `params`: `gesture` (`single_tap`, `long_press`, `get_state`, ...), `target`: `device` or `emulator` |
+| `physical_gesture` | VRTEST: `params`: `gesture` (`single_tap`, `four_tap`, `five_tap`, `long_press`, `get_state`, ...), `target`: `device` or `emulator` |
 | `device_stream_tail` | Recent serial lines (`params.limit`) |
 
 **Mandatory habit:** after connecting, call **`restart_firmware`** (or confirm user just rebooted), **sleep ~6–8 s**, **`device_connect`** again if `connected` went false, ensure **streaming**, then pull a **large** **`get_device_stream_tail`**.

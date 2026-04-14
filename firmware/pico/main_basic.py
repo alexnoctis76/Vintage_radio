@@ -425,7 +425,11 @@ class VintageRadioFirmware:
         STUCK_QUERY_REQUIRED_ZEROES = 2
         b = pin_busy.value()
         now = ticks_ms()
-        track_expected = bool(self.core.is_playing or self._was_playing)
+        # Treat DFPlayer BUSY (hw.is_playing) as authoritative: core.is_playing can lag
+        # after AM overlay / deferred starts and would suppress real track-end edges.
+        track_expected = bool(
+            self.core.is_playing or self._was_playing or self.hw.is_playing()
+        )
         ignore_until = getattr(self.hw, "ignore_busy_until", 0)
         start_tick = getattr(self.hw, "_playback_start_tick", 0)
 
@@ -459,7 +463,7 @@ class VintageRadioFirmware:
                     self._stuck_status_zero_count = 0
 
         if b == 0:
-            if self.core.is_playing:
+            if self.core.is_playing or self.hw.is_playing():
                 self._was_playing = True
             self._busy_high_since = 0
         elif b == 1 and self.prev_busy == 0:
@@ -544,10 +548,12 @@ class VintageRadioFirmware:
         print("  tap = next track")
         print("  double-tap = previous track")
         print("  triple-tap = restart station")
+        print("  four-tap = previous station")
+        print("  five-tap = first station (ordered mode)")
         print("  hold = next station")
         print("  tap + hold = exit track shuffle to ordered station mode")
         print("  double-tap + hold = track shuffle in current station (repeat = reshuffle)")
-        print("  triple-tap + hold = same as double-tap + hold (reshuffle station tracks)")
+        print("  triple-tap + hold = first station + track shuffle (reshuffle)")
 
         while True:
             try:

@@ -44,15 +44,17 @@ That's it, your device should be ready to test (you may need to click the RESET 
 ## Basic Controls
 - **Tap** = Next track (quick press and release)
 - **Double-tap** = Previous track (two quick taps)
-- **Triple-tap** = Restart album (three quick taps)
-- **Hold** = Next album/playlist (press and hold for 500ms+)
+- **Triple-tap** = Restart at track 1 on the current station (three quick taps)
+- **Four-tap** = Previous station (four quick taps; pairs with **Hold** = next station)
+- **Five-tap** = Jump to the first station at track 1 (five quick taps; exits track shuffle if active)
+- **Hold** = Next station in folder order (press and hold until the radio reacts)
 
 ## Combination Controls
-- **Tap + Hold** = Toggle Album/Playlist mode
+- **Tap + Hold** = Exit track shuffle back to normal ordered stations (basic); in the desktop emulator, also toggles album/playlist mode
   - *How to do it:* Tap once (release), then press and hold
-- **Double-tap + Hold** = Shuffle current album/playlist
+- **Double-tap + Hold** = Shuffle tracks in the current station
   - *How to do it:* Double-tap (release after each tap), then press and hold
-- **Triple-tap + Hold** = Shuffle entire library
+- **Triple-tap + Hold** = First station with a fresh track shuffle (stays in shuffle)
   - *How to do it:* Triple-tap (release after each tap), then press and hold
 
 _**Note:**_ For combination commands, complete the taps first (release after each tap), then press and hold. The system recognizes the taps and combines them with the hold gesture.

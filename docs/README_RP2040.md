@@ -87,7 +87,7 @@ If mpremote is not installed, the app will show a message; install it and try ag
 
 1. Insert the prepared SD card into the DFPlayer (or SD slot used by the DFPlayer).
 2. Power the Pico (USB or your board’s power). The script runs automatically (e.g. `main.py` is the default run target on boot).
-3. Use the button: tap = next track, double-tap = previous, triple-tap = restart album, hold = next album, tap+hold = switch mode, etc.
+3. Use the button: tap = next track, double-tap = previous track, triple-tap = restart at track 1, four-tap = previous station, five-tap = first station, hold = next station, tap+hold / multi-tap+hold for shuffle and mode (see the in-app **Button presses** reference).
 
 ## Troubleshooting
 

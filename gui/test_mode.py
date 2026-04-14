@@ -408,8 +408,9 @@ class TestModeWidget(QtWidgets.QWidget):
         self.mode_shuffle_btn.clicked.connect(lambda: self._switch_mode("shuffle"))
         self.mode_radio_btn.clicked.connect(lambda: self._switch_mode("radio"))
         self.mode_hint_label = QtWidgets.QLabel(
-            "Tap: Next | Double-tap: Prev | Triple-tap: Restart | "
-            "Hold: Next album | Tap+Hold: Switch mode | 2 taps+Hold: Shuffle current | 3 taps+Hold: Shuffle all"
+            "Tap: Next | Double: Prev track | Triple: Restart track 1 | Four: Prev station | "
+            "Five: First station (ordered) | Hold: Next station | 1 tap+Hold: Exit shuffle / mode | "
+            "2 taps+Hold: Shuffle station | 3 taps+Hold: First station + shuffle"
         )
         self.mode_hint_label.setWordWrap(True)
         self.radio_dial = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -435,14 +436,20 @@ class TestModeWidget(QtWidgets.QWidget):
         single_btn = QtWidgets.QPushButton("Tap (Next)")
         double_btn = QtWidgets.QPushButton("Double-Tap (Prev)")
         triple_btn = QtWidgets.QPushButton("Triple-Tap (Restart)")
+        four_btn = QtWidgets.QPushButton("Four-Tap (Prev station)")
+        five_btn = QtWidgets.QPushButton("Five-Tap (First station)")
         long_btn = QtWidgets.QPushButton("Hold (Next Source)")
         single_btn.clicked.connect(self.single_tap)
         double_btn.clicked.connect(self.double_tap)
         triple_btn.clicked.connect(self.triple_tap)
+        four_btn.clicked.connect(self.four_tap)
+        five_btn.clicked.connect(self.five_tap)
         long_btn.clicked.connect(self.long_press)
         tap_layout.addWidget(single_btn)
         tap_layout.addWidget(double_btn)
         tap_layout.addWidget(triple_btn)
+        tap_layout.addWidget(four_btn)
+        tap_layout.addWidget(five_btn)
         tap_layout.addWidget(long_btn)
         
         # Set pointing hand cursor for all clickable buttons
@@ -450,7 +457,14 @@ class TestModeWidget(QtWidgets.QWidget):
         for btn in [
             self.refresh_btn, self.radio_button, self.mode_album_btn,
             self.mode_playlist_btn, self.mode_shuffle_btn, self.mode_radio_btn,
-            self.play_btn, self.finish_btn, single_btn, double_btn, triple_btn, long_btn
+            self.play_btn,
+            self.finish_btn,
+            single_btn,
+            double_btn,
+            triple_btn,
+            four_btn,
+            five_btn,
+            long_btn,
         ]:
             btn.setCursor(pointer_cursor)
 
@@ -748,6 +762,22 @@ class TestModeWidget(QtWidgets.QWidget):
         self.core._triple_tap()
         self._sync_from_core()
         self._update_status("Restarted album/playlist.")
+
+    def four_tap(self) -> None:
+        """Helper: previous station / source (same as four quick taps on device)."""
+        if not self.rail2_on:
+            return
+        self.core._prev_album()
+        self._sync_from_core()
+        self._update_status("Previous station / source.")
+
+    def five_tap(self) -> None:
+        """Helper: first station / first source (same as five quick taps on device)."""
+        if not self.rail2_on:
+            return
+        self.core._five_tap_first_station()
+        self._sync_from_core()
+        self._update_status("First station / source.")
     
     def _go_previous(self) -> None:
         """Go to previous track, handling all modes correctly."""

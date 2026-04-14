@@ -498,6 +498,13 @@ class RadioCore:
             return 0
         return (self.current_album_index + 1) % n
 
+    def _prev_station_index(self) -> int:
+        """Previous station index in SD/folder order (basic mode)."""
+        n = len(self.playlists)
+        if n <= 0:
+            return 0
+        return (self.current_album_index - 1 + n) % n
+
     def _hydrate_basic_station(self, station_index: int, *, allow_assume=False) -> int:
         """Ensure a basic-mode station has track_count populated.
 
@@ -967,14 +974,15 @@ class RadioCore:
     
     def _resolve_input(self):
         """
-        Called after 500ms of idle (no button activity).
+        Called after ``TAP_WINDOW_MS`` of idle (no button activity).
         Resolves ALL accumulated input: taps and/or a hold.
         
         Gestures:
-          Taps only:  1=next, 2=prev, 3+=restart
+          Taps only:  1=next, 2=prev track, 3=restart track 1 in source, 4=prev station/source,
+                      5=first station (basic) or first album/playlist (advanced)
           Hold only:  next album/playlist/station (in station-shuffle: next station + new shuffle)
-          N taps + hold: 1+hold=exit shuffle to ordered station (basic); 2+hold=shuffle current station;
-                         3+hold=same as 2+hold (reshuffle); non-basic 3+: reshuffle current source
+          N taps + hold: 1+hold=exit shuffle to ordered station (basic); 2+hold=shuffle or
+                         reshuffle current station; 3+hold=first station + track shuffle
         """
         had_hold = getattr(self, '_pending_long_press', False)
         tap_count = self.tap_count
@@ -989,7 +997,11 @@ class RadioCore:
         if had_hold:
             # Had a hold - use _handle_long_press with accumulated tap count
             self._handle_long_press_with_taps(tap_count)
-        elif tap_count >= 3:
+        elif tap_count >= 5:
+            self._five_tap_first_station()
+        elif tap_count == 4:
+            self._prev_album()
+        elif tap_count == 3:
             self._triple_tap()
         elif tap_count == 2:
             self._double_tap()
@@ -1031,24 +1043,26 @@ class RadioCore:
     
     def _handle_long_press_with_taps(self, tap_count):
         """
-        Hold gesture resolved after 500ms idle.
+        Hold gesture resolved after ``TAP_WINDOW_MS`` idle following the hold release.
         
         Behaviour depends on how many taps preceded the hold:
           0 taps + hold = Next album/playlist/station (in station-shuffle: next station, reshuffled)
           1 tap  + hold = Non-basic: cycle mode; basic: exit shuffle to ordered station
-          2 taps + hold = Shuffle current album/playlist/station (again = new random order)
-          3+ taps + hold = Same as 2 taps (triple+hold matches double+hold in basic mode)
+          2 taps + hold = Shuffle / reshuffle current station (or album/playlist in advanced)
+          3 taps + hold = First station (basic) or first album/playlist (advanced), then track
+                          shuffle with a fresh order (stays in shuffle; not ordered mode)
+          4+ taps + hold = Ignored (not mapped)
         """
         self.hw.log(f"_handle_long_press_with_taps: tap_count={tap_count}")
         
-        if tap_count >= 3:
+        if tap_count == 3:
+            self._five_tap_hold_shuffle_first_station()
+        elif tap_count == 2:
             self._init_current_shuffle()
             if not self.basic_mode:
                 self.hw.log(
-                    f"{tap_count}-tap+hold: shuffling current source (library shuffle removed)"
+                    "2-tap+hold: shuffling current source (library shuffle removed)"
                 )
-        elif tap_count == 2:
-            self._init_current_shuffle()
         elif tap_count == 1:
             if not self.basic_mode:
                 self._cycle_mode_basic()
@@ -1057,8 +1071,46 @@ class RadioCore:
                 self.switch_mode(MODE_PLAYLIST)
             # else: already in station mode, 1-tap + hold does nothing
             # (0-tap + hold already advances the station)
-        else:
+        elif tap_count == 0:
             self._next_album()
+        else:
+            self.hw.log(
+                f"_handle_long_press_with_taps: {tap_count} taps + hold not mapped; ignoring"
+            )
+
+    def _five_tap_hold_shuffle_first_station(self) -> None:
+        """Three taps + hold: jump to first source and reshuffle tracks.
+
+        Unlike five quick taps without hold, this does **not** return to ordered playlist mode;
+        it keeps (or enters) track shuffle on station 1 / first album / first playlist.
+        """
+        self.hw.log("Three taps + hold: first station / source + reshuffle")
+        if self.mode == MODE_RADIO:
+            if self.radio_stations:
+                self.radio_station_index = 0
+                self.current_track = 1
+                self.radio_mode_start_ms = None
+                self._save_state("five tap hold first radio")
+                self._start_playback_for_current()
+            return
+        if self.basic_mode:
+            if not self.playlists:
+                self.hw.log("Three taps + hold: no stations")
+                return
+            self.current_album_index = 0
+            self.current_track = 1
+            self.shuffle_tracks = []
+            self.shuffle_index = 0
+            self._init_current_shuffle()
+            return
+        if not self.playlists and not self.albums:
+            self.hw.log("Three taps + hold: no albums or playlists")
+            return
+        self.current_album_index = 0
+        self.current_track = 1
+        self.shuffle_tracks = []
+        self.shuffle_index = 0
+        self._init_current_shuffle()
     
     def _cycle_mode_basic(self):
         """Cycle between modes. In basic_mode, album mode is not available --
@@ -1164,6 +1216,7 @@ class RadioCore:
             saved_shuffle_source = 'album'
         
         # Use switch_mode to properly initialize shuffle mode
+        prior_mode = self.mode
         self.switch_mode(MODE_SHUFFLE)
         
         # Preserve the selected shuffle source kind.
@@ -1171,8 +1224,12 @@ class RadioCore:
         
         self.hw.log(f"Mode: Track shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
         self._save_state("shuffle current")
-        # switch_mode() already calls _start_playback_for_current(); do not call again
-        # or the firmware runs two AM sequences and double delay_playback.
+        # switch_mode() is a no-op when already in MODE_SHUFFLE, so no playback start runs
+        # there — start explicitly after reshuffle-in-place.
+        if prior_mode == MODE_SHUFFLE:
+            self._start_playback_for_current()
+        # Otherwise switch_mode() already called _start_playback_for_current(); do not call
+        # again or the firmware runs two AM sequences and double delay_playback.
     
     # ===========================
     #   TRACK NAVIGATION
@@ -1428,7 +1485,196 @@ class RadioCore:
             self._save_state("next album")
             self._schedule_delayed_playback("station_change")
             self._start_playback_for_current()
-    
+
+    def _prev_album(self, from_auto_advance=False):
+        """Move to previous album/playlist/station (four quick taps, no hold).
+
+        Mirrors ``_next_album`` but walks sources backward in shuffle and ordered modes.
+        """
+        if not from_auto_advance:
+            self.hw.log("Four taps: previous album/playlist/station")
+
+        if self.mode == MODE_RADIO:
+            if not self.radio_stations:
+                return
+            n = len(self.radio_stations)
+            self.radio_station_index = (self.radio_station_index - 1 + n) % n
+            self.current_track = 1
+            self.radio_mode_start_ms = None
+            self._save_state("four tap prev radio station")
+            self._start_playback_for_current()
+            return
+
+        if self.mode == MODE_SHUFFLE and self._shuffle_source_type in ("album", "playlist", "station"):
+            prev_album_index = self.current_album_index
+            if self._shuffle_source_type == "album":
+                if self.albums:
+                    self.current_album_index = (
+                        self.current_album_index - 1 + len(self.albums)
+                    ) % len(self.albums)
+                    new_source = self.albums[self.current_album_index]
+                    tracks = new_source.get("tracks", [])
+                    source_name = new_source.get("name", "Unknown")
+                    self.hw.log(
+                        f"Shuffle: going to previous album '{source_name}' "
+                        f"(idx={self.current_album_index})"
+                    )
+                else:
+                    return
+            else:
+                if not self.playlists:
+                    return
+                if self.basic_mode and self._shuffle_source_type == "station":
+                    self.current_album_index = self._prev_station_index()
+                else:
+                    self.current_album_index = (
+                        self.current_album_index - 1 + len(self.playlists)
+                    ) % len(self.playlists)
+
+                n_playlists = len(self.playlists)
+                default_name = (
+                    "Station" if self._shuffle_source_type == "station" else "Playlist"
+                )
+                kind = (
+                    "station"
+                    if self._shuffle_source_type == "station"
+                    else "playlist"
+                )
+                tracks = []
+                new_source = self.playlists[self.current_album_index]
+                for _attempt in range(n_playlists):
+                    new_source = self.playlists[self.current_album_index]
+                    if self.basic_mode and self._shuffle_source_type == "station":
+                        self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+                    tracks = new_source.get("tracks", [])
+                    if self.basic_mode and self._shuffle_source_type == "station" and not tracks:
+                        count = self._basic_playlist_track_count(new_source)
+                        try:
+                            folder = int(new_source.get("id", self.current_album_index + 1))
+                        except (TypeError, ValueError):
+                            folder = self.current_album_index + 1
+                        if count > 0:
+                            tracks = [
+                                self._build_basic_track(folder, i)
+                                for i in range(1, count + 1)
+                            ]
+                    if tracks:
+                        break
+                    if not (self.basic_mode and self._shuffle_source_type == "station"):
+                        break
+                    self.hw.log(
+                        f"Shuffle: station idx={self.current_album_index} has no usable tracks, skipping back"
+                    )
+                    self.current_album_index = self._prev_station_index()
+
+                source_name = new_source.get("name", default_name)
+                if tracks:
+                    self.hw.log(
+                        f"Shuffle: going to previous {kind} '{source_name}' "
+                        f"(idx={self.current_album_index})"
+                    )
+
+            if not tracks:
+                if self.basic_mode and self._shuffle_source_type == "station":
+                    self.hw.log(
+                        "Shuffle: no playable station when going back; reverting to prior station"
+                    )
+                    self.current_album_index = prev_album_index
+                else:
+                    self.hw.log("Shuffle: previous source has no tracks")
+                return
+
+            if not self._assign_and_shuffle_tracks(tracks, reason="prev_album_shuffle"):
+                self.hw.log(
+                    "Shuffle: low-memory while moving to previous station; "
+                    "falling back to ordered station mode"
+                )
+                self.mode = MODE_PLAYLIST
+                self._shuffle_source_type = None
+                self.shuffle_tracks = []
+                self.shuffle_index = 0
+                self.current_track = 1
+                if self.playlists and 0 <= self.current_album_index < len(self.playlists):
+                    cur_pl = self.playlists[self.current_album_index]
+                    if not cur_pl.get("tracks") and self._basic_playlist_track_count(cur_pl) <= 0:
+                        self.current_album_index = prev_album_index
+                self._maybe_schedule_station_change_am()
+                self._start_playback_for_current()
+                return
+            self.shuffle_index = 0
+            self.current_track = 1
+            if self.shuffle_tracks:
+                first_title = self.shuffle_tracks[0].get("title", "Unknown")
+                self.hw.log(
+                    "Shuffle: previous station starts with %s (shuffled order)" % (first_title,)
+                )
+            self.hw.log(f"Mode: Track shuffle ({source_name}, {len(self.shuffle_tracks)} tracks)")
+            self._save_state("shuffle prev album")
+            self._maybe_schedule_station_change_am()
+            self._start_playback_for_current()
+        elif self.mode == MODE_PLAYLIST:
+            if self.basic_mode:
+                self.current_album_index = self._prev_station_index()
+            else:
+                self.current_album_index = (
+                    self.current_album_index - 1 + max(len(self.playlists), 1)
+                ) % max(len(self.playlists), 1)
+            self.current_track = 1
+            self._save_state("prev playlist")
+            self._maybe_schedule_station_change_am()
+            self._start_playback_for_current()
+        else:
+            self.current_album_index = (
+                self.current_album_index - 1 + max(len(self.albums), 1)
+            ) % max(len(self.albums), 1)
+            self.current_track = 1
+            self._save_state("prev album")
+            self._schedule_delayed_playback("station_change")
+            self._start_playback_for_current()
+
+    def _five_tap_first_station(self) -> None:
+        """Five quick taps: jump to first station (basic) or first album/playlist (advanced)."""
+        self.hw.log("Five taps: jump to first station / first source")
+        if self.mode == MODE_RADIO:
+            if self.radio_stations:
+                self.radio_station_index = 0
+                self.current_track = 1
+                self.radio_mode_start_ms = None
+                self._save_state("five tap first radio station")
+                self._start_playback_for_current()
+            return
+        if self.basic_mode:
+            if not self.playlists:
+                self.hw.log("Five taps: no stations")
+                return
+            if self.mode == MODE_SHUFFLE:
+                self.switch_mode(MODE_PLAYLIST)
+            self.current_album_index = 0
+            self.current_track = 1
+            self.shuffle_tracks = []
+            self.shuffle_index = 0
+            self._shuffle_source_type = None
+            self._save_state("five tap first station")
+            self._maybe_schedule_station_change_am()
+            self._start_playback_for_current()
+            return
+        if self.mode == MODE_SHUFFLE:
+            if self.playlists:
+                self.switch_mode(MODE_PLAYLIST)
+            elif self.albums:
+                self.switch_mode(MODE_ALBUM)
+            else:
+                self.hw.log("Five taps: no albums or playlists")
+                return
+        self.current_album_index = 0
+        self.current_track = 1
+        self.shuffle_tracks = []
+        self.shuffle_index = 0
+        self._shuffle_source_type = None
+        self._save_state("five tap first source")
+        self._maybe_schedule_station_change_am()
+        self._start_playback_for_current()
+
     def on_track_finished(self):
         """Called when current track finishes playing."""
         if not self.power_on:
@@ -1479,6 +1725,13 @@ class RadioCore:
         # Basic mode: end of station in sequential (playlist) mode
         if self.basic_mode and self.mode == MODE_PLAYLIST:
             total = self._get_track_count()
+            if total <= 0 and self.current_track >= 1:
+                self.hw.log(
+                    "BASIC: on_track_finished playlist advance: track count was 0; "
+                    "retrying hydrate for current station"
+                )
+                self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+                total = self._get_track_count()
             if total > 0 and self.current_track >= total:
                 if self.advance_next_station:
                     self.hw.log(

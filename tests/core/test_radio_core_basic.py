@@ -177,13 +177,15 @@ class TestBasicModeSwitching:
         basic_core._resolve_input()
         assert basic_core.mode == MODE_PLAYLIST
 
-    def test_triple_tap_hold_shuffles_station_like_double(self, basic_core):
-        assert basic_core.mode == MODE_PLAYLIST
-        basic_core.current_album_index = 0
+    def test_three_tap_hold_jumps_to_first_station_shuffle(self, basic_core):
+        basic_core._init_current_shuffle()
+        assert basic_core.mode == MODE_SHUFFLE
+        basic_core.current_album_index = 1
         basic_core._pending_long_press = True
         basic_core.tap_count = 3
         basic_core._resolve_input()
         assert basic_core.mode == MODE_SHUFFLE
+        assert basic_core.current_album_index == 0
         assert basic_core._shuffle_source_type == "station"
         assert basic_core.current_track == 1
 
@@ -196,6 +198,49 @@ class TestBasicModeSwitching:
         mock_basic_hardware.calls.clear()
         basic_core.switch_mode(MODE_PLAYLIST)
         assert not any(c[0] == "stop" for c in mock_basic_hardware.calls)
+
+    def test_four_tap_hold_unmapped_is_noop(self, basic_core):
+        basic_core.current_album_index = 1
+        basic_core.mode = MODE_PLAYLIST
+        basic_core._handle_long_press_with_taps(4)
+        assert basic_core.mode == MODE_PLAYLIST
+        assert basic_core.current_album_index == 1
+
+    def test_five_tap_hold_unmapped_is_noop(self, basic_core):
+        basic_core.current_album_index = 1
+        basic_core.mode = MODE_PLAYLIST
+        basic_core._handle_long_press_with_taps(5)
+        assert basic_core.mode == MODE_PLAYLIST
+        assert basic_core.current_album_index == 1
+
+
+class TestBasicFourFiveTap:
+    def test_five_tap_goes_first_station(self, basic_core):
+        basic_core.current_album_index = 1
+        basic_core.current_track = 2
+        basic_core.tap_count = 5
+        basic_core._pending_long_press = False
+        basic_core._resolve_input()
+        assert basic_core.current_album_index == 0
+        assert basic_core.current_track == 1
+        assert basic_core.mode == MODE_PLAYLIST
+
+    def test_five_tap_exits_shuffle_to_first_station(self, basic_core):
+        basic_core._init_current_shuffle()
+        assert basic_core.mode == MODE_SHUFFLE
+        basic_core.current_album_index = 1
+        basic_core.tap_count = 5
+        basic_core._pending_long_press = False
+        basic_core._resolve_input()
+        assert basic_core.mode == MODE_PLAYLIST
+        assert basic_core.current_album_index == 0
+
+    def test_four_tap_prev_station_via_resolve(self, basic_core):
+        basic_core.current_album_index = 1
+        basic_core.tap_count = 4
+        basic_core._pending_long_press = False
+        basic_core._resolve_input()
+        assert basic_core.current_album_index == 0
 
 
 class DelayReasonHardware(MockBasicHardware):

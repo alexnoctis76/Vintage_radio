@@ -107,6 +107,22 @@ def _cmd_triple_tap(fw) -> None:
     _resolve_pending_input(fw)
 
 
+def _cmd_four_tap(fw) -> None:
+    for _ in range(3):
+        _tap_press_release(fw, 45)
+        time.sleep_ms(85)
+    _tap_press_release(fw, 45)
+    _resolve_pending_input(fw)
+
+
+def _cmd_five_tap(fw) -> None:
+    for _ in range(4):
+        _tap_press_release(fw, 45)
+        time.sleep_ms(85)
+    _tap_press_release(fw, 45)
+    _resolve_pending_input(fw)
+
+
 def _cmd_long_press(fw) -> None:
     from radio_core import LONG_PRESS_MS
 
@@ -122,9 +138,8 @@ def _cmd_combo_tap_then_long(fw, n_taps: int) -> None:
 
     Gesture semantics (basic mode):
       1 tap + hold  -> exit shuffle to playlist (MODE_PLAYLIST)
-      2 taps + hold -> track shuffle current station  (MODE_SHUFFLE, _shuffle_source_type='station')
-      3 taps + hold -> same as 2 taps + hold (reshuffle)
-      4 taps + hold -> same as 3 taps + hold (compat alias)
+      2 taps + hold -> track shuffle / reshuffle current station (MODE_SHUFFLE, source='station')
+      3 taps + hold -> station 1 + track shuffle (reshuffle; stays in shuffle, not ordered mode)
     """
     from radio_core import LONG_PRESS_MS
 
@@ -189,6 +204,14 @@ def _handle_line(fw, arg: str) -> None:
         _cmd_triple_tap(fw)
         _emit({"ok": True, "cmd": "triple_tap"})
         return
+    if cmd == "four_tap":
+        _cmd_four_tap(fw)
+        _emit({"ok": True, "cmd": "four_tap"})
+        return
+    if cmd == "five_tap":
+        _cmd_five_tap(fw)
+        _emit({"ok": True, "cmd": "five_tap"})
+        return
     if cmd == "long_press":
         _cmd_long_press(fw)
         _emit({"ok": True, "cmd": "long_press"})
@@ -204,10 +227,6 @@ def _handle_line(fw, arg: str) -> None:
     if cmd == "triple_tap_long_press":
         _cmd_combo_tap_then_long(fw, 3)
         _emit({"ok": True, "cmd": "triple_tap_long_press"})
-        return
-    if cmd == "four_tap_long_press":
-        _cmd_combo_tap_then_long(fw, 4)
-        _emit({"ok": True, "cmd": "four_tap_long_press"})
         return
     _emit({"ok": False, "error": "unknown_command", "cmd": cmd})
 

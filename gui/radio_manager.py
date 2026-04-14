@@ -1873,6 +1873,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Restart from the beginning: track 1 in station order, or first track "
                 "in the current station track-shuffle pass",
             ],
+            [
+                "Four",
+                "Previous station (or previous album/playlist in shuffle); pairs with Hold = next station",
+            ],
+            [
+                "Five",
+                "Jump to the first station (basic) or first album/playlist (advanced); exits track shuffle",
+            ],
             [s, "HOLD (long press, no taps)"],
             [
                 "Hold",
@@ -1883,7 +1891,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 "1 tap + hold",
                 "Exit track shuffle to normal ordered-station mode (no-op if already ordered)",
             ],
-            ["2 taps + hold", "Shuffle tracks in the current station"],
+            ["2 taps + hold", "Shuffle tracks in the current station (repeat = reshuffle)"],
+            [
+                "3 taps + hold",
+                "First station (or first album/playlist) with a fresh track shuffle — stays in shuffle",
+            ],
         ]
 
     def _advanced_parse_button_rows_json(self, raw: str) -> List[List[str]]:
@@ -3139,6 +3151,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif gesture == "triple_tap":
                     tw.triple_tap()  # type: ignore[attr-defined]
                     result.update({"ok": True, "device": {"ok": True, "cmd": "triple_tap"}})
+                elif gesture == "four_tap":
+                    tw.four_tap()  # type: ignore[attr-defined]
+                    result.update({"ok": True, "device": {"ok": True, "cmd": "four_tap"}})
+                elif gesture == "five_tap":
+                    tw.five_tap()  # type: ignore[attr-defined]
+                    result.update({"ok": True, "device": {"ok": True, "cmd": "five_tap"}})
                 elif gesture == "long_press":
                     tw.long_press()  # type: ignore[attr-defined]
                     result.update({"ok": True, "device": {"ok": True, "cmd": "long_press"}})
@@ -3997,6 +4015,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "Restart from the beginning: track 1 in station order, or first track "
             "in the current station track-shuffle pass",
         )
+        _cs_data_row(
+            "Four",
+            "Previous station (or previous album/playlist when track-shuffling); "
+            "pairs with Hold = next station",
+        )
+        _cs_data_row(
+            "Five",
+            "Jump to the first station and track 1; exits track shuffle if active",
+        )
         
         _cs_header_row("Hold (long press, no taps)")
         _cs_data_row_html(
@@ -4010,6 +4037,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "Exit track shuffle to normal ordered-station mode (no-op if already ordered)",
         )
         _cs_data_row("2 taps + hold", "Shuffle tracks in the current station")
+        _cs_data_row(
+            "3 taps + hold",
+            "First station with a fresh track shuffle (stays in shuffle; does not switch to ordered mode)",
+        )
         
         btn_cheatsheet_table.verticalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeMode.ResizeToContents

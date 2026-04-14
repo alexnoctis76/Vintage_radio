@@ -79,7 +79,41 @@ class TestTripleTap:
         core.current_track = 3
         core._triple_tap()
         assert core.current_track == 1
+        # _save_state updates runtime state; mock hw only records save_state on power-off persist.
         assert not any(c[0] == "save_state" for c in mock_hardware.calls)
+
+
+class TestFourTapPrevAlbum:
+    def test_prev_playlist_station(self, core, mock_hardware):
+        core.switch_mode(MODE_PLAYLIST)
+        core.current_album_index = 0
+        mock_hardware.calls.clear()
+        core._prev_album()
+        assert core.current_album_index == len(core.playlists) - 1
+        assert core.current_track == 1
+
+    def test_prev_album_wraps(self, core, mock_hardware):
+        core.current_album_index = 0
+        core._prev_album()
+        assert core.current_album_index == len(core.albums) - 1
+        assert core.current_track == 1
+
+
+class TestFiveTapFirstStation:
+    def test_jumps_to_first_album(self, core, mock_hardware):
+        core.current_album_index = 2
+        core.current_track = 2
+        core._five_tap_first_station()
+        assert core.current_album_index == 0
+        assert core.current_track == 1
+
+    def test_playlist_mode_first_source(self, core, mock_hardware):
+        core.switch_mode(MODE_PLAYLIST)
+        core.current_album_index = 0
+        core.current_track = 2
+        core._five_tap_first_station()
+        assert core.current_album_index == 0
+        assert core.current_track == 1
 
 
 class TestLongPress:
@@ -202,9 +236,12 @@ class TestTwoTapsHold:
 
 
 class TestThreeTapsHold:
-    def test_shuffles_library(self, core, mock_hardware):
+    def test_three_tap_hold_first_album_shuffle(self, core, mock_hardware):
+        core.switch_mode(MODE_ALBUM)
+        core.current_album_index = 2
         core._handle_long_press_with_taps(3)
         assert core.mode == MODE_SHUFFLE
+        assert core.current_album_index == 0
         assert len(core.shuffle_tracks) > 0
 
 
@@ -400,13 +437,15 @@ class TestGestureEdgeCases:
         assert core.mode == "shuffle"
         assert len(core.shuffle_tracks) > 0
 
-    def test_three_taps_hold_shuffles_current_source_like_two(self, core):
+    def test_three_taps_hold_first_source_shuffle_via_resolve(self, core):
+        core.switch_mode(MODE_ALBUM)
+        core.current_album_index = 2
         core._pending_long_press = True
         core.tap_count = 3
         core._resolve_input()
         assert core.mode == "shuffle"
-        expected = len(core.albums[core.current_album_index]["tracks"])
-        assert len(core.shuffle_tracks) == expected
+        assert core.current_album_index == 0
+        assert len(core.shuffle_tracks) > 0
 
     def test_resolve_resets_tap_count(self, core):
         core.tap_count = 2
