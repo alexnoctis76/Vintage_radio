@@ -5091,6 +5091,49 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _read_pico_install_mode(self) -> Optional[str]:
+        """Read ``install_mode`` from ``VintageRadio/advanced_runtime.json`` on the Pico.
+
+        When the Device console holds the serial port, use ``VRTEST get_install_mode`` so we
+        never spawn a second ``mpremote`` session (that interrupts ``main.py``). When nothing
+        is connected, fall back to ``mpremote exec``.
+        """
+        def _norm(val: object) -> Optional[str]:
+            if val is None:
+                return None
+            m = str(val).strip().lower()
+            if m in {"basic", "advanced", "legacy"}:
+                return m
+            return None
+
+        self._ensure_device_debug_widget_loaded()
+        tried_vrtest = False
+        for _name in ("_basic_debug_widget", "_device_debug_widget"):
+            w = getattr(self, _name, None)
+            if w is None:
+                continue
+            if not getattr(w, "_connected", False):
+                continue
+            ser = getattr(w, "_serial_connection", None)
+            if ser is None or not getattr(ser, "is_open", False):
+                continue
+            if not hasattr(w, "run_vrtest_command"):
+                continue
+            tried_vrtest = True
+            vr = w.run_vrtest_command("get_install_mode", timeout=5.0)
+            if vr.get("ok") and isinstance(vr.get("device"), dict):
+                mode = _norm(vr["device"].get("install_mode"))
+                if mode is not None:
+                    return mode
+        if tried_vrtest:
+            try:
+                write_session_line(
+                    "[Pico] install_mode: VRTEST get_install_mode failed or unsupported firmware; "
+                    "skipping mpremote while serial is open."
+                )
+            except Exception:
+                pass
+            return None
+
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
             return None
@@ -5929,6 +5972,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Basic-mode SD sync ──
 
+    def _begin_host_sd_volume_sync_guard(self) -> List[Tuple[Any, bool]]:
+        """Pause CDC streaming and USB presence polling while the host writes to SD.
+
+        Keeps the serial port open (no DTR toggle). Required on macOS where concurrent
+        ``in_waiting`` polls + mass-storage writes can glitch USB and interrupt firmware.
+        """
+        self._ensure_device_debug_widget_loaded()
+        pairs: List[Tuple[Any, bool]] = []
+        for name in ("_basic_debug_widget", "_device_debug_widget"):
+            w = getattr(self, name, None)
+            if w is not None:
+                pairs.append((w, w.begin_host_sd_volume_sync()))
+        return pairs
+
+    @staticmethod
+    def _end_host_sd_volume_sync_guard(pairs: List[Tuple[Any, bool]]) -> None:
+        for w, was in pairs:
+            w.end_host_sd_volume_sync(was)
+
     def _sync_basic_to_sd(self) -> None:
         """Sync basic-mode stations to SD card."""
         sd_root = self._resolve_sd_root()
@@ -6058,139 +6120,143 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Sync will continue; existing cache files may still be reused.",
                     )
 
-        dlg = TaskProgressDialog(
-            parent=self,
-            title="Sync Stations to SD" + (" (clean)" if force_clean else ""),
-            func=self.sd_manager.sync_library_basic,
-            args=(sd_root,),
-            kwargs={
-                "force_clean": force_clean,
-                "conversion_profile": self._selected_conversion_profile(),
-                "dfplayer_eq": self._selected_dfplayer_eq() if software_source == "our" else "normal",
-            },
-            cancelable=True,
-            cancel_callback_kwarg="should_cancel",
-        )
-
-        def on_success(result):
-            conversion_failures: List[Dict[str, Any]] = []
-            missing_paths: List[Dict[str, str]] = []
-            if isinstance(result, dict):
-                copied = int(result.get("copied", 0))
-                skipped = int(result.get("skipped", 0))
-                raw_cf = result.get("conversion_failures")
-                if isinstance(raw_cf, list):
-                    conversion_failures = [x for x in raw_cf if isinstance(x, dict)]
-                raw_mp = result.get("missing_source_paths")
-                if isinstance(raw_mp, list):
-                    missing_paths = [x for x in raw_mp if isinstance(x, dict)]
-                result_sd_root = result.get("sd_root")
-                if result_sd_root:
-                    self.sd_root = str(result_sd_root)
-                    self.db.set_setting("sd_root", self.sd_root)
-            else:
-                copied, skipped = result
-            self.statusBar().showMessage(
-                f"Basic sync complete. Copied: {copied}, Skipped: {skipped}", 5000
-            )
-            if missing_paths:
-                n_mp = len(missing_paths)
-                self._show_scrollable_broken_paths_dialog(
-                    window_title="Some tracks were skipped",
-                    headline=(
-                        f"{n_mp} track{'s' if n_mp != 1 else ''} could not be found and "
-                        "were not copied to the SD card."
-                    ),
-                    explanation=(
-                        "Update the file path (Library or station track list: right-click → "
-                        "Replace source file…) or remove the tracks, then sync again.\n\n"
-                        "Full list:"
-                    ),
-                    entries=missing_paths,
-                    line_fmt=lambda e: (
-                        f"{e.get('title', '?')}  ({e.get('station', '?')})\n{e.get('path', '?')}"
-                    ),
-                    proceed_text=None,
-                )
-            if conversion_failures:
-                show_n = min(15, len(conversion_failures))
-                detail_lines = []
-                for item in conversion_failures[:show_n]:
-                    name = str(item.get("name") or Path(str(item.get("path", ""))).name)
-                    err = str(item.get("error") or "unknown error").strip()
-                    if len(err) > 200:
-                        err = err[:200] + "…"
-                    detail_lines.append(f"{name}\n  {err}")
-                tail = ""
-                if len(conversion_failures) > show_n:
-                    tail = f"\n\n… and {len(conversion_failures) - show_n} more (full paths in log)."
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Some files failed to convert",
-                    "These library files could not be converted to MP3 and were not copied "
-                    "to the SD card. Fix or remove the bad files and sync again.\n\n"
-                    + "\n\n".join(detail_lines)
-                    + tail,
-                )
-            else:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Sync complete",
-                    f"Library synced to the SD card.\n\nCopied: {copied}\nSkipped: {skipped}",
-                )
-            self._refresh_library_source_health_ui()
-            for _w in (
-                getattr(self, "_basic_debug_widget", None),
-                getattr(self, "_device_debug_widget", None),
-            ):
-                if _w is not None and hasattr(_w, "refresh_library_db_and_now_playing"):
-                    _w.refresh_library_db_and_now_playing()
-            if self.sd_root:
-                try:
-                    preserved = ""
-                    if isinstance(result, dict):
-                        preserved = str(
-                            result.get("preserved_volume_label") or ""
-                        ).strip()
-                    rename_label = preserved if preserved else None
-                    if self.sd_manager.set_sync_target_volume_label(
-                        Path(self.sd_root), label=rename_label
-                    ):
-                        effective = preserved if preserved else SYNC_TARGET_VOLUME_LABEL
-                        self.db.set_setting("sd_volume_label", effective)
-                        if preserved:
-                            self.sd_label = preserved
-                            self.db.set_setting("sd_label", preserved)
-                        # macOS diskutil rename changes the mount path
-                        if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
-                            new_path = Path("/Volumes") / effective
-                            if new_path.is_dir():
-                                self.sd_root = str(new_path)
-                                self.db.set_setting("sd_root", self.sd_root)
-                    tag = self._basic_sd_path_volume_tag(self.sd_root)
-                    if tag:
-                        self.db.set_setting("basic_trusted_sd_volume", tag)
-                except Exception:
-                    pass
-            self._update_sd_root_label()
-            self._refresh_basic_sd_capacity()
-            self._check_basic_sd_sync()
-            if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
-                QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
-
-        def on_error(msg):
-            if "Sync cancelled by user" in str(msg):
-                self.statusBar().showMessage("Basic sync cancelled.", 4000)
-                return
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Sync Error",
-                f"Error during basic sync:\n\n{msg}",
+        sd_vol_guard = self._begin_host_sd_volume_sync_guard()
+        try:
+            dlg = TaskProgressDialog(
+                parent=self,
+                title="Sync Stations to SD" + (" (clean)" if force_clean else ""),
+                func=self.sd_manager.sync_library_basic,
+                args=(sd_root,),
+                kwargs={
+                    "force_clean": force_clean,
+                    "conversion_profile": self._selected_conversion_profile(),
+                    "dfplayer_eq": self._selected_dfplayer_eq() if software_source == "our" else "normal",
+                },
+                cancelable=True,
+                cancel_callback_kwarg="should_cancel",
             )
 
-        dlg.on_success = on_success
-        dlg.on_error = on_error
-        dlg.exec()
+            def on_success(result):
+                conversion_failures: List[Dict[str, Any]] = []
+                missing_paths: List[Dict[str, str]] = []
+                if isinstance(result, dict):
+                    copied = int(result.get("copied", 0))
+                    skipped = int(result.get("skipped", 0))
+                    raw_cf = result.get("conversion_failures")
+                    if isinstance(raw_cf, list):
+                        conversion_failures = [x for x in raw_cf if isinstance(x, dict)]
+                    raw_mp = result.get("missing_source_paths")
+                    if isinstance(raw_mp, list):
+                        missing_paths = [x for x in raw_mp if isinstance(x, dict)]
+                    result_sd_root = result.get("sd_root")
+                    if result_sd_root:
+                        self.sd_root = str(result_sd_root)
+                        self.db.set_setting("sd_root", self.sd_root)
+                else:
+                    copied, skipped = result
+                self.statusBar().showMessage(
+                    f"Basic sync complete. Copied: {copied}, Skipped: {skipped}", 5000
+                )
+                if missing_paths:
+                    n_mp = len(missing_paths)
+                    self._show_scrollable_broken_paths_dialog(
+                        window_title="Some tracks were skipped",
+                        headline=(
+                            f"{n_mp} track{'s' if n_mp != 1 else ''} could not be found and "
+                            "were not copied to the SD card."
+                        ),
+                        explanation=(
+                            "Update the file path (Library or station track list: right-click → "
+                            "Replace source file…) or remove the tracks, then sync again.\n\n"
+                            "Full list:"
+                        ),
+                        entries=missing_paths,
+                        line_fmt=lambda e: (
+                            f"{e.get('title', '?')}  ({e.get('station', '?')})\n{e.get('path', '?')}"
+                        ),
+                        proceed_text=None,
+                    )
+                if conversion_failures:
+                    show_n = min(15, len(conversion_failures))
+                    detail_lines = []
+                    for item in conversion_failures[:show_n]:
+                        name = str(item.get("name") or Path(str(item.get("path", ""))).name)
+                        err = str(item.get("error") or "unknown error").strip()
+                        if len(err) > 200:
+                            err = err[:200] + "…"
+                        detail_lines.append(f"{name}\n  {err}")
+                    tail = ""
+                    if len(conversion_failures) > show_n:
+                        tail = f"\n\n… and {len(conversion_failures) - show_n} more (full paths in log)."
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Some files failed to convert",
+                        "These library files could not be converted to MP3 and were not copied "
+                        "to the SD card. Fix or remove the bad files and sync again.\n\n"
+                        + "\n\n".join(detail_lines)
+                        + tail,
+                    )
+                else:
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        "Sync complete",
+                        f"Library synced to the SD card.\n\nCopied: {copied}\nSkipped: {skipped}",
+                    )
+                self._refresh_library_source_health_ui()
+                for _w in (
+                    getattr(self, "_basic_debug_widget", None),
+                    getattr(self, "_device_debug_widget", None),
+                ):
+                    if _w is not None and hasattr(_w, "refresh_library_db_and_now_playing"):
+                        _w.refresh_library_db_and_now_playing()
+                if self.sd_root:
+                    try:
+                        preserved = ""
+                        if isinstance(result, dict):
+                            preserved = str(
+                                result.get("preserved_volume_label") or ""
+                            ).strip()
+                        rename_label = preserved if preserved else None
+                        if self.sd_manager.set_sync_target_volume_label(
+                            Path(self.sd_root), label=rename_label
+                        ):
+                            effective = preserved if preserved else SYNC_TARGET_VOLUME_LABEL
+                            self.db.set_setting("sd_volume_label", effective)
+                            if preserved:
+                                self.sd_label = preserved
+                                self.db.set_setting("sd_label", preserved)
+                            # macOS diskutil rename changes the mount path
+                            if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
+                                new_path = Path("/Volumes") / effective
+                                if new_path.is_dir():
+                                    self.sd_root = str(new_path)
+                                    self.db.set_setting("sd_root", self.sd_root)
+                        tag = self._basic_sd_path_volume_tag(self.sd_root)
+                        if tag:
+                            self.db.set_setting("basic_trusted_sd_volume", tag)
+                    except Exception:
+                        pass
+                self._update_sd_root_label()
+                self._refresh_basic_sd_capacity()
+                self._check_basic_sd_sync()
+                if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
+                    QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
+
+            def on_error(msg):
+                if "Sync cancelled by user" in str(msg):
+                    self.statusBar().showMessage("Basic sync cancelled.", 4000)
+                    return
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Sync Error",
+                    f"Error during basic sync:\n\n{msg}",
+                )
+
+            dlg.on_success = on_success
+            dlg.on_error = on_error
+            dlg.exec()
+        finally:
+            self._end_host_sd_volume_sync_guard(sd_vol_guard)
 
     def _on_experimental_sd_disk_image(self) -> None:
         """Experimental: clean sync via FAT32 image — build image, then write to physical SD."""
@@ -8492,59 +8558,63 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if reply == QtWidgets.QMessageBox.StandardButton.No:
             force_clean = True
-        
+
         effective_audio_target = "dfplayer_rp2040" if self._is_basic_like_mode() else self.audio_target
-        dlg = TaskProgressDialog(
-            parent=self,
-            title="SD Card Sync" + (" (clean install)" if force_clean else ""),
-            func=self.sd_manager.sync_library,
-            args=(sd_root,),
-            kwargs={
-                "audio_target": effective_audio_target,
-                "pi_convert_audio": self.pi_convert_audio,
-                "force_clean": force_clean,
-            },
-        )
+        sd_vol_guard = self._begin_host_sd_volume_sync_guard()
+        try:
+            dlg = TaskProgressDialog(
+                parent=self,
+                title="SD Card Sync" + (" (clean install)" if force_clean else ""),
+                func=self.sd_manager.sync_library,
+                args=(sd_root,),
+                kwargs={
+                    "audio_target": effective_audio_target,
+                    "pi_convert_audio": self.pi_convert_audio,
+                    "force_clean": force_clean,
+                },
+            )
 
-        def on_success(result):
-            copied, skipped = result
-            if skipped > 0 and copied == 0:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Sync Complete — No Files Copied",
-                    f"No music files were copied to the SD card.\n"
-                    f"{skipped} file(s) were skipped (source missing or already up to date).\n\n"
-                    "If songs are missing, re-import them in the Library tab.",
-                )
-            else:
-                self.statusBar().showMessage(
-                    f"SD sync complete. Copied: {copied}, Skipped: {skipped}", 5000
-                )
-                # Mark this SD as our sync target (set volume label so we recognize it when multiple cards are present)
-                if self.sd_root:
-                    try:
-                        if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
-                            self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
-                            if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
-                                new_path = Path("/Volumes") / SYNC_TARGET_VOLUME_LABEL
-                                if new_path.is_dir():
-                                    self.sd_root = str(new_path)
-                                    self.db.set_setting("sd_root", self.sd_root)
-                    except Exception:
-                        pass
-                    self._update_sd_root_label()
-            # Auto-eject when option is on (for both "files copied" and "nothing copied" outcomes)
-            if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
-                QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
-            if hasattr(self, 'test_mode_widget') and self.test_mode_widget:
-                self.test_mode_widget.refresh_from_db()
+            def on_success(result):
+                copied, skipped = result
+                if skipped > 0 and copied == 0:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Sync Complete — No Files Copied",
+                        f"No music files were copied to the SD card.\n"
+                        f"{skipped} file(s) were skipped (source missing or already up to date).\n\n"
+                        "If songs are missing, re-import them in the Library tab.",
+                    )
+                else:
+                    self.statusBar().showMessage(
+                        f"SD sync complete. Copied: {copied}, Skipped: {skipped}", 5000
+                    )
+                    # Mark this SD as our sync target (set volume label so we recognize it when multiple cards are present)
+                    if self.sd_root:
+                        try:
+                            if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
+                                self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                                if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
+                                    new_path = Path("/Volumes") / SYNC_TARGET_VOLUME_LABEL
+                                    if new_path.is_dir():
+                                        self.sd_root = str(new_path)
+                                        self.db.set_setting("sd_root", self.sd_root)
+                        except Exception:
+                            pass
+                        self._update_sd_root_label()
+                # Auto-eject when option is on (for both "files copied" and "nothing copied" outcomes)
+                if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
+                    QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
+                if hasattr(self, 'test_mode_widget') and self.test_mode_widget:
+                    self.test_mode_widget.refresh_from_db()
 
-        def on_error(msg):
-            QtWidgets.QMessageBox.critical(self, "Sync Error", f"An error occurred during SD sync:\n\n{msg}")
+            def on_error(msg):
+                QtWidgets.QMessageBox.critical(self, "Sync Error", f"An error occurred during SD sync:\n\n{msg}")
 
-        dlg.on_success = on_success
-        dlg.on_error = on_error
-        dlg.exec()
+            dlg.on_success = on_success
+            dlg.on_error = on_error
+            dlg.exec()
+        finally:
+            self._end_host_sd_volume_sync_guard(sd_vol_guard)
 
     def _clear_sd_storage_selection_after_eject(self) -> None:
         """Drop saved SD path so the UI matches an unplugged card (Detect / Select will re-bind)."""

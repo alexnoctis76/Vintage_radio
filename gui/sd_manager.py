@@ -58,6 +58,39 @@ _SD_ROOT_SERVICE_DIRS = frozenset({
 })
 
 
+def _darwin_begin_sd_sync_volume_prep(sd_root: Path) -> None:
+    """macOS: before large writes, tell Spotlight/Finder to leave the SD volume alone.
+
+    Creates ``.metadata_never_index`` so Spotlight skips future indexing of this
+    volume, and calls ``mdutil -i off`` to stop any active indexing session.
+
+    We intentionally do NOT delete ``.Spotlight-V100`` or ``.fseventsd`` here —
+    those directories are held open by ``mds``/``fseventsd`` daemons, and removing
+    them while they are open can crash Finder.  They are cleaned up safely on eject
+    (``safely_remove_sd`` / ``remove_hidden_junk_from_sd`` with dot_clean_merge).
+    """
+    if platform.system() != "Darwin":
+        return
+    try:
+        root = sd_root.resolve()
+    except OSError:
+        return
+    if not root.is_dir():
+        return
+    try:
+        (root / ".metadata_never_index").touch(exist_ok=True)
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            ["mdutil", "-i", "off", str(root)],
+            capture_output=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _remove_sd_root_service_dirs(root: Path) -> int:
     """Delete known OS index / trash folders at *root* only. Returns removal count."""
     removed = 0
@@ -1471,7 +1504,8 @@ class SDManager:
                 return max(1, min(32, int(raw)))
             except ValueError:
                 pass
-        # Default: more threads than before; cap to reduce FAT/USB contention on weak readers.
+        # Same default on all platforms (was briefly capped on Darwin; host-side streaming
+        # pause during sync addresses USB/CDC contention without slowing copies).
         return max(2, min(12, total_jobs, max(4, (os.cpu_count() or 4))))
 
     def get_basic_broken_source_paths(self) -> List[Dict[str, str]]:
@@ -1584,6 +1618,8 @@ class SDManager:
                 progress_callback=progress_callback,
                 volume_label=preserved_volume_label,
             )
+
+        _darwin_begin_sd_sync_volume_prep(Path(sd_root))
 
         if conversion_profile not in {"dfplayer_safe", "high_quality"}:
             conversion_profile = "dfplayer_safe"
@@ -2422,6 +2458,7 @@ class SDManager:
         After a successful sync pass, macOS/Windows hidden junk (``._*``, ``.DS_Store``,
         etc.) is removed from ``sd_root`` so DFPlayer folder counts stay accurate.
         """
+        _darwin_begin_sd_sync_volume_prep(Path(sd_root))
         target = audio_target or "dfplayer_rp2040"
         pi_convert = pi_convert_audio if pi_convert_audio is not None else True
         if target == "dfplayer_rp2040":

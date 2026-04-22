@@ -26,6 +26,7 @@ from .sd_manager import SDManager
 from .services.serial_debug import (
     append_session_ndjson_from_vrdbg_line,
     is_recoverable_usb_serial_error,
+    serial_io_errno,
 )
 
 
@@ -78,6 +79,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._presence_poll_timer.setInterval(1500)
         self._presence_poll_timer.timeout.connect(self._poll_serial_presence)
         self._presence_poll_timer.start()
+        # True while the host is writing to an SD/USB volume — pause stream reads and
+        # skip USB enumeration so CDC + mass-storage do not fight on the same host.
+        self._host_sd_volume_sync_active = False
         self._debug_log("DeviceDebugWidget initialized", "info")
 
     def _effective_db(self):
@@ -692,6 +696,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
 
     def _poll_serial_presence(self) -> None:
         """Periodic poll so plug/unplug, BOOTSEL drive, and LED update without clicking Scan Ports."""
+        if self._host_sd_volume_sync_active:
+            return
         cur_ports = self._list_port_devices()
         cur_bootsel = SDManager.is_rp2040_bootsel_present()
         cur = (cur_ports, cur_bootsel)
@@ -1563,6 +1569,38 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         self._stop_output = False  # Reset for next start
 
+    def begin_host_sd_volume_sync(self) -> bool:
+        """Host is writing to an SD card volume: stop the stream read loop and USB polls.
+
+        Keeps the serial port **open** (no DTR toggle) so MicroPython is not interrupted.
+        Returns whether streaming was active so :meth:`end_host_sd_volume_sync` can resume.
+        """
+        self._host_sd_volume_sync_active = True
+        was = bool(self._streaming_thread and self._streaming_thread.is_alive())
+        if was:
+            self._stop_streaming_forcefully()
+        try:
+            self.stream_output_btn.setText("Start Streaming")
+        except Exception:
+            pass
+        return was
+
+    def end_host_sd_volume_sync(self, was_streaming: bool) -> None:
+        """Undo :meth:`begin_host_sd_volume_sync` after SD writes finish."""
+        self._host_sd_volume_sync_active = False
+        if not was_streaming or not self._connected:
+            return
+        self._stop_streaming = False
+        self._stop_output = False
+        self._streaming_pause_event.clear()
+        self._streaming_resume_event.clear()
+        if not (self._streaming_thread and self._streaming_thread.is_alive()):
+            self._start_streaming()
+        try:
+            self.stream_output_btn.setText("Stop Streaming")
+        except Exception:
+            pass
+
     def _set_run_stop_button_state(self, *, running: bool, enabled: Optional[bool] = None) -> None:
         """Keep Run/Stop button text, style and enablement in sync."""
         self._firmware_running = bool(running)
@@ -1710,6 +1748,10 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 )
                 self._serial_error_count = 0
                 buffer = ""
+                # Track consecutive transient ENXIO errors separately so we never
+                # close/reopen the port for them.  Closing the CDC port sends a DTR
+                # drop which MicroPython interprets as Ctrl+C → firmware stops.
+                _transient_usb_stall_count = 0
                 try:
                     port_name = str(ser.port)
                 except Exception:
@@ -1755,6 +1797,18 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                         try:
                             waiting = ser.in_waiting
                         except (serial.SerialException, OSError) as e:
+                            # macOS returns ENXIO (errno 6) when USB bandwidth is
+                            # momentarily saturated (e.g. heavy SD card writes on the
+                            # same USB host).  The device is still there — do NOT
+                            # close/reopen the port.  Closing sends DTR=False which
+                            # MicroPython interprets as Ctrl+C and stops the firmware.
+                            # Just sleep and retry; the USB scheduler recovers quickly.
+                            _eno = serial_io_errno(e)
+                            if _eno == 6 and _transient_usb_stall_count < 20:
+                                _transient_usb_stall_count += 1
+                                time.sleep(0.5)
+                                continue
+                            _transient_usb_stall_count = 0
                             if _recover_stream_serial(e):
                                 time.sleep(0.05)
                                 continue
@@ -1767,6 +1821,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                         
                         if waiting > 0:
                             self._serial_error_count = 0
+                            _transient_usb_stall_count = 0
                             try:
                                 data = ser.read(waiting).decode('utf-8', errors='replace')
                                 buffer += data

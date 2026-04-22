@@ -192,6 +192,18 @@ def _handle_line(fw, arg: str) -> None:
     if cmd == "get_state":
         _emit({"ok": True, "cmd": "get_state", "state": _cmd_get_state(fw)})
         return
+    if cmd == "get_install_mode":
+        # Host sync: read VintageRadio/advanced_runtime.json without mpremote/REPL.
+        mode = "basic"
+        try:
+            d = json.load(open("VintageRadio/advanced_runtime.json", "r"))
+            raw = str(d.get("install_mode", "basic")).strip().lower()
+            if raw in {"basic", "advanced", "legacy"}:
+                mode = raw
+        except Exception:
+            pass
+        _emit({"ok": True, "cmd": "get_install_mode", "install_mode": mode})
+        return
     if cmd == "single_tap":
         _cmd_single_tap(fw)
         _emit({"ok": True, "cmd": "single_tap"})
