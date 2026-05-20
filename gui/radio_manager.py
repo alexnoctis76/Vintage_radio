@@ -50,6 +50,7 @@ from .sd_disk_image_flash import (
     write_image_to_physical_disk_darwin,
     DARWIN_FDA_REQUIRED_MARKER,
 )
+from .widgets.decorative_image_panel import RadioShellWidget
 from .widgets.sd_disk_image_wizard_dialog import SdDiskImageFlashWizardDialog
 from .session_log import write_session_line, get_session_log_path
 from .test_mode import TestModeWidget
@@ -3879,18 +3880,20 @@ class MainWindow(QtWidgets.QMainWindow):
         when multiple RP2040s are attached, the install button, and (in advanced view)
         a list of firmware versions to install.
         """
-        _CARD_BG = "white"
+        _CARD_BG = "#f2ede4"
         _BTN_CARD_SS = (
             "QPushButton {"
-            "  background-color: white;"
-            "  border: 1px solid #e0e0e0;"
+            "  background-color: #FFFFFF;"
+            "  border: 1px solid #D7CCBC;"
             "  border-radius: 10px;"
             "  padding: 18px 20px;"
             "  text-align: center;"
+            "  font-family: 'Segoe UI', 'Inter', sans-serif;"
+            "  font-weight: 600;"
             "}"
-            "QPushButton:hover { background-color: #f5f5f5; border-color: #bbb; }"
-            "QPushButton:pressed { background-color: #ebebeb; }"
-            "QPushButton:disabled { color: #aaa; background-color: #f9f9f9; }"
+            "QPushButton:hover { background-color: #F8F6F2; border-color: #C8B99F; }"
+            "QPushButton:pressed { background-color: #EEE8DE; }"
+            "QPushButton:disabled { color: #aaa; background-color: #f9f9f9; border-color: #e0dbd5; }"
         )
 
         widget = QtWidgets.QWidget()
@@ -3952,9 +3955,20 @@ class MainWindow(QtWidgets.QMainWindow):
         usb_lbl = QtWidgets.QLabel("USB")
         usb_lbl.setStyleSheet(f"background-color: {_CARD_BG}; color: #555; font-size: 13px;")
         led_row.addWidget(usb_lbl)
-        led_row.addSpacing(6)
+        led_row.addSpacing(8)
+        # Green status indicator — PNG asset when available, CSS circle as fallback.
         self._basic_device_detected_led = QtWidgets.QLabel()
-        self._basic_device_detected_led.setFixedSize(14, 14)
+        self._basic_device_detected_led.setFixedSize(22, 22)
+        _green_ind_path = resource_path("green_status_indicator_on.png")
+        self._green_indicator_pixmap = (
+            QtGui.QPixmap(str(_green_ind_path)).scaled(
+                22, 22,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+            if _green_ind_path.exists()
+            else None
+        )
         led_row.addWidget(self._basic_device_detected_led)
         led_row.addSpacing(6)
         self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
@@ -4006,8 +4020,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_install_firmware_btn = QtWidgets.QPushButton("Install firmware on device")
         self._basic_install_firmware_btn.setStyleSheet(
             _BTN_CARD_SS
-            + "QPushButton { font-size: 15px; font-weight: bold; color: #2563eb; }"
-            + "QPushButton:disabled { color: #9db5e8; }"
+            + " QPushButton { font-size: 15px; font-weight: 700; color: #2563eb; }"
+            + " QPushButton:disabled { color: #9db5e8; border-color: #e0dbd5; }"
         )
         self._basic_install_firmware_btn.setMinimumHeight(64)
         self._basic_install_firmware_btn.setCursor(
@@ -4073,12 +4087,17 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         led = getattr(self, "_basic_device_detected_led", None)
         lbl = getattr(self, "_basic_device_detected_label", None)
+        green_px = getattr(self, "_green_indicator_pixmap", None)
         if _qt_widget_alive(led):
             if detected:
-                led.setStyleSheet(
-                    "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
-                    "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
-                )
+                if green_px is not None:
+                    led.setPixmap(green_px)
+                    led.setStyleSheet("background: transparent;")
+                else:
+                    led.setStyleSheet(
+                        "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
+                        "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
+                    )
                 led.setToolTip(
                     "USB: MicroPython serial port, connected Device Console, or unflashed Pico in "
                     "BOOTSEL mode (RPI-RP2 removable drive)."
@@ -4087,6 +4106,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     lbl.setText("Device detected")
                     lbl.setStyleSheet("font-size: 13px; font-weight: bold;")
             else:
+                led.setPixmap(QtGui.QPixmap())
                 led.setStyleSheet(
                     "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
                     "border-radius: 7px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
@@ -5473,10 +5493,88 @@ class MainWindow(QtWidgets.QMainWindow):
             return mode
         return None
 
+    # ── Vintage QSS applied to the SD Card tab ───────────────────────────────
+    _SD_CARD_QSS = """
+        QWidget {
+            font-family: 'Segoe UI', 'Inter', 'Noto Sans', sans-serif;
+            color: #222222;
+        }
+        QPushButton {
+            background: #FFFFFF;
+            border: 1px solid #D7CCBC;
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-weight: 600;
+        }
+        QPushButton:hover { background: #F8F6F2; border-color: #C8B99F; }
+        QPushButton:pressed { background: #EEE8DE; }
+        QPushButton:disabled { color: #aaa; border-color: #e4dfd8; }
+        QComboBox {
+            background: #FFFFFF;
+            border: 1px solid #D7CCBC;
+            border-radius: 8px;
+            padding: 4px 10px;
+        }
+        QComboBox::drop-down { border: none; }
+        QListWidget {
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid #D7CCBC;
+            border-radius: 8px;
+            padding: 4px;
+        }
+        QListWidget::item:selected {
+            background: #D7CCBC;
+            color: #222;
+            border-radius: 4px;
+        }
+        QTableWidget {
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid #D7CCBC;
+            border-radius: 8px;
+            gridline-color: #E8E2D8;
+        }
+        QTableWidget QHeaderView::section {
+            background: #EDE7DC;
+            border: none;
+            border-bottom: 1px solid #D7CCBC;
+            padding: 4px 8px;
+            font-weight: 600;
+        }
+        QProgressBar {
+            background: #DED8CE;
+            border: 1px solid #CFC5B6;
+            border-radius: 8px;
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background: #39B54A;
+            border-radius: 8px;
+        }
+        QGroupBox {
+            background: transparent;
+            border: 1px solid rgba(180, 155, 120, 0.55);
+            border-radius: 10px;
+            margin-top: 10px;
+            padding-top: 6px;
+            font-weight: bold;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            color: #4a3520;
+        }
+        QLabel { background: transparent; }
+        QCheckBox { background: transparent; }
+        QSplitter::handle { background: rgba(180, 155, 120, 0.3); }
+    """
+
     def _build_basic_sd_card_tab(self) -> QtWidgets.QWidget:
         """Basic mode: SD Card tab with station manager, track list, capacity, and sync."""
-        widget = QtWidgets.QWidget()
+        _shell_path = str(resource_path("radio_shell_full_sd_card_background.png"))
+        widget = RadioShellWidget(_shell_path, fallback_color="#f2ede4")
+        widget.setStyleSheet(self._SD_CARD_QSS)
         layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(28, 20, 28, 16)
 
         warn_row = QtWidgets.QHBoxLayout()
         self._basic_sd_sync_warning = QtWidgets.QLabel()
@@ -5539,8 +5637,11 @@ class MainWindow(QtWidgets.QMainWindow):
         station_layout.setContentsMargins(0, 0, 0, 0)
 
         station_heading = QtWidgets.QHBoxLayout()
-        stations_label = QtWidgets.QLabel("Stations")
-        stations_label.setStyleSheet("font-weight: bold;")
+        stations_label = QtWidgets.QLabel("  Stations")
+        stations_label.setStyleSheet(
+            "font-weight: bold; color: #f5e6c8; background-color: #3D2200;"
+            " border-radius: 6px 6px 0 0; padding: 5px 8px;"
+        )
         stations_label.setToolTip(
             "Drag stations to reorder. Each station maps to a numbered folder on the SD card. "
             "You can also drop folders here to import each folder as a station."
@@ -5610,8 +5711,43 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
 
-        # ── Sync buttons ──
+        # ── Sync buttons — dark wood strip styling matching wood_sync_control_bay.png ──
         sync_group = QtWidgets.QGroupBox("Sync")
+        sync_group.setStyleSheet("""
+            QGroupBox {
+                background-color: #3D2200;
+                border: 2px solid #8B6914;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding-top: 6px;
+                font-weight: bold;
+                color: #f5e6c8;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                color: #f5e6c8;
+            }
+            QPushButton {
+                background: #f5e6c8;
+                border: 1px solid #8B6914;
+                border-radius: 8px;
+                padding: 6px 14px;
+                color: #3D2200;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #fff3dc; }
+            QPushButton:pressed { background: #e8d4a8; }
+            QCheckBox { color: #f5e6c8; background: transparent; }
+            QLabel { color: #f5e6c8; background: transparent; }
+            QComboBox {
+                background: #f5e6c8;
+                border: 1px solid #8B6914;
+                border-radius: 6px;
+                padding: 4px 8px;
+                color: #3D2200;
+            }
+        """)
         sync_layout = QtWidgets.QHBoxLayout(sync_group)
         sync_btn = QtWidgets.QPushButton("Sync Stations to SD")
         sync_btn.setToolTip("Copy all stations to the SD card in DFPlayer folder format.")
