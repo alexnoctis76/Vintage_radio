@@ -3993,7 +3993,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Insets are tuned for the radio_shell PNG: top accounts for the gold/cream
         # rim, sides leave room for the bezel, and the bottom is small so the Sync
         # controls land on the dark wood strip baked into the image.
-        v.setContentsMargins(36, 16, 36, 36)
+        v.setContentsMargins(40, 18, 200, 180)
         v.setSpacing(6)
         v.addWidget(self._build_library_row_widget())
         v.addWidget(tabs, 1)
@@ -5833,7 +5833,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sync_layout = QtWidgets.QHBoxLayout(sync_group)
         sync_btn = QtWidgets.QPushButton("Sync Stations to SD")
         sync_btn.setToolTip("Copy all stations to the SD card in DFPlayer folder format.")
-        sync_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         sync_btn.clicked.connect(self._sync_basic_to_sd)
         eject_btn = QtWidgets.QPushButton("Safely Remove SD")
         eject_btn.clicked.connect(self.safely_remove_sd)
