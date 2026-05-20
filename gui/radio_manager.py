@@ -3652,49 +3652,64 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Library switcher toolbar ──────────────────────────────
 
     def _build_library_toolbar(self) -> None:
-        tb = QtWidgets.QToolBar("Library")
-        tb.setMovable(False)
-        tb.setIconSize(QtCore.QSize(16, 16))
-        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
+        """No-op: the library row is now built inside the radio shell central widget.
 
-        self._library_heading_label = QtWidgets.QLabel("  Library: ")
-        self._library_heading_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Fixed,
-            QtWidgets.QSizePolicy.Policy.Preferred,
-        )
-        tb.addWidget(self._library_heading_label)
+        Kept as a method for backward compatibility with any old call sites. The
+        actual library row widget is constructed by ``_build_library_row_widget``
+        and placed on top of the radio shell background by ``_build_tabs``.
+        """
+        return
 
+    def _build_library_row_widget(self) -> QtWidgets.QWidget:
+        """Library selector row (Library: combo + New/Rename/Delete) as a widget.
+
+        Returned widget has a transparent background so the radio shell behind it
+        shows through. Buttons get rounded white styling via the page-wide QSS.
+        """
+        row = QtWidgets.QWidget()
+        row.setObjectName("libraryRow")
+        row.setStyleSheet("QWidget#libraryRow { background: transparent; }")
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(8)
+
+        self._library_heading_label = QtWidgets.QLabel("Library")
         app = QtWidgets.QApplication.instance()
         if app:
             lib_font = QFont(app.font())
             lib_font.setBold(True)
             self._library_heading_label.setFont(lib_font)
+        h.addWidget(self._library_heading_label)
+
         self._lib_combo = QtWidgets.QComboBox()
         if app:
             fm = QtGui.QFontMetrics(app.font())
             self._lib_combo.setMinimumWidth(max(180, fm.averageCharWidth() * 22))
         self._lib_combo.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
             QtWidgets.QSizePolicy.Policy.Preferred,
         )
-        tb.addWidget(self._lib_combo)
+        h.addWidget(self._lib_combo)
         self._populate_lib_combo()
         self._lib_combo.currentIndexChanged.connect(self._on_lib_combo_changed)
+
+        h.addStretch(1)
 
         new_btn = QtWidgets.QPushButton("New")
         new_btn.setToolTip("Create a new library")
         new_btn.clicked.connect(self._new_library)
-        tb.addWidget(new_btn)
+        h.addWidget(new_btn)
 
         rename_btn = QtWidgets.QPushButton("Rename")
         rename_btn.setToolTip("Rename the current library")
         rename_btn.clicked.connect(self._rename_library)
-        tb.addWidget(rename_btn)
+        h.addWidget(rename_btn)
 
         delete_btn = QtWidgets.QPushButton("Delete")
         delete_btn.setToolTip("Delete the current library")
         delete_btn.clicked.connect(self._delete_library)
-        tb.addWidget(delete_btn)
+        h.addWidget(delete_btn)
+        return row
 
     def _populate_lib_combo(self) -> None:
         combo = self._lib_combo
@@ -3824,8 +3839,128 @@ class MainWindow(QtWidgets.QMainWindow):
         name = self._lib_registry.active_library_name()
         self.setWindowTitle(f"Vintage Radio Music Manager - {name}")
 
+    def _radio_shell_qss(self) -> str:
+        """Window-wide QSS applied to the radio shell central widget.
+
+        Makes the tab widget, tab pages, group boxes, and library row sit on top
+        of the painted shell with transparent backgrounds. Buttons, combos, list,
+        table, and progress bar get warm vintage styling that matches the radio.
+        """
+        return """
+            /* Tab widget — sits on the cream area of the radio shell */
+            QTabWidget#mainTabs::pane {
+                background: transparent;
+                border: none;
+                border-top: 1px solid rgba(120, 90, 50, 0.35);
+                margin-top: -1px;
+            }
+            QTabWidget#mainTabs QTabBar { background: transparent; }
+            QTabBar::tab {
+                background: rgba(255, 248, 230, 0.55);
+                color: #4a3520;
+                padding: 7px 22px;
+                margin-right: 4px;
+                border: 1px solid rgba(120, 90, 50, 0.45);
+                border-bottom: none;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                font-weight: 600;
+                font-size: 13px;
+                min-width: 110px;
+            }
+            QTabBar::tab:selected {
+                background: rgba(255, 252, 244, 0.95);
+                color: #2a1c10;
+                border-color: rgba(120, 90, 50, 0.7);
+            }
+            QTabBar::tab:hover:!selected {
+                background: rgba(255, 250, 235, 0.8);
+            }
+            /* Tab page content sits transparent on the shell */
+            QTabWidget#mainTabs > QWidget > QWidget { background: transparent; }
+            /* Generic controls on the shell */
+            QPushButton {
+                background: #FFFFFF;
+                border: 1px solid #D7CCBC;
+                border-radius: 8px;
+                padding: 5px 14px;
+                font-weight: 600;
+                color: #2a1c10;
+            }
+            QPushButton:hover { background: #F8F6F2; border-color: #C8B99F; }
+            QPushButton:pressed { background: #EEE8DE; }
+            QPushButton:disabled { color: #aaa; border-color: #e4dfd8; background: #f9f9f9; }
+            QComboBox {
+                background: #FFFFFF;
+                border: 1px solid #D7CCBC;
+                border-radius: 8px;
+                padding: 4px 10px;
+                color: #2a1c10;
+                min-height: 22px;
+            }
+            QComboBox::drop-down { border: none; width: 18px; }
+            QListWidget {
+                background: rgba(255, 252, 244, 0.94);
+                border: 1px solid #D7CCBC;
+                border-radius: 8px;
+                padding: 4px;
+                color: #2a1c10;
+            }
+            QListWidget::item:selected {
+                background: #D7CCBC;
+                color: #1a1a1a;
+                border-radius: 4px;
+            }
+            QTableWidget {
+                background: rgba(255, 252, 244, 0.94);
+                border: 1px solid #D7CCBC;
+                border-radius: 8px;
+                gridline-color: #E8E2D8;
+                color: #2a1c10;
+            }
+            QTableWidget QHeaderView::section {
+                background: #EDE7DC;
+                border: none;
+                border-bottom: 1px solid #D7CCBC;
+                padding: 4px 8px;
+                font-weight: 600;
+                color: #4a3520;
+            }
+            QProgressBar {
+                background: #DED8CE;
+                border: 1px solid #CFC5B6;
+                border-radius: 8px;
+                text-align: center;
+                color: #2a1c10;
+            }
+            QProgressBar::chunk {
+                background: #39B54A;
+                border-radius: 8px;
+            }
+            QGroupBox {
+                background: transparent;
+                border: 1px solid rgba(120, 90, 50, 0.45);
+                border-radius: 10px;
+                margin-top: 12px;
+                padding-top: 8px;
+                font-weight: bold;
+                color: #4a3520;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                color: #4a3520;
+                background: transparent;
+                padding: 0 4px;
+            }
+            QLabel { background: transparent; color: #2a1c10; }
+            QCheckBox { background: transparent; color: #2a1c10; }
+            QSplitter::handle { background: rgba(180, 155, 120, 0.3); }
+        """
+
     def _build_tabs(self) -> None:
         tabs = QtWidgets.QTabWidget()
+        tabs.setObjectName("mainTabs")
         self._tabs_widget = tabs
 
         if self.devices_view_mode in ("basic", "advanced"):
@@ -3848,7 +3983,21 @@ class MainWindow(QtWidgets.QMainWindow):
             tabs.addTab(device_tab_container, "Device Debug")
 
         tabs.currentChanged.connect(self._on_tab_changed)
-        self.setCentralWidget(tabs)
+
+        # ── Radio shell central widget — entire window is the radio ──
+        shell_path = str(resource_path("radio_shell_full_sd_card_background.png"))
+        central = RadioShellWidget(shell_path, fallback_color="#f2ede4")
+        central.setObjectName("radioShellCentral")
+        central.setStyleSheet(self._radio_shell_qss())
+        v = QtWidgets.QVBoxLayout(central)
+        # Insets are tuned for the radio_shell PNG: top accounts for the gold/cream
+        # rim, sides leave room for the bezel, and the bottom is small so the Sync
+        # controls land on the dark wood strip baked into the image.
+        v.setContentsMargins(36, 16, 36, 36)
+        v.setSpacing(6)
+        v.addWidget(self._build_library_row_widget())
+        v.addWidget(tabs, 1)
+        self.setCentralWidget(central)
 
     def _ensure_test_mode_widget(self) -> TestModeWidget:
         """Create emulator widget lazily so basic view does not start hidden playback."""
@@ -3880,12 +4029,13 @@ class MainWindow(QtWidgets.QMainWindow):
         when multiple RP2040s are attached, the install button, and (in advanced view)
         a list of firmware versions to install.
         """
-        _CARD_BG = "#f2ede4"
+        # The whole window paints the radio shell already; this tab is transparent
+        # so the cream area of the radio shows through behind the white CTAs.
         _BTN_CARD_SS = (
             "QPushButton {"
             "  background-color: #FFFFFF;"
             "  border: 1px solid #D7CCBC;"
-            "  border-radius: 10px;"
+            "  border-radius: 12px;"
             "  padding: 18px 20px;"
             "  text-align: center;"
             "  font-family: 'Segoe UI', 'Inter', sans-serif;"
@@ -3897,9 +4047,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         widget = QtWidgets.QWidget()
-        widget.setStyleSheet(f"background-color: {_CARD_BG};")
+        widget.setStyleSheet("QWidget { background: transparent; }")
         outer = QtWidgets.QVBoxLayout(widget)
-        outer.setContentsMargins(36, 32, 36, 32)
+        outer.setContentsMargins(36, 24, 36, 24)
         outer.setSpacing(0)
 
         # Always create the underlying debug widget so existing references and the
@@ -3925,7 +4075,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Content column — max width so it doesn't stretch across 4K monitors ──
         content_row = QtWidgets.QHBoxLayout()
         content_col = QtWidgets.QWidget()
-        content_col.setStyleSheet(f"background-color: {_CARD_BG};")
+        content_col.setStyleSheet("QWidget { background: transparent; }")
         content_col.setMaximumWidth(680)
         col_layout = QtWidgets.QVBoxLayout(content_col)
         col_layout.setContentsMargins(0, 0, 0, 0)
@@ -3935,7 +4085,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Title and subtitle ──
         self._basic_device_title_label = QtWidgets.QLabel("Waiting for device...")
         self._basic_device_title_label.setStyleSheet(
-            f"background-color: {_CARD_BG}; font-size: 22px; font-weight: bold; color: #1a1a1a;"
+            "background: transparent; font-size: 22px; font-weight: bold; color: #2a1c10;"
         )
         col_layout.addWidget(self._basic_device_title_label)
         col_layout.addSpacing(6)
@@ -3945,7 +4095,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._basic_device_subtitle_label.setWordWrap(True)
         self._basic_device_subtitle_label.setStyleSheet(
-            f"background-color: {_CARD_BG}; font-size: 13px; color: #6b6560;"
+            "background: transparent; font-size: 13px; color: #6b5e54;"
         )
         col_layout.addWidget(self._basic_device_subtitle_label)
         col_layout.addSpacing(20)
@@ -3953,7 +4103,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── USB LED row ──
         led_row = QtWidgets.QHBoxLayout()
         usb_lbl = QtWidgets.QLabel("USB")
-        usb_lbl.setStyleSheet(f"background-color: {_CARD_BG}; color: #555; font-size: 13px;")
+        usb_lbl.setStyleSheet("background: transparent; color: #555; font-size: 13px;")
         led_row.addWidget(usb_lbl)
         led_row.addSpacing(8)
         # Green status indicator — PNG asset when available, CSS circle as fallback.
@@ -3973,7 +4123,7 @@ class MainWindow(QtWidgets.QMainWindow):
         led_row.addSpacing(6)
         self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
         self._basic_device_detected_label.setStyleSheet(
-            f"background-color: {_CARD_BG}; font-size: 13px;"
+            "background: transparent; font-size: 13px;"
         )
         led_row.addWidget(self._basic_device_detected_label)
         led_row.addStretch(1)
@@ -3993,7 +4143,6 @@ class MainWindow(QtWidgets.QMainWindow):
             browse_row = QtWidgets.QHBoxLayout()
             browse_row.addStretch(1)
             browse_btn = QtWidgets.QPushButton("Browse local file...")
-            browse_btn.setStyleSheet(f"background-color: {_CARD_BG};")
             browse_btn.setToolTip(
                 "Select a .uf2 or MicroPython (.py/.mpy) file. .uf2 files install "
                 "directly without a MicroPython prompt. The selection is saved to your "
@@ -4006,7 +4155,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Choose Device button (basic: only if >1 RP2040; advanced: always) ──
         self._basic_choose_device_btn = QtWidgets.QPushButton("Choose Device")
-        self._basic_choose_device_btn.setStyleSheet(f"background-color: {_CARD_BG};")
         self._basic_choose_device_btn.setToolTip(
             "Pick a specific RP2040 serial port when more than one is connected."
         )
@@ -5493,88 +5641,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return mode
         return None
 
-    # ── Vintage QSS applied to the SD Card tab ───────────────────────────────
-    _SD_CARD_QSS = """
-        QWidget {
-            font-family: 'Segoe UI', 'Inter', 'Noto Sans', sans-serif;
-            color: #222222;
-        }
-        QPushButton {
-            background: #FFFFFF;
-            border: 1px solid #D7CCBC;
-            border-radius: 8px;
-            padding: 6px 14px;
-            font-weight: 600;
-        }
-        QPushButton:hover { background: #F8F6F2; border-color: #C8B99F; }
-        QPushButton:pressed { background: #EEE8DE; }
-        QPushButton:disabled { color: #aaa; border-color: #e4dfd8; }
-        QComboBox {
-            background: #FFFFFF;
-            border: 1px solid #D7CCBC;
-            border-radius: 8px;
-            padding: 4px 10px;
-        }
-        QComboBox::drop-down { border: none; }
-        QListWidget {
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid #D7CCBC;
-            border-radius: 8px;
-            padding: 4px;
-        }
-        QListWidget::item:selected {
-            background: #D7CCBC;
-            color: #222;
-            border-radius: 4px;
-        }
-        QTableWidget {
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid #D7CCBC;
-            border-radius: 8px;
-            gridline-color: #E8E2D8;
-        }
-        QTableWidget QHeaderView::section {
-            background: #EDE7DC;
-            border: none;
-            border-bottom: 1px solid #D7CCBC;
-            padding: 4px 8px;
-            font-weight: 600;
-        }
-        QProgressBar {
-            background: #DED8CE;
-            border: 1px solid #CFC5B6;
-            border-radius: 8px;
-            text-align: center;
-        }
-        QProgressBar::chunk {
-            background: #39B54A;
-            border-radius: 8px;
-        }
-        QGroupBox {
-            background: transparent;
-            border: 1px solid rgba(180, 155, 120, 0.55);
-            border-radius: 10px;
-            margin-top: 10px;
-            padding-top: 6px;
-            font-weight: bold;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            color: #4a3520;
-        }
-        QLabel { background: transparent; }
-        QCheckBox { background: transparent; }
-        QSplitter::handle { background: rgba(180, 155, 120, 0.3); }
-    """
-
     def _build_basic_sd_card_tab(self) -> QtWidgets.QWidget:
-        """Basic mode: SD Card tab with station manager, track list, capacity, and sync."""
-        _shell_path = str(resource_path("radio_shell_full_sd_card_background.png"))
-        widget = RadioShellWidget(_shell_path, fallback_color="#f2ede4")
-        widget.setStyleSheet(self._SD_CARD_QSS)
+        """Basic mode: SD Card tab with station manager, track list, capacity, and sync.
+
+        The entire window already paints the radio shell as its background (see
+        ``_build_tabs``). This tab simply lays out controls with a transparent
+        background so the shell shows through.
+        """
+        widget = QtWidgets.QWidget()
+        widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        widget.setStyleSheet("QWidget { background: transparent; }")
         layout = QtWidgets.QVBoxLayout(widget)
-        layout.setContentsMargins(28, 20, 28, 16)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         warn_row = QtWidgets.QHBoxLayout()
         self._basic_sd_sync_warning = QtWidgets.QLabel()
@@ -5637,10 +5715,10 @@ class MainWindow(QtWidgets.QMainWindow):
         station_layout.setContentsMargins(0, 0, 0, 0)
 
         station_heading = QtWidgets.QHBoxLayout()
-        stations_label = QtWidgets.QLabel("  Stations")
+        stations_label = QtWidgets.QLabel("Stations")
         stations_label.setStyleSheet(
-            "font-weight: bold; color: #f5e6c8; background-color: #3D2200;"
-            " border-radius: 6px 6px 0 0; padding: 5px 8px;"
+            "font-weight: bold; font-size: 14px; color: #4a3520; background: transparent;"
+            " padding: 2px 4px;"
         )
         stations_label.setToolTip(
             "Drag stations to reorder. Each station maps to a numbered folder on the SD card. "
@@ -5711,12 +5789,14 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
 
-        # ── Sync buttons — dark wood strip styling matching wood_sync_control_bay.png ──
+        # ── Sync controls — sit on the dark wood strip baked into the radio shell ──
+        # The shell PNG already shows a dark wood bay at the bottom of the window;
+        # these controls overlay that area with cream button styling that reads on wood.
         sync_group = QtWidgets.QGroupBox("Sync")
         sync_group.setStyleSheet("""
             QGroupBox {
-                background-color: #3D2200;
-                border: 2px solid #8B6914;
+                background: transparent;
+                border: 1px solid rgba(255, 230, 200, 0.45);
                 border-radius: 10px;
                 margin-top: 10px;
                 padding-top: 6px;
@@ -5725,8 +5805,10 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 10px;
+                left: 12px;
                 color: #f5e6c8;
+                background: transparent;
+                padding: 0 4px;
             }
             QPushButton {
                 background: #f5e6c8;
