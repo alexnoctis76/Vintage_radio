@@ -33,7 +33,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Experimental: SD image (clean install)")
         self.setModal(True)
-        self.resize(520, 420)
+        self.resize(520, 260)
 
         self._sd_root = sd_root
         self._disk_number: Optional[int] = None
@@ -41,44 +41,27 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
 
-        warn = QtWidgets.QLabel(
-            "This will erase the entire target SD card / USB drive and replace it with a fresh "
-            "FAT32 image built from your library. All other data on that disk will be destroyed.\n\n"
-            + (
-                "The write goes only to the disk identifier you pick below. On macOS, only external "
-                "physical disks from diskutil are listed — still verify size and volume names match "
-                "your SD card."
-                if sys.platform == "darwin"
-                else "The write goes only to the PhysicalDrive number you pick below. The list hides typical "
-                "internal fixed disks (NVMe/SATA), but USB covers external drives too — confirm the size "
-                "and volume labels match your SD card before you continue."
-            )
+        intro = QtWidgets.QLabel(
+            "Faster than a normal sync — builds a fresh FAT32 image from your library and writes it "
+            "to the target disk. The selected disk will be erased."
         )
-        warn.setWordWrap(True)
-        warn.setStyleSheet("font-weight: bold; color: #a33;")
-        layout.addWidget(warn)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
 
         self._admin_label = QtWidgets.QLabel()
         self._admin_label.setWordWrap(True)
+        self._admin_label.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(self._admin_label)
 
-        src = QtWidgets.QLabel(
-            f"Selected SD path (used to pick the default disk and for 'use existing' mode):\n{sd_root}\n\n"
-            "When preparing for an image, tracks are copied to a temporary folder on this PC "
-            "(not onto the SD card), then a single .img is built and flashed."
-        )
-        src.setWordWrap(True)
-        layout.addWidget(src)
-
         self._prepare_on_pc_cb = QtWidgets.QCheckBox(
-            "Prepare library on this PC (recommended): clean output to a temp folder, then build image"
+            "Prepare library on this PC (recommended)"
         )
         self._prepare_on_pc_cb.setChecked(True)
         layout.addWidget(self._prepare_on_pc_cb)
 
         self._last_img_path = app_data_dir() / "sd_image_cache" / LAST_CACHED_SD_IMAGE_FILENAME
         self._flash_last_cb = QtWidgets.QCheckBox(
-            "Flash only (reuse last built disk image — skips prepare and build; faster for testing)"
+            "Flash only (reuse last built image — faster for testing)"
         )
         self._flash_last_cb.setToolTip(
             f"If a previous run succeeded in building an image, it is kept at:\n{self._last_img_path}"
@@ -88,7 +71,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         layout.addWidget(self._flash_last_cb)
 
         disk_title = (
-            "Target physical disk (macOS — external):" if sys.platform == "darwin" else "Target physical disk (Windows):"
+            "Target disk:" if sys.platform == "darwin" else "Target disk (Windows):"
         )
         layout.addWidget(QtWidgets.QLabel(disk_title))
         self._disk_combo = QtWidgets.QComboBox()
@@ -96,26 +79,6 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         layout.addWidget(self._disk_combo)
 
         self._populate_disks(default_disk_number, default_darwin_bsd_disk)
-
-        if sys.platform == "darwin":
-            hint_txt = (
-                "Disks come from `diskutil list external physical`. Confirm the capacity and "
-                "volume names match your SD reader before continuing.\n\n"
-                "Uncheck 'Prepare library on this PC' only if this folder already has a full DFPlayer sync; "
-                "then no track copy runs and the image is built from that folder alone."
-            )
-        else:
-            hint_txt = (
-                "Only USB and MMC (SD slot) disks are listed; internal NVMe/SATA system drives are filtered "
-                "out. Drive letters and volume labels shown are what Windows reports for each disk — use them "
-                "to confirm you are not selecting a USB hard drive or the wrong stick.\n\n"
-                "Uncheck 'Prepare library on this PC' only if this folder already has a full DFPlayer sync; "
-                "then no track copy runs and the image is built from that folder alone."
-            )
-        hint = QtWidgets.QLabel(hint_txt)
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray; font-size: 11px;")
-        layout.addWidget(hint)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -155,8 +118,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
                 self._admin_label.hide()
             else:
                 self._admin_label.setText(
-                    "The final write step will ask for your macOS password or Touch ID so the app can "
-                    "write to the raw SD device."
+                    "Writing requires your macOS password or Touch ID."
                 )
                 self._admin_label.show()
         elif is_windows_admin():
@@ -164,8 +126,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
             self._admin_label.hide()
         else:
             self._admin_label.setText(
-                "The final write step uses a Windows security prompt (UAC). If that fails, you can "
-                "right-click Vintage Radio → Run as administrator and try again."
+                "Writing requires Windows administrator (UAC) approval."
             )
             self._admin_label.show()
 

@@ -3616,17 +3616,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _rebuild_tabs(self) -> None:
         """Tear down the current tab widget and rebuild for the active view mode."""
-        self._capture_serial_debug_session_for_rebuild()
-        old_central = self.centralWidget()
-        self._device_debug_widget = None
-        self._sd_card_tab_enter_refresh_done = False
-        self._build_tabs()
-        if old_central is not None:
-            old_central.deleteLater()
-        if self.devices_view_mode == "legacy":
-            self._refresh_all()
-        elif self.devices_view_mode in ("basic", "advanced"):
-            QtCore.QTimer.singleShot(200, self._apply_serial_debug_restore)
+        # Guard install/setup slots so wiring signals during tab rebuild can't fire an
+        # install action. Switching from Basic to Advanced previously triggered an
+        # accidental "Install to Pico (Basic Mode)" progress dialog because rebuilding
+        # the firmware-version widget could synthesise a clicked() while we connected
+        # the install button. The guard is checked at the top of every install slot.
+        self._rebuilding_tabs = True
+        try:
+            self._capture_serial_debug_session_for_rebuild()
+            old_central = self.centralWidget()
+            # Drop the previous Advanced Tools window (and the debug widget it owned)
+            # so the rebuilt tab can construct a fresh one tied to the new widgets.
+            old_advanced_tools = getattr(self, "_advanced_tools_dialog", None)
+            if old_advanced_tools is not None:
+                try:
+                    old_advanced_tools.close()
+                except Exception:
+                    pass
+                self._advanced_tools_dialog = None
+            self._device_debug_widget = None
+            self._sd_card_tab_enter_refresh_done = False
+            self._build_tabs()
+            if old_central is not None:
+                old_central.deleteLater()
+            if self.devices_view_mode == "legacy":
+                self._refresh_all()
+            elif self.devices_view_mode in ("basic", "advanced"):
+                QtCore.QTimer.singleShot(200, self._apply_serial_debug_restore)
+        finally:
+            # Defer flag clear by one event-loop tick so any queued click() emitted
+            # during widget setup is processed (and gated) before normal use resumes.
+            QtCore.QTimer.singleShot(0, lambda: setattr(self, "_rebuilding_tabs", False))
 
     # ── Library switcher toolbar ──────────────────────────────
 
@@ -3812,8 +3832,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # QLabel destroyed when switching from advanced — clear stale refs.
             if not _qt_widget_alive(getattr(self, "sd_root_label", None)):
                 self.sd_root_label = None
-            tabs.addTab(self._build_basic_mcu_tab(), "Microprocessor")
-            tabs.addTab(self._build_basic_sd_card_tab(), "SD Card")
+            # New order: Load Music (SD Card) is shown first (index 0), then Install Firmware.
+            tabs.addTab(self._build_basic_sd_card_tab(), "Load Music")
+            tabs.addTab(self._build_basic_mcu_tab(), "Install Firmware")
             self._device_debug_tab_index = -1
         else:
             tabs.addTab(self._build_library_tab(), "Library")
@@ -3849,476 +3870,184 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_debug_tab_layout = layout
         return container
 
-    def _append_basic_mcu_cheatsheet(self, fw_layout: QtWidgets.QVBoxLayout) -> None:
-        # Collapsible reference: low-saturation grays (section / gesture / action differ by value).
-        btn_cheatsheet_toggle = QtWidgets.QPushButton()
-        btn_cheatsheet_toggle.setFlat(True)
-        btn_cheatsheet_toggle.setCursor(
-            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        )
-        btn_cheatsheet_toggle.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        btn_cheatsheet_toggle.setStyleSheet(
-            "QPushButton { text-align: left; font-weight: bold; font-size: 14px; "
-            "margin-top: 10px; padding: 6px 4px; border: none; background: transparent; }"
-            "QPushButton:hover { background: rgba(128, 128, 128, 0.12); border-radius: 4px; }"
-        )
-        _cheatsheet_expanded = True
-        
-        def _toggle_basic_button_cheatsheet() -> None:
-            nonlocal _cheatsheet_expanded
-            _cheatsheet_expanded = not _cheatsheet_expanded
-            btn_cheatsheet_table.setVisible(_cheatsheet_expanded)
-            arrow = "\u25bc " if _cheatsheet_expanded else "\u25b6 "
-            btn_cheatsheet_toggle.setText(arrow + "Button presses")
-        
-        btn_cheatsheet_toggle.clicked.connect(_toggle_basic_button_cheatsheet)
-        btn_cheatsheet_toggle.setText("\u25bc Button presses")
-        btn_cheatsheet_toggle.setToolTip("Show or hide the on-device button reference.")
-        show_button_cheatsheet = not self._uses_custom_software()
-        if show_button_cheatsheet:
-            fw_layout.addWidget(btn_cheatsheet_toggle)
-        
-        # Table cheatsheet: shades of black (tiny lightness steps only).
-        _cs_header_bg = QColor(38, 38, 40)
-        _cs_header_fg = QColor(240, 240, 242)
-        _cs_label_bg = QColor(22, 22, 24)
-        _cs_label_fg = QColor(190, 190, 194)
-        _cs_action_bg = QColor(30, 30, 32)
-        _cs_action_fg = QColor(208, 208, 212)
-        
-        btn_cheatsheet_table = QtWidgets.QTableWidget()
-        btn_cheatsheet_table.setObjectName("basicButtonCheatsheetTable")
-        btn_cheatsheet_table.setColumnCount(2)
-        btn_cheatsheet_table.verticalHeader().setVisible(False)
-        btn_cheatsheet_table.horizontalHeader().setVisible(False)
-        btn_cheatsheet_table.setShowGrid(True)
-        btn_cheatsheet_table.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
-        )
-        btn_cheatsheet_table.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        btn_cheatsheet_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        # Vertical Minimum makes Qt give a short viewport → pointless scrollbar. We
-        # size exactly to rows + turn scroll bars off so the cheatsheet never scrolls.
-        btn_cheatsheet_table.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        btn_cheatsheet_table.setVerticalScrollBarPolicy(
-            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        btn_cheatsheet_table.setHorizontalScrollBarPolicy(
-            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        btn_cheatsheet_table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
-        )
-        btn_cheatsheet_table.horizontalHeader().setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeMode.Stretch
-        )
-        btn_cheatsheet_table.setStyleSheet(
-            "QTableWidget#basicButtonCheatsheetTable { "
-            "gridline-color: #2a2a2c; border: 1px solid #2a2a2c; "
-            "background-color: #141416; border-radius: 4px; }"
-            "QTableWidget#basicButtonCheatsheetTable::item { padding: 8px; }"
-        )
-        
-        def _cs_header_row(title: str) -> None:
-            r = btn_cheatsheet_table.rowCount()
-            btn_cheatsheet_table.insertRow(r)
-            it = QtWidgets.QTableWidgetItem(title)
-            it.setBackground(QBrush(_cs_header_bg))
-            it.setForeground(QBrush(_cs_header_fg))
-            _hf = QFont(it.font())
-            _hf.setBold(True)
-            it.setFont(_hf)
-            it.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            btn_cheatsheet_table.setItem(r, 0, it)
-            btn_cheatsheet_table.setSpan(r, 0, 1, 2)
-        
-        def _cs_data_row(gesture: str, desc_plain: str) -> None:
-            r = btn_cheatsheet_table.rowCount()
-            btn_cheatsheet_table.insertRow(r)
-            left = QtWidgets.QTableWidgetItem(gesture)
-            left.setBackground(QBrush(_cs_label_bg))
-            left.setForeground(QBrush(_cs_label_fg))
-            lf = QFont(left.font())
-            lf.setWeight(QFont.Weight.DemiBold)
-            left.setFont(lf)
-            left.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            btn_cheatsheet_table.setItem(r, 0, left)
-            right = QtWidgets.QTableWidgetItem(desc_plain)
-            right.setBackground(QBrush(_cs_action_bg))
-            right.setForeground(QBrush(_cs_action_fg))
-            right.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            right.setTextAlignment(
-                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
-            )
-            btn_cheatsheet_table.setItem(r, 1, right)
-        
-        def _cs_data_row_html(gesture: str, desc_html: str) -> None:
-            r = btn_cheatsheet_table.rowCount()
-            btn_cheatsheet_table.insertRow(r)
-            left = QtWidgets.QTableWidgetItem(gesture)
-            left.setBackground(QBrush(_cs_label_bg))
-            left.setForeground(QBrush(_cs_label_fg))
-            lf = QFont(left.font())
-            lf.setWeight(QFont.Weight.DemiBold)
-            left.setFont(lf)
-            left.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            btn_cheatsheet_table.setItem(r, 0, left)
-            # Cell widget + flat QLabel: a bare QLabel in a table cell often picks up a
-            # sunken/frame border on macOS; wrapper + WA_StyledBackground + NoFrame fixes it.
-            cell_wrap = QtWidgets.QWidget()
-            cell_wrap.setObjectName("basicButtonCheatsheetCell")
-            cell_wrap.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
-            cell_wrap.setAutoFillBackground(True)
-            _cw_pal = cell_wrap.palette()
-            _cw_pal.setColor(QtGui.QPalette.ColorRole.Window, _cs_action_bg)
-            cell_wrap.setPalette(_cw_pal)
-            cell_lay = QtWidgets.QVBoxLayout(cell_wrap)
-            cell_lay.setContentsMargins(0, 0, 0, 0)
-            cell_lay.setSpacing(0)
-            desc_lbl = QtWidgets.QLabel()
-            desc_lbl.setObjectName("basicButtonCheatsheetRich")
-            desc_lbl.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-            desc_lbl.setLineWidth(0)
-            desc_lbl.setMidLineWidth(0)
-            desc_lbl.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
-            desc_lbl.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-            desc_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
-            desc_lbl.setText(desc_html)
-            desc_lbl.setWordWrap(True)
-            desc_lbl.setAlignment(
-                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop
-            )
-            desc_lbl.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.MinimumExpanding,
-            )
-            _ag = _cs_action_bg.name()
-            _afg = _cs_action_fg.name()
-            desc_lbl.setStyleSheet(
-                f"QLabel#basicButtonCheatsheetRich {{ "
-                f"background-color: {_ag}; color: {_afg}; "
-                "border: none; outline: none; margin: 0px; padding: 8px; }}"
-            )
-            cell_lay.addWidget(desc_lbl, 1)
-            btn_cheatsheet_table.setCellWidget(r, 1, cell_wrap)
-        
-        _cs_header_row("Taps")
-        _cs_data_row("Single", "Next track")
-        _cs_data_row("Double", "Previous track")
-        _cs_data_row(
-            "Triple",
-            "Restart from the beginning: track 1 in station order, or first track "
-            "in the current station track-shuffle pass",
-        )
-        _cs_data_row(
-            "Four",
-            "Previous station (or previous album/playlist when track-shuffling); "
-            "pairs with Hold = next station",
-        )
-        _cs_data_row(
-            "Five",
-            "Jump to the first station and track 1; exits track shuffle if active",
-        )
-        
-        _cs_header_row("Hold (long press, no taps)")
-        _cs_data_row_html(
-            "Hold",
-            "Next station in folder order (also advances station while in track-shuffle mode).",
-        )
-        
-        _cs_header_row("Tap + hold")
-        _cs_data_row(
-            "1 tap + hold",
-            "Exit track shuffle to normal ordered-station mode (no-op if already ordered)",
-        )
-        _cs_data_row("2 taps + hold", "Shuffle tracks in the current station")
-        _cs_data_row(
-            "3 taps + hold",
-            "First station with a fresh track shuffle (stays in shuffle; does not switch to ordered mode)",
-        )
-        
-        btn_cheatsheet_table.verticalHeader().setSectionResizeMode(
-            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
-        )
-        
-        def _refit_basic_button_cheatsheet_height() -> None:
-            t = btn_cheatsheet_table
-            t.resizeRowsToContents()
-            h = 0
-            hh = t.horizontalHeader()
-            if hh.isVisible():
-                h += hh.height()
-            for r in range(t.rowCount()):
-                rh = t.rowHeight(r)
-                if rh <= 0:
-                    rh = t.sizeHintForRow(r)
-                h += max(rh, 1)
-            h += 2 * t.frameWidth() + 4
-            t.setFixedHeight(max(h, 120))
-        
-        _refit_basic_button_cheatsheet_height()
-        QtCore.QTimer.singleShot(0, _refit_basic_button_cheatsheet_height)
-        
-        btn_cheatsheet_table.setToolTip(
-            "Same gestures as firmware (radio_core). A tap is a short press; "
-            "for Tap + hold, do your tap(s), then keep holding until the radio reacts."
-        )
-        if show_button_cheatsheet:
-            fw_layout.addWidget(btn_cheatsheet_table)
-
     def _build_basic_mcu_tab(self) -> QtWidgets.QWidget:
-        """Basic mode: Microprocessor tab with single setup button (left) and debug console (right)."""
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(widget)
+        """Install Firmware tab: centered firmware install card.
 
-        # ── Left panel: single setup button ──
-        left = QtWidgets.QWidget()
-        left.setMinimumWidth(260)
-        left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 8, 0)
-
-        fw_group = QtWidgets.QGroupBox("Device Setup")
-        fw_layout = QtWidgets.QVBoxLayout(fw_group)
-
-        info_label = QtWidgets.QLabel(
-            "Connect your RP2040 Pico via USB, then click the button below.\n"
-            "MicroPython is installed automatically if needed, then Vintage Radio "
-            "Pico firmware and supporting files are copied to the device."
+        The device debug console (Connection / Console / Send Command / Now Playing)
+        is hosted in a separate Advanced Tools window opened from this tab. The card
+        itself shows the device-presence state, an optional Choose Device picker for
+        when multiple RP2040s are attached, the install button, and (in advanced view)
+        a list of firmware versions to install.
+        """
+        _CARD_BG = "white"
+        _BTN_CARD_SS = (
+            "QPushButton {"
+            "  background-color: white;"
+            "  border: 1px solid #e0e0e0;"
+            "  border-radius: 10px;"
+            "  padding: 18px 20px;"
+            "  text-align: center;"
+            "}"
+            "QPushButton:hover { background-color: #f5f5f5; border-color: #bbb; }"
+            "QPushButton:pressed { background-color: #ebebeb; }"
+            "QPushButton:disabled { color: #aaa; background-color: #f9f9f9; }"
         )
-        info_label.setWordWrap(True)
-        info_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
-        info_label.setStyleSheet("padding: 4px;")
-        fw_layout.addWidget(info_label)
 
-        presence_row = QtWidgets.QHBoxLayout()
-        presence_row.addWidget(QtWidgets.QLabel("USB"))
-        self._basic_device_detected_led = QtWidgets.QLabel()
-        self._basic_device_detected_led.setFixedSize(16, 16)
-        self._set_basic_device_presence_indicator(False)
-        presence_row.addWidget(self._basic_device_detected_led)
-        self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
-        self._basic_device_detected_label.setForegroundRole(QtGui.QPalette.ColorRole.Text)
-        presence_row.addWidget(self._basic_device_detected_label)
-        presence_row.addStretch()
-        fw_layout.addLayout(presence_row)
+        widget = QtWidgets.QWidget()
+        widget.setStyleSheet(f"background-color: {_CARD_BG};")
+        outer = QtWidgets.QVBoxLayout(widget)
+        outer.setContentsMargins(36, 32, 36, 32)
+        outer.setSpacing(0)
 
-        fw_layout.addSpacing(8)
-
-        setup_btn = QtWidgets.QPushButton("Setup Device")
-        if self._is_advanced_mode():
-            setup_btn.setToolTip(
-                "Advanced setup. For 'Our software' this flashes advanced app firmware. "
-                "For custom software, it installs MicroPython (if needed) and copies your selected files."
-            )
-            setup_btn.clicked.connect(self._on_setup_advanced_device_clicked)
-        else:
-            setup_btn.setToolTip(
-                "One-click setup: installs MicroPython if needed, then copies Vintage Radio "
-                "basic-mode firmware, pin configuration, and the AM overlay sound file to the Pico."
-            )
-            setup_btn.clicked.connect(self._on_setup_basic_device_clicked)
-        setup_btn.setStyleSheet("font-weight: bold; padding: 10px; font-size: 14px;")
-        fw_layout.addWidget(setup_btn)
-
-        if self._is_advanced_mode():
-            source_label = QtWidgets.QLabel("Software source")
-            source_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-            fw_layout.addWidget(source_label)
-            self._advanced_software_source_combo = QtWidgets.QComboBox()
-            self._advanced_software_source_combo.addItem("Our software (recommended)", "our")
-            self._advanced_software_source_combo.addItem("Custom software (local files/folder)", "custom")
-            src_setting = self._software_source_for_sync()
-            self._advanced_software_source_combo.setCurrentIndex(1 if src_setting == "custom" else 0)
-            self._advanced_software_source_combo.currentIndexChanged.connect(self._on_advanced_software_source_changed)
-            fw_layout.addWidget(self._advanced_software_source_combo)
-
-            profile_row = QtWidgets.QWidget()
-            profile_layout = QtWidgets.QHBoxLayout(profile_row)
-            profile_layout.setContentsMargins(0, 0, 0, 0)
-            profile_layout.addWidget(QtWidgets.QLabel("Saved custom sources"))
-            self._advanced_custom_profile_combo = QtWidgets.QComboBox()
-            self._advanced_custom_profile_combo.blockSignals(True)
-            profiles = self._advanced_custom_profiles_ensure()
-            active_i = self._advanced_active_profile_index()
-            if profiles and active_i >= len(profiles):
-                active_i = max(0, len(profiles) - 1)
-                self._advanced_set_active_profile_index(active_i)
-            for p in profiles:
-                self._advanced_custom_profile_combo.addItem(p.get("name") or "Unnamed")
-            if self._advanced_custom_profile_combo.count() > 0:
-                self._advanced_custom_profile_combo.setCurrentIndex(
-                    min(active_i, self._advanced_custom_profile_combo.count() - 1)
-                )
-            self._advanced_custom_profile_combo.blockSignals(False)
-            profile_layout.addWidget(self._advanced_custom_profile_combo, 1)
-            add_src_btn = QtWidgets.QPushButton("Add Software Source")
-            add_src_btn.setToolTip("Pick a folder, then name it. It appears in the list for install and notes.")
-            add_src_btn.clicked.connect(self._on_advanced_add_software_source)
-            rem_src_btn = QtWidgets.QPushButton("Remove")
-            rem_src_btn.setToolTip("Remove the selected saved source from this library.")
-            rem_src_btn.clicked.connect(self._on_advanced_remove_custom_source)
-            profile_layout.addWidget(add_src_btn)
-            profile_layout.addWidget(rem_src_btn)
-            fw_layout.addWidget(profile_row)
-            profile_row.setVisible(self._uses_custom_software())
-
-            notes_above_eq = QtWidgets.QLabel("Notes / description (above DFPlayer EQ)")
-            notes_above_eq.setStyleSheet("font-weight: bold; margin-top: 10px;")
-            fw_layout.addWidget(notes_above_eq)
-            self._advanced_mcu_notes_edit = QtWidgets.QTextEdit()
-            self._advanced_mcu_notes_edit.setMinimumHeight(72)
-            self._advanced_mcu_notes_edit.setMaximumHeight(160)
-            fw_layout.addWidget(self._advanced_mcu_notes_edit)
-
-            eq_label = QtWidgets.QLabel("DFPlayer EQ (our software only)")
-            eq_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-            fw_layout.addWidget(eq_label)
-            self._advanced_dfplayer_eq_combo = QtWidgets.QComboBox()
-            for lbl, data in (
-                ("Normal", "normal"),
-                ("Pop", "pop"),
-                ("Rock", "rock"),
-                ("Jazz", "jazz"),
-                ("Classic", "classic"),
-                ("Bass", "bass"),
-            ):
-                self._advanced_dfplayer_eq_combo.addItem(lbl, data)
-            eq_current = self._selected_dfplayer_eq()
-            for idx in range(self._advanced_dfplayer_eq_combo.count()):
-                if self._advanced_dfplayer_eq_combo.itemData(idx) == eq_current:
-                    self._advanced_dfplayer_eq_combo.setCurrentIndex(idx)
-                    break
-            self._advanced_dfplayer_eq_combo.currentIndexChanged.connect(self._on_advanced_dfplayer_eq_changed)
-            fw_layout.addWidget(self._advanced_dfplayer_eq_combo)
-
-            btn_doc_label = QtWidgets.QLabel("Button presses (editable table, saved per library or source)")
-            btn_doc_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-            btn_doc_label.setToolTip(
-                "Each row has a row-action control on the left (green highlight on hover). "
-                "Click it for insert/delete and section options, or right-click gesture/action cells."
-            )
-            fw_layout.addWidget(btn_doc_label)
-            self._advanced_mcu_buttons_scroll = QtWidgets.QScrollArea()
-            self._advanced_mcu_buttons_scroll.setObjectName("advancedMcuButtonsScroll")
-            self._advanced_mcu_buttons_scroll.setWidgetResizable(False)
-            self._advanced_mcu_buttons_scroll.setHorizontalScrollBarPolicy(
-                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-            )
-            self._advanced_mcu_buttons_scroll.setVerticalScrollBarPolicy(
-                QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            )
-            self._advanced_mcu_buttons_scroll.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-            self._advanced_mcu_buttons_scroll.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Fixed,
-            )
-            self._advanced_mcu_buttons_scroll.setStyleSheet(
-                "QScrollArea#advancedMcuButtonsScroll { border: 1px solid #2a2a2c; border-radius: 4px; "
-                "background-color: #0e0e10; }"
-                "QScrollBar:vertical { min-width: 16px; background: #1a1a1c; margin: 2px; border-radius: 4px; }"
-                "QScrollBar::handle:vertical { min-height: 36px; background: #4a4a52; border-radius: 7px; }"
-                "QScrollBar::handle:vertical:hover { background: #4CAF50; }"
-                "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
-            )
-            self._advanced_mcu_buttons_table = QtWidgets.QTableWidget(0, 3)
-            self._advanced_mcu_buttons_table.setObjectName("advancedMcuButtonsTable")
-            self._advanced_mcu_buttons_table.setHorizontalHeaderLabels(
-                ["", "Gesture / control", "Action"]
-            )
-            self._advanced_mcu_buttons_table.verticalHeader().setVisible(False)
-            _mcu_hh = self._advanced_mcu_buttons_table.horizontalHeader()
-            _mcu_hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
-            _mcu_hh.resizeSection(0, _ADV_MCU_JUNCTION_W)
-            _mcu_hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
-            _mcu_hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
-            _mcu_hh.resizeSection(1, 200)
-            self._advanced_mcu_buttons_table.setSelectionMode(
-                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
-            )
-            self._advanced_mcu_buttons_table.setEditTriggers(
-                QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
-                | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
-                | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
-            )
-            self._advanced_mcu_buttons_table.setVerticalScrollBarPolicy(
-                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-            )
-            self._advanced_mcu_buttons_table.setHorizontalScrollBarPolicy(
-                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-            )
-            self._advanced_mcu_buttons_table.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Fixed,
-            )
-            self._advanced_mcu_buttons_table.setStyleSheet(
-                "QTableWidget#advancedMcuButtonsTable { "
-                "gridline-color: #2a2a2c; border: none; "
-                "background-color: #141416; }"
-                "QTableWidget#advancedMcuButtonsTable::item { padding: 6px; color: #e8e8ea; }"
-                "QHeaderView::section { background-color: #262628; color: #f0f0f2; padding: 6px; "
-                "border: 1px solid #2a2a2c; font-weight: bold; }"
-            )
-            self._advanced_mcu_buttons_table.setContextMenuPolicy(
-                QtCore.Qt.ContextMenuPolicy.CustomContextMenu
-            )
-            self._advanced_mcu_buttons_table.customContextMenuRequested.connect(
-                self._on_advanced_mcu_buttons_table_context_menu
-            )
-            self._advanced_mcu_buttons_table.setMouseTracking(True)
-            self._advanced_mcu_buttons_table.viewport().setMouseTracking(True)
-            self._advanced_mcu_buttons_scroll.setWidget(self._advanced_mcu_buttons_table)
-            self._advanced_mcu_layout_filter = _AdvancedMcuTableLayoutFilter(self)
-            self._advanced_mcu_buttons_scroll.viewport().installEventFilter(self._advanced_mcu_layout_filter)
-            self._advanced_mcu_buttons_scroll.installEventFilter(self._advanced_mcu_layout_filter)
-            self._advanced_mcu_buttons_table.cellEntered.connect(self._advanced_mcu_on_cell_entered)
-            fw_layout.addWidget(self._advanced_mcu_buttons_scroll)
-            self._advanced_mcu_install_outside_selection_filters(fw_group)
-
-            self._advanced_custom_profile_combo.currentIndexChanged.connect(
-                self._on_advanced_custom_profile_changed
-            )
-            self._load_advanced_mcu_profile_into_ui()
-            self._advanced_mcu_notes_edit.textChanged.connect(self._schedule_flush_advanced_mcu_fields)
-            self._advanced_mcu_buttons_table.itemChanged.connect(
-                self._on_advanced_mcu_button_table_item_changed
-            )
-            QtCore.QTimer.singleShot(0, self._advanced_refit_mcu_button_table_height)
-            if self._uses_custom_software() and self._advanced_custom_profile_combo.count() > 0:
-                self._advanced_profile_combo_last_idx = self._advanced_custom_profile_combo.currentIndex()
-            else:
-                self._advanced_profile_combo_last_idx = -1
-
-        if not self._is_advanced_mode():
-            self._append_basic_mcu_cheatsheet(fw_layout)
-
-        fw_layout.addStretch()
-        left_layout.addWidget(fw_group)
-
-        # ── Right panel: streamlined debug console ──
-        right = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right)
-        right_layout.setContentsMargins(8, 0, 0, 0)
-
-        debug_group = QtWidgets.QGroupBox("Device Console")
-        debug_layout = QtWidgets.QVBoxLayout(debug_group)
-        self._basic_debug_container = debug_group
-        self._basic_debug_layout = debug_layout
+        # Always create the underlying debug widget so existing references and the
+        # device_presence_changed signal keep working. Park it on a hidden parent
+        # until Advanced Tools opens — that dialog will re-parent it into its layout.
+        self._basic_debug_widget_host = QtWidgets.QWidget()
+        self._basic_debug_widget_host.setVisible(False)
+        host_layout = QtWidgets.QVBoxLayout(self._basic_debug_widget_host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
         self._basic_debug_widget = DeviceDebugWidget(
             basic_mode=True,
             db=self.db,
             db_getter=lambda: self.db,
         )
+        host_layout.addWidget(self._basic_debug_widget)
         self._basic_debug_widget.device_presence_changed.connect(
             self._set_basic_device_presence_indicator
         )
-        debug_layout.addWidget(self._basic_debug_widget)
-        right_layout.addWidget(debug_group)
+        # Keep references for compatibility with the old layout-based access patterns.
+        self._basic_debug_container = self._basic_debug_widget_host
+        self._basic_debug_layout = host_layout
 
+        # ── Content column — max width so it doesn't stretch across 4K monitors ──
+        content_row = QtWidgets.QHBoxLayout()
+        content_col = QtWidgets.QWidget()
+        content_col.setStyleSheet(f"background-color: {_CARD_BG};")
+        content_col.setMaximumWidth(680)
+        col_layout = QtWidgets.QVBoxLayout(content_col)
+        col_layout.setContentsMargins(0, 0, 0, 0)
+        col_layout.setSpacing(0)
+        content_row.addWidget(content_col, 1)
+
+        # ── Title and subtitle ──
+        self._basic_device_title_label = QtWidgets.QLabel("Waiting for device...")
+        self._basic_device_title_label.setStyleSheet(
+            f"background-color: {_CARD_BG}; font-size: 22px; font-weight: bold; color: #1a1a1a;"
+        )
+        col_layout.addWidget(self._basic_device_title_label)
+        col_layout.addSpacing(6)
+
+        self._basic_device_subtitle_label = QtWidgets.QLabel(
+            "Plug your Vintage Radio device into a USB port to begin."
+        )
+        self._basic_device_subtitle_label.setWordWrap(True)
+        self._basic_device_subtitle_label.setStyleSheet(
+            f"background-color: {_CARD_BG}; font-size: 13px; color: #6b6560;"
+        )
+        col_layout.addWidget(self._basic_device_subtitle_label)
+        col_layout.addSpacing(20)
+
+        # ── USB LED row ──
+        led_row = QtWidgets.QHBoxLayout()
+        usb_lbl = QtWidgets.QLabel("USB")
+        usb_lbl.setStyleSheet(f"background-color: {_CARD_BG}; color: #555; font-size: 13px;")
+        led_row.addWidget(usb_lbl)
+        led_row.addSpacing(6)
+        self._basic_device_detected_led = QtWidgets.QLabel()
+        self._basic_device_detected_led.setFixedSize(14, 14)
+        led_row.addWidget(self._basic_device_detected_led)
+        led_row.addSpacing(6)
+        self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
+        self._basic_device_detected_label.setStyleSheet(
+            f"background-color: {_CARD_BG}; font-size: 13px;"
+        )
+        led_row.addWidget(self._basic_device_detected_label)
+        led_row.addStretch(1)
+        col_layout.addLayout(led_row)
+        col_layout.addSpacing(24)
+
+        # ── Advanced-mode firmware version selector ──
+        if self._is_advanced_mode():
+            self._fw_section_header_label = QtWidgets.QLabel("Choose firmware to install")
+            self._fw_section_header_label.setStyleSheet(
+                "font-weight: bold; font-size: 13px; color: #333;"
+            )
+            col_layout.addWidget(self._fw_section_header_label)
+            col_layout.addSpacing(8)
+            self._advanced_firmware_list_widget = self._build_advanced_firmware_list_widget()
+            col_layout.addWidget(self._advanced_firmware_list_widget)
+            browse_row = QtWidgets.QHBoxLayout()
+            browse_row.addStretch(1)
+            browse_btn = QtWidgets.QPushButton("Browse local file...")
+            browse_btn.setStyleSheet(f"background-color: {_CARD_BG};")
+            browse_btn.setToolTip(
+                "Select a .uf2 or MicroPython (.py/.mpy) file. .uf2 files install "
+                "directly without a MicroPython prompt. The selection is saved to your "
+                "custom firmware list."
+            )
+            browse_btn.clicked.connect(self._on_browse_custom_firmware_local)
+            browse_row.addWidget(browse_btn)
+            col_layout.addLayout(browse_row)
+            col_layout.addSpacing(12)
+
+        # ── Choose Device button (basic: only if >1 RP2040; advanced: always) ──
+        self._basic_choose_device_btn = QtWidgets.QPushButton("Choose Device")
+        self._basic_choose_device_btn.setStyleSheet(f"background-color: {_CARD_BG};")
+        self._basic_choose_device_btn.setToolTip(
+            "Pick a specific RP2040 serial port when more than one is connected."
+        )
+        self._basic_choose_device_btn.clicked.connect(self._on_choose_device_clicked)
+        col_layout.addWidget(
+            self._basic_choose_device_btn, alignment=QtCore.Qt.AlignmentFlag.AlignLeft
+        )
+        col_layout.addSpacing(16)
+
+        # ── Install firmware on device — primary card button ──
+        self._basic_install_firmware_btn = QtWidgets.QPushButton("Install firmware on device")
+        self._basic_install_firmware_btn.setStyleSheet(
+            _BTN_CARD_SS
+            + "QPushButton { font-size: 15px; font-weight: bold; color: #2563eb; }"
+            + "QPushButton:disabled { color: #9db5e8; }"
+        )
+        self._basic_install_firmware_btn.setMinimumHeight(64)
+        self._basic_install_firmware_btn.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        )
+        if self._is_advanced_mode():
+            self._basic_install_firmware_btn.setToolTip(
+                "Install the selected firmware. .uf2 files copy to the BOOTSEL drive; "
+                "MicroPython files install MicroPython if needed, then copy the source."
+            )
+            self._basic_install_firmware_btn.clicked.connect(
+                self._on_install_firmware_advanced_clicked
+            )
+        else:
+            self._basic_install_firmware_btn.setToolTip(
+                "One-click install: installs MicroPython if needed, then copies the "
+                "Vintage Radio basic-mode firmware, pin configuration, and AM overlay sound."
+            )
+            self._basic_install_firmware_btn.clicked.connect(self._on_setup_basic_device_clicked)
+        col_layout.addWidget(self._basic_install_firmware_btn)
+        col_layout.addSpacing(10)
+
+        # ── Advanced tools — secondary card button ──
+        advanced_tools_btn = QtWidgets.QPushButton("Advanced tools")
+        advanced_tools_btn.setStyleSheet(_BTN_CARD_SS + "QPushButton { font-size: 14px; }")
+        advanced_tools_btn.setMinimumHeight(56)
+        advanced_tools_btn.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        )
+        advanced_tools_btn.setToolTip(
+            "Open the device console: connect, view serial output, send commands, "
+            "and inspect the currently playing track."
+        )
+        advanced_tools_btn.clicked.connect(self._open_advanced_tools_dialog)
+        col_layout.addWidget(advanced_tools_btn)
+
+        outer.addLayout(content_row)
+        outer.addStretch(1)
+
+        # ── Initial device presence + button enable state ──
         has_usb = SDManager.is_rp2040_bootsel_present()
         try:
             import serial.tools.list_ports as list_ports
@@ -4330,42 +4059,641 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._set_basic_device_presence_indicator(bool(has_usb))
-
-        layout.addWidget(left, 1)
-        layout.addWidget(right, 2)
+        # In basic mode, the Choose Device button only appears when multiple RP2040
+        # ports are detected; in advanced mode it is always shown.
+        self._refresh_basic_choose_device_visibility()
         return widget
 
     def _set_basic_device_presence_indicator(self, detected: bool) -> None:
-        """Green LED when a Pico shows up as serial, console connected, or BOOTSEL (RPI-RP2 drive)."""
+        """Green LED when a Pico shows up as serial, console connected, or BOOTSEL (RPI-RP2 drive).
+
+        Also updates the centered card header ("Waiting for device..." vs device name),
+        enables/disables the install button, and refreshes the Choose Device visibility
+        (basic mode only shows it when more than one RP2040 is connected).
+        """
         led = getattr(self, "_basic_device_detected_led", None)
         lbl = getattr(self, "_basic_device_detected_label", None)
-        if not _qt_widget_alive(led):
+        if _qt_widget_alive(led):
+            if detected:
+                led.setStyleSheet(
+                    "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
+                    "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
+                )
+                led.setToolTip(
+                    "USB: MicroPython serial port, connected Device Console, or unflashed Pico in "
+                    "BOOTSEL mode (RPI-RP2 removable drive)."
+                )
+                if _qt_widget_alive(lbl):
+                    lbl.setText("Device detected")
+                    lbl.setStyleSheet("font-size: 13px; font-weight: bold;")
+            else:
+                led.setStyleSheet(
+                    "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
+                    "border-radius: 7px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
+                )
+                led.setToolTip(
+                    "No Pico detected. Plug in USB, or hold BOOTSEL while plugging in (RPI-RP2 drive)."
+                )
+                if _qt_widget_alive(lbl):
+                    lbl.setText("No serial device detected")
+                    lbl.setStyleSheet("font-size: 13px;")
+
+        title = getattr(self, "_basic_device_title_label", None)
+        subtitle = getattr(self, "_basic_device_subtitle_label", None)
+        if _qt_widget_alive(title) and _qt_widget_alive(subtitle):
+            if detected:
+                title.setText(self._basic_detected_device_name() or "RP2040 device")
+                subtitle.setText("Ready to install firmware on the connected device.")
+            else:
+                title.setText("Waiting for device...")
+                subtitle.setText(
+                    "Plug your Vintage Radio device into a USB port to begin."
+                )
+
+        install_btn = getattr(self, "_basic_install_firmware_btn", None)
+        if _qt_widget_alive(install_btn):
+            install_btn.setEnabled(bool(detected))
+
+        # Update the advanced-mode firmware section header with device context.
+        fw_hdr = getattr(self, "_fw_section_header_label", None)
+        if _qt_widget_alive(fw_hdr):
+            if detected:
+                device_name = self._basic_detected_device_name() or "RP2040 device"
+                fw_hdr.setText(f"Connected to {device_name}")
+            else:
+                fw_hdr.setText("Choose firmware to install")
+
+        # Choose Device visibility depends on the number of RP2040 ports detected.
+        self._refresh_basic_choose_device_visibility()
+
+    def _basic_detected_device_name(self) -> str:
+        """Best-effort human-readable label for the first detected RP2040 USB device."""
+        try:
+            import serial.tools.list_ports as list_ports
+
+            for port_info in list_ports.comports():
+                if not DeviceDebugWidget._is_rp2040_port(port_info):
+                    continue
+                desc = (getattr(port_info, "description", "") or "").strip()
+                product = (getattr(port_info, "product", "") or "").strip()
+                device = getattr(port_info, "device", "") or ""
+                friendly = product or desc or "RP2040 device"
+                if device:
+                    return f"{friendly}  ({device})"
+                return friendly
+        except Exception:
+            pass
+        if SDManager.is_rp2040_bootsel_present():
+            return "RP2040 (BOOTSEL mode)"
+        return "RP2040 device"
+
+    def _refresh_basic_choose_device_visibility(self) -> None:
+        """Show Choose Device only when needed: basic = multiple RP2040s; advanced = always."""
+        btn = getattr(self, "_basic_choose_device_btn", None)
+        if not _qt_widget_alive(btn):
             return
-        if detected:
-            led.setStyleSheet(
-                "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
-                "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
+        if self._is_advanced_mode():
+            btn.setVisible(True)
+            return
+        try:
+            import serial.tools.list_ports as list_ports
+
+            count = sum(
+                1
+                for p in list_ports.comports()
+                if DeviceDebugWidget._is_rp2040_port(p)
             )
-            led.setToolTip(
-                "USB: MicroPython serial port, connected Device Console, or unflashed Pico in "
-                "BOOTSEL mode (RPI-RP2 removable drive)."
+        except Exception:
+            count = 0
+        btn.setVisible(count > 1)
+
+    # ── Advanced Tools window (debug console) ──────────────────────────────
+
+    def _open_advanced_tools_dialog(self) -> None:
+        """Open the non-modal Advanced Tools window hosting the DeviceDebugWidget."""
+        dlg = getattr(self, "_advanced_tools_dialog", None)
+        if not _qt_widget_alive(dlg):
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Advanced tools — Device console")
+            dlg.setModal(False)
+            # Inherit the parent's stylesheet so no dark background leaks in from
+            # any sub-widget; explicit stylesheet resets to the application default.
+            dlg.setStyleSheet("")
+            v = QtWidgets.QVBoxLayout(dlg)
+            v.setContentsMargins(8, 8, 8, 8)
+            # Re-parent the debug widget from its hidden host into this dialog.
+            w = getattr(self, "_basic_debug_widget", None)
+            if _qt_widget_alive(w):
+                w.setParent(dlg)
+                w.setStyleSheet("")
+                v.addWidget(w)
+            close_row = QtWidgets.QHBoxLayout()
+            close_row.addStretch(1)
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(dlg.close)
+            close_row.addWidget(close_btn)
+            v.addLayout(close_row)
+            self._advanced_tools_dialog = dlg
+            # Size to roughly match the parent window and show maximized by default.
+            parent_rect = self.geometry()
+            dlg.resize(max(820, int(parent_rect.width() * 0.8)), max(580, int(parent_rect.height() * 0.8)))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    # ── Choose Device picker ──────────────────────────────
+
+    def _on_choose_device_clicked(self) -> None:
+        """Show a picker of detected RP2040 ports and select it on the debug widget."""
+        try:
+            import serial.tools.list_ports as list_ports
+
+            ports = [
+                p for p in list_ports.comports() if DeviceDebugWidget._is_rp2040_port(p)
+            ]
+        except Exception:
+            ports = []
+        if not ports:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Choose Device",
+                "No RP2040 devices detected. Plug in your Pico and try again.",
             )
-            if _qt_widget_alive(lbl):
-                lbl.setText("Device detected")
-                lbl.setForegroundRole(QtGui.QPalette.ColorRole.Text)
-                lbl.setStyleSheet("font-weight: bold;")
+            return
+        labels: List[str] = []
+        devices: List[str] = []
+        for p in ports:
+            desc = (getattr(p, "description", "") or "").strip()
+            product = (getattr(p, "product", "") or "").strip()
+            dev = getattr(p, "device", "") or "?"
+            friendly = product or desc or "RP2040"
+            labels.append(f"{friendly}  ({dev})")
+            devices.append(str(dev))
+        if len(labels) == 1:
+            chosen, ok = labels[0], True
         else:
-            led.setStyleSheet(
-                "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
-                "border-radius: 7px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
+            chosen, ok = QtWidgets.QInputDialog.getItem(
+                self,
+                "Choose Device",
+                "Select the RP2040 device to use:",
+                labels,
+                0,
+                False,
             )
-            led.setToolTip(
-                "No Pico detected. Plug in USB, or hold BOOTSEL while plugging in (RPI-RP2 drive)."
+        if not ok or not chosen:
+            return
+        try:
+            idx = labels.index(chosen)
+        except ValueError:
+            return
+        port_dev = devices[idx]
+        w = getattr(self, "_basic_debug_widget", None)
+        if _qt_widget_alive(w) and hasattr(w, "port_combo"):
+            self._mcp_select_serial_port(w, port_dev)
+        self.statusBar().showMessage(f"Selected device: {port_dev}", 5000)
+
+    # ── Advanced firmware list ──────────────────────────────
+
+    def _builtin_firmware_entries(self) -> List[Dict[str, Any]]:
+        """Hardcoded built-in firmware entries shown at the top of the Advanced list.
+
+        Each entry has keys: ``id`` (stable), ``name``, ``description``, ``notes``,
+        ``recommended`` (bool), ``available`` (bool — hide placeholders).
+        """
+        return [
+            {
+                "id": "v1.1_stable",
+                "name": "V1.1 - stable release",
+                "description": "Current stable build. Works with all hardware.",
+                "notes": (
+                    "Vintage Radio basic-mode firmware (main_basic.py + radio_core).\n\n"
+                    "Includes DFPlayer playback, AM tuning overlay, and the full gesture set.\n\n"
+                    "Button presses:\n"
+                    "  Single tap       — Next track\n"
+                    "  Double tap       — Previous track\n"
+                    "  Triple tap       — Restart station at track 1\n"
+                    "  Long press       — Next station\n"
+                    "  Tap + hold       — Exit shuffle, return to ordered playback\n"
+                    "  Double tap + hold — Shuffle current station\n"
+                    "  Triple tap + hold — First station + shuffle tracks\n"
+                    "  Four taps        — Previous station\n"
+                    "  Five taps        — First station (exits track shuffle)"
+                ),
+                "recommended": True,
+                "available": True,
+            },
+        ]
+
+    def _selected_firmware_entry_id(self) -> str:
+        return (self.db.get_setting("install_firmware_selected_entry", "") or "").strip()
+
+    def _set_selected_firmware_entry_id(self, entry_id: str) -> None:
+        self.db.set_setting("install_firmware_selected_entry", str(entry_id or ""))
+
+    def _build_advanced_firmware_list_widget(self) -> QtWidgets.QWidget:
+        """Build the radio-button list of firmware versions (built-in + custom)."""
+        container = QtWidgets.QFrame()
+        container.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        container.setStyleSheet(
+            "QFrame { border: 1px solid #d0d0d0; border-radius: 8px; background-color: white; }"
+        )
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(2)
+        self._advanced_firmware_button_group = QtWidgets.QButtonGroup(container)
+        self._advanced_firmware_button_group.setExclusive(True)
+        # Map button → entry dict so install / ellipsis menu can look up the selection.
+        self._advanced_firmware_button_to_entry: Dict[QtWidgets.QAbstractButton, Dict[str, Any]] = {}
+
+        self._populate_advanced_firmware_list(layout)
+        return container
+
+    def _populate_advanced_firmware_list(self, layout: QtWidgets.QVBoxLayout) -> None:
+        """(Re)populate the firmware radio list inside *layout*."""
+        # Clear existing rows.
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._advanced_firmware_button_to_entry.clear()
+        for b in list(self._advanced_firmware_button_group.buttons()):
+            self._advanced_firmware_button_group.removeButton(b)
+
+        selected_id = self._selected_firmware_entry_id()
+        first_button: Optional[QtWidgets.QRadioButton] = None
+        selected_button: Optional[QtWidgets.QRadioButton] = None
+
+        for entry in self._builtin_firmware_entries():
+            if not entry.get("available", True):
+                continue
+            row = self._build_firmware_row(entry, custom=False)
+            layout.addWidget(row)
+            btn = row.findChild(QtWidgets.QRadioButton)
+            if btn is not None:
+                if first_button is None:
+                    first_button = btn
+                if entry.get("id") == selected_id:
+                    selected_button = btn
+
+        custom_entries = self._custom_firmware_entries_load()
+        if custom_entries:
+            sep = QtWidgets.QFrame()
+            sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            sep.setStyleSheet("color: #2a2a2c;")
+            layout.addWidget(sep)
+        for entry in custom_entries:
+            row = self._build_firmware_row(entry, custom=True)
+            layout.addWidget(row)
+            btn = row.findChild(QtWidgets.QRadioButton)
+            if btn is not None:
+                if entry.get("id") == selected_id:
+                    selected_button = btn
+
+        target = selected_button or first_button
+        if target is not None:
+            target.setChecked(True)
+            entry = self._advanced_firmware_button_to_entry.get(target)
+            if entry:
+                self._set_selected_firmware_entry_id(str(entry.get("id", "")))
+
+    def _build_firmware_row(self, entry: Dict[str, Any], *, custom: bool) -> QtWidgets.QWidget:
+        """Build a single row: [○ name + description] [...]."""
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(2, 2, 2, 2)
+        h.setSpacing(6)
+        rb = QtWidgets.QRadioButton()
+        name = str(entry.get("name") or "Firmware")
+        if entry.get("recommended"):
+            label_html = (
+                f"<b>{name}</b> &nbsp;"
+                f"<span style='background-color:#16a34a; color:white; border-radius:4px;"
+                f" padding:1px 6px; font-size:11px; font-weight:bold;'>Recommended</span>"
             )
-            if _qt_widget_alive(lbl):
-                lbl.setText("No serial device detected")
-                lbl.setForegroundRole(QtGui.QPalette.ColorRole.Text)
-                lbl.setStyleSheet("")
+        else:
+            label_html = f"<b>{name}</b>"
+        desc = str(entry.get("description") or "").strip()
+        if desc:
+            label_html += f"<br><span style='color:#777; font-size:11px;'>{desc}</span>"
+        label = QtWidgets.QLabel(label_html)
+        label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        label.setWordWrap(True)
+        rb.toggled.connect(
+            lambda checked, e=entry: checked
+            and self._set_selected_firmware_entry_id(str(e.get("id", "")))
+        )
+        # Clicking the label should also select the radio (improves UX a lot).
+        def _label_click(_event, _rb=rb):
+            _rb.setChecked(True)
+
+        label.mousePressEvent = _label_click  # type: ignore[assignment]
+        h.addWidget(rb)
+        h.addWidget(label, 1)
+        ellipsis = QtWidgets.QToolButton()
+        ellipsis.setText("...")
+        ellipsis.setToolTip("Firmware actions: notes, edit, remove")
+        ellipsis.clicked.connect(
+            lambda _checked=False, e=entry, c=custom, src=ellipsis: self._show_firmware_ellipsis_menu(e, c, src)
+        )
+        h.addWidget(ellipsis)
+        self._advanced_firmware_button_group.addButton(rb)
+        self._advanced_firmware_button_to_entry[rb] = entry
+        return row
+
+    # ── Custom firmware persistence ──────────────────────────────
+
+    def _custom_firmware_entries_load(self) -> List[Dict[str, Any]]:
+        """Load custom firmware entries persisted under ``custom_firmware_entries_json``.
+
+        Each entry: ``{id, name, path, kind: 'uf2'|'micropython', notes}``.
+        """
+        raw = (self.db.get_setting("custom_firmware_entries_json", "") or "").strip()
+        out: List[Dict[str, Any]] = []
+        try:
+            data = json.loads(raw) if raw else []
+        except Exception:
+            data = []
+        if isinstance(data, list):
+            for e in data:
+                if not isinstance(e, dict):
+                    continue
+                kind = str(e.get("kind") or "micropython").strip().lower()
+                if kind not in ("uf2", "micropython"):
+                    kind = "micropython"
+                out.append(
+                    {
+                        "id": str(e.get("id") or e.get("path") or e.get("name") or "custom"),
+                        "name": str(e.get("name") or "Custom firmware"),
+                        "path": str(e.get("path") or ""),
+                        "kind": kind,
+                        "notes": str(e.get("notes") or e.get("description") or ""),
+                        "description": "Local file"
+                        if kind == "uf2"
+                        else "Local MicroPython source",
+                        "custom": True,
+                    }
+                )
+        return out
+
+    def _custom_firmware_entries_save(self, entries: List[Dict[str, Any]]) -> None:
+        serializable = [
+            {
+                "id": str(e.get("id", "")),
+                "name": str(e.get("name", "")),
+                "path": str(e.get("path", "")),
+                "kind": str(e.get("kind", "micropython")),
+                "notes": str(e.get("notes", "")),
+            }
+            for e in entries
+        ]
+        self.db.set_setting("custom_firmware_entries_json", json.dumps(serializable))
+
+    def _on_browse_custom_firmware_local(self) -> None:
+        path_str, _flt = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select firmware file",
+            "",
+            "Firmware files (*.uf2 *.py *.mpy);;UF2 (*.uf2);;MicroPython (*.py *.mpy);;All files (*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if not path.is_file():
+            QtWidgets.QMessageBox.warning(
+                self, "Browse firmware", f"Not a file: {path}"
+            )
+            return
+        ext = path.suffix.lower()
+        if ext not in (".uf2", ".py", ".mpy"):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Browse firmware",
+                "Only .uf2, .py, or .mpy files are accepted.",
+            )
+            return
+        kind = "uf2" if ext == ".uf2" else "micropython"
+        entries = self._custom_firmware_entries_load()
+        new_id = f"custom:{path.resolve()}"
+        # Replace any existing entry with the same path.
+        entries = [e for e in entries if e.get("id") != new_id]
+        entries.append(
+            {
+                "id": new_id,
+                "name": path.name,
+                "path": str(path),
+                "kind": kind,
+                "notes": "",
+            }
+        )
+        self._custom_firmware_entries_save(entries)
+        self._set_selected_firmware_entry_id(new_id)
+        self._rebuild_advanced_firmware_list()
+
+    def _rebuild_advanced_firmware_list(self) -> None:
+        container = getattr(self, "_advanced_firmware_list_widget", None)
+        if not _qt_widget_alive(container):
+            return
+        layout = container.layout()
+        if isinstance(layout, QtWidgets.QVBoxLayout):
+            self._populate_advanced_firmware_list(layout)
+
+    def _show_firmware_ellipsis_menu(
+        self,
+        entry: Dict[str, Any],
+        custom: bool,
+        source_widget: QtWidgets.QWidget,
+    ) -> None:
+        menu = QtWidgets.QMenu(self)
+        act_view = menu.addAction("View notes")
+        act_edit = None
+        act_remove = None
+        if custom:
+            act_edit = menu.addAction("Edit notes")
+            menu.addSeparator()
+            act_remove = menu.addAction("Remove")
+        chosen = menu.exec(source_widget.mapToGlobal(QtCore.QPoint(0, source_widget.height())))
+        if chosen is None:
+            return
+        if chosen == act_view:
+            self._show_firmware_notes_dialog(entry, custom=custom, editable=False)
+        elif act_edit is not None and chosen == act_edit:
+            self._show_firmware_notes_dialog(entry, custom=custom, editable=True)
+        elif act_remove is not None and chosen == act_remove:
+            self._remove_custom_firmware_entry(entry)
+
+    def _show_firmware_notes_dialog(
+        self,
+        entry: Dict[str, Any],
+        *,
+        custom: bool,
+        editable: bool,
+    ) -> None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Notes — {entry.get('name', 'Firmware')}")
+        dlg.setMinimumSize(420, 320)
+        v = QtWidgets.QVBoxLayout(dlg)
+        text = QtWidgets.QTextEdit()
+        text.setPlainText(str(entry.get("notes") or ""))
+        text.setReadOnly(not editable)
+        v.addWidget(text)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        close_btn = QtWidgets.QPushButton("Save" if (custom and editable) else "Close")
+        if custom and not editable:
+            edit_btn = QtWidgets.QPushButton("Edit")
+
+            def _begin_edit() -> None:
+                text.setReadOnly(False)
+                edit_btn.setEnabled(False)
+                close_btn.setText("Save")
+
+            edit_btn.clicked.connect(_begin_edit)
+            btn_row.addWidget(edit_btn)
+
+        def _on_close() -> None:
+            if custom and not text.isReadOnly():
+                entries = self._custom_firmware_entries_load()
+                for e in entries:
+                    if e.get("id") == entry.get("id"):
+                        e["notes"] = text.toPlainText()
+                        break
+                self._custom_firmware_entries_save(entries)
+            dlg.accept()
+
+        close_btn.clicked.connect(_on_close)
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
+        dlg.exec()
+
+    def _remove_custom_firmware_entry(self, entry: Dict[str, Any]) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Remove custom firmware",
+            f"Remove '{entry.get('name', 'this entry')}' from your custom firmware list?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        entries = self._custom_firmware_entries_load()
+        entries = [e for e in entries if e.get("id") != entry.get("id")]
+        self._custom_firmware_entries_save(entries)
+        if self._selected_firmware_entry_id() == str(entry.get("id", "")):
+            self._set_selected_firmware_entry_id("")
+        self._rebuild_advanced_firmware_list()
+
+    def _on_install_firmware_advanced_clicked(self) -> None:
+        """Install the currently selected firmware in the Advanced list."""
+        if getattr(self, "_rebuilding_tabs", False):
+            return
+        group = getattr(self, "_advanced_firmware_button_group", None)
+        if group is None:
+            return
+        checked = group.checkedButton()
+        entry = self._advanced_firmware_button_to_entry.get(checked) if checked else None
+        if not entry:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Install firmware",
+                "Select a firmware version first.",
+            )
+            return
+        entry_id = str(entry.get("id", ""))
+        if entry_id == "v1.1_stable":
+            # Bundled basic firmware path.
+            self._setup_basic_device(
+                install_callback=lambda: self.install_to_pico(basic_mode=True),
+                install_label="basic firmware (V1.1)",
+                require_builtin_firmware=True,
+            )
+            return
+        # Custom entry: install based on file kind.
+        kind = str(entry.get("kind") or "micropython").lower()
+        path_str = str(entry.get("path") or "")
+        if not path_str:
+            QtWidgets.QMessageBox.warning(
+                self, "Install firmware", "This entry has no file path on disk."
+            )
+            return
+        path = Path(path_str)
+        if not path.is_file():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Install firmware",
+                f"File not found: {path}\n\nUse the ellipsis menu to remove or replace it.",
+            )
+            return
+        if kind == "uf2":
+            # .uf2 installs directly to the Pico's BOOTSEL drive — no MicroPython prompt.
+            self._install_custom_uf2_to_pico(path)
+            return
+        # MicroPython source: point the legacy custom-install path setting at the file
+        # and reuse the existing custom-install pipeline.
+        self.db.set_setting("advanced_custom_software_path", str(path))
+        self.install_custom_software_to_pico()
+
+    def _install_custom_uf2_to_pico(self, uf2_path: Path) -> None:
+        """Copy a .uf2 directly to a Pico in BOOTSEL mode (no MicroPython prompt)."""
+        if not self._is_rpi_rp2_present():
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "BOOTSEL required",
+                "No RPI-RP2 drive detected.\n\n"
+                "Hold the BOOTSEL button while plugging in the Pico so it appears as "
+                "a USB drive, then click OK to try again.",
+                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Ok,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Ok:
+                return
+            if not self._is_rpi_rp2_present():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "BOOTSEL required",
+                    "Still no RPI-RP2 drive detected. Aborting install.",
+                )
+                return
+        dest_dir: Optional[Path] = None
+        try:
+            for path, label in SDManager.detect_sd_roots():
+                if label and label.strip().upper() == "RPI-RP2":
+                    dest_dir = Path(path)
+                    break
+        except Exception:
+            dest_dir = None
+        if dest_dir is None and platform.system() == "Darwin":
+            vols = Path("/Volumes")
+            if vols.is_dir():
+                for item in vols.iterdir():
+                    try:
+                        if item.is_dir() and item.name.upper().startswith("RPI-RP2"):
+                            dest_dir = item
+                            break
+                    except OSError:
+                        continue
+        if dest_dir is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Install firmware",
+                "Could not locate the RPI-RP2 drive. Replug the Pico (BOOTSEL held) and retry.",
+            )
+            return
+        dest_file = dest_dir / uf2_path.name
+        try:
+            shutil.copy2(uf2_path, dest_file)
+        except OSError as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Install firmware",
+                f"Could not copy .uf2 to {dest_dir}: {e}",
+            )
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Install firmware",
+            f"Copied {uf2_path.name} to {dest_dir}.\n\nThe Pico should reboot automatically.",
+        )
 
     def _current_max_tracks_per_station(self) -> int:
         if not self._is_advanced_mode():
@@ -4817,10 +5145,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_setup_basic_device_clicked(self) -> None:
         """Qt slot: log first (durable) then run setup — isolates signal vs handler crashes."""
+        if getattr(self, "_rebuilding_tabs", False):
+            # Guard against accidental clicked() emitted while wiring buttons during a
+            # tab rebuild (e.g. switching view mode); see _rebuild_tabs.
+            return
         write_session_line("Setup Device: Qt clicked (before _setup_basic_device)", prefix="SETUP")
         self._setup_basic_device()
 
     def _on_setup_advanced_device_clicked(self) -> None:
+        if getattr(self, "_rebuilding_tabs", False):
+            return
         self._flush_advanced_mcu_notes_and_buttons()
         source = self._software_source_for_sync()
         if source == "custom":
@@ -4994,9 +5328,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 write_session_line("Opening InstallMicroPythonDialog", prefix="SETUP")
                 print("[Setup Basic Device] Opening InstallMicroPythonDialog")
                 dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
-                dlg.exec()
-                self.statusBar().showMessage(f"MicroPython installed. Installing {install_label}...", 8000)
-                QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
+                result = dlg.exec()
+                if result == QtWidgets.QDialog.DialogCode.Accepted:
+                    # User completed MicroPython installation — proceed after the Pico reboots.
+                    self.statusBar().showMessage(
+                        f"MicroPython installed. Installing {install_label}...", 8000
+                    )
+                    QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
+                else:
+                    self.statusBar().showMessage(
+                        "Install MicroPython first, then click Install firmware on device again.",
+                        8000,
+                    )
                 return
 
             if rp_ports:
@@ -5025,12 +5368,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 msg.exec()
                 if msg.clickedButton() == install_btn:
                     dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
-                    dlg.exec()
-                    self.statusBar().showMessage(
-                        f"When MicroPython is running, click Setup Device again to install {install_label}.",
-                        12000,
-                    )
-                    QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
+                    result = dlg.exec()
+                    if result == QtWidgets.QDialog.DialogCode.Accepted:
+                        self.statusBar().showMessage(
+                            f"MicroPython installed. Installing {install_label}...", 8000
+                        )
+                        QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
+                    else:
+                        self.statusBar().showMessage(
+                            "Install MicroPython first, then click Install firmware on device again.",
+                            8000,
+                        )
                 return
 
             write_session_line("No compatible Pico detected (user message)", prefix="SETUP")
@@ -5292,13 +5640,8 @@ class MainWindow(QtWidgets.QMainWindow):
             sync_layout.addWidget(conv_box)
 
         sync_layout.addWidget(sync_btn)
-        exp_img_btn = QtWidgets.QPushButton("Experimental: SD image sync (clean install)…")
-        exp_img_btn.setToolTip(
-            "Build a FAT32 disk image from your stations, then write it to a physical SD card "
-            "(Windows, Administrator; experimental)."
-        )
-        exp_img_btn.clicked.connect(self._on_experimental_sd_disk_image)
-        sync_layout.addWidget(exp_img_btn)
+        # The "Experimental: SD image sync (clean install)" flow is reachable from the
+        # Sync Stations to SD dialog via a checkbox — no standalone button here.
         sync_layout.addWidget(eject_btn)
         sync_layout.addWidget(self._basic_auto_eject_cb)
         sync_layout.addStretch()
@@ -5992,35 +6335,92 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
 
         force_clean = False
-        sync_choice = QtWidgets.QMessageBox(self)
-        sync_choice.setWindowTitle("Sync Stations to SD")
-        sync_choice.setText("How do you want to sync stations to the SD card?")
-        sync_choice.setInformativeText(
-            "Each station is written to its own DFPlayer folder (01, 02, …).\n\n"
-            "Normal sync — copies only new or changed files.\n\n"
-            "Clean install — quick-formats or wipes the SD card, then writes every track fresh.\n\n"
-            "Converted MP3s are saved on this computer (user cache) so later syncs can skip "
-            "re-encoding and finish faster. You can delete that cache when choosing clean install "
-            "if you want a full re-encode from source files."
+        # ── Simplified sync dialog ──────────────────────────────────────────
+        # Show only the two action buttons up front. Detail text is behind a "?" button.
+        sync_dlg = QtWidgets.QDialog(self)
+        sync_dlg.setWindowTitle("Sync Stations to SD")
+        sync_dlg.setMinimumWidth(360)
+        sync_dlg.setWindowFlags(
+            sync_dlg.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint
         )
-        sync_choice.setIcon(QtWidgets.QMessageBox.Icon.Question)
-        btn_normal = sync_choice.addButton(
-            "Normal sync",
-            QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+        _sdv = QtWidgets.QVBoxLayout(sync_dlg)
+        _sdv.setSpacing(12)
+        _sdv.setContentsMargins(20, 20, 20, 16)
+
+        # Title row with "?" info button
+        _title_row = QtWidgets.QHBoxLayout()
+        _title_lbl = QtWidgets.QLabel("<b>How do you want to sync?</b>")
+        _title_row.addWidget(_title_lbl, 1)
+        _info_btn = QtWidgets.QToolButton()
+        _info_btn.setText("?")
+        _info_btn.setToolTip("Click for more information")
+        _info_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        _info_btn.setStyleSheet(
+            "QToolButton { border: 1px solid gray; border-radius: 10px; "
+            "min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px; "
+            "font-weight: bold; }"
         )
-        btn_clean = sync_choice.addButton(
-            "Clean install",
-            QtWidgets.QMessageBox.ButtonRole.ActionRole,
+
+        def _show_sync_info() -> None:
+            QtWidgets.QMessageBox.information(
+                sync_dlg,
+                "Sync options explained",
+                "Sync Changes — copies only new or changed tracks to the SD card. "
+                "Faster for day-to-day use.\n\n"
+                "Full Sync — quick-formats the SD card and writes every track fresh. "
+                "Use this to clean up leftover files or start from scratch.\n\n"
+                "Fast Full Sync — builds a FAT32 disk image and writes it directly to "
+                "the SD card. Fastest clean install, but replaces the entire disk contents.\n\n"
+                "Converted MP3s are cached on this computer so later syncs can skip "
+                "re-encoding. You can clear the cache during a Full Sync if you want a "
+                "full re-encode from your source files.",
+            )
+
+        _info_btn.clicked.connect(_show_sync_info)
+        _title_row.addWidget(_info_btn)
+        _sdv.addLayout(_title_row)
+
+        # Experimental fast-sync checkbox
+        cb_experimental = QtWidgets.QCheckBox("Fast Full Sync (experimental)")
+        cb_experimental.setToolTip(
+            "Build a FAT32 disk image and write it directly to the SD card. "
+            "Faster than a normal full sync but overwrites the entire disk."
         )
-        sync_choice.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-        sync_choice.setDefaultButton(btn_normal)
-        sync_choice.exec()
-        clicked = sync_choice.clickedButton()
-        if clicked is None:
+        _sdv.addWidget(cb_experimental)
+
+        # Button row: Full Sync | Sync Changes | Cancel
+        _btn_row = QtWidgets.QHBoxLayout()
+        _btn_row.addStretch(1)
+        _btn_full = QtWidgets.QPushButton("Full Sync")
+        _btn_full.setToolTip(
+            "Quick-format the SD card and re-copy every track fresh. "
+            "Use to clean up leftover files or start over."
+        )
+        _btn_changes = QtWidgets.QPushButton("Sync Changes")
+        _btn_changes.setToolTip("Copy only new or changed tracks. Fast and non-destructive.")
+        _btn_cancel = QtWidgets.QPushButton("Cancel")
+        _btn_row.addWidget(_btn_full)
+        _btn_row.addWidget(_btn_changes)
+        _btn_row.addWidget(_btn_cancel)
+        _sdv.addLayout(_btn_row)
+
+        _sync_result: List[str] = []
+        _btn_full.clicked.connect(lambda: (_sync_result.append("full"), sync_dlg.accept()))
+        _btn_changes.clicked.connect(lambda: (_sync_result.append("changes"), sync_dlg.accept()))
+        _btn_cancel.clicked.connect(sync_dlg.reject)
+        _btn_changes.setDefault(True)
+
+        if sync_dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
-        if clicked == sync_choice.button(QtWidgets.QMessageBox.StandardButton.Cancel):
+        if not _sync_result:
             return
-        if clicked == btn_clean:
+
+        # If the user chose the experimental fast sync, delegate entirely.
+        if cb_experimental.isChecked():
+            self._on_experimental_sd_disk_image()
+            return
+
+        if _sync_result[0] == "full":
             force_clean = True
             clean_opts = QtWidgets.QMessageBox(self)
             clean_opts.setWindowTitle("Clean install — local cache")
@@ -6629,10 +7029,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ensure_device_debug_widget_loaded()
             self._check_device_tab_sync()
 
-        # Basic mode: SD Card tab (index 1) — full refresh + wait cursor only on first visit
-        # per session (reset on library switch / tab rebuild). Later visits skip to avoid
-        # re-scanning the whole library on every tab click.
-        if self._is_basic_like_mode() and index == 1:
+        # Basic mode: Load Music (SD Card) tab is now index 0 (shown first).
+        # Full refresh + wait cursor only on first visit per session (reset on library
+        # switch / tab rebuild). Later visits skip to avoid re-scanning the whole library.
+        if self._is_basic_like_mode() and index == 0:
             if not getattr(self, "_sd_card_tab_enter_refresh_done", False):
                 self._sd_card_tab_enter_refresh_done = True
                 with self._wait_cursor_scope():
@@ -9071,9 +9471,15 @@ class MainWindow(QtWidgets.QMainWindow):
         print(f"[Setup Device] All connection attempts failed. Output:\n{conn_err}")
         if is_pico and self._is_rpi_rp2_present():
             dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
-            dlg.exec()
-            self.statusBar().showMessage("MicroPython installed. Installing app...", 8000)
-            QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, self._install_to_pico_after_firmware)
+            result = dlg.exec()
+            if result == QtWidgets.QDialog.DialogCode.Accepted:
+                self.statusBar().showMessage("MicroPython installed. Installing app...", 8000)
+                QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, self._install_to_pico_after_firmware)
+            else:
+                self.statusBar().showMessage(
+                    "Install MicroPython first, then click Install firmware on device again.",
+                    8000,
+                )
         else:
             board_name = bp.name if bp else "device"
             msg = (
@@ -9608,6 +10014,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 func=self._install_to_pico_worker,
                 args=(mpremote_cmd, root, self.sd_root, self.sd_manager),
                 kwargs=profile_params,
+                show_byte_detail=False,
             )
 
             def on_success(msg):

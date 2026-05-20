@@ -1077,6 +1077,32 @@ def _sparse_copy_image_to_fd(
     """
     write_limit = cap_bytes if cap_bytes is not None else image_size
     written_from_file = 0
+    # ``bytes_actually_written`` counts only chunks that hit the disk (non-sparse).
+    # ``written_from_file`` is the position within the image, so it advances even when
+    # we skip empty FAT32 free space via ``_seek_disk_fd_cur``.  Reporting the actual
+    # write count to the progress callback keeps the ETA rate (= current / elapsed)
+    # aligned with real disk throughput instead of jumping wildly through sparse runs.
+    bytes_actually_written = 0
+    # Once enough of the image has been scanned, use observed density to estimate
+    # the total non-sparse byte count so the progress bar fills proportionally.
+    # Until then, fall back to ``image_size`` so the bar isn't pinned at 100%
+    # early on (when bytes_actually_written would briefly exceed a low estimate).
+    _density_warmup_bytes = max(_WRITE_CHUNK_BYTES * 32, image_size // 50)
+
+    def _emit(msg: str) -> None:
+        total_for_eta = image_size
+        if written_from_file >= _density_warmup_bytes and written_from_file > 0:
+            density = bytes_actually_written / written_from_file
+            total_for_eta = max(bytes_actually_written + 1, int(density * image_size))
+            total_for_eta = min(total_for_eta, image_size)
+        _emit_disk_write_progress(
+            bytes_actually_written,
+            total_for_eta,
+            msg,
+            progress_callback=progress_callback,
+            progress_file_path=progress_file_path,
+        )
+
     try:
         img = open(image_path, "rb")
     except OSError as e:
@@ -1097,13 +1123,9 @@ def _sparse_copy_image_to_fd(
                 if len(chunk) == _WRITE_CHUNK_BYTES and chunk == _ZERO_CHUNK:
                     _seek_disk_fd_cur(fd, _WRITE_CHUNK_BYTES)
                     written_from_file += len(chunk)
-                    _emit_disk_write_progress(
-                        written_from_file,
-                        image_size,
+                    _emit(
                         f"Writing to SD card ({written_from_file // (1024 * 1024)} MiB / "
-                        f"{image_size // (1024 * 1024)} MiB, skipping empty sectors)…",
-                        progress_callback=progress_callback,
-                        progress_file_path=progress_file_path,
+                        f"{image_size // (1024 * 1024)} MiB, skipping empty sectors)…"
                     )
                     continue
 
@@ -1113,13 +1135,10 @@ def _sparse_copy_image_to_fd(
                     to_write = to_write + (b"\x00" * (512 - rem))
                 _write_raw_to_disk_fd(fd, to_write)
                 written_from_file += len(chunk)
-                _emit_disk_write_progress(
-                    written_from_file,
-                    image_size,
+                bytes_actually_written += len(chunk)
+                _emit(
                     f"Writing to SD card ({written_from_file // (1024 * 1024)} MiB / "
-                    f"{image_size // (1024 * 1024)} MiB)…",
-                    progress_callback=progress_callback,
-                    progress_file_path=progress_file_path,
+                    f"{image_size // (1024 * 1024)} MiB)…"
                 )
     except OSError as e:
         parts = [f"Disk write to {device_label} failed: {e}"]

@@ -62,6 +62,7 @@ class TaskProgressDialog(QtWidgets.QDialog):
         kwargs: dict | None = None,
         cancelable: bool = False,
         cancel_callback_kwarg: str | None = None,
+        show_byte_detail: bool = True,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -90,6 +91,7 @@ class TaskProgressDialog(QtWidgets.QDialog):
         self._detail_label = QtWidgets.QLabel("")
         self._detail_label.setStyleSheet("color: gray; font-size: 11px;")
         self._detail_label.setWordWrap(True)
+        self._detail_label.setVisible(show_byte_detail)
         layout.addWidget(self._detail_label)
 
         if cancelable:
@@ -135,6 +137,24 @@ class TaskProgressDialog(QtWidgets.QDialog):
             return f"{n / (1 << 10):.0f} KiB"
         return f"{n} B"
 
+    @staticmethod
+    def _is_file_count_phase(message: str) -> bool:
+        """True when current/total represent file indices rather than byte counts.
+
+        The experimental SD image-build phase reports progress as
+        ``"Writing disk image (X/Y files)..."`` (and the lead-in message
+        ``"FAT32 image created - packing files into disk image..."``). Detecting
+        these prevents the detail label from formatting file indices as bytes.
+        """
+        if not message:
+            return False
+        m = message.strip().lower()
+        return (
+            m.startswith("writing disk image")
+            or m.startswith("image: writing disk image")
+            or "packing files into disk image" in m
+        )
+
     @QtCore.pyqtSlot(object, object, str)
     def _on_progress(self, current: object, total: object, message: str):
         # Ensure plain Python ints (signal carries object to avoid Qt int32 truncation).
@@ -156,16 +176,24 @@ class TaskProgressDialog(QtWidgets.QDialog):
                 scaled_val = min(scaled_max, max(0, cur * scaled_max // max(1, total)))
                 self._progress_bar.setRange(0, scaled_max)
                 self._progress_bar.setValue(scaled_val)
-                # Qt default percent text is literally "%p%" (percentage + sign).
-                self._progress_bar.setFormat("%p%%")
+                # QProgressBar::setFormat does literal substitution of %p/%v/%m only;
+                # it does NOT treat "%%" as an escape, so "%p%%" renders as "1%%".
+                # Use a single percent sign for the trailing literal.
+                self._progress_bar.setFormat("%p%")
             else:
                 self._progress_bar.setRange(0, total)
                 self._progress_bar.setValue(cur)
                 self._progress_bar.setFormat("%v / %m")
 
-            detail_parts = [
-                f"{self._format_bytes_short(cur)} / {self._format_bytes_short(total)}"
-            ]
+            # During the image-build phase ``current``/``total`` are file indices,
+            # not byte counts. Show them as files so the detail label doesn't read
+            # "11 KiB / 24 KiB" for what is really "11321 / 24992 files".
+            if self._is_file_count_phase(message):
+                detail_parts = [f"{cur} / {total} files"]
+            else:
+                detail_parts = [
+                    f"{self._format_bytes_short(cur)} / {self._format_bytes_short(total)}"
+                ]
             if cur > 0 and cur < total and self._progress_monotonic_start is not None:
                 elapsed = time.monotonic() - self._progress_monotonic_start
                 if elapsed > 0.4:
