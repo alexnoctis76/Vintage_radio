@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtWidgets  # noqa: E402
 
-from gui.widgets.task_progress_dialog import TaskProgressDialog  # noqa: E402
+from gui.widgets.dialogs.task_progress import TaskProgressDialog  # noqa: E402
 
 
 @pytest.fixture(scope="module")

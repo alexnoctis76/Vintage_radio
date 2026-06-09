@@ -50,12 +50,23 @@ from .sd_disk_image_flash import (
     write_image_to_physical_disk_darwin,
     DARWIN_FDA_REQUIRED_MARKER,
 )
-from .widgets.decorative_image_panel import RadioShellWidget
-from .widgets.sd_disk_image_wizard_dialog import SdDiskImageFlashWizardDialog
+from .widgets.dialogs.sd_disk_image_wizard import SdDiskImageFlashWizardDialog
 from .session_log import write_session_line, get_session_log_path
+import gui.theme as _theme
+from .widgets.common.delegates import (
+    StationItemDelegate as _StationItemDelegateNew,
+    TrackItemDelegate as _TrackItemDelegateNew,
+    STATION_NUM_ROLE as _STATION_NUM_ROLE_NEW,
+    STATION_NAME_ROLE as _STATION_NAME_ROLE_NEW,
+    STATION_COUNT_ROLE as _STATION_COUNT_ROLE_NEW,
+)
+from .widgets.common.mockup_scrollbar import sync_track_table_column_widths
+from .widgets.load_music.page           import LoadMusicPage  as _LoadMusicPage
+from .widgets.library_bar.library_bar   import LibraryBar     as _LibraryBar
+from .widgets.sidebar.sidebar           import Sidebar        as _Sidebar, _NAV_ITEMS as _SIDEBAR_NAV_ITEMS
 from .test_mode import TestModeWidget
 from .debug_mcp_server import DebugMcpServerManager
-from .widgets.task_progress_dialog import TaskProgressDialog, _BackgroundWorker
+from .widgets.dialogs.task_progress import TaskProgressDialog, _BackgroundWorker
 from . import __version__, sd_manager as sd_manager_module, updater
 from .update_dialog import UpdateAvailableDialog
 
@@ -74,6 +85,39 @@ _ADV_MCU_COL_HANDLE = 0
 _ADV_MCU_COL_GESTURE = 1
 _ADV_MCU_COL_ACTION = 2
 _ADV_MCU_JUNCTION_W = 44
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VINTAGE RADIO UI — COLOUR PALETTE
+#
+# All colours used in the UI are defined here.  Change a constant and every
+# widget that references it will update automatically (no hunting through QSS).
+#
+# Naming:
+#   _S_*      → Sidebar elements
+#   _C_*      → Content / page area
+#   _PANEL_*  → Station/Track panel blocks
+#   _TRACK_*  → Track table specific
+#   _ORANGE_* / _BAR_* → Accent orange uses
+#   _BORDER   → All thin dividers and outlines
+#   _TEXT_*   → Text colours
+#   _TOP_BAR_BG → Library bar background
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_S_BG        = "#3A281C"   # Sidebar background       — Dark Walnut
+_S_ACTIVE    = "#D46F1A"   # Sidebar active button    — Primary Accent Orange
+_S_TEXT      = "#F3E9D6"   # Sidebar label / icon     — Parchment Cream
+_C_BG        = "#FBF6EE"   # Page / content area      — Warm Ivory
+_TOP_BAR_BG  = "#F3E9D6"   # Library bar background   — Parchment
+_PANEL_DARK  = "#6B5A46"   # Station list rows        — Mocha Taupe
+_PANEL_HDR   = "#4A341F"   # Panel header strips      — Cocoa
+_STA_ACTIVE  = "#D46F1A"   # Selected station row     — Accent Orange
+_TRACK_BG    = "#FBF6EE"   # Track table rows         — Warm Ivory
+_TRACK_SEL   = "#FFE6C6"   # Selected track row       — Apricot Highlight
+_ORANGE_BTN  = "#D46F1A"   # "Sync to SD" button      — Accent Orange
+_BAR_ORANGE  = "#D46F1A"   # Storage bar fill         — Accent Orange
+_BORDER      = "#C9A066"   # All dividers / outlines  — Border Bronze
+_TEXT_PRI    = "#2C1F14"   # Primary text             — Near-black Brown
+_TEXT_SEC    = "#7A6C5A"   # Secondary / dim text     — Mid Taupe
 
 
 class _AdvancedMcuTableLayoutFilter(QtCore.QObject):
@@ -1097,6 +1141,241 @@ class StationImportListWidget(ReorderListWidget):
         super().dropEvent(event)
 
 
+# Data roles used by _StationItemDelegate to render station rows. Kept well above
+# UserRole+1 (used by the tracks table) to avoid any collision.
+_STATION_NUM_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 10
+_STATION_NAME_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 11
+_STATION_COUNT_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 12
+
+
+class _StationItemDelegate(QtWidgets.QStyledItemDelegate):
+    """Custom painter for each row in the basic-mode station list.
+
+    Draws: ≡ drag-handle | 01 number | Station Name | 7/255 count | ✎ edit icon
+    Data comes from _STATION_*_ROLE; DisplayRole text is untouched for backend logic.
+
+    ── HOW TO EDIT ─────────────────────────────────────────────────────────────
+    • Row height          → change ROW_H (px).
+    • Left padding        → change PAD_LEFT (px from widget edge).
+    • Column widths       → adjust the offsets in the five paint sections below.
+    • Colors              → edit the palette constants at the top of this file.
+    • Fonts               → set font size on each *_font object inside paint().
+    • Accent bar width    → change ACCENT_W (the coloured strip on selected rows).
+    • Separator line      → change SEP_LIGHTER (% brightness relative to row bg).
+    ────────────────────────────────────────────────────────────────────────────
+    """
+
+    _MAX = BASIC_MAX_TRACKS_PER_STATION
+
+    # ── Station row layout constants (px) ────────────────────────────────────
+    ROW_H       = 56    # height of each station row
+    PAD_LEFT    = 14    # gap between widget left edge and first element
+    HANDLE_W    = 18    # width of the ≡ drag-handle column
+    NUM_OFFSET  = 22    # x-offset from PAD_LEFT to start of "01" number
+    NUM_W       = 34    # width of the two-digit station number column
+    NAME_OFFSET = 60    # x-offset from PAD_LEFT to start of the station name
+    NAME_RSVD   = 90    # px reserved on the right for count + pencil
+    COUNT_W     = 52    # width of the "N/255" count label
+    COUNT_ROFF  = 86    # distance from row right edge to start of count
+    PENCIL_ROFF = 26    # distance from row right edge to the ✎ pencil glyph
+    PENCIL_W    = 18    # width of the pencil glyph column
+    ACCENT_W    = 4     # width of the left accent bar on the selected row (px)
+    SEP_LIGHTER = 130   # lighter() factor for the row separator line (100 = same)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+
+    def sizeHint(self, option, index) -> QtCore.QSize:  # type: ignore[override]
+        return QtCore.QSize(option.rect.width(), self.ROW_H)
+
+    def paint(self, painter, option, index) -> None:  # type: ignore[override]
+        painter.save()
+        rect = option.rect
+        selected = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
+
+        # ── 1. Row background ────────────────────────────────────────────────
+        # selected → _STA_ACTIVE (Primary Accent Orange)
+        # normal   → _PANEL_DARK (Stations Pane Mocha Taupe)
+        painter.fillRect(rect, QColor(_STA_ACTIVE if selected else _PANEL_DARK))
+
+        # ── 2. Left accent bar (selected rows only) ──────────────────────────
+        # Coloured strip at the very left edge; width = ACCENT_W px.
+        if selected:
+            painter.fillRect(
+                QtCore.QRect(rect.left(), rect.top(), self.ACCENT_W, rect.height()),
+                QColor(_C_BG),
+            )
+
+        # ── Data from item roles ─────────────────────────────────────────────
+        num   = index.data(_STATION_NUM_ROLE)
+        name  = index.data(_STATION_NAME_ROLE) or index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+        count = index.data(_STATION_COUNT_ROLE)
+
+        # Colors: bright text on selected (orange), cream on normal (taupe)
+        text_color = QColor("#ffffff" if selected else _S_TEXT)
+        dim_color  = QColor(_C_BG    if selected else _BORDER)
+
+        x = rect.left() + self.PAD_LEFT
+
+        # ── 3. Drag-handle glyph (≡) ─────────────────────────────────────────
+        painter.setPen(dim_color)
+        painter.setFont(QFont(option.font))   # regular weight
+        painter.drawText(
+            QtCore.QRect(x, rect.top(), self.HANDLE_W, rect.height()),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            "\u2630",
+        )
+
+        # ── 4. Station / folder number (bold, e.g. "01") ─────────────────────
+        num_font = QFont(option.font)
+        num_font.setBold(True)                # make the number stand out
+        painter.setFont(num_font)
+        painter.setPen(text_color)
+        painter.drawText(
+            QtCore.QRect(x + self.NUM_OFFSET, rect.top(), self.NUM_W, rect.height()),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            f"{int(num):02d}" if num is not None else "",
+        )
+
+        # ── 5. Station name (bold, elided if too long) ───────────────────────
+        name_font = QFont(option.font)
+        name_font.setBold(True)
+        painter.setFont(name_font)
+        painter.setPen(text_color)
+        name_rect = QtCore.QRect(
+            x + self.NAME_OFFSET,
+            rect.top(),
+            rect.width() - self.NAME_OFFSET - self.NAME_RSVD,
+            rect.height(),
+        )
+        painter.drawText(
+            name_rect,
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            QtGui.QFontMetrics(name_font).elidedText(
+                str(name), QtCore.Qt.TextElideMode.ElideRight, name_rect.width()
+            ),
+        )
+
+        # ── 6. Track count ("N/255") ─────────────────────────────────────────
+        painter.setFont(QFont(option.font))   # regular weight
+        painter.setPen(dim_color)
+        painter.drawText(
+            QtCore.QRect(rect.right() - self.COUNT_ROFF, rect.top(), self.COUNT_W, rect.height()),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignRight,
+            f"{int(count)}/{self._MAX}" if count is not None else "",
+        )
+
+        # ── 7. Edit pencil glyph (✎) ─────────────────────────────────────────
+        painter.setPen(dim_color)
+        painter.drawText(
+            QtCore.QRect(rect.right() - self.PENCIL_ROFF, rect.top(), self.PENCIL_W, rect.height()),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            "\u270E",
+        )
+
+        # ── 8. Subtle row separator (skip for selected) ──────────────────────
+        if not selected:
+            sep_color = QColor(_PANEL_DARK).lighter(self.SEP_LIGHTER)
+            painter.setPen(QtGui.QPen(sep_color, 1))
+            painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+        painter.restore()
+
+
+class _TrackItemDelegate(QtWidgets.QStyledItemDelegate):
+    """Custom painter for the Title column of the tracks table.
+
+    Each row shows:  [bold song title]
+                     [smaller artist in secondary colour]
+
+    The artist comes from the hidden column 1 (Artist). Paint-only: the actual
+    cell data and column order are never touched, so drag-reorder still works.
+
+    ── HOW TO EDIT ─────────────────────────────────────────────────────────────
+    • Row height          → change ROW_H (px).
+    • Left padding        → change PAD_X (px from cell left).
+    • Title / artist split→ the midpoint is ROW_H // 2; adjust top/bottom offsets.
+    • Artist font size    → change ARTIST_SIZE_DELTA (points smaller than title).
+    • Colors              → edit palette constants at the top of this file.
+    ────────────────────────────────────────────────────────────────────────────
+    """
+
+    # ── Track row layout constants ────────────────────────────────────────────
+    ROW_H            = 48     # height of each track row (px)
+    PAD_X            = 14     # left padding inside the cell (px)
+    PAD_RIGHT        = 18     # px to subtract from right edge for elide width
+    TITLE_TOP_BIAS   = 4      # extra px from top of upper half for title baseline
+    ARTIST_SIZE_DELTA = 1.0   # points to subtract from title font for artist
+    ARTIST_MIN_PT    = 7.0    # minimum artist font size (pt)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def sizeHint(self, option, index) -> QtCore.QSize:  # type: ignore[override]
+        return QtCore.QSize(option.rect.width(), self.ROW_H)
+
+    def paint(self, painter, option, index) -> None:  # type: ignore[override]
+        painter.save()
+        rect     = option.rect
+        selected = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
+
+        # ── 1. Row background ────────────────────────────────────────────────
+        # selected → _TRACK_SEL (Apricot Highlight)
+        # normal   → _TRACK_BG  (Warm Ivory)
+        painter.fillRect(rect, QColor(_TRACK_SEL if selected else _TRACK_BG))
+
+        # ── 2. Pull data ─────────────────────────────────────────────────────
+        title  = index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+        artist = ""
+        sib    = index.siblingAtColumn(1)   # hidden Artist column
+        if sib.isValid():
+            artist = sib.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+
+        mid = rect.height() // 2           # vertical midpoint — title above, artist below
+
+        # ── 3. Song title (bold, primary colour) ─────────────────────────────
+        title_font = QFont(option.font)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor(_TEXT_PRI))
+        painter.drawText(
+            QtCore.QRect(
+                rect.left() + self.PAD_X,
+                rect.top() + self.TITLE_TOP_BIAS,
+                rect.width() - self.PAD_RIGHT,
+                mid,
+            ),
+            QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignLeft,
+            QtGui.QFontMetrics(title_font).elidedText(
+                str(title), QtCore.Qt.TextElideMode.ElideRight,
+                rect.width() - self.PAD_RIGHT,
+            ),
+        )
+
+        # ── 4. Artist name (smaller, secondary colour; omitted if empty) ─────
+        if artist:
+            artist_font = QFont(option.font)
+            artist_font.setPointSizeF(
+                max(self.ARTIST_MIN_PT, artist_font.pointSizeF() - self.ARTIST_SIZE_DELTA)
+            )
+            painter.setFont(artist_font)
+            painter.setPen(QColor(_TEXT_SEC))
+            painter.drawText(
+                QtCore.QRect(
+                    rect.left() + self.PAD_X,
+                    rect.top() + mid,
+                    rect.width() - self.PAD_RIGHT,
+                    rect.height() - mid - self.TITLE_TOP_BIAS,
+                ),
+                QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft,
+                QtGui.QFontMetrics(artist_font).elidedText(
+                    str(artist), QtCore.Qt.TextElideMode.ElideRight,
+                    rect.width() - self.PAD_RIGHT,
+                ),
+            )
+
+        painter.restore()
+
+
 class InstallMicroPythonDialog(QtWidgets.QDialog):
     """One-time setup: copy MicroPython .uf2 to Pico in BOOTSEL mode.
 
@@ -1507,8 +1786,10 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     update_check_finished = QtCore.pyqtSignal(object, bool, str)
 
-    def __init__(self) -> None:
+    def __init__(self, dev_mode: bool = False) -> None:
         super().__init__()
+        self._ui_dev_mode = dev_mode   # True when launched with --dev
+        self._theme_watcher: Optional[QtCore.QFileSystemWatcher] = None
         self._apply_default_window_geometry()
 
         icon_path = resource_path("vintage_radio.png")
@@ -1549,6 +1830,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.library_table.files_dropped.connect(self.import_files)
         self.library_table.itemChanged.connect(self.on_library_item_changed)
         self._loading_library = False
+        self._basic_tracks_load_token = 0
+        self._basic_tracks_target_station_id: Optional[int] = None
+        self._basic_tracks_loader_thread: Optional[QtCore.QThread] = None
+        self._song_path_missing_cache: dict[str, bool] = {}
         self.library_table.setContextMenuPolicy(
             QtCore.Qt.ContextMenuPolicy.CustomContextMenu
         )
@@ -1608,42 +1893,114 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(1200, self._check_for_updates_on_startup)
 
     def _apply_default_window_geometry(self) -> None:
-        """Size and center window to a fraction of available screen (min/max bounds)."""
+        """Size and centre the window at 1200×780 (clamped to available screen)."""
         app = QtWidgets.QApplication.instance()
+        fallback_w, fallback_h = 1200, 780
         if not app:
-            self.resize(1000, 700)
+            self.resize(fallback_w, fallback_h)
             return
         screen = app.primaryScreen()
         if not screen:
-            self.resize(1000, 700)
+            self.resize(fallback_w, fallback_h)
             return
         rect = screen.availableGeometry()
-        w = min(max(int(rect.width() * 0.85), 800), 1600)
-        h = min(max(int(rect.height() * 0.85), 550), 1000)
+        w = min(fallback_w, rect.width())
+        h = min(fallback_h, rect.height())
         x = rect.x() + (rect.width() - w) // 2
         y = rect.y() + (rect.height() - h) // 2
         self.setGeometry(x, y, w, h)
 
     def _build_status_bar_zoom(self) -> None:
-        """Add zoom +/- buttons at bottom left of the status bar."""
+        """Build the footer bar: zoom controls on left, version label on right.
+
+        Styled to match the HTML mockup:
+          background: #f5eadc; border-top: 1px solid #d8c6ad; height: 48px.
+        Zoom buttons: gradient pill with border and drop shadow.
+
+        HOW TO EDIT
+        -----------
+          Footer colours / height  → theme.FOOTER_*
+          Zoom button sizes        → theme.ZOOM_BTN_W / H / RADIUS etc.
+        """
+        sb = self.statusBar()
+        sb.setFixedHeight(_theme.FOOTER_H)
+        sb.setStyleSheet(f"""
+            QStatusBar {{
+                background: {_theme.FOOTER_BG};
+                border-top: 1px solid {_theme.FOOTER_BORDER};
+                color: {_theme.FOOTER_TEXT};
+                font-size: {_theme.FOOTER_FONT_SIZE}px;
+            }}
+            QStatusBar::item {{
+                border: none;
+            }}
+        """)
+
+        _zoom_btn_qss = f"""
+            QPushButton {{
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 {_theme.ZOOM_BTN_GRAD_TOP},
+                    stop:1 {_theme.ZOOM_BTN_GRAD_BOT});
+                border: 1px solid {_theme.ZOOM_BTN_BORDER};
+                border-radius: {_theme.ZOOM_BTN_RADIUS}px;
+                color: {_theme.FOOTER_TEXT};
+                font-weight: bold;
+                font-size: {_theme.FOOTER_FONT_SIZE}px;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 {_theme.ZOOM_BTN_GRAD_BOT},
+                    stop:1 {_theme.ZOOM_BTN_GRAD_TOP});
+            }}
+            QPushButton:pressed {{
+                background: {_theme.ZOOM_BTN_GRAD_BOT};
+            }}
+        """
+
+        def _zoom_shadow():
+            eff = QtWidgets.QGraphicsDropShadowEffect()
+            eff.setBlurRadius(8)
+            eff.setOffset(0, 2)
+            eff.setColor(QtGui.QColor(0, 0, 0, 45))
+            return eff
+
         container = QtWidgets.QWidget()
         zoom_layout = QtWidgets.QHBoxLayout(container)
-        zoom_layout.setContentsMargins(4, 0, 4, 0)
-        zoom_layout.setSpacing(2)
+        zoom_layout.setContentsMargins(10, 0, 6, 0)
+        zoom_layout.setSpacing(_theme.ZOOM_SPACING)
+
         zoom_label = QtWidgets.QLabel("Zoom")
-        zoom_label.setStyleSheet("font-weight: bold;")
+        zoom_label.setStyleSheet(
+            f"color: {_theme.FOOTER_TEXT}; font-size: {_theme.FOOTER_FONT_SIZE}px;"
+        )
         zoom_layout.addWidget(zoom_label)
+
         zoom_out_btn = QtWidgets.QPushButton("\u2212")
         zoom_out_btn.setToolTip("Zoom out (min 80%)")
-        zoom_out_btn.setFixedSize(26, 22)
+        zoom_out_btn.setFixedSize(_theme.ZOOM_BTN_W, _theme.ZOOM_BTN_H)
+        zoom_out_btn.setStyleSheet(_zoom_btn_qss)
+        zoom_out_btn.setGraphicsEffect(_zoom_shadow())
         zoom_out_btn.clicked.connect(self._on_zoom_out)
+
         zoom_in_btn = QtWidgets.QPushButton("+")
         zoom_in_btn.setToolTip("Zoom in (max 200%)")
-        zoom_in_btn.setFixedSize(26, 22)
+        zoom_in_btn.setFixedSize(_theme.ZOOM_BTN_W, _theme.ZOOM_BTN_H)
+        zoom_in_btn.setStyleSheet(_zoom_btn_qss)
+        zoom_in_btn.setGraphicsEffect(_zoom_shadow())
         zoom_in_btn.clicked.connect(self._on_zoom_in)
+
         zoom_layout.addWidget(zoom_out_btn)
         zoom_layout.addWidget(zoom_in_btn)
-        self.statusBar().addWidget(container)
+        sb.addWidget(container)
+
+        # Version label — pinned to the right via addPermanentWidget
+        ver_label = QtWidgets.QLabel(f"v{__version__}")
+        ver_label.setStyleSheet(
+            f"color: {_theme.FOOTER_TEXT}; "
+            f"font-size: {_theme.FOOTER_FONT_SIZE - 1}px; "
+            "margin-right: 14px;"
+        )
+        sb.addPermanentWidget(ver_label)
 
     def _apply_ui_zoom(self) -> None:
         """Apply UI zoom level via application font scale. Uses a fixed base point size so direction stays correct."""
@@ -3652,64 +4009,40 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Library switcher toolbar ──────────────────────────────
 
     def _build_library_toolbar(self) -> None:
-        """No-op: the library row is now built inside the radio shell central widget.
+        """Kept for backwards-compat with the __init__ call sequence.
 
-        Kept as a method for backward compatibility with any old call sites. The
-        actual library row widget is constructed by ``_build_library_row_widget``
-        and placed on top of the radio shell background by ``_build_tabs``.
+        The library selector is now an inline bar built by
+        ``_build_library_bar_widget()`` and placed inside the page shell, so this
+        method intentionally does nothing (no QToolBar is added).
         """
         return
 
-    def _build_library_row_widget(self) -> QtWidgets.QWidget:
-        """Library selector row (Library: combo + New/Rename/Delete) as a widget.
+    def _build_library_bar_widget(self) -> QtWidgets.QWidget:
+        """Library selector bar — delegates to gui/widgets/library_bar/library_bar.py.
 
-        Returned widget has a transparent background so the radio shell behind it
-        shows through. Buttons get rounded white styling via the page-wide QSS.
+        ── EDIT in gui/theme.py ──────────────────────────────────────────────
+        LIBBAR_HEIGHT, LIBBAR_H_MARGINS, LIBBAR_SPACING, LIBBAR_BORDER_W,
+        LIBBAR_BTN_RADIUS, LIBBAR_BTN_PADDING, LIBBAR_BTN_FONT_SIZE,
+        LIBBAR_COMBO_MIN_W, LIBBAR_COMBO_MAX_W, LIBBAR_COMBO_PADDING,
+        LIBBAR_COMBO_RADIUS, LIBBAR_COMBO_FONT_SIZE, LIBBAR_COMBO_ARROW_W,
+        LIBBAR_COMBO_ARROW_SIZE, LIBBAR_COMBO_ARROW_H,
+        LIBBAR_LABEL_FONT_SIZE, LIBBAR_LABEL_BOLD,
+        TOP_BAR_BG, BORDER, TEXT_PRI, TRACK_SEL, COMBO_BG, COMBO_LIST_BG,
+        LIGHT_BTN_HOVER, LIGHT_BTN_PRESSED
+        ─────────────────────────────────────────────────────────────────────
         """
-        row = QtWidgets.QWidget()
-        row.setObjectName("libraryRow")
-        row.setStyleSheet("QWidget#libraryRow { background: transparent; }")
-        h = QtWidgets.QHBoxLayout(row)
-        h.setContentsMargins(8, 4, 8, 4)
-        h.setSpacing(8)
-
-        self._library_heading_label = QtWidgets.QLabel("Library")
-        app = QtWidgets.QApplication.instance()
-        if app:
-            lib_font = QFont(app.font())
-            lib_font.setBold(True)
-            self._library_heading_label.setFont(lib_font)
-        h.addWidget(self._library_heading_label)
-
-        self._lib_combo = QtWidgets.QComboBox()
-        if app:
-            fm = QtGui.QFontMetrics(app.font())
-            self._lib_combo.setMinimumWidth(max(180, fm.averageCharWidth() * 22))
-        self._lib_combo.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Preferred,
-            QtWidgets.QSizePolicy.Policy.Preferred,
-        )
-        h.addWidget(self._lib_combo)
+        bar = _LibraryBar()
+        # Alias MainWindow attributes so all existing backend code still works.
+        self._lib_combo             = bar.combo
+        self._library_heading_label = bar.heading_label
+        # Populate the combo with current libraries.
         self._populate_lib_combo()
-        self._lib_combo.currentIndexChanged.connect(self._on_lib_combo_changed)
-
-        h.addStretch(1)
-
-        new_btn = QtWidgets.QPushButton("New")
-        new_btn.setToolTip("Create a new library")
-        new_btn.clicked.connect(self._new_library)
-        h.addWidget(new_btn)
-
-        rename_btn = QtWidgets.QPushButton("Rename")
-        rename_btn.setToolTip("Rename the current library")
-        rename_btn.clicked.connect(self._rename_library)
-        h.addWidget(rename_btn)
-
-        delete_btn = QtWidgets.QPushButton("Delete")
-        delete_btn.setToolTip("Delete the current library")
-        delete_btn.clicked.connect(self._delete_library)
-        h.addWidget(delete_btn)
-        return row
+        # Connect widget signals to existing MainWindow handlers.
+        bar.library_changed.connect(self._on_lib_combo_changed)
+        bar.new_clicked.connect(self._new_library)
+        bar.rename_clicked.connect(self._rename_library)
+        bar.delete_clicked.connect(self._delete_library)
+        return bar
 
     def _populate_lib_combo(self) -> None:
         combo = self._lib_combo
@@ -3806,6 +4139,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         with self._wait_cursor_scope():
             self.db.close()
+            self._cancel_basic_tracks_load()
+            self._song_path_missing_cache.clear()
             self._lib_registry.set_active(slug)
             self.db = DatabaseManager(db_path=self._lib_registry.db_path_for(slug))
             self._propagate_db()
@@ -3839,165 +4174,351 @@ class MainWindow(QtWidgets.QMainWindow):
         name = self._lib_registry.active_library_name()
         self.setWindowTitle(f"Vintage Radio Music Manager - {name}")
 
-    def _radio_shell_qss(self) -> str:
-        """Window-wide QSS applied to the radio shell central widget.
-
-        Makes the tab widget, tab pages, group boxes, and library row sit on top
-        of the painted shell with transparent backgrounds. Buttons, combos, list,
-        table, and progress bar get warm vintage styling that matches the radio.
-        """
-        return """
-            /* Tab widget — sits on the cream area of the radio shell */
-            QTabWidget#mainTabs::pane {
-                background: transparent;
-                border: none;
-                border-top: 1px solid rgba(120, 90, 50, 0.35);
-                margin-top: -1px;
-            }
-            QTabWidget#mainTabs QTabBar { background: transparent; }
-            QTabBar::tab {
-                background: rgba(255, 248, 230, 0.55);
-                color: #4a3520;
-                padding: 7px 22px;
-                margin-right: 4px;
-                border: 1px solid rgba(120, 90, 50, 0.45);
-                border-bottom: none;
-                border-top-left-radius: 10px;
-                border-top-right-radius: 10px;
-                font-weight: 600;
-                font-size: 13px;
-                min-width: 110px;
-            }
-            QTabBar::tab:selected {
-                background: rgba(255, 252, 244, 0.95);
-                color: #2a1c10;
-                border-color: rgba(120, 90, 50, 0.7);
-            }
-            QTabBar::tab:hover:!selected {
-                background: rgba(255, 250, 235, 0.8);
-            }
-            /* Tab page content sits transparent on the shell */
-            QTabWidget#mainTabs > QWidget > QWidget { background: transparent; }
-            /* Generic controls on the shell */
-            QPushButton {
-                background: #FFFFFF;
-                border: 1px solid #D7CCBC;
-                border-radius: 8px;
-                padding: 5px 14px;
-                font-weight: 600;
-                color: #2a1c10;
-            }
-            QPushButton:hover { background: #F8F6F2; border-color: #C8B99F; }
-            QPushButton:pressed { background: #EEE8DE; }
-            QPushButton:disabled { color: #aaa; border-color: #e4dfd8; background: #f9f9f9; }
-            QComboBox {
-                background: #FFFFFF;
-                border: 1px solid #D7CCBC;
-                border-radius: 8px;
-                padding: 4px 10px;
-                color: #2a1c10;
-                min-height: 22px;
-            }
-            QComboBox::drop-down { border: none; width: 18px; }
-            QListWidget {
-                background: rgba(255, 252, 244, 0.94);
-                border: 1px solid #D7CCBC;
-                border-radius: 8px;
-                padding: 4px;
-                color: #2a1c10;
-            }
-            QListWidget::item:selected {
-                background: #D7CCBC;
-                color: #1a1a1a;
-                border-radius: 4px;
-            }
-            QTableWidget {
-                background: rgba(255, 252, 244, 0.94);
-                border: 1px solid #D7CCBC;
-                border-radius: 8px;
-                gridline-color: #E8E2D8;
-                color: #2a1c10;
-            }
-            QTableWidget QHeaderView::section {
-                background: #EDE7DC;
-                border: none;
-                border-bottom: 1px solid #D7CCBC;
-                padding: 4px 8px;
-                font-weight: 600;
-                color: #4a3520;
-            }
-            QProgressBar {
-                background: #DED8CE;
-                border: 1px solid #CFC5B6;
-                border-radius: 8px;
-                text-align: center;
-                color: #2a1c10;
-            }
-            QProgressBar::chunk {
-                background: #39B54A;
-                border-radius: 8px;
-            }
-            QGroupBox {
-                background: transparent;
-                border: 1px solid rgba(120, 90, 50, 0.45);
-                border-radius: 10px;
-                margin-top: 12px;
-                padding-top: 8px;
-                font-weight: bold;
-                color: #4a3520;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                color: #4a3520;
-                background: transparent;
-                padding: 0 4px;
-            }
-            QLabel { background: transparent; color: #2a1c10; }
-            QCheckBox { background: transparent; color: #2a1c10; }
-            QSplitter::handle { background: rgba(180, 155, 120, 0.3); }
-        """
-
     def _build_tabs(self) -> None:
-        tabs = QtWidgets.QTabWidget()
-        tabs.setObjectName("mainTabs")
-        self._tabs_widget = tabs
-
         if self.devices_view_mode in ("basic", "advanced"):
-            # Devices tab (advanced) is not built; sd_root_label may point at a
-            # QLabel destroyed when switching from advanced — clear stale refs.
-            if not _qt_widget_alive(getattr(self, "sd_root_label", None)):
-                self.sd_root_label = None
-            # New order: Load Music (SD Card) is shown first (index 0), then Install Firmware.
-            tabs.addTab(self._build_basic_sd_card_tab(), "Load Music")
-            tabs.addTab(self._build_basic_mcu_tab(), "Install Firmware")
-            self._device_debug_tab_index = -1
-        else:
-            tabs.addTab(self._build_library_tab(), "Library")
-            tabs.addTab(self._build_albums_tab(), "Albums")
-            tabs.addTab(self._build_playlists_tab(), "Playlists")
-            tabs.addTab(self._build_sd_tab(), "Devices")
-            tabs.addTab(self._ensure_test_mode_widget(), "Emulator")
-            device_tab_container = self._build_device_debug_tab()
-            self._device_debug_tab_index = tabs.count()
-            tabs.addTab(device_tab_container, "Device Debug")
+            self._build_basic_shell()
+            self._start_theme_watcher()   # dev-mode live reload (no-op in production)
+            return
+
+        tabs = QtWidgets.QTabWidget()
+        self._tabs_widget = tabs
+        tabs.addTab(self._build_library_tab(), "Library")
+        tabs.addTab(self._build_albums_tab(), "Albums")
+        tabs.addTab(self._build_playlists_tab(), "Playlists")
+        tabs.addTab(self._build_sd_tab(), "Devices")
+        tabs.addTab(self._ensure_test_mode_widget(), "Emulator")
+        device_tab_container = self._build_device_debug_tab()
+        self._device_debug_tab_index = tabs.count()
+        tabs.addTab(device_tab_container, "Device Debug")
 
         tabs.currentChanged.connect(self._on_tab_changed)
+        self.setCentralWidget(tabs)
 
-        # ── Radio shell central widget — entire window is the radio ──
-        shell_path = str(resource_path("radio_shell_full_sd_card_background.png"))
-        central = RadioShellWidget(shell_path, fallback_color="#f2ede4")
-        central.setObjectName("radioShellCentral")
-        central.setStyleSheet(self._radio_shell_qss())
-        v = QtWidgets.QVBoxLayout(central)
-        # Insets are tuned for the radio_shell PNG: top accounts for the gold/cream
-        # rim, sides leave room for the bezel, and the bottom is small so the Sync
-        # controls land on the dark wood strip baked into the image.
-        v.setContentsMargins(40, 18, 200, 180)
-        v.setSpacing(6)
-        v.addWidget(self._build_library_row_widget())
-        v.addWidget(tabs, 1)
+    # Page indices in the basic/advanced sidebar shell.
+    _PAGE_LOAD_MUSIC = 0
+    _PAGE_INSTALL_FW = 1
+    _PAGE_TOOLS = 2
+    _PAGE_SETTINGS = 3
+    _PAGE_HELP = 4
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DEV-MODE THEME LIVE RELOAD
+    #
+    # Active only when the app is launched with  --dev  (never in production).
+    # How it works:
+    #   1. QFileSystemWatcher watches gui/theme.py for changes.
+    #   2. On save, importlib reloads the module so gui.theme.* values update.
+    #   3. Sidebar, library bar, and the current page are rebuilt from scratch.
+    #
+    # To use:
+    #   python run_vintage_radio.py --dev
+    #   Open gui/theme.py in your editor, change a value, save.
+    #   Shell chrome + current page update within ~0.5 s.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _start_theme_watcher(self) -> None:
+        """Start watching gui/theme.py for changes (dev mode only)."""
+        if not self._ui_dev_mode:
+            return
+        theme_path = Path(__file__).parent / "theme.py"
+        if not theme_path.exists():
+            return
+        self._theme_watcher = QtCore.QFileSystemWatcher([str(theme_path)], self)
+        self._theme_watcher.fileChanged.connect(self._on_theme_file_changed)
+        print(f"[DEV] Theme live-reload active — watching {theme_path}")
+
+    def _on_theme_file_changed(self, path: str) -> None:
+        """Called when theme.py is saved. Reload theme and rebuild shell + page."""
+        import importlib
+        try:
+            importlib.reload(_theme)
+        except Exception as exc:
+            print(f"[DEV] theme.py reload error: {exc}")
+            return
+
+        # Re-watch the file (editors often replace-write rather than modify in place)
+        if self._theme_watcher:
+            self._theme_watcher.addPath(path)
+
+        print("[DEV] theme.py reloaded — rebuilding sidebar, library bar, and page …")
+        self._reload_dev_theme_ui()
+        print("[DEV] Theme reload complete.")
+
+    def _reload_dev_theme_ui(self) -> None:
+        """Rebuild sidebar, library bar, page backgrounds, and the current page."""
+        central = self.centralWidget()
+        if _qt_widget_alive(central):
+            central.setStyleSheet(f"#appRoot {{ background: {_theme.C_BG}; }}")
+
+        right = getattr(self, "_right_pane", None)
+        if _qt_widget_alive(right):
+            right.setStyleSheet(f"#rightPane {{ background: {_theme.C_BG}; }}")
+
+        self._dev_rebuild_sidebar()
+        self._dev_rebuild_library_bar()
+        self._dev_rebuild_current_page()
+
+    def _dev_rebuild_sidebar(self) -> None:
+        """Swap in a fresh Sidebar widget (picks up SIDEBAR_* / S_* from theme)."""
+        old = getattr(self, "_sidebar", None)
+        if not _qt_widget_alive(old):
+            return
+        parent = old.parentWidget()
+        layout = parent.layout() if parent else None
+        if layout is None:
+            return
+
+        stack = getattr(self, "_page_stack", None)
+        nav_idx = stack.currentIndex() if _qt_widget_alive(stack) else self._PAGE_LOAD_MUSIC
+
+        new = self._build_sidebar()
+        new.set_active(nav_idx)
+
+        idx = layout.indexOf(old)
+        layout.removeWidget(old)
+        layout.insertWidget(idx, new)
+        old.deleteLater()
+        self._sidebar = new
+
+    def _dev_rebuild_library_bar(self) -> None:
+        """Swap in a fresh LibraryBar (picks up LIBBAR_* from theme)."""
+        old = getattr(self, "_library_bar", None)
+        if not _qt_widget_alive(old):
+            return
+        parent = old.parentWidget()
+        layout = parent.layout() if parent else None
+        if layout is None:
+            return
+
+        visible = old.isVisible()
+        active_slug = self._lib_registry.active_library()
+
+        new = self._build_library_bar_widget()
+        new.setVisible(visible)
+
+        # Restore the library selection without triggering a switch.
+        combo = self._lib_combo
+        if _qt_widget_alive(combo):
+            for i in range(combo.count()):
+                if combo.itemData(i) == active_slug:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(i)
+                    combo.blockSignals(False)
+                    break
+
+        idx = layout.indexOf(old)
+        layout.removeWidget(old)
+        layout.insertWidget(idx, new)
+        old.deleteLater()
+        self._library_bar = new
+
+    def _dev_rebuild_current_page(self) -> None:
+        """Rebuild the visible page in the stack."""
+        stack = getattr(self, "_page_stack", None)
+        if not _qt_widget_alive(stack):
+            return
+
+        page_idx = stack.currentIndex()
+        rebuilders = {
+            self._PAGE_LOAD_MUSIC: self._build_basic_sd_card_tab,
+            self._PAGE_INSTALL_FW: self._build_basic_mcu_tab,
+        }
+        builder = rebuilders.get(page_idx)
+        if builder is None:
+            w = stack.widget(page_idx)
+            if w and hasattr(w, "reload_theme"):
+                w.reload_theme()
+            return
+
+        old = stack.widget(page_idx)
+        new = builder()
+        stack.insertWidget(page_idx, new)
+        stack.setCurrentIndex(page_idx)
+        if old:
+            stack.removeWidget(old)
+            old.deleteLater()
+
+        # Refresh data on the rebuilt Load Music page.
+        if page_idx == self._PAGE_LOAD_MUSIC:
+            self._refresh_basic_station_list()
+            self._update_basic_stations_size()
+            self._refresh_basic_sd_capacity()
+
+    def _build_basic_shell(self) -> None:
+        """Basic/advanced layout: left sidebar nav + library bar + page stack."""
+        # Hide the traditional menu bar — navigation lives in the sidebar.
+        self.menuBar().setVisible(False)
+
+        # Devices tab (advanced) is not built; sd_root_label may point at a QLabel
+        # destroyed when switching from advanced — clear stale refs.
+        if not _qt_widget_alive(getattr(self, "sd_root_label", None)):
+            self.sd_root_label = None
+
+        central = QtWidgets.QWidget()
+        central.setObjectName("appRoot")
+        central.setStyleSheet(f"#appRoot {{ background: {_theme.C_BG}; }}")
+        outer = QtWidgets.QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._sidebar = self._build_sidebar()
+        outer.addWidget(self._sidebar)
+
+        right = QtWidgets.QWidget()
+        right.setObjectName("rightPane")
+        self._right_pane = right
+        right.setStyleSheet(f"#rightPane {{ background: {_theme.C_BG}; }}")
+        right_v = QtWidgets.QVBoxLayout(right)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        right_v.setSpacing(0)
+
+        self._library_bar = self._build_library_bar_widget()
+        # Wrap in a container so the bar has the same margins as the HTML mockup:
+        # left:26px; top:13px; right:17px — matching .library-bar positioning.
+        _lib_wrap = QtWidgets.QWidget()
+        _lib_wrap.setObjectName("libBarWrap")
+        _lib_wrap.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        _lib_wrap.setStyleSheet("#libBarWrap { background: transparent; }")
+        _lw = QtWidgets.QVBoxLayout(_lib_wrap)
+        _lw.setContentsMargins(
+            _theme.LIBBAR_WRAP_L, _theme.LIBBAR_WRAP_T,
+            _theme.LIBBAR_WRAP_R, _theme.LIBBAR_WRAP_B,
+        )
+        _lw.setSpacing(0)
+        _lw.addWidget(self._library_bar)
+        right_v.addWidget(_lib_wrap)
+
+        stack = QtWidgets.QStackedWidget()
+        self._page_stack = stack
+        self._tabs_widget = stack  # keep downstream references working
+        stack.addWidget(self._build_basic_sd_card_tab())   # 0 Load Music
+        stack.addWidget(self._build_basic_mcu_tab())        # 1 Install Firmware
+        stack.addWidget(self._build_tools_page())           # 2 Tools
+        stack.addWidget(self._build_settings_page())        # 3 Settings
+        stack.addWidget(self._build_help_page())            # 4 Help
+        self._device_debug_tab_index = -1
+        stack.currentChanged.connect(self._on_tab_changed)
+        right_v.addWidget(stack, 1)
+
+        outer.addWidget(right, 1)
         self.setCentralWidget(central)
+
+        stack.setCurrentIndex(self._PAGE_LOAD_MUSIC)
+        if getattr(self, "_nav_buttons", None):
+            self._nav_buttons[self._PAGE_LOAD_MUSIC].setChecked(True)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SIDEBAR — navigation rail
+    #
+    # Icons are Unicode glyphs rendered into QPixmaps.
+    # To swap an icon: change the glyph character in _SIDEBAR_GLYPHS.
+    # To add a page: add an entry to _SIDEBAR_GLYPHS, _build_sidebar's
+    # nav_specs, and a new stack.addWidget() call in _build_basic_shell.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── Icon glyphs (Unicode characters rendered as warm-cream bitmaps) ───────
+    # Replace any character here to change what icon is shown for that nav item.
+    _SIDEBAR_GLYPHS = [
+        "\u266b",   # 0 Load Music      ♫  (music beam notes)
+        "\u2193",   # 1 Install Firmware ↓  (downward arrow)
+        "\u2692",   # 2 Tools            ⚒  (hammer and pick)
+        "\u2699",   # 3 Settings         ⚙  (gear)
+        "?",        # 4 Help             ?
+    ]
+
+    @staticmethod
+    def _make_sidebar_icon(glyph: str, size: int = 36,
+                           color: str = _S_TEXT) -> "QtGui.QIcon":
+        """Render a Unicode glyph as a coloured QIcon for use in the sidebar.
+
+        ── EDIT ──────────────────────────────────────────────────────────────
+        • Icon canvas size (square px)  → size parameter default
+        • Glyph fill fraction           → the 0.78 multiplier in setPixelSize
+        • Normal icon colour            → color parameter default (_S_TEXT)
+        • Active icon colour            → "#ffffff" passed in _make_sidebar_icon_active
+        ──────────────────────────────────────────────────────────────────────
+        """
+        pix = QtGui.QPixmap(size, size)
+        pix.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(pix)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
+        font = QtGui.QFont()
+        font.setPixelSize(max(16, int(size * 0.78)))  # glyph size relative to canvas
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor(color))
+        painter.drawText(pix.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, glyph)
+        painter.end()
+        return QtGui.QIcon(pix)
+
+    @staticmethod
+    def _make_sidebar_icon_active(glyph: str, size: int = 36) -> "QtGui.QIcon":
+        """White variant of the glyph icon used when the button is checked."""
+        return MainWindow._make_sidebar_icon(glyph, size, color="#ffffff")
+
+    def _build_sidebar(self) -> QtWidgets.QWidget:
+        """Left navigation rail — delegates to gui/widgets/sidebar.py.
+
+        ── EDIT in gui/theme.py ──────────────────────────────────────────────
+        SIDEBAR_WIDTH, SIDEBAR_MARGINS, SIDEBAR_SPACING,
+        SIDEBAR_BTN_RADIUS, SIDEBAR_BTN_PADDING, SIDEBAR_BTN_FONT_SIZE,
+        SIDEBAR_BTN_FONT_WEIGHT, SIDEBAR_BTN_MIN_H,
+        SIDEBAR_ICON_SIZE, SIDEBAR_ICON_FILL,
+        S_BG, S_TEXT, S_ACTIVE, S_HOVER_TINT
+
+        ── EDIT glyph icons in gui/widgets/sidebar/sidebar.py ───────────────
+        GLYPHS list and LABELS list at the top of that file.
+        ─────────────────────────────────────────────────────────────────────
+        """
+        bar = _Sidebar()
+        # Alias MainWindow attributes so all existing backend code still works.
+        self._nav_buttons      = bar.buttons
+        self._nav_button_group = bar.button_group
+        # Connect the single page_changed signal to the existing handler.
+        bar.page_changed.connect(self._on_sidebar_nav)
+        return bar
+
+    def _on_sidebar_nav(self, index: int) -> None:
+        """Switch the page stack and toggle library-bar visibility."""
+        stack = getattr(self, "_page_stack", None)
+        if stack is None:
+            return
+        stack.setCurrentIndex(index)
+        bar = getattr(self, "_library_bar", None)
+        if _qt_widget_alive(bar):
+            bar.setVisible(index not in (self._PAGE_SETTINGS, self._PAGE_HELP))
+
+    def _build_tools_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        label = QtWidgets.QLabel("Tools \u2014 coming soon")
+        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #6b6560; font-size: 16px;")
+        lay.addStretch(1)
+        lay.addWidget(label)
+        lay.addStretch(1)
+        return page
+
+    def _build_settings_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        label = QtWidgets.QLabel("Settings \u2014 coming soon")
+        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #6b6560; font-size: 16px;")
+        lay.addStretch(1)
+        lay.addWidget(label)
+        lay.addStretch(1)
+        return page
+
+    def _build_help_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        label = QtWidgets.QLabel("Help \u2014 coming soon")
+        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #6b6560; font-size: 16px;")
+        lay.addStretch(1)
+        lay.addWidget(label)
+        lay.addStretch(1)
+        return page
 
     def _ensure_test_mode_widget(self) -> TestModeWidget:
         """Create emulator widget lazily so basic view does not start hidden playback."""
@@ -4029,27 +4550,24 @@ class MainWindow(QtWidgets.QMainWindow):
         when multiple RP2040s are attached, the install button, and (in advanced view)
         a list of firmware versions to install.
         """
-        # The whole window paints the radio shell already; this tab is transparent
-        # so the cream area of the radio shows through behind the white CTAs.
+        _CARD_BG = "white"
         _BTN_CARD_SS = (
             "QPushButton {"
-            "  background-color: #FFFFFF;"
-            "  border: 1px solid #D7CCBC;"
-            "  border-radius: 12px;"
+            "  background-color: white;"
+            "  border: 1px solid #e0e0e0;"
+            "  border-radius: 10px;"
             "  padding: 18px 20px;"
             "  text-align: center;"
-            "  font-family: 'Segoe UI', 'Inter', sans-serif;"
-            "  font-weight: 600;"
             "}"
-            "QPushButton:hover { background-color: #F8F6F2; border-color: #C8B99F; }"
-            "QPushButton:pressed { background-color: #EEE8DE; }"
-            "QPushButton:disabled { color: #aaa; background-color: #f9f9f9; border-color: #e0dbd5; }"
+            "QPushButton:hover { background-color: #f5f5f5; border-color: #bbb; }"
+            "QPushButton:pressed { background-color: #ebebeb; }"
+            "QPushButton:disabled { color: #aaa; background-color: #f9f9f9; }"
         )
 
         widget = QtWidgets.QWidget()
-        widget.setStyleSheet("QWidget { background: transparent; }")
+        widget.setStyleSheet(f"background-color: {_CARD_BG};")
         outer = QtWidgets.QVBoxLayout(widget)
-        outer.setContentsMargins(36, 24, 36, 24)
+        outer.setContentsMargins(36, 32, 36, 32)
         outer.setSpacing(0)
 
         # Always create the underlying debug widget so existing references and the
@@ -4075,7 +4593,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Content column — max width so it doesn't stretch across 4K monitors ──
         content_row = QtWidgets.QHBoxLayout()
         content_col = QtWidgets.QWidget()
-        content_col.setStyleSheet("QWidget { background: transparent; }")
+        content_col.setStyleSheet(f"background-color: {_CARD_BG};")
         content_col.setMaximumWidth(680)
         col_layout = QtWidgets.QVBoxLayout(content_col)
         col_layout.setContentsMargins(0, 0, 0, 0)
@@ -4085,7 +4603,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Title and subtitle ──
         self._basic_device_title_label = QtWidgets.QLabel("Waiting for device...")
         self._basic_device_title_label.setStyleSheet(
-            "background: transparent; font-size: 22px; font-weight: bold; color: #2a1c10;"
+            f"background-color: {_CARD_BG}; font-size: 22px; font-weight: bold; color: #1a1a1a;"
         )
         col_layout.addWidget(self._basic_device_title_label)
         col_layout.addSpacing(6)
@@ -4095,7 +4613,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._basic_device_subtitle_label.setWordWrap(True)
         self._basic_device_subtitle_label.setStyleSheet(
-            "background: transparent; font-size: 13px; color: #6b5e54;"
+            f"background-color: {_CARD_BG}; font-size: 13px; color: #6b6560;"
         )
         col_layout.addWidget(self._basic_device_subtitle_label)
         col_layout.addSpacing(20)
@@ -4103,27 +4621,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── USB LED row ──
         led_row = QtWidgets.QHBoxLayout()
         usb_lbl = QtWidgets.QLabel("USB")
-        usb_lbl.setStyleSheet("background: transparent; color: #555; font-size: 13px;")
+        usb_lbl.setStyleSheet(f"background-color: {_CARD_BG}; color: #555; font-size: 13px;")
         led_row.addWidget(usb_lbl)
-        led_row.addSpacing(8)
-        # Green status indicator — PNG asset when available, CSS circle as fallback.
+        led_row.addSpacing(6)
         self._basic_device_detected_led = QtWidgets.QLabel()
-        self._basic_device_detected_led.setFixedSize(22, 22)
-        _green_ind_path = resource_path("green_status_indicator_on.png")
-        self._green_indicator_pixmap = (
-            QtGui.QPixmap(str(_green_ind_path)).scaled(
-                22, 22,
-                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                QtCore.Qt.TransformationMode.SmoothTransformation,
-            )
-            if _green_ind_path.exists()
-            else None
-        )
+        self._basic_device_detected_led.setFixedSize(14, 14)
         led_row.addWidget(self._basic_device_detected_led)
         led_row.addSpacing(6)
         self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
         self._basic_device_detected_label.setStyleSheet(
-            "background: transparent; font-size: 13px;"
+            f"background-color: {_CARD_BG}; font-size: 13px;"
         )
         led_row.addWidget(self._basic_device_detected_label)
         led_row.addStretch(1)
@@ -4132,17 +4639,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Advanced-mode firmware version selector ──
         if self._is_advanced_mode():
-            self._fw_section_header_label = QtWidgets.QLabel("Choose firmware to install")
-            self._fw_section_header_label.setStyleSheet(
-                "font-weight: bold; font-size: 13px; color: #333;"
+            fw_header = QtWidgets.QLabel("Choose firmware to install")
+            fw_header.setStyleSheet(
+                f"background-color: {_CARD_BG}; font-weight: bold; font-size: 13px; color: #333;"
             )
-            col_layout.addWidget(self._fw_section_header_label)
+            col_layout.addWidget(fw_header)
             col_layout.addSpacing(8)
             self._advanced_firmware_list_widget = self._build_advanced_firmware_list_widget()
             col_layout.addWidget(self._advanced_firmware_list_widget)
             browse_row = QtWidgets.QHBoxLayout()
             browse_row.addStretch(1)
             browse_btn = QtWidgets.QPushButton("Browse local file...")
+            browse_btn.setStyleSheet(f"background-color: {_CARD_BG};")
             browse_btn.setToolTip(
                 "Select a .uf2 or MicroPython (.py/.mpy) file. .uf2 files install "
                 "directly without a MicroPython prompt. The selection is saved to your "
@@ -4155,6 +4663,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Choose Device button (basic: only if >1 RP2040; advanced: always) ──
         self._basic_choose_device_btn = QtWidgets.QPushButton("Choose Device")
+        self._basic_choose_device_btn.setStyleSheet(f"background-color: {_CARD_BG};")
         self._basic_choose_device_btn.setToolTip(
             "Pick a specific RP2040 serial port when more than one is connected."
         )
@@ -4168,8 +4677,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_install_firmware_btn = QtWidgets.QPushButton("Install firmware on device")
         self._basic_install_firmware_btn.setStyleSheet(
             _BTN_CARD_SS
-            + " QPushButton { font-size: 15px; font-weight: 700; color: #2563eb; }"
-            + " QPushButton:disabled { color: #9db5e8; border-color: #e0dbd5; }"
+            + "QPushButton { font-size: 15px; font-weight: bold; color: #2563eb; }"
+            + "QPushButton:disabled { color: #9db5e8; }"
         )
         self._basic_install_firmware_btn.setMinimumHeight(64)
         self._basic_install_firmware_btn.setCursor(
@@ -4235,17 +4744,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         led = getattr(self, "_basic_device_detected_led", None)
         lbl = getattr(self, "_basic_device_detected_label", None)
-        green_px = getattr(self, "_green_indicator_pixmap", None)
         if _qt_widget_alive(led):
             if detected:
-                if green_px is not None:
-                    led.setPixmap(green_px)
-                    led.setStyleSheet("background: transparent;")
-                else:
-                    led.setStyleSheet(
-                        "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
-                        "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
-                    )
+                led.setStyleSheet(
+                    "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
+                    "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
+                )
                 led.setToolTip(
                     "USB: MicroPython serial port, connected Device Console, or unflashed Pico in "
                     "BOOTSEL mode (RPI-RP2 removable drive)."
@@ -4254,7 +4758,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     lbl.setText("Device detected")
                     lbl.setStyleSheet("font-size: 13px; font-weight: bold;")
             else:
-                led.setPixmap(QtGui.QPixmap())
                 led.setStyleSheet(
                     "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
                     "border-radius: 7px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
@@ -4281,15 +4784,6 @@ class MainWindow(QtWidgets.QMainWindow):
         install_btn = getattr(self, "_basic_install_firmware_btn", None)
         if _qt_widget_alive(install_btn):
             install_btn.setEnabled(bool(detected))
-
-        # Update the advanced-mode firmware section header with device context.
-        fw_hdr = getattr(self, "_fw_section_header_label", None)
-        if _qt_widget_alive(fw_hdr):
-            if detected:
-                device_name = self._basic_detected_device_name() or "RP2040 device"
-                fw_hdr.setText(f"Connected to {device_name}")
-            else:
-                fw_hdr.setText("Choose firmware to install")
 
         # Choose Device visibility depends on the number of RP2040 ports detected.
         self._refresh_basic_choose_device_visibility()
@@ -4462,9 +4956,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Build the radio-button list of firmware versions (built-in + custom)."""
         container = QtWidgets.QFrame()
         container.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-        container.setStyleSheet(
-            "QFrame { border: 1px solid #d0d0d0; border-radius: 8px; background-color: white; }"
-        )
         layout = QtWidgets.QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(2)
@@ -4535,15 +5026,13 @@ class MainWindow(QtWidgets.QMainWindow):
         name = str(entry.get("name") or "Firmware")
         if entry.get("recommended"):
             label_html = (
-                f"<b>{name}</b> &nbsp;"
-                f"<span style='background-color:#16a34a; color:white; border-radius:4px;"
-                f" padding:1px 6px; font-size:11px; font-weight:bold;'>Recommended</span>"
+                f"<b>{name}</b> &nbsp;<span style='color:#ffcc44;'>&#9733; Recommended</span>"
             )
         else:
             label_html = f"<b>{name}</b>"
         desc = str(entry.get("description") or "").strip()
         if desc:
-            label_html += f"<br><span style='color:#777; font-size:11px;'>{desc}</span>"
+            label_html += f"<br><span style='color:#b0b0b4; font-size:11px;'>{desc}</span>"
         label = QtWidgets.QLabel(label_html)
         label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         label.setWordWrap(True)
@@ -5641,232 +6130,82 @@ class MainWindow(QtWidgets.QMainWindow):
             return mode
         return None
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LOAD MUSIC PAGE — widget factories
+    #
+    # The page is assembled in _build_basic_sd_card_tab() from five focused
+    # sub-widgets.  Edit each sub-method independently; values are annotated
+    # so you can find every size, colour, and spacing in one place.
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _build_basic_sd_card_tab(self) -> QtWidgets.QWidget:
-        """Basic mode: SD Card tab with station manager, track list, capacity, and sync.
+        """Load Music page — assembled by LoadMusicPage in gui/widgets/load_music/.
 
-        The entire window already paints the radio shell as its background (see
-        ``_build_tabs``). This tab simply lays out controls with a transparent
-        background so the shell shows through.
+        All appearance values are in gui/theme.py (LM_PAGE_MARGINS, LM_PAGE_SPACING,
+        WARN_*, LM_SPLITTER_*, etc.).  Edit each sub-widget file independently:
+          gui/widgets/load_music/storage_section/storage_section.py
+          gui/widgets/load_music/station_panel/station_panel.py
+          gui/widgets/load_music/track_panel/track_panel.py
+          gui/widgets/load_music/sync_bar/sync_bar.py
         """
-        widget = QtWidgets.QWidget()
-        widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        widget.setStyleSheet("QWidget { background: transparent; }")
-        layout = QtWidgets.QVBoxLayout(widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-
-        warn_row = QtWidgets.QHBoxLayout()
-        self._basic_sd_sync_warning = QtWidgets.QLabel()
-        self._basic_sd_sync_warning.setWordWrap(True)
-        self._basic_sd_sync_warning.setStyleSheet("color: #b07800; font-weight: bold;")
-        self._basic_sd_sync_warning.setVisible(False)
-        warn_row.addWidget(self._basic_sd_sync_warning, 1)
-        self._basic_sd_sync_details_btn = QtWidgets.QPushButton("Details...")
-        self._basic_sd_sync_details_btn.setVisible(False)
-        self._basic_sd_sync_details_btn.setFixedWidth(80)
-        self._basic_sd_sync_details_btn.clicked.connect(self._show_basic_sd_sync_details)
-        warn_row.addWidget(self._basic_sd_sync_details_btn)
-        layout.addLayout(warn_row)
-
         self._basic_sd_sync_issues: List[str] = []
 
-        # ── Storage selector row ──
-        storage_group = QtWidgets.QGroupBox("Storage")
-        storage_layout = QtWidgets.QHBoxLayout(storage_group)
-        storage_layout.addWidget(QtWidgets.QLabel("SD card root:"))
-        self._basic_sd_root_label = QtWidgets.QLabel(self.sd_root or "(not set)")
-        self._basic_sd_root_label.setStyleSheet("color: #555;")
-        storage_layout.addWidget(self._basic_sd_root_label, 1)
-        detect_btn = QtWidgets.QPushButton("Detect")
-        detect_btn.setToolTip(
-            "Find your SD card again using the saved volume name (e.g. after reconnecting USB). "
-            "Does not ask to confirm a different card."
+        page = _LoadMusicPage(
+            is_advanced=self._is_advanced_mode(),
+            auto_eject_checked=self.db.get_setting("auto_eject_after_sync", "0") == "1",
+            conversion_profile=self._selected_conversion_profile(),
+            sd_root=self.sd_root or "",
+            max_tracks=BASIC_MAX_TRACKS_PER_STATION,
         )
-        detect_btn.clicked.connect(self._select_sd_root_basic)
-        select_btn = QtWidgets.QPushButton("Select")
-        select_btn.setToolTip(
-            "Pick from detected removable drives (dropdown). "
-            "If nothing is listed, use Browse. Wrong-card safety is only on Sync."
-        )
-        select_btn.clicked.connect(self._select_sd_root_manual_basic)
-        browse_btn = QtWidgets.QPushButton("Browse")
-        browse_btn.clicked.connect(self._browse_sd_root_basic)
-        storage_layout.addWidget(detect_btn)
-        storage_layout.addWidget(select_btn)
-        storage_layout.addWidget(browse_btn)
-        layout.addWidget(storage_group)
 
-        # ── SD capacity bar ──
-        cap_layout = QtWidgets.QHBoxLayout()
-        cap_layout.addWidget(QtWidgets.QLabel("SD Capacity:"))
-        self._basic_sd_capacity_bar = QtWidgets.QProgressBar()
-        self._basic_sd_capacity_bar.setFormat("%p% used")
-        self._basic_sd_capacity_bar.setValue(0)
-        cap_layout.addWidget(self._basic_sd_capacity_bar, 1)
-        self._basic_sd_capacity_label = QtWidgets.QLabel("")
-        cap_layout.addWidget(self._basic_sd_capacity_label)
-        layout.addLayout(cap_layout)
+        # ── Warning banner aliases and signal ─────────────────────────────────
+        self._basic_sd_sync_warning    = page.warning_label
+        self._basic_sd_sync_details_btn = page.warning_details_btn
+        self._basic_sd_sync_details_btn.clicked.connect(self._show_basic_sd_sync_details)
 
-        # ── Station manager (left) + track list (right) ──
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        # ── StorageSection aliases and signals ────────────────────────────────
+        self._basic_sd_root_label     = page.storage_section.sd_root_label
+        self._basic_sd_capacity_bar   = page.storage_section.capacity_bar
+        self._basic_sd_percent_label  = page.storage_section.percent_label
+        self._basic_sd_capacity_label = page.storage_section.capacity_label
+        page.storage_section.detect_clicked.connect(self._select_sd_root_basic)
+        page.storage_section.select_clicked.connect(self._select_sd_root_manual_basic)
+        page.storage_section.browse_clicked.connect(self._browse_sd_root_basic)
 
-        # Left: station list
-        station_panel = QtWidgets.QWidget()
-        station_layout = QtWidgets.QVBoxLayout(station_panel)
-        station_layout.setContentsMargins(0, 0, 0, 0)
+        # ── StationPanel aliases and signals ──────────────────────────────────
+        self._basic_station_list        = page.station_panel.station_list
+        self._basic_stations_size_label = page.station_panel.size_label
+        page.station_panel.station_selected.connect(self._on_basic_station_selected)
+        page.station_panel.order_changed.connect(self._on_basic_station_reordered)
+        page.station_panel.folders_dropped.connect(self._import_folders_as_basic_stations)
+        page.station_panel.context_menu_requested.connect(self._show_station_context_menu)
+        page.station_panel.new_station_clicked.connect(self._create_basic_station)
 
-        station_heading = QtWidgets.QHBoxLayout()
-        stations_label = QtWidgets.QLabel("Stations")
-        stations_label.setStyleSheet(
-            "font-weight: bold; font-size: 14px; color: #4a3520; background: transparent;"
-            " padding: 2px 4px;"
-        )
-        stations_label.setToolTip(
-            "Drag stations to reorder. Each station maps to a numbered folder on the SD card. "
-            "You can also drop folders here to import each folder as a station."
-        )
-        station_heading.addWidget(stations_label)
-        self._basic_stations_size_label = QtWidgets.QLabel("")
-        self._basic_stations_size_label.setStyleSheet("color: #888; font-size: 11px;")
-        self._basic_stations_size_label.setToolTip("Estimated total size of all station tracks on the SD card")
-        station_heading.addWidget(self._basic_stations_size_label)
-        station_heading.addStretch()
-        station_layout.addLayout(station_heading)
+        # ── TrackPanel aliases and signals ────────────────────────────────────
+        self._basic_station_tracks_table = page.track_panel.tracks_table
+        self._basic_station_detail       = page.track_panel.station_detail
+        page.track_panel.add_tracks_clicked.connect(self._add_tracks_to_basic_station)
+        page.track_panel.files_dropped.connect(self._import_files_to_basic_station)
+        page.track_panel.order_changed.connect(self._persist_basic_station_track_order)
+        page.track_panel.context_menu_requested.connect(self._show_station_track_context_menu)
 
-        self._basic_station_list = StationImportListWidget()
-        self._basic_station_list.order_changed.connect(self._on_basic_station_reordered)
-        self._basic_station_list.currentItemChanged.connect(self._on_basic_station_selected)
-        self._basic_station_list.folders_dropped.connect(self._import_folders_as_basic_stations)
-        self._basic_station_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self._basic_station_list.customContextMenuRequested.connect(self._show_station_context_menu)
-        station_layout.addWidget(self._basic_station_list)
-
-        station_btns = QtWidgets.QHBoxLayout()
-        add_station_btn = QtWidgets.QPushButton("New Station")
-        add_station_btn.clicked.connect(self._create_basic_station)
-        rename_station_btn = QtWidgets.QPushButton("Rename")
-        rename_station_btn.clicked.connect(self._rename_basic_station)
-        del_station_btn = QtWidgets.QPushButton("Delete")
-        del_station_btn.clicked.connect(self._delete_basic_station)
-        station_btns.addWidget(add_station_btn)
-        station_btns.addWidget(rename_station_btn)
-        station_btns.addWidget(del_station_btn)
-        station_layout.addLayout(station_btns)
-        splitter.addWidget(station_panel)
-
-        # Right: tracks in selected station (reorderable + file drop)
-        track_panel = QtWidgets.QWidget()
-        track_layout = QtWidgets.QVBoxLayout(track_panel)
-        track_layout.setContentsMargins(0, 0, 0, 0)
-        self._basic_station_detail = QtWidgets.QLabel("Select a station to view tracks.")
-        self._basic_station_detail.setWordWrap(True)
-        track_layout.addWidget(self._basic_station_detail)
-
-        self._basic_station_tracks_table = CollectionDropTable()
-        self._basic_station_tracks_table.setColumnCount(4)
-        self._basic_station_tracks_table.setHorizontalHeaderLabels(["Title", "Artist", "Duration", "Format"])
-        self._basic_station_tracks_table.horizontalHeader().setStretchLastSection(True)
-        self._basic_station_tracks_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._basic_station_tracks_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self._basic_station_tracks_table.files_dropped.connect(self._import_files_to_basic_station)
-        self._basic_station_tracks_table.order_changed.connect(self._persist_basic_station_track_order)
-        self._basic_station_tracks_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self._basic_station_tracks_table.customContextMenuRequested.connect(self._show_station_track_context_menu)
-        track_layout.addWidget(self._basic_station_tracks_table, 1)
-
-        track_btns = QtWidgets.QHBoxLayout()
-        add_tracks_btn = QtWidgets.QPushButton("Add Tracks")
-        add_tracks_btn.setToolTip("Browse for audio files to add to this station (also imports them to the library)")
-        add_tracks_btn.clicked.connect(self._add_tracks_to_basic_station)
-        remove_tracks_btn = QtWidgets.QPushButton("Remove Selected")
-        remove_tracks_btn.clicked.connect(self._remove_songs_from_basic_station)
-        track_btns.addWidget(add_tracks_btn)
-        track_btns.addWidget(remove_tracks_btn)
-        track_btns.addStretch()
-        track_layout.addLayout(track_btns)
-        splitter.addWidget(track_panel)
-
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        layout.addWidget(splitter, 1)
-
-        # ── Sync controls — sit on the dark wood strip baked into the radio shell ──
-        # The shell PNG already shows a dark wood bay at the bottom of the window;
-        # these controls overlay that area with cream button styling that reads on wood.
-        sync_group = QtWidgets.QGroupBox("Sync")
-        sync_group.setStyleSheet("""
-            QGroupBox {
-                background: transparent;
-                border: 1px solid rgba(255, 230, 200, 0.45);
-                border-radius: 10px;
-                margin-top: 10px;
-                padding-top: 6px;
-                font-weight: bold;
-                color: #f5e6c8;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                color: #f5e6c8;
-                background: transparent;
-                padding: 0 4px;
-            }
-            QPushButton {
-                background: #f5e6c8;
-                border: 1px solid #8B6914;
-                border-radius: 8px;
-                padding: 6px 14px;
-                color: #3D2200;
-                font-weight: bold;
-            }
-            QPushButton:hover { background: #fff3dc; }
-            QPushButton:pressed { background: #e8d4a8; }
-            QCheckBox { color: #f5e6c8; background: transparent; }
-            QLabel { color: #f5e6c8; background: transparent; }
-            QComboBox {
-                background: #f5e6c8;
-                border: 1px solid #8B6914;
-                border-radius: 6px;
-                padding: 4px 8px;
-                color: #3D2200;
-            }
-        """)
-        sync_layout = QtWidgets.QHBoxLayout(sync_group)
-        sync_btn = QtWidgets.QPushButton("Sync Stations to SD")
-        sync_btn.setToolTip("Copy all stations to the SD card in DFPlayer folder format.")
-        sync_btn.clicked.connect(self._sync_basic_to_sd)
-        eject_btn = QtWidgets.QPushButton("Safely Remove SD")
-        eject_btn.clicked.connect(self.safely_remove_sd)
-        self._basic_auto_eject_cb = QtWidgets.QCheckBox("Automatically safely remove SD card after syncing")
-        self._basic_auto_eject_cb.setChecked(self.db.get_setting("auto_eject_after_sync", "0") == "1")
-        self._basic_auto_eject_cb.stateChanged.connect(self._on_auto_eject_after_sync_changed)
-
-        if self._is_advanced_mode():
-            conv_box = QtWidgets.QGroupBox("Conversion Profile")
-            conv_layout = QtWidgets.QHBoxLayout(conv_box)
-            self._advanced_conversion_profile_combo = QtWidgets.QComboBox()
-            self._advanced_conversion_profile_combo.addItem("DFPlayer-safe (default)", "dfplayer_safe")
-            self._advanced_conversion_profile_combo.addItem("Higher quality (advanced)", "high_quality")
-            current_profile = self._selected_conversion_profile()
-            self._advanced_conversion_profile_combo.setCurrentIndex(
-                1 if current_profile == "high_quality" else 0
-            )
+        # ── SyncBar aliases and signals ───────────────────────────────────────
+        self._basic_auto_eject_cb = page.sync_bar.auto_eject_checkbox
+        if page.sync_bar.conversion_profile_combo is not None:
+            self._advanced_conversion_profile_combo = page.sync_bar.conversion_profile_combo
             self._advanced_conversion_profile_combo.currentIndexChanged.connect(
                 self._on_advanced_conversion_profile_changed
             )
-            conv_layout.addWidget(self._advanced_conversion_profile_combo)
-            sync_layout.addWidget(conv_box)
-
-        sync_layout.addWidget(sync_btn)
-        # The "Experimental: SD image sync (clean install)" flow is reachable from the
-        # Sync Stations to SD dialog via a checkbox — no standalone button here.
-        sync_layout.addWidget(eject_btn)
-        sync_layout.addWidget(self._basic_auto_eject_cb)
-        sync_layout.addStretch()
-        layout.addWidget(sync_group)
+        page.sync_bar.sync_clicked.connect(self._sync_basic_to_sd)
+        page.sync_bar.eject_clicked.connect(self.safely_remove_sd)
+        page.sync_bar.auto_eject_changed.connect(self._on_auto_eject_after_sync_changed)
 
         self._refresh_basic_station_list()
         self._update_basic_stations_size()
-        return widget
+        # Populate the capacity bar immediately on build so it shows without
+        # requiring the user to click Detect first.
+        QtCore.QTimer.singleShot(0, self._refresh_basic_sd_capacity)
+        return page
 
     # ── Basic-mode SD capacity ──
 
@@ -5874,17 +6213,25 @@ class MainWindow(QtWidgets.QMainWindow):
         """Update the SD capacity bar and label from the current sd_root."""
         bar = getattr(self, "_basic_sd_capacity_bar", None)
         cap_label = getattr(self, "_basic_sd_capacity_label", None)
+        pct_label = getattr(self, "_basic_sd_percent_label", None)
         if not _qt_widget_alive(bar) or not _qt_widget_alive(cap_label):
             return
+
+        def _set_pct(text: str) -> None:
+            if _qt_widget_alive(pct_label):
+                pct_label.setText(text)
+
         sd_root = self._resolve_sd_root(interactive=False)
         if not sd_root:
             bar.setValue(0)
+            _set_pct("")
             cap_label.setText("No SD card selected")
             return
         try:
             usage = shutil.disk_usage(str(sd_root))
             pct = int(usage.used * 100 / usage.total) if usage.total else 0
             bar.setValue(pct)
+            _set_pct(f"{pct}% used")
             used_mb = usage.used / (1024 * 1024)
             total_mb = usage.total / (1024 * 1024)
             free_mb = usage.free / (1024 * 1024)
@@ -5898,6 +6245,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
         except OSError:
             bar.setValue(0)
+            _set_pct("")
             cap_label.setText("Cannot read SD card")
 
     # ── Basic-mode station list management ──
@@ -5923,21 +6271,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_station_list.blockSignals(True)
         self._basic_station_list.clear()
         stations = self.db.list_basic_stations()
+        track_counts = self.db.basic_station_track_counts()
         restore_row = -1
         for idx, station in enumerate(stations):
-            track_count = len(self.db.list_basic_station_tracks(station["id"]))
+            track_count = track_counts.get(int(station["id"]), 0)
             item = QtWidgets.QListWidgetItem(
                 f'{station["name"]}  (Folder {station["folder_number"]:02d}, {track_count} tracks)'
             )
             item.setData(QtCore.Qt.ItemDataRole.UserRole, station["id"])
+            # Extra roles drive _StationItemDelegate's custom rendering.
+            item.setData(_STATION_NUM_ROLE, int(station["folder_number"]))
+            item.setData(_STATION_NAME_ROLE, station["name"])
+            item.setData(_STATION_COUNT_ROLE, int(track_count))
             self._basic_station_list.addItem(item)
             if preserve_selection and prev_station_id is not None and station["id"] == prev_station_id:
                 restore_row = idx
-        self._basic_station_list.blockSignals(False)
         if preserve_selection and restore_row >= 0:
             self._basic_station_list.setCurrentRow(restore_row)
         else:
             self._basic_station_list.setCurrentRow(-1)
+        self._basic_station_list.blockSignals(False)
         self._sync_basic_station_tracks_from_selection()
 
     def _sync_basic_station_tracks_from_selection(self) -> None:
@@ -5948,46 +6301,131 @@ class MainWindow(QtWidgets.QMainWindow):
         self._on_basic_station_selected(cur, None)
 
     def _on_basic_station_selected(self, current, _previous) -> None:
+        """Switch stations immediately; load tracks without blocking the UI thread."""
         if current is None:
-            self._basic_station_detail.setText("Select a station to view tracks.")
-            self._basic_station_tracks_table.setRowCount(0)
+            self._cancel_basic_tracks_load()
+            self._apply_empty_basic_station_tracks()
             return
+
         station_id = current.data(QtCore.Qt.ItemDataRole.UserRole)
         if station_id is None:
-            self._basic_station_detail.setText("Select a station to view tracks.")
-            self._basic_station_tracks_table.setRowCount(0)
+            self._cancel_basic_tracks_load()
+            self._apply_empty_basic_station_tracks()
             return
-        station = self.db.get_basic_station(station_id)
-        if station is None:
-            self._basic_station_detail.setText("Select a station to view tracks.")
-            self._basic_station_tracks_table.setRowCount(0)
-            return
-        track_count = len(self.db.list_basic_station_tracks(station_id))
+
+        station_id = int(station_id)
+        self._update_basic_station_detail_from_item(current)
+        self._cancel_basic_tracks_load()
+        self._basic_tracks_load_token += 1
+        token = self._basic_tracks_load_token
+        self._basic_tracks_target_station_id = station_id
+
+        # Clear stale tracks right away so the previous station doesn't linger.
+        self._basic_station_tracks_table.setRowCount(0)
+
+        QtCore.QTimer.singleShot(
+            0,
+            lambda sid=station_id, t=token: self._load_basic_station_tracks_sync(sid, t),
+        )
+
+    def _update_basic_station_detail_from_item(self, item: QtWidgets.QListWidgetItem) -> None:
+        name = item.data(_STATION_NAME_ROLE) or ""
+        folder = int(item.data(_STATION_NUM_ROLE) or 0)
+        track_count = int(item.data(_STATION_COUNT_ROLE) or 0)
         max_tracks = self._current_max_tracks_per_station()
         self._basic_station_detail.setText(
-            f'Station: {station["name"]}  |  Folder: {station["folder_number"]:02d}'
-            f"  |  Tracks: {track_count}/{max_tracks}"
+            f"Station: {name}  |  Folder: {folder:02d}  |  Tracks: {track_count}/{max_tracks}"
         )
-        self._refresh_basic_station_tracks(station_id)
+
+    def _apply_empty_basic_station_tracks(self) -> None:
+        self._basic_station_detail.setText("Select a station to view tracks.")
+        self._basic_station_tracks_table.setRowCount(0)
+
+    def _cancel_basic_tracks_load(self) -> None:
+        thread = self._basic_tracks_loader_thread
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait(200)
+        self._basic_tracks_loader_thread = None
+
+    def _load_basic_station_tracks_sync(self, station_id: int, token: int) -> None:
+        if token != self._basic_tracks_load_token:
+            return
+        if station_id != self._basic_tracks_target_station_id:
+            return
+        songs = [dict(row) for row in self.db.list_basic_station_songs(station_id)]
+        if token != self._basic_tracks_load_token:
+            return
+        if station_id != self._basic_tracks_target_station_id:
+            return
+        self._populate_basic_station_tracks_table(songs)
+        sync_track_table_column_widths(self._basic_station_tracks_table)
+        self._schedule_track_source_health_checks(songs)
+        self._sync_station_track_count_on_item(station_id, len(songs))
+
+    def _sync_station_track_count_on_item(self, station_id: int, track_count: int) -> None:
+        """Keep the station row's cached count in sync after a track reload."""
+        for i in range(self._basic_station_list.count()):
+            item = self._basic_station_list.item(i)
+            if item is None:
+                continue
+            sid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if sid is not None and int(sid) == station_id:
+                item.setData(_STATION_COUNT_ROLE, int(track_count))
+                break
+
+    def _populate_basic_station_tracks_table(self, songs: list) -> None:
+        """Fill the tracks table in one batched pass (no per-row filesystem checks)."""
+        table = self._basic_station_tracks_table
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            table.setRowCount(len(songs))
+            for row_idx, song in enumerate(songs):
+                title = song.get("title") or song.get("original_filename") or ""
+                title_item = QtWidgets.QTableWidgetItem(title)
+                title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song.get("id"))
+                title_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, song.get("bst_id"))
+                table.setItem(row_idx, 0, title_item)
+                table.setItem(
+                    row_idx, 1,
+                    QtWidgets.QTableWidgetItem(song.get("artist") or ""),
+                )
+                dur = song.get("duration")
+                dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur else ""
+                table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(dur_str))
+                table.setItem(row_idx, 3, QtWidgets.QTableWidgetItem(song.get("format") or ""))
+        finally:
+            table.blockSignals(False)
+            table.setUpdatesEnabled(True)
+
+    def _schedule_track_source_health_checks(self, songs: list, start: int = 0) -> None:
+        """Apply missing-file warning icons in small batches so the UI stays responsive."""
+        table = self._basic_station_tracks_table
+        if table.rowCount() != len(songs):
+            return
+        batch = 40
+        end = min(start + batch, len(songs))
+        for row_idx in range(start, end):
+            item = table.item(row_idx, 0)
+            if item is not None:
+                self._decorate_track_title_item_source_health(item, songs[row_idx])
+        if end < len(songs):
+            QtCore.QTimer.singleShot(
+                0,
+                lambda s=songs, n=end: self._schedule_track_source_health_checks(s, n),
+            )
+
+    def _apply_basic_station_selection(self, current) -> None:
+        """Legacy entry point — redirects to the non-blocking selection handler."""
+        self._on_basic_station_selected(current, None)
 
     def _refresh_basic_station_tracks(self, station_id: int) -> None:
         """Reload the tracks table for a given station (including duplicates)."""
-        songs = self.db.list_basic_station_songs(station_id)
-        table = self._basic_station_tracks_table
-        table.setRowCount(len(songs))
-        for row_idx, song in enumerate(songs):
-            title_item = QtWidgets.QTableWidgetItem(song["title"] or song["original_filename"])
-            # Store song id for reorder; store bst_id (track row id) in UserRole+1 for removal
-            title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song["id"])
-            title_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, song["bst_id"])
-            self._decorate_track_title_item_source_health(title_item, song)
-            table.setItem(row_idx, 0, title_item)
-            table.setItem(row_idx, 1, QtWidgets.QTableWidgetItem(song["artist"] or ""))
-            dur = song["duration"]
-            dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur else ""
-            table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(dur_str))
-            table.setItem(row_idx, 3, QtWidgets.QTableWidgetItem(song["format"] or ""))
-        table.resizeColumnsToContents()
+        songs = [dict(row) for row in self.db.list_basic_station_songs(station_id)]
+        self._populate_basic_station_tracks_table(songs)
+        sync_track_table_column_widths(self._basic_station_tracks_table)
+        self._schedule_track_source_health_checks(songs)
 
     def _create_basic_station(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(self, "New Station", "Station name:")
@@ -7959,8 +8397,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if station_id is not None:
             self._refresh_basic_station_tracks(station_id)
 
-    @staticmethod
-    def _song_source_path_missing(song: Any) -> bool:
+    def _song_source_path_missing(self, song: Any) -> bool:
         """True when the library has no usable path or the file is not on disk."""
         try:
             fp = (song["file_path"] or "").strip()
@@ -7968,10 +8405,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
         if not fp:
             return True
+        cache = getattr(self, "_song_path_missing_cache", None)
+        if cache is not None and fp in cache:
+            return cache[fp]
         try:
-            return not Path(fp).is_file()
+            missing = not Path(fp).is_file()
         except OSError:
-            return True
+            missing = True
+        if cache is not None:
+            cache[fp] = missing
+        return missing
 
     def _broken_source_file_tooltip(self, song: Any) -> str:
         try:
@@ -11407,7 +11850,8 @@ def run_app() -> None:
         # If diagnostic fails, ignore silently — normal app functionality is unaffected.
         pass
 
-    window = MainWindow()
+    _dev_mode = "--dev" in sys.argv
+    window = MainWindow(dev_mode=_dev_mode)
     window.show()
     sys.exit(app.exec())
 

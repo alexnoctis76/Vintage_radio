@@ -1,1 +1,1 @@
-"""Reusable Qt widgets for the GUI layer."""
+# gui/widgets — reusable vintage-radio UI components

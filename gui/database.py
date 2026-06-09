@@ -586,6 +586,33 @@ class DatabaseManager:
         self.conn.commit()
         self._maybe_backup()
 
+    def basic_station_track_counts(self) -> Dict[int, int]:
+        """Return {station_id: track_count} in one query (avoids N+1 on list refresh)."""
+        rows = self.conn.execute(
+            "SELECT station_id, COUNT(*) AS cnt FROM basic_station_tracks GROUP BY station_id;"
+        ).fetchall()
+        return {int(r["station_id"]): int(r["cnt"]) for r in rows}
+
+    @classmethod
+    def read_basic_station_songs(
+        cls, db_path: Path, station_id: int, **_kwargs: Any
+    ) -> List[Dict[str, Any]]:
+        """Thread-safe read of station tracks using a short-lived connection."""
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """SELECT basic_station_tracks.id AS bst_id, songs.*
+                   FROM basic_station_tracks
+                   JOIN songs ON songs.id = basic_station_tracks.song_id
+                   WHERE basic_station_tracks.station_id = ?
+                   ORDER BY basic_station_tracks.track_order ASC;""",
+                (station_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     def list_basic_station_songs(self, station_id: int) -> List[sqlite3.Row]:
         """Return all tracks for a station, including duplicates. Each row has a
         ``bst_id`` column (the basic_station_tracks row id) for individual removal."""

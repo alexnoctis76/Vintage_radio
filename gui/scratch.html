@@ -1,0 +1,2187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Vintage Radio Music Manager</title>
+
+<style>
+  :root {
+    --title-dark: #1a1208;
+    --title-dark-2: #2b1e14;
+
+    --workspace: #faf1e4;
+    --floating: #f1dfc8;
+
+    --header: #3b2917;
+    --header-2: #4a341f;
+
+    --station-pane: #6b5a43;
+    --station-pane-2: #5a4b37;
+
+    --accent: #d46f1a;
+    --selected-2: #ffc475;
+
+    --border: #9b6a36;
+    --text: #2c1f14;
+    --text-soft: #5e4b38;
+    --text-light: #fff6e9;
+
+    --danger: #9e321d;
+    --danger-2: #c04a29;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at top, #4b2d13 0, #1b1108 42%, #0d0804 100%);
+    display: grid;
+    place-items: center;
+    font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    color: var(--text);
+    overflow: auto;
+  }
+
+  .scale-shell {
+    transform-origin: center center;
+    transition: transform 180ms ease;
+  }
+
+  .app {
+    width: 1448px;
+    height: 1086px;
+    overflow: hidden;
+    position: relative;
+    border-radius: 9px;
+    background: var(--workspace);
+    box-shadow:
+      0 24px 65px rgba(0, 0, 0, 0.48),
+      0 0 0 1px rgba(255, 255, 255, 0.22) inset;
+  }
+
+  .title-bar {
+    height: 58px;
+    width: 100%;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.05), rgba(0,0,0,0.16)),
+      repeating-linear-gradient(
+        90deg,
+        rgba(255,255,255,0.018) 0,
+        rgba(255,255,255,0.018) 1px,
+        transparent 1px,
+        transparent 8px
+      ),
+      linear-gradient(90deg, var(--title-dark), var(--title-dark-2), var(--title-dark));
+    color: white;
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    position: absolute;
+    top: 0;
+    left: 0;
+  }
+
+  .app-title {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.1px;
+  }
+
+  .radio-icon {
+    width: 36px;
+    height: 36px;
+    flex: 0 0 36px;
+    filter: drop-shadow(0 1px 0 rgba(0,0,0,0.4));
+  }
+
+  .window-controls {
+    margin-left: auto;
+    display: flex;
+    gap: 30px;
+    align-items: center;
+    color: #fffaf0;
+    font-size: 31px;
+    line-height: 1;
+  }
+
+  .win-control {
+    width: 23px;
+    text-align: center;
+    opacity: 0.96;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .win-control.min {
+    transform: translateY(-3px);
+  }
+
+  .win-control.max {
+    font-size: 26px;
+  }
+
+  .win-control.close {
+    font-size: 35px;
+    transform: translateY(-1px);
+  }
+
+  .sidebar {
+    position: absolute;
+    left: 0;
+    top: 58px;
+    bottom: 58px;
+    width: 164px;
+    background:
+      radial-gradient(circle at 55% 20%, rgba(255,255,255,0.06), transparent 27%),
+      repeating-linear-gradient(
+        90deg,
+        rgba(255,255,255,0.018) 0,
+        rgba(255,255,255,0.018) 1px,
+        transparent 1px,
+        transparent 7px
+      ),
+      linear-gradient(180deg, #130902, #21150c 45%, #110904);
+    box-shadow:
+      inset -1px 0 0 rgba(255,255,255,0.08),
+      inset -5px 0 16px rgba(0,0,0,0.24);
+    color: var(--text-light);
+  }
+
+  .main {
+    position: absolute;
+    left: 164px;
+    right: 0;
+    top: 58px;
+    bottom: 58px;
+    background:
+      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.82), transparent 40%),
+      linear-gradient(180deg, #fff8ee 0, var(--workspace) 34%, #fbf2e6 100%);
+    border-left: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .bottom-bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 58px;
+    background: #f5eadc;
+    border-top: 1px solid #d8c6ad;
+    display: flex;
+    align-items: center;
+    padding: 0 30px;
+    color: #35271a;
+    font-size: 20px;
+  }
+
+  .zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .zoom-btn {
+    width: 42px;
+    height: 36px;
+    border-radius: 11px;
+    border: 1px solid #d3b995;
+    background: linear-gradient(180deg, #fff8ef, #eadcc9);
+    display: grid;
+    place-items: center;
+    box-shadow:
+      0 2px 4px rgba(81,45,13,0.15),
+      inset 0 1px 0 rgba(255,255,255,0.9);
+    font-weight: 700;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .version {
+    margin-left: auto;
+    font-size: 19px;
+  }
+
+  .nav {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 13px;
+  }
+
+  .nav-item {
+    min-height: 135px;
+    border-radius: 8px;
+    margin-bottom: 7px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: #fff4e3;
+    font-size: 23px;
+    text-align: center;
+    position: relative;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .nav-item:hover {
+    background: rgba(255, 255, 255, 0.055);
+  }
+
+  .nav-item svg {
+    width: 70px;
+    height: 70px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 3.3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .nav-item.active {
+    background:
+      radial-gradient(circle at 45% 24%, rgba(255,255,255,0.22), transparent 35%),
+      linear-gradient(180deg, #c86917, #8c3f08);
+    box-shadow:
+      0 0 0 2px #e07918,
+      0 0 20px rgba(232,110,11,0.36),
+      inset 0 1px 0 rgba(255,255,255,0.22);
+  }
+
+  .nav-divider {
+    height: 1px;
+    background: rgba(255,255,255,0.13);
+    box-shadow: 0 1px 0 rgba(0,0,0,0.4);
+    margin: 14px 0 25px;
+  }
+
+  .spacer {
+    flex: 1;
+  }
+
+  .small-nav {
+    min-height: 110px;
+    margin-bottom: 8px;
+  }
+
+  .library-bar {
+    position: absolute;
+    left: 26px;
+    right: 17px;
+    top: 13px;
+    height: 78px;
+    border: 1px solid #d6bd99;
+    border-radius: 9px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0.15)),
+      linear-gradient(180deg, var(--floating), #f1dfc6);
+    box-shadow:
+      0 6px 18px rgba(78, 39, 8, 0.12),
+      inset 0 1px 0 rgba(255,255,255,0.82);
+    display: grid;
+    grid-template-columns: 105px 1fr 119px 119px 119px;
+    align-items: center;
+    gap: 16px;
+    padding: 0 32px 0 39px;
+    z-index: 4;
+  }
+
+  .library-label {
+    font-size: 22px;
+    font-weight: 700;
+    text-align: right;
+  }
+
+  .library-select {
+    height: 52px;
+    border-radius: 8px;
+    border: 1px solid #c6a77e;
+    background:
+      linear-gradient(180deg, #fff9f1, #f2e5d2);
+    padding: 0 24px;
+    font-size: 21px;
+    color: #2b2117;
+    box-shadow:
+      0 2px 4px rgba(76,45,18,0.1),
+      inset 0 1px 0 rgba(255,255,255,0.92);
+  }
+
+  .top-button,
+  .outline-button {
+    height: 52px;
+    border-radius: 8px;
+    border: 2px solid var(--border);
+    background:
+      linear-gradient(180deg, #fff8ef, #ead6bd);
+    color: #302316;
+    font-size: 21px;
+    box-shadow:
+      0 3px 6px rgba(71, 35, 8, 0.16),
+      inset 0 1px 0 rgba(255,255,255,0.9);
+    cursor: pointer;
+  }
+
+  .top-button:hover,
+  .outline-button:hover,
+  .secondary-action:hover {
+    filter: brightness(1.035);
+  }
+
+  .top-button:active,
+  .outline-button:active,
+  .secondary-action:active,
+  .primary-action:active,
+  .mini-button:active,
+  .modal-button:active {
+    transform: translateY(1px);
+  }
+
+  .page {
+    display: none;
+    position: absolute;
+    inset: 0;
+  }
+
+  .page.active {
+    display: block;
+  }
+
+  .storage {
+    position: absolute;
+    left: 32px;
+    right: 45px;
+    top: 116px;
+  }
+
+  .storage h2 {
+    margin: 0 0 4px;
+    font-size: 28px;
+    line-height: 1.1;
+  }
+
+  .storage-row {
+    display: grid;
+    grid-template-columns: 252px 1fr 89px 120px 102px 102px;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .drive-text {
+    font-size: 21px;
+  }
+
+  .capacity-bar {
+    height: 30px;
+    border-radius: 13px;
+    border: 2px solid #a8703d;
+    background:
+      linear-gradient(180deg, #f9efe0, #f0dfca);
+    box-shadow:
+      inset 0 2px 4px rgba(73,43,17,0.2);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .capacity-fill {
+    width: 31%;
+    height: 100%;
+    border-radius: 10px;
+    background:
+      linear-gradient(180deg, #e8994d, #cc6c1f 58%, #a74d12);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.28),
+      4px 0 12px rgba(147,70,12,0.28);
+    transition: width 220ms ease;
+  }
+
+  .usage,
+  .capacity-text {
+    font-size: 17px;
+    color: #3b2d20;
+  }
+
+  .storage .outline-button {
+    height: 55px;
+    font-size: 21px;
+  }
+
+  .split-panel {
+    position: absolute;
+    left: 18px;
+    right: 18px;
+    top: 214px;
+    height: 641px;
+    border: 2px solid #5a3b1f;
+    border-radius: 8px;
+    overflow: hidden;
+    display: grid;
+    grid-template-columns: 382px 1fr;
+    box-shadow:
+      0 9px 18px rgba(75,43,18,0.15),
+      inset 0 1px 0 rgba(255,255,255,0.42);
+  }
+
+  .pane {
+    position: relative;
+    min-width: 0;
+  }
+
+  .stations-pane {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.05), transparent 36%),
+      linear-gradient(180deg, var(--station-pane), var(--station-pane-2));
+    border-right: 2px solid #4c321d;
+    color: #fff4df;
+  }
+
+  .tracks-pane {
+    background:
+      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.72), transparent 40%),
+      linear-gradient(180deg, #fff3e2, #fbf2e6 72%, #f4e4cd);
+  }
+
+  .pane-header {
+    height: 56px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.07), rgba(0,0,0,0.14)),
+      linear-gradient(180deg, var(--header-2), var(--header));
+    color: #fff4e5;
+    display: flex;
+    align-items: center;
+    padding: 0 30px;
+    font-size: 28px;
+    font-weight: 700;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.16),
+      inset 0 -1px 0 rgba(0,0,0,0.35);
+  }
+
+  .pane-header .mini-button {
+    margin-left: auto;
+  }
+
+  .mini-button {
+    height: 40px;
+    min-width: 104px;
+    padding: 0 14px;
+    border-radius: 7px;
+    border: 1px solid #7a4c24;
+    background:
+      linear-gradient(180deg, #6e4826, #3f2715);
+    color: #fff5e7;
+    font-size: 22px;
+    font-weight: 650;
+    box-shadow:
+      0 2px 4px rgba(0,0,0,0.24),
+      inset 0 1px 0 rgba(255,255,255,0.13);
+    cursor: pointer;
+  }
+
+  .mini-button.add {
+    min-width: 96px;
+  }
+
+  .scroll-wrap {
+    position: absolute;
+    top: 75px;
+    bottom: 0;
+    overflow: hidden;
+  }
+
+  .station-scroll-wrap {
+    left: 20px;
+    right: 0;
+  }
+
+  .track-scroll-wrap {
+    left: 38px;
+    right: 0;
+  }
+
+  .content-scroll {
+    height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 38px;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .content-scroll::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+
+  .station-list,
+  .track-list {
+    position: relative;
+  }
+
+  .custom-scrollbar {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 30px;
+    display: grid;
+    grid-template-rows: 38px 1fr 38px;
+    z-index: 10;
+    user-select: none;
+  }
+
+  .station-custom-scrollbar {
+    background: #625642;
+    border-left: 1px solid rgba(28, 18, 10, 0.58);
+    border-right: 1px solid rgba(255, 240, 210, 0.14);
+  }
+
+  .track-custom-scrollbar {
+    background: #f7efe3;
+    border-left: 1px solid #d3b995;
+    border-right: 1px solid rgba(83, 52, 24, 0.22);
+  }
+
+  .scroll-arrow {
+    border: 0;
+    background: transparent;
+    position: relative;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .scroll-arrow::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 13px;
+    height: 13px;
+    border-top: 3px solid currentColor;
+    border-left: 3px solid currentColor;
+    transform-origin: center;
+  }
+
+  .scroll-up::before {
+    transform: translate(-50%, -32%) rotate(45deg);
+  }
+
+  .scroll-down::before {
+    transform: translate(-50%, -68%) rotate(225deg);
+  }
+
+  .station-custom-scrollbar .scroll-arrow {
+    color: #f3dcc0;
+  }
+
+  .track-custom-scrollbar .scroll-arrow {
+    color: #543a23;
+  }
+
+  .scroll-arrow:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .track-custom-scrollbar .scroll-arrow:hover {
+    background: rgba(122, 78, 37, 0.08);
+  }
+
+  .scroll-track {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+
+  .scroll-thumb {
+    position: absolute;
+    left: 8px;
+    top: 0;
+    width: 14px;
+    min-height: 64px;
+    border-radius: 999px;
+    background:
+      linear-gradient(180deg, #eba04d 0%, #db852e 42%, #c46617 100%);
+    border: 1px solid #9f4c12;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.42),
+      inset 0 -1px 0 rgba(67, 32, 9, 0.28),
+      0 1px 3px rgba(0, 0, 0, 0.24);
+    cursor: grab;
+  }
+
+  .scroll-thumb:active {
+    cursor: grabbing;
+  }
+
+  .custom-scrollbar.not-scrollable .scroll-thumb {
+    opacity: 0.36;
+  }
+
+  .custom-scrollbar.not-scrollable .scroll-arrow {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .station-row {
+    min-height: 84px;
+    display: grid;
+    grid-template-columns: 30px 40px 1fr 75px 32px;
+    align-items: center;
+    padding: 0 13px;
+    margin-right: 4px;
+    border-bottom: 1px solid rgba(255,255,255,0.14);
+    font-size: 21px;
+    color: #fff4df;
+    cursor: pointer;
+  }
+
+  .station-row .drag {
+    font-size: 27px;
+    opacity: 0.88;
+  }
+
+  .station-row .number {
+    font-size: 18px;
+    opacity: 0.92;
+  }
+
+  .station-row .name {
+    font-size: 24px;
+    font-weight: 700;
+  }
+
+  .station-row .count {
+    text-align: right;
+    font-size: 19px;
+  }
+
+  .station-row .edit {
+    display: none;
+    font-size: 24px;
+    cursor: pointer;
+  }
+
+  .station-row.selected {
+    border: 1px solid #eea54c;
+    border-radius: 7px;
+    background:
+      linear-gradient(180deg, var(--selected-2), #cf761f 55%, #ad5514);
+    box-shadow:
+      0 2px 6px rgba(69,32,5,0.26),
+      inset 0 1px 0 rgba(255,255,255,0.42);
+    color: white;
+    margin-bottom: 8px;
+  }
+
+  .station-row.selected .edit {
+    display: block;
+  }
+
+  .track-row {
+    min-height: 78px;
+    display: grid;
+    grid-template-columns: 52px 1fr 92px 78px 34px;
+    align-items: center;
+    border-bottom: 1px solid #dfc9a8;
+    padding: 0 22px;
+    margin-right: 4px;
+    color: #281c12;
+    cursor: pointer;
+  }
+
+  .track-row .num {
+    font-size: 19px;
+    color: #4d3d2c;
+  }
+
+  .track-title {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+
+  .track-name {
+    font-size: 24px;
+    font-weight: 750;
+    line-height: 1.05;
+  }
+
+  .artist {
+    margin-top: 5px;
+    font-size: 17px;
+    color: #4f3e2c;
+  }
+
+  .duration,
+  .format {
+    font-size: 18px;
+    color: #3f3022;
+  }
+
+  .track-row .edit {
+    display: none;
+    font-size: 23px;
+    cursor: pointer;
+  }
+
+  .track-row.selected {
+    border: 1px solid #eca34a;
+    border-radius: 7px;
+    background:
+      linear-gradient(180deg, #fff0d7, #ffdfaa);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.72);
+    margin-bottom: 7px;
+  }
+
+  .track-row.selected .edit {
+    display: block;
+  }
+
+  .actions {
+    position: absolute;
+    right: 18px;
+    bottom: 28px;
+    display: flex;
+    align-items: center;
+    gap: 17px;
+  }
+
+  .primary-action {
+    height: 62px;
+    width: 246px;
+    border-radius: 7px;
+    border: 2px solid #813c09;
+    background:
+      linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
+    color: white;
+    font-size: 22px;
+    font-weight: 700;
+    box-shadow:
+      0 4px 8px rgba(86,41,5,0.28),
+      inset 0 1px 0 rgba(255,255,255,0.32);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 13px;
+    cursor: pointer;
+  }
+
+  .secondary-action {
+    height: 62px;
+    width: 248px;
+    border-radius: 7px;
+    border: 2px solid #9b6a36;
+    background:
+      linear-gradient(180deg, #fff7ec, #ead8bf);
+    color: #352516;
+    font-size: 22px;
+    font-weight: 650;
+    box-shadow:
+      0 3px 7px rgba(72,38,10,0.13),
+      inset 0 1px 0 rgba(255,255,255,0.84);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 13px;
+    cursor: pointer;
+  }
+
+  .sd-icon {
+    width: 22px;
+    height: 26px;
+    border: 2px solid currentColor;
+    border-radius: 3px;
+    position: relative;
+  }
+
+  .sd-icon::before {
+    content: "";
+    position: absolute;
+    left: 4px;
+    top: 4px;
+    width: 4px;
+    height: 5px;
+    background: currentColor;
+    box-shadow: 6px 0 0 currentColor, 12px 0 0 currentColor;
+  }
+
+  .eject-icon {
+    width: 0;
+    height: 0;
+    border-left: 11px solid transparent;
+    border-right: 11px solid transparent;
+    border-bottom: 16px solid currentColor;
+    position: relative;
+    transform: translateY(-3px);
+  }
+
+  .eject-icon::after {
+    content: "";
+    position: absolute;
+    left: -13px;
+    top: 21px;
+    width: 26px;
+    height: 4px;
+    background: currentColor;
+    border-radius: 2px;
+  }
+
+  .placeholder-page {
+    position: absolute;
+    inset: 112px 42px 40px;
+    display: grid;
+    place-items: center;
+    border: 1px solid #d6bd99;
+    border-radius: 12px;
+    background: rgba(255, 248, 238, 0.72);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+    text-align: center;
+  }
+
+  .placeholder-card {
+    max-width: 620px;
+  }
+
+  .placeholder-card h1 {
+    font-size: 42px;
+    margin: 0 0 12px;
+  }
+
+  .placeholder-card p {
+    font-size: 21px;
+    color: var(--text-soft);
+    line-height: 1.45;
+  }
+
+  .toast {
+    position: absolute;
+    right: 32px;
+    bottom: 78px;
+    z-index: 20;
+    min-width: 300px;
+    max-width: 520px;
+    padding: 16px 20px;
+    border-radius: 10px;
+    border: 1px solid #b8874e;
+    background:
+      linear-gradient(180deg, #fff8ee, #f0ddc2);
+    box-shadow: 0 10px 25px rgba(54, 27, 5, 0.22);
+    color: #2c1f14;
+    font-size: 18px;
+    opacity: 0;
+    transform: translateY(12px);
+    pointer-events: none;
+    transition: 180ms ease;
+  }
+
+  .toast.show {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .modal-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    display: none;
+    place-items: center;
+    background:
+      radial-gradient(circle at 50% 28%, rgba(255, 244, 226, 0.16), transparent 42%),
+      rgba(25, 14, 6, 0.54);
+    backdrop-filter: blur(4px);
+  }
+
+  .modal-backdrop.show {
+    display: grid;
+  }
+
+  .modal-window {
+    width: 890px;
+    border-radius: 16px;
+    border: 1px solid #b98a55;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.18)),
+      linear-gradient(180deg, #fff8ed, #f1dfc6);
+    box-shadow:
+      0 24px 70px rgba(24, 12, 4, 0.44),
+      inset 0 1px 0 rgba(255,255,255,0.8);
+    overflow: hidden;
+  }
+
+  .confirm-window {
+    width: 650px;
+  }
+
+  .modal-header {
+    height: 78px;
+    padding: 0 28px 0 32px;
+    display: flex;
+    align-items: center;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.07), rgba(0,0,0,0.14)),
+      linear-gradient(180deg, #4a341f, #2d1d10);
+    color: #fff5e6;
+  }
+
+  .modal-title-group {
+    min-width: 0;
+  }
+
+  .modal-title {
+    margin: 0;
+    font-size: 28px;
+    line-height: 1.1;
+  }
+
+  .modal-subtitle {
+    margin: 6px 0 0;
+    font-size: 16px;
+    color: #ead9c1;
+  }
+
+  .modal-close {
+    margin-left: auto;
+    width: 38px;
+    height: 38px;
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 10px;
+    background: rgba(255,255,255,0.08);
+    color: #fff5e6;
+    font-size: 28px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .modal-body {
+    padding: 30px 32px 28px;
+  }
+
+  .sync-options {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 22px;
+  }
+
+  .sync-card {
+    min-height: 322px;
+    border-radius: 14px;
+    border: 1px solid #c7a06d;
+    background:
+      radial-gradient(circle at 25% 0%, rgba(255,255,255,0.9), transparent 42%),
+      linear-gradient(180deg, #fff7eb, #ead7bd);
+    box-shadow:
+      0 8px 20px rgba(90, 49, 14, 0.13),
+      inset 0 1px 0 rgba(255,255,255,0.84);
+    padding: 24px 24px 22px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sync-card.full-refresh {
+    border-color: #b87a46;
+    background:
+      radial-gradient(circle at 25% 0%, rgba(255,255,255,0.9), transparent 42%),
+      linear-gradient(180deg, #fff4e5, #ecd1b5);
+  }
+
+  .card-topline {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+
+  .sync-card h3 {
+    margin: 0;
+    font-size: 28px;
+    color: #2b1d11;
+  }
+
+  .badge {
+    border-radius: 999px;
+    padding: 5px 11px 6px;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    color: #fff6ea;
+    background: linear-gradient(180deg, #df852f, #a94f10);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.28);
+  }
+
+  .badge.alt {
+    background: linear-gradient(180deg, #8b6240, #4a321e);
+  }
+
+  .sync-card p {
+    margin: 0;
+    font-size: 19px;
+    line-height: 1.42;
+    color: #4f3d2b;
+  }
+
+  .helper-text {
+    margin-top: auto;
+    padding-top: 18px;
+    font-size: 16px;
+    color: #705640;
+  }
+
+  .modal-button {
+    height: 54px;
+    margin-top: 18px;
+    border-radius: 9px;
+    border: 2px solid #813c09;
+    background:
+      linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
+    color: white;
+    font-size: 20px;
+    font-weight: 750;
+    box-shadow:
+      0 4px 8px rgba(86,41,5,0.23),
+      inset 0 1px 0 rgba(255,255,255,0.32);
+    cursor: pointer;
+  }
+
+  .sync-card .modal-button {
+    width: 100%;
+  }
+
+  .modal-button.secondary {
+    border-color: #9b6a36;
+    background:
+      linear-gradient(180deg, #fff7ec, #ead8bf);
+    color: #352516;
+  }
+
+  .modal-button.danger {
+    border-color: #752617;
+    background:
+      linear-gradient(180deg, #cf5a38, #a83a22 58%, #802715);
+    color: #fff7ed;
+  }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 14px;
+    padding: 0 32px 30px;
+  }
+
+  .modal-footer .modal-button {
+    width: 160px;
+    margin-top: 0;
+  }
+
+  .confirm-body {
+    padding: 30px 34px 8px;
+  }
+
+  .confirm-body p {
+    margin: 0 0 18px;
+    font-size: 20px;
+    line-height: 1.45;
+    color: #45311f;
+  }
+
+  .safety-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin-top: 18px;
+    padding: 16px 18px;
+    border-radius: 12px;
+    border: 1px solid #d1a979;
+    background: rgba(255, 246, 232, 0.72);
+    color: #5c4128;
+    font-size: 17px;
+    line-height: 1.35;
+  }
+
+  .safety-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    flex: 0 0 26px;
+    display: grid;
+    place-items: center;
+    background: #d46f1a;
+    color: white;
+    font-weight: 800;
+  }
+
+  .hidden-file {
+    display: none;
+  }
+
+  button:disabled {
+    opacity: 0.58;
+    cursor: not-allowed;
+  }
+</style>
+</head>
+
+<body>
+  <div class="scale-shell" id="scaleShell">
+    <div class="app" id="app">
+
+      <header class="title-bar">
+        <div class="app-title">
+          <svg class="radio-icon" viewBox="0 0 64 64" aria-hidden="true">
+            <defs>
+              <linearGradient id="radioGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#ffb357"/>
+                <stop offset="1" stop-color="#c45b11"/>
+              </linearGradient>
+            </defs>
+            <rect x="7" y="19" width="48" height="34" rx="6" fill="url(#radioGrad)" stroke="#f6c07a" stroke-width="2"/>
+            <path d="M18 18 L39 8" stroke="#ffd18e" stroke-width="4" stroke-linecap="round"/>
+            <circle cx="44" cy="40" r="6" fill="#4a2e16"/>
+            <path d="M15 29h23M15 36h20M15 43h17" stroke="#4a2e16" stroke-width="3" stroke-linecap="round"/>
+            <rect x="12" y="23" width="11" height="7" rx="2" fill="#ffe0a8"/>
+          </svg>
+          <span>Vintage Radio Music Manager</span>
+        </div>
+
+        <div class="window-controls">
+          <div class="win-control min" id="minimizeBtn">−</div>
+          <div class="win-control max" id="maximizeBtn">□</div>
+          <div class="win-control close" id="closeBtn">×</div>
+        </div>
+      </header>
+
+      <aside class="sidebar">
+        <nav class="nav">
+          <div class="nav-item active" data-page="loadMusic">
+            <svg viewBox="0 0 80 80" aria-hidden="true">
+              <path d="M24 17v30" />
+              <path d="M24 17l22-6v30" />
+              <circle cx="18" cy="50" r="6" />
+              <circle cx="40" cy="44" r="6" />
+              <rect x="48" y="34" width="18" height="27" rx="3" />
+              <path d="M53 39h8M53 45h8M53 51h8" />
+              <path d="M56 15c9 5 15 13 16 23" />
+              <path d="M72 38l-6-5" />
+              <path d="M72 38l5-6" />
+              <path d="M24 66C14 62 8 53 8 42" />
+              <path d="M8 42l5 6" />
+              <path d="M8 42l-5 6" />
+            </svg>
+            <div>Load Music</div>
+          </div>
+
+          <div class="nav-item" data-page="firmware">
+            <svg viewBox="0 0 64 64" aria-hidden="true">
+              <rect x="19" y="17" width="26" height="30" rx="3"/>
+              <path d="M24 9v8M32 9v8M40 9v8M24 47v8M32 47v8M40 47v8"/>
+              <path d="M11 23h8M11 32h8M11 41h8M45 23h8M45 32h8M45 41h8"/>
+              <path d="M32 22v17"/>
+              <path d="M24 32l8 8 8-8"/>
+            </svg>
+            <div>Install Firmware</div>
+          </div>
+
+          <div class="nav-divider"></div>
+
+          <div class="nav-item" data-page="tools">
+            <svg viewBox="0 0 64 64" aria-hidden="true">
+              <path d="M22 12l8 8-9 9-8-8z"/>
+              <path d="M20 30L8 42l14 14 12-12"/>
+              <path d="M45 9a11 11 0 0 0-9 16L13 48l6 6 23-23a11 11 0 0 0 16-12l-8 8-7-7 8-8a11 11 0 0 0-6-3z"/>
+            </svg>
+            <div>Tools</div>
+          </div>
+
+          <div class="spacer"></div>
+
+          <div class="nav-item small-nav" data-page="settings">
+            <svg viewBox="0 0 64 64" aria-hidden="true">
+              <circle cx="32" cy="32" r="8"/>
+              <path d="M32 6v8M32 50v8M6 32h8M50 32h8"/>
+              <path d="M13.6 13.6l5.7 5.7M44.7 44.7l5.7 5.7M50.4 13.6l-5.7 5.7M19.3 44.7l-5.7 5.7"/>
+            </svg>
+            <div>Settings</div>
+          </div>
+
+          <div class="nav-divider"></div>
+
+          <div class="nav-item small-nav" data-page="help">
+            <svg viewBox="0 0 64 64" aria-hidden="true">
+              <circle cx="32" cy="32" r="24"/>
+              <path d="M25 25a8 8 0 1 1 13 6c-4 3-6 5-6 10"/>
+              <path d="M32 50h.1"/>
+            </svg>
+            <div>Help</div>
+          </div>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <section class="library-bar">
+          <div class="library-label">Library:</div>
+
+          <select class="library-select" id="librarySelect"></select>
+
+          <button class="top-button" id="newLibraryBtn">New</button>
+          <button class="top-button" id="renameLibraryBtn">Rename</button>
+          <button class="top-button" id="deleteLibraryBtn">Delete</button>
+        </section>
+
+        <section class="page active" id="loadMusicPage">
+          <section class="storage">
+            <h2>Storage</h2>
+
+            <div class="storage-row">
+              <div class="drive-text" id="driveText">SD Drive: G:\ (VINTAGER)</div>
+
+              <div class="capacity-bar">
+                <div class="capacity-fill" id="capacityFill"></div>
+              </div>
+
+              <div class="usage" id="usageText">31% used</div>
+              <div class="capacity-text" id="capacityText">9.3/29.0 GB</div>
+
+              <button class="outline-button" id="detectSdBtn">Detect</button>
+              <button class="outline-button" id="selectSdBtn">Select</button>
+            </div>
+          </section>
+
+          <section class="split-panel">
+            <div class="pane stations-pane">
+              <div class="pane-header">
+                <span>Stations</span>
+                <button class="mini-button" id="newStationBtn">＋ New</button>
+              </div>
+
+              <div class="scroll-wrap station-scroll-wrap">
+                <div class="station-list content-scroll" id="stationList"></div>
+
+                <div class="custom-scrollbar station-custom-scrollbar" data-target="stationList">
+                  <button class="scroll-arrow scroll-up" type="button" aria-label="Scroll stations up"></button>
+
+                  <div class="scroll-track">
+                    <div class="scroll-thumb"></div>
+                  </div>
+
+                  <button class="scroll-arrow scroll-down" type="button" aria-label="Scroll stations down"></button>
+                </div>
+              </div>
+            </div>
+
+            <div class="pane tracks-pane">
+              <div class="pane-header">
+                <span>Tracks</span>
+                <button class="mini-button add" id="addTracksBtn">＋ Add</button>
+              </div>
+
+              <div class="scroll-wrap track-scroll-wrap">
+                <div class="track-list content-scroll" id="trackList"></div>
+
+                <div class="custom-scrollbar track-custom-scrollbar" data-target="trackList">
+                  <button class="scroll-arrow scroll-up" type="button" aria-label="Scroll tracks up"></button>
+
+                  <div class="scroll-track">
+                    <div class="scroll-thumb"></div>
+                  </div>
+
+                  <button class="scroll-arrow scroll-down" type="button" aria-label="Scroll tracks down"></button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="actions">
+            <button class="primary-action" id="syncBtn">
+              <span class="sd-icon"></span>
+              <span id="syncBtnText">Sync to SD Card</span>
+            </button>
+
+            <button class="secondary-action" id="removeSdBtn">
+              <span class="eject-icon"></span>
+              <span>Safely Remove SD</span>
+            </button>
+          </section>
+        </section>
+
+        <section class="page" id="firmwarePage">
+          <div class="placeholder-page">
+            <div class="placeholder-card">
+              <h1>Install Firmware</h1>
+              <p>This is a placeholder firmware screen. Replace it with the firmware card layout once you wire up device detection and MicroPython firmware installation.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="page" id="toolsPage">
+          <div class="placeholder-page">
+            <div class="placeholder-card">
+              <h1>Tools</h1>
+              <p>Future utilities, conversion tools, SD diagnostics, and repair actions can live here.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="page" id="settingsPage">
+          <div class="placeholder-page">
+            <div class="placeholder-card">
+              <h1>Settings</h1>
+              <p>Theme, conversion profile defaults, sync behavior, and device preferences can live here.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="page" id="helpPage">
+          <div class="placeholder-page">
+            <div class="placeholder-card">
+              <h1>Help</h1>
+              <p>Guides, button controls, firmware notes, and troubleshooting can live here.</p>
+            </div>
+          </div>
+        </section>
+
+        <div class="modal-backdrop" id="syncChoiceModal" aria-hidden="true">
+          <div class="modal-window" role="dialog" aria-modal="true" aria-labelledby="syncChoiceTitle">
+            <header class="modal-header">
+              <div class="modal-title-group">
+                <h2 class="modal-title" id="syncChoiceTitle">Sync music to SD card</h2>
+                <p class="modal-subtitle" id="syncChoiceSubtitle">
+                  Choose how you want to update G:\ (VINTAGER) from My Jazz Collection.
+                </p>
+              </div>
+
+              <button class="modal-close" id="closeSyncChoiceBtn" type="button" aria-label="Close">×</button>
+            </header>
+
+            <div class="modal-body">
+              <div class="sync-options">
+                <article class="sync-card">
+                  <div class="card-topline">
+                    <h3>Sync Changes</h3>
+                    <span class="badge">Update</span>
+                  </div>
+
+                  <p>
+                    Update only the stations and tracks that changed since your last sync.
+                    Existing music stays in place, so this usually finishes faster.
+                  </p>
+
+                  <div class="helper-text">Best for regular updates.</div>
+
+                  <button class="modal-button" id="syncChangesBtn" type="button">
+                    Sync Changes
+                  </button>
+                </article>
+
+                <article class="sync-card full-refresh">
+                  <div class="card-topline">
+                    <h3>Replace All Music</h3>
+                    <span class="badge alt">Full refresh</span>
+                  </div>
+
+                  <p>
+                    Formats the SD card, then reloads the entire selected library from scratch.
+                    Use this when loading a new library, making many changes, or starting fresh.
+                  </p>
+
+                  <div class="helper-text">Best for new libraries, big changes, or a clean start.</div>
+
+                  <button class="modal-button secondary" id="replaceAllMusicBtn" type="button">
+                    Replace All Music
+                  </button>
+                </article>
+              </div>
+            </div>
+
+            <footer class="modal-footer">
+              <button class="modal-button secondary" id="cancelSyncChoiceBtn" type="button">Cancel</button>
+            </footer>
+          </div>
+        </div>
+
+        <div class="modal-backdrop" id="replaceConfirmModal" aria-hidden="true">
+          <div class="modal-window confirm-window" role="dialog" aria-modal="true" aria-labelledby="replaceConfirmTitle">
+            <header class="modal-header">
+              <div class="modal-title-group">
+                <h2 class="modal-title" id="replaceConfirmTitle">Replace all music on this SD card?</h2>
+                <p class="modal-subtitle">This action refreshes the SD card from the beginning.</p>
+              </div>
+
+              <button class="modal-close" id="closeReplaceConfirmBtn" type="button" aria-label="Close">×</button>
+            </header>
+
+            <div class="confirm-body">
+              <p id="replaceConfirmText">
+                This will remove the music currently on <strong>G:\ (VINTAGER)</strong> and copy
+                <strong>My Jazz Collection</strong> to the SD card from the beginning.
+              </p>
+
+              <div class="safety-note">
+                <span class="safety-icon">!</span>
+                <span>Your music library on this computer will not be changed.</span>
+              </div>
+            </div>
+
+            <footer class="modal-footer">
+              <button class="modal-button secondary" id="cancelReplaceConfirmBtn" type="button">Cancel</button>
+              <button class="modal-button danger" id="confirmReplaceAllMusicBtn" type="button">Replace All Music</button>
+            </footer>
+          </div>
+        </div>
+
+        <div class="toast" id="toast"></div>
+
+        <input class="hidden-file" id="trackFileInput" type="file" accept="audio/*" multiple />
+        <input class="hidden-file" id="sdFileInput" type="file" webkitdirectory directory multiple />
+      </main>
+
+      <footer class="bottom-bar">
+        <div class="zoom-controls">
+          <span>Zoom</span>
+          <span class="zoom-btn" id="zoomOutBtn">−</span>
+          <span class="zoom-btn" id="zoomInBtn">＋</span>
+        </div>
+
+        <div class="version">v1.0</div>
+      </footer>
+    </div>
+  </div>
+
+<script>
+  const state = {
+    zoom: 1,
+    selectedPage: "loadMusic",
+    sdConnected: true,
+    syncing: false,
+    sdDriveName: "G:\\ (VINTAGER)",
+    libraries: ["My Jazz Collection", "Stress Test", "Road Trip Mix"],
+    selectedLibrary: "My Jazz Collection",
+    selectedStationId: 1,
+    selectedTrackId: 1,
+    stations: [
+      {
+        id: 1,
+        name: "Jazz",
+        tracks: [
+          { id: 1, title: "God Bless the Child", artist: "Sonny Rollins", duration: "3:54", format: "mp3" },
+          { id: 2, title: "Take Five", artist: "Dave Brubeck", duration: "5:24", format: "mp3" },
+          { id: 3, title: "Blue in Green", artist: "Miles Davis", duration: "5:38", format: "flac" },
+          { id: 4, title: "In a Sentimental Mood", artist: "Duke Ellington & John Coltrane", duration: "4:15", format: "wav" },
+          { id: 5, title: "My Favorite Things", artist: "John Coltrane", duration: "13:41", format: "flac" },
+          { id: 6, title: "Round Midnight", artist: "Thelonious Monk", duration: "3:12", format: "mp3" },
+          { id: 7, title: "Autumn Leaves", artist: "Cannonball Adderley", duration: "10:59", format: "mp3" },
+          { id: 8, title: "So What", artist: "Miles Davis", duration: "9:22", format: "flac" },
+          { id: 9, title: "Naima", artist: "John Coltrane", duration: "4:24", format: "wav" },
+          { id: 10, title: "Misty", artist: "Erroll Garner", duration: "2:48", format: "mp3" },
+          { id: 11, title: "Cantaloupe Island", artist: "Herbie Hancock", duration: "5:32", format: "mp3" },
+          { id: 12, title: "Strange Meadow Lark", artist: "Dave Brubeck", duration: "7:22", format: "flac" }
+        ]
+      },
+      {
+        id: 2,
+        name: "Soul",
+        tracks: [
+          { id: 1, title: "A Change Is Gonna Come", artist: "Sam Cooke", duration: "3:11", format: "mp3" },
+          { id: 2, title: "Respect", artist: "Aretha Franklin", duration: "2:28", format: "mp3" },
+          { id: 3, title: "Let's Stay Together", artist: "Al Green", duration: "3:18", format: "wav" }
+        ]
+      },
+      {
+        id: 3,
+        name: "Funk",
+        tracks: [
+          { id: 1, title: "Flash Light", artist: "Parliament", duration: "5:46", format: "mp3" },
+          { id: 2, title: "Give Up the Funk", artist: "Parliament", duration: "5:44", format: "mp3" }
+        ]
+      },
+      {
+        id: 4,
+        name: "Blues",
+        tracks: [
+          { id: 1, title: "The Thrill Is Gone", artist: "B.B. King", duration: "5:25", format: "mp3" },
+          { id: 2, title: "Born Under a Bad Sign", artist: "Albert King", duration: "2:46", format: "mp3" }
+        ]
+      },
+      {
+        id: 5,
+        name: "Lo-fi",
+        tracks: [
+          { id: 1, title: "Evening Tape Hiss", artist: "Vintage Radio", duration: "2:14", format: "mp3" }
+        ]
+      },
+      {
+        id: 6,
+        name: "Oldies",
+        tracks: [
+          { id: 1, title: "Stand by Me", artist: "Ben E. King", duration: "2:57", format: "mp3" }
+        ]
+      },
+      { id: 7, name: "Ambient", tracks: [] },
+      { id: 8, name: "Classical", tracks: [] },
+      { id: 9, name: "Rock", tracks: [] },
+      { id: 10, name: "Afrobeats", tracks: [] },
+      { id: 11, name: "City Pop", tracks: [] },
+      { id: 12, name: "Soundtracks", tracks: [] }
+    ]
+  };
+
+  const els = {
+    scaleShell: document.getElementById("scaleShell"),
+    app: document.getElementById("app"),
+    toast: document.getElementById("toast"),
+
+    librarySelect: document.getElementById("librarySelect"),
+    newLibraryBtn: document.getElementById("newLibraryBtn"),
+    renameLibraryBtn: document.getElementById("renameLibraryBtn"),
+    deleteLibraryBtn: document.getElementById("deleteLibraryBtn"),
+
+    driveText: document.getElementById("driveText"),
+    capacityFill: document.getElementById("capacityFill"),
+    usageText: document.getElementById("usageText"),
+    capacityText: document.getElementById("capacityText"),
+    detectSdBtn: document.getElementById("detectSdBtn"),
+    selectSdBtn: document.getElementById("selectSdBtn"),
+    removeSdBtn: document.getElementById("removeSdBtn"),
+    syncBtn: document.getElementById("syncBtn"),
+    syncBtnText: document.getElementById("syncBtnText"),
+
+    stationList: document.getElementById("stationList"),
+    trackList: document.getElementById("trackList"),
+    newStationBtn: document.getElementById("newStationBtn"),
+    addTracksBtn: document.getElementById("addTracksBtn"),
+    trackFileInput: document.getElementById("trackFileInput"),
+    sdFileInput: document.getElementById("sdFileInput"),
+
+    syncChoiceModal: document.getElementById("syncChoiceModal"),
+    replaceConfirmModal: document.getElementById("replaceConfirmModal"),
+    syncChoiceSubtitle: document.getElementById("syncChoiceSubtitle"),
+    replaceConfirmText: document.getElementById("replaceConfirmText"),
+    closeSyncChoiceBtn: document.getElementById("closeSyncChoiceBtn"),
+    cancelSyncChoiceBtn: document.getElementById("cancelSyncChoiceBtn"),
+    syncChangesBtn: document.getElementById("syncChangesBtn"),
+    replaceAllMusicBtn: document.getElementById("replaceAllMusicBtn"),
+    closeReplaceConfirmBtn: document.getElementById("closeReplaceConfirmBtn"),
+    cancelReplaceConfirmBtn: document.getElementById("cancelReplaceConfirmBtn"),
+    confirmReplaceAllMusicBtn: document.getElementById("confirmReplaceAllMusicBtn"),
+
+    zoomInBtn: document.getElementById("zoomInBtn"),
+    zoomOutBtn: document.getElementById("zoomOutBtn"),
+
+    closeBtn: document.getElementById("closeBtn"),
+    maximizeBtn: document.getElementById("maximizeBtn"),
+    minimizeBtn: document.getElementById("minimizeBtn")
+  };
+
+  const customScrollbarRefreshers = [];
+
+  function showToast(message) {
+    els.toast.textContent = message;
+    els.toast.classList.add("show");
+
+    window.clearTimeout(showToast.timer);
+    showToast.timer = window.setTimeout(() => {
+      els.toast.classList.remove("show");
+    }, 2600);
+  }
+
+  function updateModalCopy() {
+    els.syncChoiceSubtitle.textContent =
+      `Choose how you want to update ${state.sdDriveName} from ${state.selectedLibrary}.`;
+
+    els.replaceConfirmText.innerHTML =
+      `This will remove the music currently on <strong>${escapeHtml(state.sdDriveName)}</strong> and copy ` +
+      `<strong>${escapeHtml(state.selectedLibrary)}</strong> to the SD card from the beginning.`;
+  }
+
+  function openModal(modal) {
+    updateModalCopy();
+    modal.classList.add("show");
+    modal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeModal(modal) {
+    modal.classList.remove("show");
+    modal.setAttribute("aria-hidden", "true");
+  }
+
+  function closeAllModals() {
+    closeModal(els.syncChoiceModal);
+    closeModal(els.replaceConfirmModal);
+  }
+
+  function openSyncChoiceModal() {
+    if (!state.sdConnected) {
+      showToast("Connect or select an SD card before syncing.");
+      return;
+    }
+
+    if (state.syncing) {
+      showToast("A sync is already running.");
+      return;
+    }
+
+    openModal(els.syncChoiceModal);
+  }
+
+  function getSelectedStation() {
+    return state.stations.find(station => station.id === state.selectedStationId);
+  }
+
+  function renderLibraries() {
+    els.librarySelect.innerHTML = "";
+
+    state.libraries.forEach(libraryName => {
+      const option = document.createElement("option");
+      option.value = libraryName;
+      option.textContent = libraryName;
+      option.selected = libraryName === state.selectedLibrary;
+      els.librarySelect.appendChild(option);
+    });
+  }
+
+  function renderStations() {
+    els.stationList.innerHTML = "";
+
+    state.stations.forEach((station, index) => {
+      const row = document.createElement("div");
+      row.className = "station-row";
+
+      if (station.id === state.selectedStationId) {
+        row.classList.add("selected");
+      }
+
+      row.innerHTML = `
+        <div class="drag">≡</div>
+        <div class="number">${String(index + 1).padStart(2, "0")}</div>
+        <div class="name">${escapeHtml(station.name)}</div>
+        <div class="count">${station.tracks.length}/255</div>
+        <div class="edit pencil" title="Rename station">✎</div>
+      `;
+
+      row.addEventListener("click", () => {
+        state.selectedStationId = station.id;
+        state.selectedTrackId = station.tracks[0]?.id ?? null;
+        renderStations();
+        renderTracks();
+      });
+
+      row.querySelector(".edit").addEventListener("click", event => {
+        event.stopPropagation();
+
+        const newName = prompt("Rename station:", station.name);
+        if (!newName || !newName.trim()) return;
+
+        station.name = newName.trim();
+        renderStations();
+        showToast("Station renamed.");
+      });
+
+      els.stationList.appendChild(row);
+    });
+
+    refreshCustomScrollbars();
+  }
+
+  function renderTracks() {
+    els.trackList.innerHTML = "";
+
+    const station = getSelectedStation();
+
+    if (!station || station.tracks.length === 0) {
+      const empty = document.createElement("div");
+      empty.style.padding = "24px";
+      empty.style.fontSize = "22px";
+      empty.style.color = "#6f5c48";
+      empty.textContent = "No tracks in this station yet. Click + Add to add music.";
+      els.trackList.appendChild(empty);
+      refreshCustomScrollbars();
+      return;
+    }
+
+    station.tracks.forEach((track, index) => {
+      const row = document.createElement("div");
+      row.className = "track-row";
+
+      if (track.id === state.selectedTrackId) {
+        row.classList.add("selected");
+      }
+
+      row.innerHTML = `
+        <div class="num">${String(index + 1).padStart(2, "0")}</div>
+        <div class="track-title">
+          <div class="track-name">${escapeHtml(track.title)}</div>
+          <div class="artist">${escapeHtml(track.artist || "Unknown Artist")}</div>
+        </div>
+        <div class="duration">${escapeHtml(track.duration || "0:00")}</div>
+        <div class="format">${escapeHtml(track.format || "mp3")}</div>
+        <div class="edit pencil" title="Edit track">✎</div>
+      `;
+
+      row.addEventListener("click", () => {
+        state.selectedTrackId = track.id;
+        renderTracks();
+      });
+
+      row.querySelector(".edit").addEventListener("click", event => {
+        event.stopPropagation();
+
+        const title = prompt("Track title:", track.title);
+        if (!title || !title.trim()) return;
+
+        const artist = prompt("Artist:", track.artist || "");
+        track.title = title.trim();
+        track.artist = artist?.trim() || "Unknown Artist";
+
+        renderTracks();
+        showToast("Track updated.");
+      });
+
+      els.trackList.appendChild(row);
+    });
+
+    refreshCustomScrollbars();
+  }
+
+  function renderStorage() {
+    if (state.sdConnected) {
+      els.driveText.textContent = `SD Drive: ${state.sdDriveName}`;
+      els.usageText.textContent = "31% used";
+      els.capacityText.textContent = "9.3/29.0 GB";
+      els.capacityFill.style.width = "31%";
+      els.syncBtn.disabled = false;
+      els.removeSdBtn.disabled = false;
+    } else {
+      els.driveText.textContent = "SD Drive: Not connected";
+      els.usageText.textContent = "0% used";
+      els.capacityText.textContent = "No SD card";
+      els.capacityFill.style.width = "0%";
+      els.syncBtn.disabled = true;
+      els.removeSdBtn.disabled = true;
+    }
+  }
+
+  function renderPages() {
+    document.querySelectorAll(".nav-item").forEach(item => {
+      item.classList.toggle("active", item.dataset.page === state.selectedPage);
+    });
+
+    document.querySelectorAll(".page").forEach(page => {
+      page.classList.remove("active");
+    });
+
+    const pageMap = {
+      loadMusic: "loadMusicPage",
+      firmware: "firmwarePage",
+      tools: "toolsPage",
+      settings: "settingsPage",
+      help: "helpPage"
+    };
+
+    document.getElementById(pageMap[state.selectedPage]).classList.add("active");
+    refreshCustomScrollbars();
+  }
+
+  function syncToSdCard(mode) {
+    if (!state.sdConnected || state.syncing) return;
+
+    state.syncing = true;
+    let progress = 31;
+
+    const isReplaceAll = mode === "replace-all";
+
+    els.syncBtn.disabled = true;
+    els.syncBtnText.textContent = isReplaceAll ? "Replacing..." : "Syncing...";
+
+    showToast(
+      isReplaceAll
+        ? "Replace All Music started. Refreshing the SD card from the beginning..."
+        : "Sync Changes started. Copying recent library changes..."
+    );
+
+    const timer = window.setInterval(() => {
+      progress += Math.floor(Math.random() * 8) + 4;
+
+      if (progress >= 100) {
+        progress = 31;
+        window.clearInterval(timer);
+        state.syncing = false;
+        els.syncBtn.disabled = false;
+        els.syncBtnText.textContent = "Sync to SD Card";
+        els.capacityFill.style.width = "31%";
+        els.usageText.textContent = "31% used";
+        els.capacityText.textContent = "9.3/29.0 GB";
+
+        showToast(
+          isReplaceAll
+            ? "Replace All Music complete. SD card is ready."
+            : "Sync Changes complete. SD card is ready."
+        );
+
+        return;
+      }
+
+      els.capacityFill.style.width = `${progress}%`;
+      els.usageText.textContent = `${progress}% used`;
+    }, isReplaceAll ? 340 : 250);
+  }
+
+  function addTracksFromFiles(files) {
+    const station = getSelectedStation();
+    if (!station) return;
+
+    const fileList = Array.from(files);
+    if (fileList.length === 0) return;
+
+    const nextIdStart = station.tracks.reduce((max, track) => Math.max(max, track.id), 0) + 1;
+
+    fileList.forEach((file, index) => {
+      const cleanName = file.name.replace(/\.[^/.]+$/, "");
+      const extension = file.name.includes(".")
+        ? file.name.split(".").pop().toLowerCase()
+        : "mp3";
+
+      station.tracks.push({
+        id: nextIdStart + index,
+        title: titleCase(cleanName.replace(/[-_]+/g, " ")),
+        artist: "Unknown Artist",
+        duration: "0:00",
+        format: extension
+      });
+    });
+
+    state.selectedTrackId = station.tracks[station.tracks.length - 1].id;
+    renderStations();
+    renderTracks();
+
+    showToast(`${fileList.length} track${fileList.length === 1 ? "" : "s"} added to ${station.name}.`);
+  }
+
+  function setupCustomScrollbars() {
+    document.querySelectorAll(".custom-scrollbar").forEach(scrollbar => {
+      const scroller = document.getElementById(scrollbar.dataset.target);
+      const track = scrollbar.querySelector(".scroll-track");
+      const thumb = scrollbar.querySelector(".scroll-thumb");
+      const upButton = scrollbar.querySelector(".scroll-up");
+      const downButton = scrollbar.querySelector(".scroll-down");
+
+      let isDragging = false;
+      let dragStartY = 0;
+      let dragStartTop = 0;
+
+      function getMaxScrollTop() {
+        return Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+      }
+
+      function getMaxThumbTop() {
+        return Math.max(1, track.clientHeight - thumb.offsetHeight);
+      }
+
+      function updateThumb() {
+        const canScroll = scroller.scrollHeight > scroller.clientHeight + 1;
+        scrollbar.classList.toggle("not-scrollable", !canScroll);
+
+        const trackHeight = track.clientHeight;
+        const visibleRatio = scroller.clientHeight / Math.max(scroller.scrollHeight, 1);
+        const thumbHeight = Math.max(64, Math.min(trackHeight, trackHeight * visibleRatio));
+
+        thumb.style.height = `${thumbHeight}px`;
+
+        const maxTop = Math.max(0, trackHeight - thumbHeight);
+        const scrollRatio = scroller.scrollTop / getMaxScrollTop();
+        const nextTop = maxTop * scrollRatio;
+
+        thumb.style.transform = `translateY(${nextTop}px)`;
+        thumb.dataset.top = String(nextTop);
+      }
+
+      function scrollByAmount(amount) {
+        scroller.scrollBy({
+          top: amount,
+          behavior: "smooth"
+        });
+      }
+
+      scroller.addEventListener("scroll", updateThumb);
+
+      upButton.addEventListener("click", () => {
+        scrollByAmount(-140);
+      });
+
+      downButton.addEventListener("click", () => {
+        scrollByAmount(140);
+      });
+
+      track.addEventListener("click", event => {
+        if (event.target !== track) return;
+
+        const rect = track.getBoundingClientRect();
+        const clickY = event.clientY - rect.top;
+        const thumbTop = Number(thumb.dataset.top || 0);
+
+        if (clickY < thumbTop) {
+          scrollByAmount(-scroller.clientHeight * 0.75);
+        } else {
+          scrollByAmount(scroller.clientHeight * 0.75);
+        }
+      });
+
+      thumb.addEventListener("mousedown", event => {
+        isDragging = true;
+        dragStartY = event.clientY;
+        dragStartTop = Number(thumb.dataset.top || 0);
+        document.body.style.userSelect = "none";
+        event.preventDefault();
+      });
+
+      window.addEventListener("mousemove", event => {
+        if (!isDragging) return;
+
+        const deltaY = event.clientY - dragStartY;
+        const nextTop = Math.max(0, Math.min(getMaxThumbTop(), dragStartTop + deltaY));
+        const scrollRatio = nextTop / getMaxThumbTop();
+
+        scroller.scrollTop = scrollRatio * getMaxScrollTop();
+        updateThumb();
+      });
+
+      window.addEventListener("mouseup", () => {
+        if (!isDragging) return;
+
+        isDragging = false;
+        document.body.style.userSelect = "";
+      });
+
+      const resizeObserver = new ResizeObserver(updateThumb);
+      resizeObserver.observe(scroller);
+      resizeObserver.observe(track);
+
+      customScrollbarRefreshers.push(updateThumb);
+      updateThumb();
+    });
+  }
+
+  function refreshCustomScrollbars() {
+    requestAnimationFrame(() => {
+      customScrollbarRefreshers.forEach(refresh => refresh());
+    });
+  }
+
+  function setZoom(nextZoom) {
+    state.zoom = Math.max(0.7, Math.min(1.15, nextZoom));
+    els.scaleShell.style.transform = `scale(${state.zoom})`;
+    refreshCustomScrollbars();
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function titleCase(value) {
+    return value
+      .split(" ")
+      .filter(Boolean)
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ");
+  }
+
+  function initEvents() {
+    document.querySelectorAll(".nav-item").forEach(item => {
+      item.addEventListener("click", () => {
+        state.selectedPage = item.dataset.page;
+        renderPages();
+
+        if (state.selectedPage !== "loadMusic") {
+          showToast(`${item.textContent.trim()} selected.`);
+        }
+      });
+    });
+
+    els.librarySelect.addEventListener("change", () => {
+      state.selectedLibrary = els.librarySelect.value;
+      updateModalCopy();
+      showToast(`Library changed to ${state.selectedLibrary}.`);
+    });
+
+    els.newLibraryBtn.addEventListener("click", () => {
+      const name = prompt("New library name:");
+      if (!name || !name.trim()) return;
+
+      state.libraries.push(name.trim());
+      state.selectedLibrary = name.trim();
+      renderLibraries();
+      updateModalCopy();
+      showToast("Library created.");
+    });
+
+    els.renameLibraryBtn.addEventListener("click", () => {
+      const currentName = state.selectedLibrary;
+      const newName = prompt("Rename library:", currentName);
+      if (!newName || !newName.trim()) return;
+
+      state.libraries = state.libraries.map(name =>
+        name === currentName ? newName.trim() : name
+      );
+
+      state.selectedLibrary = newName.trim();
+      renderLibraries();
+      updateModalCopy();
+      showToast("Library renamed.");
+    });
+
+    els.deleteLibraryBtn.addEventListener("click", () => {
+      if (state.libraries.length <= 1) {
+        showToast("You need at least one library.");
+        return;
+      }
+
+      const ok = confirm(`Delete "${state.selectedLibrary}"?`);
+      if (!ok) return;
+
+      state.libraries = state.libraries.filter(name => name !== state.selectedLibrary);
+      state.selectedLibrary = state.libraries[0];
+      renderLibraries();
+      updateModalCopy();
+      showToast("Library deleted.");
+    });
+
+    els.detectSdBtn.addEventListener("click", () => {
+      state.sdConnected = true;
+      renderStorage();
+      updateModalCopy();
+      showToast(`SD card detected: ${state.sdDriveName}.`);
+    });
+
+    els.selectSdBtn.addEventListener("click", () => {
+      els.sdFileInput.click();
+    });
+
+    els.sdFileInput.addEventListener("change", () => {
+      state.sdConnected = true;
+      renderStorage();
+      updateModalCopy();
+      showToast("SD card folder selected.");
+    });
+
+    els.removeSdBtn.addEventListener("click", () => {
+      state.sdConnected = false;
+      renderStorage();
+      showToast("SD card safely removed.");
+    });
+
+    els.syncBtn.addEventListener("click", openSyncChoiceModal);
+
+    els.closeSyncChoiceBtn.addEventListener("click", () => closeModal(els.syncChoiceModal));
+    els.cancelSyncChoiceBtn.addEventListener("click", () => closeModal(els.syncChoiceModal));
+
+    els.syncChangesBtn.addEventListener("click", () => {
+      closeModal(els.syncChoiceModal);
+      syncToSdCard("changes");
+    });
+
+    els.replaceAllMusicBtn.addEventListener("click", () => {
+      closeModal(els.syncChoiceModal);
+      openModal(els.replaceConfirmModal);
+    });
+
+    els.closeReplaceConfirmBtn.addEventListener("click", () => closeModal(els.replaceConfirmModal));
+    els.cancelReplaceConfirmBtn.addEventListener("click", () => closeModal(els.replaceConfirmModal));
+
+    els.confirmReplaceAllMusicBtn.addEventListener("click", () => {
+      closeModal(els.replaceConfirmModal);
+      syncToSdCard("replace-all");
+    });
+
+    [els.syncChoiceModal, els.replaceConfirmModal].forEach(modal => {
+      modal.addEventListener("click", event => {
+        if (event.target === modal) {
+          closeModal(modal);
+        }
+      });
+    });
+
+    window.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        closeAllModals();
+      }
+    });
+
+    els.newStationBtn.addEventListener("click", () => {
+      const name = prompt("New station name:");
+      if (!name || !name.trim()) return;
+
+      const nextId = state.stations.reduce((max, station) => Math.max(max, station.id), 0) + 1;
+
+      state.stations.push({
+        id: nextId,
+        name: name.trim(),
+        tracks: []
+      });
+
+      state.selectedStationId = nextId;
+      state.selectedTrackId = null;
+
+      renderStations();
+      renderTracks();
+      showToast("Station created.");
+    });
+
+    els.addTracksBtn.addEventListener("click", () => {
+      els.trackFileInput.click();
+    });
+
+    els.trackFileInput.addEventListener("change", () => {
+      addTracksFromFiles(els.trackFileInput.files);
+      els.trackFileInput.value = "";
+    });
+
+    els.zoomInBtn.addEventListener("click", () => {
+      setZoom(state.zoom + 0.05);
+    });
+
+    els.zoomOutBtn.addEventListener("click", () => {
+      setZoom(state.zoom - 0.05);
+    });
+
+    els.closeBtn.addEventListener("click", () => {
+      els.app.style.display = "none";
+    });
+
+    els.maximizeBtn.addEventListener("click", () => {
+      setZoom(state.zoom === 1 ? 0.85 : 1);
+      showToast("Browser demo zoom toggled.");
+    });
+
+    els.minimizeBtn.addEventListener("click", () => {
+      showToast("Minimize would be handled by PyQt or Electron in the desktop app.");
+    });
+  }
+
+  function init() {
+    renderLibraries();
+    renderStations();
+    renderTracks();
+    renderStorage();
+    renderPages();
+    initEvents();
+    setupCustomScrollbars();
+    updateModalCopy();
+    refreshCustomScrollbars();
+  }
+
+  init();
+</script>
+</body>
+</html>

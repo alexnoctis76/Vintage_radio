@@ -9,8 +9,8 @@ from typing import List, Optional, Tuple
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from ..resource_paths import app_data_dir
-from ..sd_disk_image_flash import (
+from ...resource_paths import app_data_dir
+from ...sd_disk_image_flash import (
     LAST_CACHED_SD_IMAGE_FILENAME,
     darwin_list_external_physical_disks,
     format_disk_size,
