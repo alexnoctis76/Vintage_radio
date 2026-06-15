@@ -64,6 +64,7 @@ from .widgets.common.delegates import (
     StationItemDelegate as _StationItemDelegateNew,
     TrackItemDelegate as _TrackItemDelegateNew,
     configure_track_title_item,
+    track_title_text,
     STATION_NUM_ROLE as _STATION_NUM_ROLE_NEW,
     STATION_NAME_ROLE as _STATION_NAME_ROLE_NEW,
     STATION_COUNT_ROLE as _STATION_COUNT_ROLE_NEW,
@@ -782,7 +783,10 @@ class ReorderTable(QtWidgets.QTableWidget):
             cols = []
             for c in range(self.columnCount()):
                 it = self.item(row, c)
-                cols.append(it.text() if it is not None else "")
+                if c == 0:
+                    cols.append(track_title_text(it))
+                else:
+                    cols.append(it.text() if it is not None else "")
             result.append((row, int(song_id), cols, extra))
         return result
 
@@ -793,8 +797,13 @@ class ReorderTable(QtWidgets.QTableWidget):
         try:
             self.setRowCount(len(ordered_snap))
             for new_row, (_, sid, cols, extra) in enumerate(ordered_snap):
+                artist = cols[1] if len(cols) > 1 else ""
                 for c, text in enumerate(cols):
-                    item = QtWidgets.QTableWidgetItem(text)
+                    if c == 0:
+                        item = QtWidgets.QTableWidgetItem()
+                        configure_track_title_item(item, text, artist=artist)
+                    else:
+                        item = QtWidgets.QTableWidgetItem(text)
                     if c == 0:
                         item.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
                         if extra is not None:
@@ -7063,8 +7072,9 @@ class MainWindow(QtWidgets.QMainWindow):
             table.setRowCount(len(songs))
             for row_idx, song in enumerate(songs):
                 title = song.get("title") or song.get("original_filename") or ""
-                title_item = QtWidgets.QTableWidgetItem(title)
-                configure_track_title_item(title_item)
+                artist = song.get("artist") or ""
+                title_item = QtWidgets.QTableWidgetItem()
+                configure_track_title_item(title_item, title, artist=artist)
                 title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song.get("id"))
                 title_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, song.get("bst_id"))
                 table.setItem(row_idx, 0, title_item)

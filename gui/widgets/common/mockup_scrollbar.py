@@ -15,6 +15,7 @@ from typing import Callable, Literal, Optional
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
+from gui.widgets.common.delegates import track_title_text
 
 Variant = Literal["station", "track", "dark", "light"]
 OnViewportResize = Optional[Callable[[], None]]
@@ -429,19 +430,18 @@ def wrap_with_mockup_scrollbar(
 def _track_title_column_min_width(table: QtWidgets.QTableWidget) -> int:
     """Minimum width required to show full title + artist text without clipping."""
     title_font = QtGui.QFont(table.font())
+    title_font.setPixelSize(u.px(t.LM_TRACK_TITLE_FONT_SIZE))
     title_font.setBold(True)
     title_fm = QtGui.QFontMetrics(title_font)
     artist_font = QtGui.QFont(table.font())
-    artist_font.setPointSizeF(
-        max(t.TRACK_ARTIST_MIN_PT, artist_font.pointSizeF() - t.TRACK_ARTIST_SIZE_DELTA)
-    )
+    artist_font.setPixelSize(u.px(t.LM_TRACK_ARTIST_FONT_SIZE))
     artist_fm = QtGui.QFontMetrics(artist_font)
 
     title_col_w = t.LM_TRACK_TITLE_MIN_W
     for row in range(table.rowCount()):
         title_item = table.item(row, 0)
         artist_item = table.item(row, 1)
-        title = title_item.text() if title_item else ""
+        title = track_title_text(title_item)
         artist = artist_item.text() if artist_item else ""
         text_w = max(
             title_fm.horizontalAdvance(title),

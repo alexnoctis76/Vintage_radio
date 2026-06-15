@@ -4,17 +4,21 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtSvg, QtWidgets
 from PyQt6.QtCore import pyqtSignal
 
 import gui.theme as t
 from gui import ui_scale as u
+from gui.resource_paths import resource_path
 from gui.widgets.common.styled_combo import VintageComboBox
 from gui.widgets.install_firmware.common.pill_label import PillLabel
 
+_USB_SVG = resource_path("USB.svg")
+_USB_GLYPH_COLOR = "#fff4e6"
+
 
 def _paint_usb_connection_icon(size: int) -> QtGui.QPixmap:
-    """Orange badge with a USB plug + cable glyph (Tools connection banner)."""
+    """Orange badge with the USB.svg resource (cream-tinted)."""
     pix = QtGui.QPixmap(size, size)
     pix.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pix)
@@ -27,28 +31,28 @@ def _paint_usb_connection_icon(size: int) -> QtGui.QPixmap:
     p.setBrush(bg)
     p.setPen(QtCore.Qt.PenStyle.NoPen)
     p.drawRoundedRect(QtCore.QRectF(size * 0.06, size * 0.06, size * 0.88, size * 0.88), r, r)
-
-    pen = QtGui.QPen(QtGui.QColor("#fff4e6"))
-    pen.setWidthF(max(1.8, size * 0.045))
-    pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-
-    s = size / 64.0
-    # USB-A plug shell
-    p.drawRoundedRect(QtCore.QRectF(14 * s, 15 * s, 36 * s, 22 * s), 3.5 * s, 3.5 * s)
-    # Inner tongue / slot
-    p.drawRoundedRect(QtCore.QRectF(25 * s, 21 * s, 14 * s, 11 * s), 2 * s, 2 * s)
-    # Contact pins
-    p.drawLine(QtCore.QPointF(22 * s, 24 * s), QtCore.QPointF(22 * s, 30 * s))
-    p.drawLine(QtCore.QPointF(42 * s, 24 * s), QtCore.QPointF(42 * s, 30 * s))
-    # Cable
-    p.drawLine(QtCore.QPointF(32 * s, 37 * s), QtCore.QPointF(32 * s, 50 * s))
-    # Cable plug end (connected device hint)
-    p.drawRoundedRect(QtCore.QRectF(27 * s, 48 * s, 10 * s, 7 * s), 2 * s, 2 * s)
     p.end()
-    return pix
+
+    inset = size * 0.16
+    glyph_size = int(size - 2 * inset)
+    glyph = QtGui.QPixmap(glyph_size, glyph_size)
+    glyph.fill(QtCore.Qt.GlobalColor.transparent)
+    renderer = QtSvg.QSvgRenderer(str(_USB_SVG))
+    gp = QtGui.QPainter(glyph)
+    gp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    renderer.render(gp, QtCore.QRectF(glyph.rect()))
+    gp.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceIn)
+    gp.fillRect(glyph.rect(), QtGui.QColor(_USB_GLYPH_COLOR))
+    gp.end()
+
+    out = QtGui.QPixmap(size, size)
+    out.fill(QtCore.Qt.GlobalColor.transparent)
+    op = QtGui.QPainter(out)
+    op.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    op.drawPixmap(0, 0, pix)
+    op.drawPixmap(int(inset), int(inset), glyph)
+    op.end()
+    return out
 
 
 def _banner_btn_style(*, primary: bool = False) -> str:

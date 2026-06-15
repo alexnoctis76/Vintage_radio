@@ -293,6 +293,8 @@ LM_TRACK_VHEADER_W       = 0    # px — 0 = vertical header hidden; row# drawn 
 LM_TRACK_NUM_COL_W       = 52   # px — width reserved in col-0 for row-number area (HTML: 52px)
 LM_TRACK_DEFAULT_SECTION = 66   # px — default row height (must match TRACK_ROW_H)
 LM_TRACK_NUM_FONT_SIZE   = 11   # pt
+LM_TRACK_TITLE_FONT_SIZE = 13   # px — bold title in track delegate
+LM_TRACK_ARTIST_FONT_SIZE = 11  # px — artist sub-line (must stay ≤ title)
 LM_TRACK_NUM_COLOR       = "#4d3d2c"   # row-number colour (HTML: .track-row .num)
 
 LM_TRACK_ITEM_PAD_RIGHT = 8     # px

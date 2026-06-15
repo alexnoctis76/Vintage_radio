@@ -221,12 +221,12 @@ class TrackPanel(QtWidgets.QWidget):
                 background: transparent;
                 color: transparent;
                 padding-right: {t.LM_TRACK_ITEM_PAD_RIGHT}px;
-                border-bottom: 1px solid {t.LM_TRACK_DIVIDER_COLOR};
+                border: none;
             }}
             QTableWidget::item:selected {{
                 background: transparent;
                 color: transparent;
-                border-bottom: none;
+                border: none;
             }}
             QHeaderView::section:vertical {{
                 background: transparent;

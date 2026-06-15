@@ -333,9 +333,41 @@ def _draw_track_sel_pill(
     )
 
 
-def configure_track_title_item(item: QtWidgets.QTableWidgetItem) -> None:
-    """Prevent Qt from painting DisplayRole text over the custom title/artist layout."""
+TRACK_TITLE_ROLE = QtCore.Qt.ItemDataRole.UserRole + 2
+TRACK_ARTIST_ROLE = QtCore.Qt.ItemDataRole.UserRole + 3
+
+
+def track_title_text(item: Optional[QtWidgets.QTableWidgetItem]) -> str:
+    """Return the visible track title stored on a title-column item."""
+    if item is None:
+        return ""
+    stored = item.data(TRACK_TITLE_ROLE)
+    if stored is not None and str(stored).strip():
+        return str(stored)
+    return item.text()
+
+
+def configure_track_title_item(
+    item: QtWidgets.QTableWidgetItem,
+    title: str,
+    *,
+    artist: str = "",
+) -> None:
+    """Store title/artist for the delegate and clear native item text."""
+    item.setData(TRACK_TITLE_ROLE, (title or "").strip())
+    item.setData(TRACK_ARTIST_ROLE, (artist or "").strip())
+    item.setText("")
     item.setForeground(QtGui.QBrush(QtCore.Qt.GlobalColor.transparent))
+
+
+def track_artist_text(item: Optional[QtWidgets.QTableWidgetItem]) -> str:
+    """Return artist text cached on the title-column item."""
+    if item is None:
+        return ""
+    stored = item.data(TRACK_ARTIST_ROLE)
+    if stored is not None and str(stored).strip():
+        return str(stored)
+    return ""
 
 
 class RowBgDelegate(QtWidgets.QStyledItemDelegate):
@@ -370,6 +402,14 @@ class RowBgDelegate(QtWidgets.QStyledItemDelegate):
             QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignHCenter,
             str(text),
         )
+        if not is_sel:
+            painter.setPen(QtGui.QColor(t.LM_TRACK_DIVIDER_COLOR))
+            painter.drawLine(
+                option.rect.left(),
+                option.rect.bottom(),
+                option.rect.right(),
+                option.rect.bottom(),
+            )
         painter.restore()
 
 
@@ -407,20 +447,27 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
         center the title over the artist line on unselected rows."""
         super().initStyleOption(option, index)
         option.text = ""
+        option.icon = QtGui.QIcon()
+        option.features &= ~QtWidgets.QStyleOptionViewItem.ViewItemFeature.HasDisplay
+        option.features &= ~QtWidgets.QStyleOptionViewItem.ViewItemFeature.HasDecoration
 
     def _artist_for_row(
         self, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex
     ) -> str:
+        view = option.widget
+        if isinstance(view, QtWidgets.QTableWidget):
+            title_item = view.item(index.row(), 0)
+            cached = track_artist_text(title_item)
+            if cached:
+                return cached
+            artist_item = view.item(index.row(), 1)
+            if artist_item is not None:
+                return artist_item.text()
         sib = index.siblingAtColumn(1)
         if sib.isValid():
             artist = sib.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
             if artist:
                 return str(artist)
-        view = option.widget
-        if isinstance(view, QtWidgets.QTableWidget):
-            item = view.item(index.row(), 1)
-            if item is not None:
-                return item.text()
         return ""
 
     def paint(self, painter, option, index) -> None:  # type: ignore[override]
@@ -477,7 +524,13 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
         )
 
         # ── Title + artist ────────────────────────────────────────────────────
-        title = index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+        title = track_title_text(
+            option.widget.item(index.row(), 0)
+            if isinstance(option.widget, QtWidgets.QTableWidget)
+            else None
+        )
+        if not title:
+            title = index.data(TRACK_TITLE_ROLE) or index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
         artist = self._artist_for_row(option, index)
 
         content_x = x0 + t.TRACK_HANDLE_W + t.TRACK_NUM_W + u.px(t.TRACK_PAD_X)
@@ -489,12 +542,14 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
         )
         gap = u.px(t.TRACK_ARTIST_GAP)
         top_bias = u.px(t.TRACK_TITLE_TOP_BIAS)
-        mid = rect.height() // 2
+        layout_h = min(rect.height(), u.px(t.TRACK_ROW_H))
+        mid = layout_h // 2
         title_h = max(1, mid - gap // 2)
         artist_y = rect.top() + mid + (gap + 1) // 2
-        artist_h = max(1, rect.height() - artist_y - top_bias)
+        artist_h = max(1, layout_h - mid - (gap + 1) // 2 - top_bias)
 
         title_font = QFont(option.font)
+        title_font.setPixelSize(u.px(t.LM_TRACK_TITLE_FONT_SIZE))
         title_font.setBold(True)
         painter.setFont(title_font)
         painter.setPen(text_pri)
@@ -508,10 +563,8 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
 
         if artist:
             af = QFont(option.font)
-            title_px = title_font.pixelSize()
-            if title_px <= 0:
-                title_px = u.px(t.LM_TRACK_NUM_FONT_SIZE + 3)
-            af.setPixelSize(max(u.px(8), title_px - u.px(2)))
+            af.setPixelSize(u.px(t.LM_TRACK_ARTIST_FONT_SIZE))
+            af.setBold(False)
             painter.setFont(af)
             painter.setPen(text_sec)
             painter.drawText(
@@ -537,5 +590,9 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
             QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
             "\u270E",
         )
+
+        if not selected:
+            painter.setPen(QColor(t.LM_TRACK_DIVIDER_COLOR))
+            painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
 
         painter.restore()
