@@ -44,9 +44,18 @@ def vintage_rendering_fix_stylesheet() -> str:
 def configure_vintage_app_rendering(app: QtWidgets.QApplication) -> None:
     """Use Fusion (QSS-friendly) and round HiDPI sizes to whole pixels."""
     try:
-        app.setStyle("Fusion")
+        from PyQt6.QtWidgets import QStyleFactory
+
+        fusion = QStyleFactory.create("Fusion")
+        if fusion is not None:
+            app.setStyle(fusion)
+        else:
+            app.setStyle("Fusion")
     except Exception:
-        pass
+        try:
+            app.setStyle("Fusion")
+        except Exception:
+            pass
     configure_vintage_tooltip_palette(app)
 
 

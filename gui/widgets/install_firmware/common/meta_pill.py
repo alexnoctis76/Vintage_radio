@@ -21,14 +21,13 @@ def _svg_resource(filename: str) -> Path:
 
 
 def meta_pill_stylesheet(*, width: int) -> str:
-    radius = t.if_pill_radius(t.IF_META_PILL_H)
+    w = u.px(width)
     return f"""
         QFrame#ifMetaPill {{
-            border-radius: {radius}px;
-            border: 1px solid {t.IF_META_PILL_BORDER};
-            background: {t.IF_META_BOX_BG};
-            min-width: {width}px;
-            max-width: {width}px;
+            background: transparent;
+            border: none;
+            min-width: {w}px;
+            max-width: {w}px;
         }}
         QFrame#ifMetaPill QLabel {{
             background: transparent;
@@ -115,7 +114,7 @@ class MetaPill(QtWidgets.QFrame):
         self._pill_width = width or t.IF_META_PILL_W
         self._icon_kind = icon
         self.setObjectName("ifMetaPill")
-        self.setFixedSize(self._pill_width, t.IF_META_PILL_H)
+        self.setFixedSize(u.px(self._pill_width), u.px(t.IF_META_PILL_H))
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed,
@@ -137,10 +136,11 @@ class MetaPill(QtWidgets.QFrame):
         value_row.addStretch(1)
 
         self._icon = QtWidgets.QLabel()
-        self._icon.setFixedSize(t.IF_META_ICON, t.IF_META_ICON)
+        icon_sz = u.px(t.IF_META_ICON)
+        self._icon.setFixedSize(icon_sz, icon_sz)
         self._icon.setVisible(icon is not None)
         if icon is not None:
-            self._icon.setPixmap(_icon_pixmap(icon, t.IF_META_ICON))
+            self._icon.setPixmap(_icon_pixmap(icon, icon_sz))
         value_row.addWidget(self._icon)
 
         self._value = QtWidgets.QLabel("")
@@ -165,11 +165,27 @@ class MetaPill(QtWidgets.QFrame):
     def _apply_style(self) -> None:
         self.setStyleSheet(meta_pill_stylesheet(width=self._pill_width))
 
+    def paintEvent(self, a0: QtGui.QPaintEvent) -> None:
+        """Paint rounded pill chrome — QSS border-radius is ignored by Windows native style."""
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        rect = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = max(u.px(4), self.height() // 2)
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+        p.fillPath(path, QtGui.QColor(t.IF_META_BOX_BG))
+        pen = QtGui.QPen(QtGui.QColor(t.IF_META_PILL_BORDER))
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        super().paintEvent(a0)
+
     def set_value(self, text: str) -> None:
         self._value.setText(text)
 
     def reload_theme(self) -> None:
-        self.setFixedSize(self._pill_width, u.px(t.IF_META_PILL_H))
+        self.setFixedSize(u.px(self._pill_width), u.px(t.IF_META_PILL_H))
         self._apply_style()
         self._label.setStyleSheet(self._label_style())
         self._value.setStyleSheet(self._value_style())
