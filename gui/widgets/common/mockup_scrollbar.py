@@ -16,7 +16,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
 
-Variant = Literal["station", "track"]
+Variant = Literal["station", "track", "dark", "light"]
 OnViewportResize = Optional[Callable[[], None]]
 
 
@@ -109,9 +109,10 @@ class MockupScrollBar(QtWidgets.QWidget):
     # ── painting ─────────────────────────────────────────────────────────────
 
     def _bg_colors(self) -> tuple[str, str, str, str]:
-        if self._variant == "station":
-            return t.SB_STA_BG, t.SB_STA_BORDER_L, t.SB_STA_BORDER_R, t.SB_STA_ARROW_COLOR
-        return t.SB_TRK_BG, t.SB_TRK_BORDER_L, t.SB_TRK_BORDER_R, t.SB_TRK_ARROW_COLOR
+        v = self._variant
+        if v in ("track", "light"):
+            return t.SB_TRK_BG, t.SB_TRK_BORDER_L, t.SB_TRK_BORDER_R, t.SB_TRK_ARROW_COLOR
+        return t.SB_STA_BG, t.SB_STA_BORDER_L, t.SB_STA_BORDER_R, t.SB_STA_ARROW_COLOR
 
     def _paint_thumb(self, p: QtGui.QPainter, tr: QtCore.QRect) -> None:
         path = QtGui.QPainterPath()
@@ -321,8 +322,13 @@ def _prepare_scroll_area(
     """Hide native bars and optionally inset the scroll area from the top."""
     widget.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     widget.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-    widget.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
-    widget.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
+    if isinstance(widget, QtWidgets.QAbstractItemView):
+        widget.setHorizontalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        widget.setVerticalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
 
     if top_pad <= 0:
         return widget

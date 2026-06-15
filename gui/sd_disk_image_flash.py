@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Chunk size for raw writes (bytes). Must be a multiple of 512 for some APIs.
-_WRITE_CHUNK_BYTES = 1024 * 1024
+_WRITE_CHUNK_BYTES = int(os.environ.get("VINTAGE_RADIO_SD_WRITE_CHUNK_BYTES", 4 * 1024 * 1024))
+if _WRITE_CHUNK_BYTES < 512 or _WRITE_CHUNK_BYTES % 512 != 0:
+    _WRITE_CHUNK_BYTES = 4 * 1024 * 1024
+_PROGRESS_EMIT_INTERVAL_BYTES = 32 * 1024 * 1024
+
+
+def _zero_chunk(size: int = _WRITE_CHUNK_BYTES) -> bytes:
+    return bytes(size)
 
 # Marker embedded in error strings when macOS Full Disk Access is required.
 # Radio manager detects this to show an actionable FDA dialog instead of a plain error.
@@ -81,8 +88,133 @@ def _sd_log(message: str) -> None:
     except Exception:
         pass
 
+
+# Progress/ETA for sparse disk writes.
+_DEFAULT_ZERO_WEIGHT_RATIO = 0.125
+# Record separator — appended to status messages; stripped before showing in UI.
+_DISK_WRITE_ETA_SEP = "\x1e"
+# Separates partition status from install-image scan status in one message string.
+_DISK_WRITE_IMAGE_SCAN_SEP = "\x1c"
+
+
+def disk_write_estimated_data_bytes(
+    *,
+    image_size: int,
+    written_from_file: int,
+    bytes_data_written: int,
+    bytes_zero_skipped: int,
+    known_data_bytes: Optional[int] = None,
+) -> int:
+    """Estimate non-empty bytes in the image (monotone non-increasing when scanned)."""
+    image_size = max(1, int(image_size))
+    bytes_data_written = max(0, int(bytes_data_written))
+
+    if known_data_bytes is not None and known_data_bytes > 0:
+        return min(image_size, max(bytes_data_written, int(known_data_bytes)))
+
+    if written_from_file <= 0:
+        return min(image_size, max(bytes_data_written, 512 * 1024 * 1024))
+
+    density = bytes_data_written / written_from_file
+    est = max(bytes_data_written, int(density * image_size))
+    if bytes_zero_skipped > bytes_data_written:
+        est = min(est, max(bytes_data_written, int(density * image_size)))
+    return min(image_size, est)
+
+
+def disk_write_eta_seconds(
+    *,
+    image_size: int,
+    written_from_file: int,
+    bytes_data_written: int,
+    bytes_zero_skipped: int,
+    time_data: float,
+    time_zero: float,
+    est_data_bytes: int,
+) -> Optional[float]:
+    """Seconds remaining: data still to write + empty file tail still to scan/skip."""
+    image_size = max(1, int(image_size))
+    written_from_file = max(0, int(written_from_file))
+    if written_from_file >= image_size:
+        return 0.0
+
+    remaining_file = image_size - written_from_file
+    remaining_data = max(0, int(est_data_bytes) - int(bytes_data_written))
+    remaining_empty = max(0, remaining_file - remaining_data)
+
+    total_time = time_data + time_zero
+    min_data = _WRITE_CHUNK_BYTES * 4
+    min_zero = _WRITE_CHUNK_BYTES * 32
+
+    w_data: Optional[float] = None
+    w_zero: Optional[float] = None
+    if bytes_data_written >= min_data and time_data > 0:
+        w_data = time_data / bytes_data_written
+    if bytes_zero_skipped >= min_zero and time_zero > 0:
+        w_zero = time_zero / bytes_zero_skipped
+
+    if w_data is not None and w_zero is not None:
+        w_zero = min(w_zero, w_data)
+        rem = remaining_data * w_data + remaining_empty * w_zero
+        return rem if rem >= 1.0 else None
+
+    if w_data is not None:
+        w_zero_eff = min(w_data * _DEFAULT_ZERO_WEIGHT_RATIO, w_data)
+        rem = remaining_data * w_data + remaining_empty * w_zero_eff
+        return rem if rem >= 1.0 else None
+
+    if total_time > 0.5 and written_from_file > 256:
+        scan_rate = written_from_file / total_time
+        weight = (remaining_data + remaining_empty * _DEFAULT_ZERO_WEIGHT_RATIO) / max(
+            1, remaining_file
+        )
+        rem = remaining_file * weight / scan_rate
+        return rem if rem >= 1.0 else None
+
+    return None
+
+
+def _attach_disk_write_eta(message: str, eta_seconds: Optional[float]) -> str:
+    if eta_seconds is None or eta_seconds < 1.0:
+        return message
+    return f"{message}{_DISK_WRITE_ETA_SEP}{eta_seconds:.3f}"
+
+
+def parse_disk_write_progress_message(message: str) -> Tuple[str, Optional[str], Optional[float]]:
+    """Return ``(partition_status, image_scan_status, eta_seconds)``."""
+    base = message
+    eta: Optional[float] = None
+    if _DISK_WRITE_ETA_SEP in message:
+        base, _, eta_raw = message.partition(_DISK_WRITE_ETA_SEP)
+        try:
+            parsed = float(eta_raw)
+            eta = parsed if parsed >= 1.0 else None
+        except ValueError:
+            eta = None
+
+    if _DISK_WRITE_IMAGE_SCAN_SEP in base:
+        partition, _, image = base.partition(_DISK_WRITE_IMAGE_SCAN_SEP)
+        return partition, image or None, eta
+    return base, None, eta
+
+
+def format_disk_write_progress_message(
+    *,
+    image_scanned: int,
+    image_size: int,
+    data_written: int,
+    data_total: int,
+    eta_seconds: Optional[float] = None,
+) -> str:
+    """Build progress payload: partition line + image scan line + optional ETA."""
+    partition = sd_write_partition_message(data_written, data_total)
+    image = sd_write_image_scan_message(image_scanned, image_size)
+    payload = f"{partition}{_DISK_WRITE_IMAGE_SCAN_SEP}{image}"
+    return _attach_disk_write_eta(payload, eta_seconds)
+
+
 # Pre-allocated zero block for zero-skip comparison (avoids per-chunk allocation).
-_ZERO_CHUNK = bytes(_WRITE_CHUNK_BYTES)
+_ZERO_CHUNK = _zero_chunk()
 
 
 def _win32_write_physical_disk(fd: int, data: bytes) -> None:
@@ -193,8 +325,62 @@ def _read_uac_progress_file(path: Path) -> Optional[Tuple[int, int, str]]:
     except (OSError, ValueError, TypeError):
         return None
 
-# Cached FAT32 image under ``app_data_dir()/sd_image_cache/`` for reuse / faster flash testing.
+# Cached FAT32 image under ``app_data_dir()/sd_image_cache/`` for reuse when library unchanged.
 LAST_CACHED_SD_IMAGE_FILENAME = "vintage_radio_sd_last.img"
+LAST_CACHED_SD_MANIFEST_FILENAME = "vintage_radio_sd_last.manifest.json"
+_CACHED_SD_MANIFEST_VERSION = 1
+
+
+def load_cached_sd_image_manifest(cache_dir: Path) -> Optional[dict]:
+    """Return the manifest saved after the last successful disk-image build, or *None*."""
+    path = cache_dir / LAST_CACHED_SD_MANIFEST_FILENAME
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != _CACHED_SD_MANIFEST_VERSION:
+        return None
+    stations = data.get("stations")
+    if not isinstance(stations, dict):
+        return None
+    return data
+
+
+def save_cached_sd_image_manifest(
+    cache_dir: Path,
+    *,
+    stations: Dict[str, Any],
+    conversion_profile: str,
+    dfplayer_eq: str,
+    image_size_bytes: int,
+    data_bytes: Optional[int] = None,
+) -> None:
+    """Persist library fingerprint used to decide whether the cached image can be reused."""
+    import datetime
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "version": _CACHED_SD_MANIFEST_VERSION,
+        "built_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "conversion_profile": str(conversion_profile or ""),
+        "dfplayer_eq": str(dfplayer_eq or ""),
+        "image_size_bytes": int(image_size_bytes),
+        "stations": stations,
+    }
+    if data_bytes is not None and data_bytes > 0:
+        manifest["data_bytes"] = int(data_bytes)
+    path = cache_dir / LAST_CACHED_SD_MANIFEST_FILENAME
+    tmp = path.with_suffix(".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, separators=(",", ":"))
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def is_windows_admin() -> bool:
@@ -945,7 +1131,7 @@ def _write_image_via_uac_subprocess(
 
         if r_code == 0:
             if progress_callback and image_size > 0:
-                progress_callback(image_size, image_size, "SD card write complete.")
+                progress_callback(1, 1, "SD card write complete.")
             try:
                 diag_log.unlink(missing_ok=True)
             except OSError:
@@ -1001,6 +1187,7 @@ def write_image_to_physical_disk(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     try_offline_first: bool = True,
+    known_data_bytes: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Write *entire* *image_path* to ``PhysicalDrive`` *disk_number* (Windows).
 
@@ -1054,6 +1241,7 @@ def write_image_to_physical_disk(
         progress_callback=progress_callback,
         should_cancel=should_cancel,
         try_offline_first=try_offline_first,
+        known_data_bytes=known_data_bytes,
     )
 
 
@@ -1063,6 +1251,7 @@ def _sparse_copy_image_to_fd(
     image_size: int,
     *,
     cap_bytes: Optional[int] = None,
+    known_data_bytes: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     progress_file_path: Optional[Path] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
@@ -1077,28 +1266,82 @@ def _sparse_copy_image_to_fd(
     """
     write_limit = cap_bytes if cap_bytes is not None else image_size
     written_from_file = 0
-    # ``bytes_actually_written`` counts only chunks that hit the disk (non-sparse).
-    # ``written_from_file`` is the position within the image, so it advances even when
-    # we skip empty FAT32 free space via ``_seek_disk_fd_cur``.  Reporting the actual
-    # write count to the progress callback keeps the ETA rate (= current / elapsed)
-    # aligned with real disk throughput instead of jumping wildly through sparse runs.
-    bytes_actually_written = 0
-    # Once enough of the image has been scanned, use observed density to estimate
-    # the total non-sparse byte count so the progress bar fills proportionally.
-    # Until then, fall back to ``image_size`` so the bar isn't pinned at 100%
-    # early on (when bytes_actually_written would briefly exceed a low estimate).
-    _density_warmup_bytes = max(_WRITE_CHUNK_BYTES * 32, image_size // 50)
+    bytes_data_written = 0
+    bytes_zero_skipped = 0
+    time_data = 0.0
+    time_zero = 0.0
+    last_emit_at = 0
+    phase: Optional[str] = None
+    phase_t0 = time.monotonic()
+    stable_est_data = (
+        min(image_size, int(known_data_bytes))
+        if known_data_bytes is not None and known_data_bytes > 0
+        else image_size
+    )
 
-    def _emit(msg: str) -> None:
-        total_for_eta = image_size
-        if written_from_file >= _density_warmup_bytes and written_from_file > 0:
-            density = bytes_actually_written / written_from_file
-            total_for_eta = max(bytes_actually_written + 1, int(density * image_size))
-            total_for_eta = min(total_for_eta, image_size)
+    def _end_phase() -> None:
+        nonlocal time_data, time_zero, phase_t0, phase
+        if phase is None:
+            phase_t0 = time.monotonic()
+            return
+        dt = time.monotonic() - phase_t0
+        if phase == "data":
+            time_data += dt
+        elif phase == "zero":
+            time_zero += dt
+        phase_t0 = time.monotonic()
+
+    def _begin_phase(name: str) -> None:
+        nonlocal phase
+        if phase != name:
+            _end_phase()
+            phase = name
+
+    def _chunk_is_zero(data: bytes) -> bool:
+        if not data:
+            return False
+        if len(data) == _WRITE_CHUNK_BYTES:
+            return data == _ZERO_CHUNK
+        return data.count(0) == len(data)
+
+    def _emit(*, force: bool = False) -> None:
+        nonlocal last_emit_at, stable_est_data
+        if (
+            not force
+            and last_emit_at > 0
+            and (written_from_file - last_emit_at) < _PROGRESS_EMIT_INTERVAL_BYTES
+        ):
+            return
+        last_emit_at = written_from_file
+        est = disk_write_estimated_data_bytes(
+            image_size=image_size,
+            written_from_file=written_from_file,
+            bytes_data_written=bytes_data_written,
+            bytes_zero_skipped=bytes_zero_skipped,
+            known_data_bytes=known_data_bytes,
+        )
+        stable_est_data = min(stable_est_data, est)
+        data_total = max(stable_est_data, bytes_data_written + 1)
+        eta = disk_write_eta_seconds(
+            image_size=image_size,
+            written_from_file=written_from_file,
+            bytes_data_written=bytes_data_written,
+            bytes_zero_skipped=bytes_zero_skipped,
+            time_data=time_data,
+            time_zero=time_zero,
+            est_data_bytes=stable_est_data,
+        )
+        full_msg = format_disk_write_progress_message(
+            image_scanned=written_from_file,
+            image_size=image_size,
+            data_written=bytes_data_written,
+            data_total=data_total,
+            eta_seconds=eta,
+        )
         _emit_disk_write_progress(
-            bytes_actually_written,
-            total_for_eta,
-            msg,
+            bytes_data_written,
+            data_total,
+            full_msg,
             progress_callback=progress_callback,
             progress_file_path=progress_file_path,
         )
@@ -1120,26 +1363,37 @@ def _sparse_copy_image_to_fd(
                 if not chunk:
                     break
 
-                if len(chunk) == _WRITE_CHUNK_BYTES and chunk == _ZERO_CHUNK:
-                    _seek_disk_fd_cur(fd, _WRITE_CHUNK_BYTES)
-                    written_from_file += len(chunk)
-                    _emit(
-                        f"Writing to SD card ({written_from_file // (1024 * 1024)} MiB / "
-                        f"{image_size // (1024 * 1024)} MiB, skipping empty sectors)…"
-                    )
+                if _chunk_is_zero(chunk):
+                    _begin_phase("zero")
+                    zero_run = len(chunk)
+                    while written_from_file + zero_run < write_limit:
+                        next_size = min(
+                            _WRITE_CHUNK_BYTES, write_limit - written_from_file - zero_run
+                        )
+                        nxt = img.read(next_size)
+                        if not nxt:
+                            break
+                        if not _chunk_is_zero(nxt):
+                            img.seek(-len(nxt), os.SEEK_CUR)
+                            break
+                        zero_run += len(nxt)
+                    _seek_disk_fd_cur(fd, zero_run)
+                    written_from_file += zero_run
+                    bytes_zero_skipped += zero_run
+                    _emit()
                     continue
 
+                _begin_phase("data")
                 to_write = chunk
                 rem = len(to_write) % 512
                 if rem:
                     to_write = to_write + (b"\x00" * (512 - rem))
                 _write_raw_to_disk_fd(fd, to_write)
                 written_from_file += len(chunk)
-                bytes_actually_written += len(chunk)
-                _emit(
-                    f"Writing to SD card ({written_from_file // (1024 * 1024)} MiB / "
-                    f"{image_size // (1024 * 1024)} MiB)…"
-                )
+                bytes_data_written += len(chunk)
+                _emit()
+            _end_phase()
+            _emit(force=True)
     except OSError as e:
         parts = [f"Disk write to {device_label} failed: {e}"]
         if platform.system() == "Windows":
@@ -1178,6 +1432,7 @@ def _write_image_to_physical_disk_impl(
     should_cancel: Optional[Callable[[], bool]] = None,
     try_offline_first: bool = True,
     progress_file_path: Optional[Path] = None,
+    known_data_bytes: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Perform raw write; caller must already hold Administrator rights."""
     image_path = Path(image_path).resolve()
@@ -1247,6 +1502,7 @@ def _write_image_to_physical_disk_impl(
             fd,
             image_path,
             image_size,
+            known_data_bytes=known_data_bytes,
             progress_callback=progress_callback,
             progress_file_path=progress_file_path,
             should_cancel=should_cancel,
@@ -1317,6 +1573,7 @@ def _write_image_to_darwin_disk_impl(
     bsd_whole_disk: str,
     *,
     cap_bytes: Optional[int] = None,
+    known_data_bytes: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     progress_file_path: Optional[Path] = None,
@@ -1376,6 +1633,7 @@ def _write_image_to_darwin_disk_impl(
             image_path,
             image_size,
             cap_bytes=cap_bytes,
+            known_data_bytes=known_data_bytes,
             progress_callback=progress_callback,
             progress_file_path=progress_file_path,
             should_cancel=should_cancel,
@@ -1390,8 +1648,8 @@ def _write_image_to_darwin_disk_impl(
 
     if ok:
         _emit_disk_write_progress(
-            image_size,
-            image_size,
+            1,
+            1,
             "SD card write complete.",
             progress_callback=progress_callback,
             progress_file_path=progress_file_path,
@@ -1567,9 +1825,7 @@ def _write_image_via_darwin_sudo_dd(
             progress_callback(
                 est,
                 image_size,
-                "Writing to SD card (progress is estimated — bar will jump to 100 % "
-                "when dd confirms completion): "
-                f"~{est // (1024 * 1024)} / {image_size // (1024 * 1024)} MiB …",
+                sd_write_progress_message(est, image_size),
             )
         time.sleep(0.5)
 
@@ -1607,7 +1863,7 @@ def _write_image_via_darwin_sudo_dd(
     if rc == 0:
         _sd_log(f"dd complete: rc=0 elapsed={time.time() - _start:.0f}s")
         if progress_callback:
-            progress_callback(image_size, image_size, "SD card write complete.")
+            progress_callback(1, 1, "SD card write complete.")
         _darwin_remount_async(d)
         return True, ""
 
@@ -1655,6 +1911,7 @@ def write_image_to_physical_disk_darwin(
     *,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    known_data_bytes: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Write *image_path* to whole disk ``diskN`` on macOS (raw ``/dev/rdiskN``).
 
@@ -1716,6 +1973,7 @@ def write_image_to_physical_disk_darwin(
             image_path,
             d,
             cap_bytes=cap_bytes,
+            known_data_bytes=known_data_bytes,
             progress_callback=progress_callback,
             should_cancel=should_cancel,
             progress_file_path=None,
@@ -1744,3 +2002,21 @@ def format_disk_size(n: int) -> str:
     if n >= 1024**2:
         return f"{n / (1024**2):.0f} MB"
     return f"{n} bytes"
+
+
+def sd_write_image_scan_message(scanned: int, image_size: int) -> str:
+    """Text-only install-image progress (matches SD card capacity)."""
+    return f"Install image: {format_disk_size(scanned)} of {format_disk_size(image_size)}"
+
+
+def sd_write_partition_message(data_written: int, data_total: int) -> str:
+    """Partition data write progress (drives the progress bar)."""
+    return (
+        f"Writing to SD card ({format_disk_size(data_written)} "
+        f"of {format_disk_size(data_total)})…"
+    )
+
+
+def sd_write_progress_message(written: int, total: int) -> str:
+    """Legacy single-line status (non-sparse paths)."""
+    return sd_write_image_scan_message(written, total)

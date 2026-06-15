@@ -177,12 +177,20 @@ def _fat_makedirs(fs: Any, path: str) -> None:
             raise
 
 
+# Progress scale for disk-image export (format step + file copy).
+_IMAGE_PROGRESS_SCALE = 1000
+_IMAGE_FORMAT_WEIGHT = 50  # first 5 % reserved for FAT32 format
+
+
 def copy_sd_folder_into_fat_image(
     sd_root: Path,
     image_path: Path,
     *,
+    files: Optional[list[Path]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    progress_scale: int = _IMAGE_PROGRESS_SCALE,
+    progress_format_weight: int = _IMAGE_FORMAT_WEIGHT,
 ) -> Tuple[bool, str]:
     """Copy all files under *sd_root* into an existing FAT32 *image_path*."""
     try:
@@ -195,14 +203,19 @@ def copy_sd_folder_into_fat_image(
     if not sd_root.is_dir():
         return False, f"SD folder not found: {sd_root}"
 
+    file_list = files if files is not None else sorted(
+        [p for p in sd_root.rglob("*") if p.is_file()]
+    )
+    total_files = len(file_list)
+    if total_files == 0:
+        return False, "No files found under the SD folder. Sync to the card (or folder) first."
+
+    copy_weight = max(1, progress_scale - progress_format_weight)
+    report_stride = 1 if total_files <= 500 else 10
+
     fs = PyFatFS(str(image_path), read_only=False)
     try:
-        files = sorted([p for p in sd_root.rglob("*") if p.is_file()])
-        total = len(files)
-        if total == 0:
-            return False, "No files found under the SD folder. Sync to the card (or folder) first."
-
-        for i, src_path in enumerate(files):
+        for i, src_path in enumerate(file_list):
             if should_cancel and should_cancel():
                 return False, "Cancelled"
             rel = src_path.relative_to(sd_root)
@@ -214,11 +227,16 @@ def copy_sd_folder_into_fat_image(
             data = src_path.read_bytes()
             with fs.openbin(fat_path, "w") as out:
                 out.write(data)
-            if progress_callback and (i % 10 == 0 or i == total - 1):
+            if progress_callback and (
+                i % report_stride == 0 or i == total_files - 1
+            ):
+                cur = progress_format_weight + (
+                    (i + 1) * copy_weight // max(1, total_files)
+                )
                 progress_callback(
-                    i + 1,
-                    total,
-                    f"Writing disk image ({i + 1}/{total} files)...",
+                    min(cur, progress_scale),
+                    progress_scale,
+                    f"Creating install image ({i + 1}/{total_files} files)…",
                 )
         fs.close()
         return True, ""
@@ -240,7 +258,11 @@ def run_experimental_sd_disk_image_export(
 ) -> Tuple[bool, str]:
     """Create a FAT32 image and copy *sd_root* into it."""
     sd_root = Path(sd_root).resolve()
-    nfiles = len([p for p in sd_root.rglob("*") if p.is_file()])
+    file_list = sorted([p for p in sd_root.rglob("*") if p.is_file()])
+    nfiles = len(file_list)
+    if nfiles == 0:
+        return False, "No files found under the SD folder. Sync to the card (or folder) first."
+
     content_size = suggest_image_size_bytes(sd_root)
     if size_bytes is None:
         size_bytes = content_size
@@ -248,6 +270,15 @@ def run_experimental_sd_disk_image_export(
         # Caller passed a disk size that is somehow smaller than the content — fall back
         # to the content-derived size rather than silently producing a truncated image.
         size_bytes = content_size
+
+    scale = _IMAGE_PROGRESS_SCALE
+    if progress_callback:
+        progress_callback(
+            0,
+            scale,
+            "Creating install image — formatting empty card layout…",
+        )
+
     ok, err = create_fat32_image_file(image_path, size_bytes)
     if not ok:
         try:
@@ -255,17 +286,22 @@ def run_experimental_sd_disk_image_export(
         except OSError:
             pass
         return False, err
-    if progress_callback and nfiles > 0:
+
+    if progress_callback:
         progress_callback(
-            0,
-            nfiles,
-            "FAT32 image created — packing files into disk image…",
+            _IMAGE_FORMAT_WEIGHT,
+            scale,
+            "Creating install image — formatting complete, copying files…",
         )
+
     ok2, err2 = copy_sd_folder_into_fat_image(
         sd_root,
         image_path,
+        files=file_list,
         progress_callback=progress_callback,
         should_cancel=should_cancel,
+        progress_scale=scale,
+        progress_format_weight=_IMAGE_FORMAT_WEIGHT,
     )
     if not ok2:
         try:

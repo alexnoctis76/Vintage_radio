@@ -12,7 +12,7 @@ Sub-widgets (each in its own subfolder):
   storage_section/  — "Storage" heading, SD path label, capacity bar, buttons
   station_panel/    — left pane: header + drag-reorderable station list
   track_panel/      — right pane: header + drag-reorderable track table
-  sync_bar/         — bottom row: auto-eject checkbox + Sync/Eject buttons
+  sync_bar/         — bottom row: Sync / Eject buttons
 
 HOW TO EDIT
 -----------
@@ -32,6 +32,7 @@ from typing import Optional
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
+from gui import ui_scale as u
 from gui.widgets.load_music.storage_section.storage_section import StorageSection
 from gui.widgets.load_music.station_panel.station_panel     import StationPanel
 from gui.widgets.load_music.track_panel.track_panel         import TrackPanel
@@ -46,12 +47,6 @@ class LoadMusicPage(QtWidgets.QWidget):
 
     Parameters
     ----------
-    is_advanced:
-        Whether the app is in advanced mode (shows the Conversion Profile combo).
-    auto_eject_checked:
-        Initial state of the auto-eject checkbox.
-    conversion_profile:
-        Initial conversion profile slug ("dfplayer_safe" or "high_quality").
     sd_root:
         Currently selected SD card root path (shown in the storage section).
     max_tracks:
@@ -61,17 +56,11 @@ class LoadMusicPage(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        is_advanced: bool = False,
-        auto_eject_checked: bool = False,
-        conversion_profile: str = "dfplayer_safe",
         sd_root: str = "",
         max_tracks: int = 255,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._is_advanced         = is_advanced
-        self._auto_eject_checked  = auto_eject_checked
-        self._conversion_profile  = conversion_profile
         self._sd_root             = sd_root
         self._max_tracks          = max_tracks
         self._build()
@@ -156,23 +145,49 @@ class LoadMusicPage(QtWidgets.QWidget):
 
         self._warn_details_btn = QtWidgets.QPushButton("Details...")
         self._warn_details_btn.setVisible(False)
-        self._warn_details_btn.setFixedWidth(t.LM_WARN_BTN_W)
         row.addWidget(self._warn_details_btn)
+        self._apply_warn_details_btn_theme()
 
         return row
+
+    @staticmethod
+    def _warn_details_btn_style() -> str:
+        return t.outline_button_stylesheet(font_weight=700)
+
+    def _apply_warn_details_btn_theme(self) -> None:
+        btn = self._warn_details_btn
+        btn.setStyleSheet(self._warn_details_btn_style())
+        btn.setFixedHeight(u.px(t.LIBBAR_BTN_H))
+        btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        font = QtGui.QFont(btn.font())
+        font.setPixelSize(u.px(t.LIBBAR_BTN_FONT_SIZE))
+        font.setBold(True)
+        text_w = QtGui.QFontMetrics(font).horizontalAdvance(btn.text())
+        btn.setFixedWidth(
+            t.outline_button_width_for_text(btn.text(), text_w, min_w=t.LM_WARN_BTN_W)
+        )
+
+    def apply_ui_zoom(self) -> None:
+        self.reload_theme()
+
+
+    def reload_theme(self) -> None:
+        """Re-apply theme tokens (dev theme live-reload)."""
+        self.setStyleSheet(f"#loadMusicPage {{ background: {t.C_BG}; }}")
+        self._warn_label.setStyleSheet(
+            f"color: {t.WARN_TEXT};"
+            f"font-weight: {'bold' if t.WARN_BOLD else 'normal'};"
+        )
+        self._apply_warn_details_btn_theme()
+        self._storage.reload_theme()
+        self._stations.reload_theme()
+        self._tracks.reload_theme()
+        self._sync.reload_theme()
 
     # ── 2. Storage section ────────────────────────────────────────────────────
 
     def _build_storage_section(self) -> StorageSection:
-        """'Storage' heading + SD capacity bar + Detect / Select buttons.
-
-        ── EDIT in gui/theme.py ──────────────────────────────────────────────
-        LM_HEADING_FONT_SIZE, LM_STORAGE_SECTION_SPACING, LM_STORAGE_ROW_SPACING,
-        LM_CAPACITY_BAR_H, LM_CAPACITY_BAR_MIN_W, LM_CAPACITY_BAR_MAX_W,
-        LM_CAPACITY_BAR_RADIUS, BAR_TRACK_BG, BAR_ORANGE,
-        LM_SD_BTN_RADIUS, LM_SD_BTN_PADDING, LM_SD_BTN_FONT
-        ─────────────────────────────────────────────────────────────────────
-        """
+        """SD storage banner — capacity bar + Detect / Select (device-banner style)."""
         self._storage = StorageSection(sd_root=self._sd_root)
         return self._storage
 
@@ -238,18 +253,6 @@ class LoadMusicPage(QtWidgets.QWidget):
     # ── 4. Sync bar ───────────────────────────────────────────────────────────
 
     def _build_sync_bar(self) -> SyncBar:
-        """Bottom action row — Sync to SD Card / Safely Remove SD.
-
-        ── EDIT in gui/theme.py ──────────────────────────────────────────────
-        LM_SYNC_TOP_MARGIN, LM_SYNC_SPACING, ORANGE_BTN, ORANGE_BTN_HOVER,
-        LM_SYNC_BTN_RADIUS, LM_SYNC_BTN_PADDING, LM_SYNC_BTN_FONT,
-        TOP_BAR_BG, BORDER, LIGHT_BTN_HOVER,
-        LM_EJECT_BTN_RADIUS, LM_EJECT_BTN_PADDING, LM_EJECT_BTN_FONT
-        ─────────────────────────────────────────────────────────────────────
-        """
-        self._sync = SyncBar(
-            is_advanced=self._is_advanced,
-            auto_eject_checked=self._auto_eject_checked,
-            conversion_profile=self._conversion_profile,
-        )
+        """Bottom action row — Sync to SD Card / Safely Remove SD."""
+        self._sync = SyncBar()
         return self._sync

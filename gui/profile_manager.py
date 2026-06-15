@@ -14,6 +14,10 @@ from PyQt6 import QtCore, QtWidgets
 
 from .database import DatabaseManager
 from .board_profiles import BOARD_PROFILES_BY_ID, get_board_profile
+from .widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
+from .widgets.dialogs.vintage_input import get_text
+from .widgets.dialogs.vintage_message import VintageMessageBox
 
 
 class ProfileSelectorBar(QtWidgets.QWidget):
@@ -112,12 +116,11 @@ class ProfileSelectorBar(QtWidgets.QWidget):
         active = self._db.get_active_profile()
         if active is None:
             return
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self,
             "Save Profile As",
             "New profile name:",
-            QtWidgets.QLineEdit.EchoMode.Normal,
-            f"{active['name']} (copy)",
+            text=f"{active['name']} (copy)",
         )
         if not ok or not name.strip():
             return
@@ -151,10 +154,13 @@ class ProfileManagerDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self._db = db
-        self.setWindowTitle("Manage Device Profiles")
-        self.resize(700, 450)
 
-        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout, footer = begin_sync_modal_dialog(
+            self,
+            title="Manage Device Profiles",
+            subtitle="Create, duplicate, or delete saved device profiles.",
+            min_width=700,
+        )
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter, 1)
@@ -175,7 +181,8 @@ class ProfileManagerDialog(QtWidgets.QDialog):
         self._notes_edit = QtWidgets.QPlainTextEdit()
         self._notes_edit.setMaximumHeight(80)
         self._notes_edit.textChanged.connect(self._save_notes)
-        details_layout.addRow("Notes:", self._notes_edit)
+        notes_scroll = wrap_with_mockup_scrollbar(self._notes_edit, variant="track")
+        details_layout.addRow("Notes:", notes_scroll)
 
         self._board_label = QtWidgets.QLabel()
         details_layout.addRow("Board:", self._board_label)
@@ -196,31 +203,25 @@ class ProfileManagerDialog(QtWidgets.QDialog):
         splitter.addWidget(details)
         splitter.setSizes([250, 450])
 
-        # Bottom buttons
-        btn_layout = QtWidgets.QHBoxLayout()
-
-        new_btn = QtWidgets.QPushButton("New Profile")
+        new_btn = ModalButton("New Profile", variant="secondary")
         new_btn.clicked.connect(self._new_profile)
-        btn_layout.addWidget(new_btn)
+        footer.add_left_widget(new_btn)
 
-        dup_btn = QtWidgets.QPushButton("Duplicate")
+        dup_btn = ModalButton("Duplicate", variant="secondary")
         dup_btn.clicked.connect(self._duplicate_profile)
-        btn_layout.addWidget(dup_btn)
+        footer.add_left_widget(dup_btn)
 
-        self._delete_btn = QtWidgets.QPushButton("Delete")
+        self._delete_btn = ModalButton("Delete", variant="danger")
         self._delete_btn.clicked.connect(self._delete_profile)
-        btn_layout.addWidget(self._delete_btn)
+        footer.add_left_widget(self._delete_btn)
 
-        btn_layout.addStretch()
-
-        close_btn = QtWidgets.QPushButton("Close")
+        close_btn = ModalButton("Close", variant="secondary")
         close_btn.clicked.connect(self.accept)
-        btn_layout.addWidget(close_btn)
-
-        main_layout.addLayout(btn_layout)
+        footer.add_button(close_btn)
 
         self._profiles: List[Any] = []
         self._refresh_list()
+        self.resize(700, 450)
 
     def _refresh_list(self) -> None:
         current_row = self._list.currentRow()
@@ -285,13 +286,13 @@ class ProfileManagerDialog(QtWidgets.QDialog):
             return
         name = self._name_edit.text().strip()
         if not name:
-            QtWidgets.QMessageBox.warning(self, "Invalid Name", "Profile name cannot be empty.")
+            VintageMessageBox.warning(self, "Invalid Name", "Profile name cannot be empty.")
             self._name_edit.setText(p["name"])
             return
         existing = self._db.list_device_profiles()
         for other in existing:
             if other["id"] != p["id"] and other["name"].strip().lower() == name.lower():
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self, "Duplicate Name",
                     f"A profile named \"{other['name']}\" already exists.",
                 )
@@ -307,7 +308,7 @@ class ProfileManagerDialog(QtWidgets.QDialog):
     def _new_profile(self) -> None:
         from .board_profiles import get_default_board_profile
         bp = get_default_board_profile()
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self, "New Profile", "Profile name:", text="New Profile"
         )
         if not ok or not name.strip():
@@ -325,7 +326,7 @@ class ProfileManagerDialog(QtWidgets.QDialog):
         p = self._selected_profile()
         if p is None:
             return
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self,
             "Duplicate Profile",
             "New profile name:",
@@ -340,12 +341,12 @@ class ProfileManagerDialog(QtWidgets.QDialog):
         p = self._selected_profile()
         if p is None:
             return
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "Delete Profile",
             f"Delete profile \"{p['name']}\"? This cannot be undone.",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
         )
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply == VintageMessageBox.StandardButton.Yes:
             self._db.delete_device_profile(p["id"])
             self._refresh_list()

@@ -17,7 +17,7 @@ HOW TO EDIT
   • Header height            → t.LM_PANEL_HEADER_H  (px)
   • Header inner margins     → t.LM_PANEL_HDR_MARGINS  (left, top, right, bottom)
   • Header element gap       → t.LM_PANEL_HDR_SPACING  (px)
-  • Header label font        → t.LM_PANEL_HDR_FONT_SIZE  (pt, bold)
+  • Header label font        → t.LM_PANEL_HDR_FONT_SIZE / LM_PANEL_HDR_FONT_WEIGHT
   • "+ Add" button gradient  → t.MINI_BTN_GRAD_TOP / BOT
   • "+ Add" button height    → t.LM_PANEL_NEW_BTN_H  (px)
   • "+ Add" button radius    → t.LM_PANEL_NEW_BTN_RADIUS  (px)
@@ -35,6 +35,7 @@ from PyQt6 import QtCore, QtWidgets
 from PyQt6.QtCore import pyqtSignal
 
 import gui.theme as t
+from gui import ui_scale as u
 from gui.widgets.common.delegates import TrackItemDelegate, RowBgDelegate
 from gui.widgets.common.mockup_scrollbar import (
     sync_track_table_column_widths,
@@ -49,6 +50,7 @@ class TrackPanel(QtWidgets.QWidget):
     files_dropped          = pyqtSignal(list)
     order_changed          = pyqtSignal()
     context_menu_requested = pyqtSignal(QtCore.QPoint)
+    edit_track_requested = pyqtSignal(int)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -74,7 +76,8 @@ class TrackPanel(QtWidgets.QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        v.addWidget(self._make_header())
+        self._header = self._make_header()
+        v.addWidget(self._header)
 
         self._detail_label = QtWidgets.QLabel("Select a station to view tracks.")
         self._detail_label.setWordWrap(True)
@@ -122,40 +125,34 @@ class TrackPanel(QtWidgets.QWidget):
         row.setSpacing(t.LM_PANEL_HDR_SPACING)
 
         lbl = QtWidgets.QLabel("Tracks")
-        lbl.setStyleSheet(
-            f"color: {t.LM_PANEL_HDR_TEXT_COLOR};"
-            f"font-weight: {'bold' if t.LM_PANEL_HDR_FONT_BOLD else 'normal'};"
-            f"font-size: {t.LM_PANEL_HDR_FONT_SIZE}px;"
-            f"background: transparent;"
-        )
+        self._header_title = lbl
+        lbl.setStyleSheet(self._header_title_style())
         row.addWidget(lbl)
         row.addStretch()
 
         add_btn = QtWidgets.QPushButton("+ Add")
-        add_btn.setFixedHeight(t.LM_PANEL_NEW_BTN_H)
-        add_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: qlineargradient(
-                    x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {t.MINI_BTN_GRAD_TOP},
-                    stop:1 {t.MINI_BTN_GRAD_BOT}
-                );
-                color: #f5dab5;
-                border: 1px solid {t.MINI_BTN_BORDER};
-                border-radius: {t.LM_PANEL_NEW_BTN_RADIUS}px;
-                padding: {t.LM_PANEL_NEW_BTN_PADDING};
-                font-weight: bold;
-                font-size: {t.LM_PANEL_HDR_FONT_SIZE}px;
-            }}
-            QPushButton:hover   {{ background: {t.MINI_BTN_GRAD_TOP}; }}
-            QPushButton:pressed {{ background: {t.MINI_BTN_GRAD_BOT}; }}
-        """)
+        self._add_btn = add_btn
+        add_btn.setFixedHeight(u.px(t.LM_PANEL_NEW_BTN_H))
+        add_btn.setStyleSheet(self._add_btn_style())
         add_btn.setToolTip(
             "Browse for audio files to add to this station (also imports them to the library)"
         )
         add_btn.clicked.connect(self.add_tracks_clicked)
         row.addWidget(add_btn)
         return header
+
+    def _on_edit_track_requested(self, row: int) -> None:
+        table = self._table
+        idx = table.model().index(row, 0)
+        if not idx.isValid():
+            return
+        table.selectRow(row)
+        rect = table.visualRect(idx)
+        pos = QtCore.QPoint(
+            rect.right() - t.TRACK_PENCIL_ROFF - 4,
+            rect.center().y(),
+        )
+        self.context_menu_requested.emit(pos)
 
     def _make_table(self) -> QtWidgets.QWidget:
         from gui.radio_manager import CollectionDropTable  # type: ignore[attr-defined]
@@ -184,7 +181,7 @@ class TrackPanel(QtWidgets.QWidget):
         vh = self._table.verticalHeader()
         vh.setVisible(False)   # row numbers drawn inside TrackItemDelegate
         vh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
-        vh.setDefaultSectionSize(t.LM_TRACK_DEFAULT_SECTION)
+        vh.setDefaultSectionSize(u.px(t.LM_TRACK_DEFAULT_SECTION))
 
         self._table.setShowGrid(False)
         self._apply_table_style()
@@ -202,6 +199,7 @@ class TrackPanel(QtWidgets.QWidget):
         self._table.order_changed.connect(self.order_changed)
         self._table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self.context_menu_requested)
+        self._table.edit_track_requested.connect(self._on_edit_track_requested)
 
         return wrap_with_mockup_scrollbar(
             self._table,
@@ -217,17 +215,17 @@ class TrackPanel(QtWidgets.QWidget):
                 border: none;
                 outline: none;
                 selection-background-color: transparent;
-                selection-color: {t.TEXT_PRI};
+                selection-color: transparent;
             }}
             QTableWidget::item {{
                 background: transparent;
-                color: {t.TEXT_PRI};
+                color: transparent;
                 padding-right: {t.LM_TRACK_ITEM_PAD_RIGHT}px;
                 border-bottom: 1px solid {t.LM_TRACK_DIVIDER_COLOR};
             }}
             QTableWidget::item:selected {{
                 background: transparent;
-                color: {t.TEXT_PRI};
+                color: transparent;
                 border-bottom: none;
             }}
             QHeaderView::section:vertical {{
@@ -235,11 +233,58 @@ class TrackPanel(QtWidgets.QWidget):
                 color: {t.TEXT_SEC};
                 border: none;
                 font-weight: bold;
-                font-size: {t.LM_TRACK_NUM_FONT_SIZE}px;
+                font-size: {u.px(t.LM_TRACK_NUM_FONT_SIZE)}px;
             }}
         """)
 
+    def _header_title_style(self) -> str:
+        return (
+            f"color: {t.LM_PANEL_HDR_TEXT_COLOR};"
+            f"font-weight: {t.LM_PANEL_HDR_FONT_WEIGHT};"
+            f"font-size: {u.px(t.LM_PANEL_HDR_FONT_SIZE)}px;"
+            f"background: transparent;"
+        )
+
+    def _add_btn_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.MINI_BTN_GRAD_TOP},
+                    stop:1 {t.MINI_BTN_GRAD_BOT}
+                );
+                color: #f5dab5;
+                border: 1px solid {t.MINI_BTN_BORDER};
+                border-radius: {u.px(t.LM_PANEL_NEW_BTN_RADIUS)}px;
+                padding: {t.LM_PANEL_NEW_BTN_PADDING};
+                font-weight: bold;
+                font-size: {u.px(t.LM_PANEL_HDR_FONT_SIZE)}px;
+            }}
+            QPushButton:hover   {{ background: {t.MINI_BTN_GRAD_TOP}; }}
+            QPushButton:pressed {{ background: {t.MINI_BTN_GRAD_BOT}; }}
+        """
+
+    def _refresh_header_theme(self) -> None:
+        self._header.setFixedHeight(u.px(t.LM_PANEL_HEADER_H))
+        self._header.setStyleSheet(f"""
+            #trackHeader {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.PANEL_HDR_GRAD_TOP},
+                    stop:1 {t.PANEL_HDR_GRAD_BOT}
+                );
+                border-top: 1px solid rgba(255,255,255,0.16);
+                border-bottom: 1px solid rgba(0,0,0,0.35);
+            }}
+        """)
+        self._header_title.setStyleSheet(self._header_title_style())
+        self._add_btn.setFixedHeight(u.px(t.LM_PANEL_NEW_BTN_H))
+        self._add_btn.setStyleSheet(self._add_btn_style())
+
     def reload_theme(self) -> None:
         self._apply_panel_style()
+        self._refresh_header_theme()
         self._apply_table_style()
+        vh = self._table.verticalHeader()
+        vh.setDefaultSectionSize(u.px(t.LM_TRACK_DEFAULT_SECTION))
         self._table.update()

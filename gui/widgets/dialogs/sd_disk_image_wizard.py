@@ -1,4 +1,4 @@
-"""Wizard dialog for experimental SD disk image build + raw flash (Windows / macOS)."""
+"""Wizard dialog for quick SD card install (build library image + raw flash)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,20 @@ from typing import List, Optional, Tuple
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from ...resource_paths import app_data_dir
+import gui.theme as t
+from gui import ui_scale as u
+from gui.widgets.common.styled_combo import VintageComboBox
+from gui.widgets.dialogs.sync.primitives import (
+    ModalButton,
+    ModalFooter,
+    ModalHeader,
+    SyncModalShell,
+    apply_frameless_modal,
+    apply_modal_rounded_mask,
+)
+from gui.widgets.dialogs.vintage_message import VintageMessageBox
+
 from ...sd_disk_image_flash import (
-    LAST_CACHED_SD_IMAGE_FILENAME,
     darwin_list_external_physical_disks,
     format_disk_size,
     is_windows_admin,
@@ -19,8 +30,16 @@ from ...sd_disk_image_flash import (
 )
 
 
+def _field_label_style() -> str:
+    return (
+        f"color: {t.SYNC_MDL_CONFIRM_TEXT_CLR};"
+        f"font-size: {u.px(t.SYNC_MDL_CONFIRM_TEXT_SIZE)}px;"
+        f"background: transparent;"
+    )
+
+
 class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
-    """Collect options for: optional prepare on PC → build .img → write to physical disk."""
+    """Pick the SD card to receive a full-library install."""
 
     def __init__(
         self,
@@ -31,84 +50,88 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         default_darwin_bsd_disk: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Experimental: SD image (clean install)")
+        self.setWindowTitle("Quick Replace All Music")
         self.setModal(True)
-        self.resize(520, 260)
+        self.setFixedWidth(t.SYNC_MDL_CONFIRM_W)
 
         self._sd_root = sd_root
         self._disk_number: Optional[int] = None
         self._darwin_bsd_disk: Optional[str] = None
 
-        layout = QtWidgets.QVBoxLayout(self)
+        apply_frameless_modal(self)
+        self.setStyleSheet("QDialog { background: transparent; }")
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        shell = SyncModalShell()
+        header = ModalHeader(
+            "Quick Replace All Music",
+            "Copy your whole library to the card in one step.",
+        )
+        header.closed.connect(self.reject)
+        shell.add_widget(header)
+
+        body = QtWidgets.QWidget()
+        body_lay = QtWidgets.QVBoxLayout(body)
+        body_lay.setContentsMargins(
+            t.SYNC_MDL_CONFIRM_BODY_PAD,
+            12,
+            t.SYNC_MDL_CONFIRM_BODY_PAD,
+            4,
+        )
+        body_lay.setSpacing(10)
 
         intro = QtWidgets.QLabel(
-            "Faster than a normal sync — builds a fresh FAT32 image from your library and writes it "
-            "to the target disk. The selected disk will be erased."
+            "Your music is prepared on this computer, then written to the SD card "
+            "you choose below. Everything already on that card will be erased."
         )
         intro.setWordWrap(True)
-        layout.addWidget(intro)
+        intro.setStyleSheet(_field_label_style())
+        body_lay.addWidget(intro)
 
         self._admin_label = QtWidgets.QLabel()
         self._admin_label.setWordWrap(True)
-        self._admin_label.setStyleSheet("color: gray; font-size: 11px;")
-        layout.addWidget(self._admin_label)
+        self._admin_label.setStyleSheet(
+            f"color: {t.SYNC_MDL_CARD_HELPER_CLR}; font-size: {u.px(t.SYNC_MDL_CARD_HELPER_SIZE)}px;"
+            f"background: transparent;"
+        )
+        body_lay.addWidget(self._admin_label)
 
-        self._prepare_on_pc_cb = QtWidgets.QCheckBox(
-            "Prepare library on this PC (recommended)"
-        )
-        self._prepare_on_pc_cb.setChecked(True)
-        layout.addWidget(self._prepare_on_pc_cb)
+        disk_title = QtWidgets.QLabel("Which card should we use?")
+        disk_title.setStyleSheet(_field_label_style())
+        body_lay.addWidget(disk_title)
 
-        self._last_img_path = app_data_dir() / "sd_image_cache" / LAST_CACHED_SD_IMAGE_FILENAME
-        self._flash_last_cb = QtWidgets.QCheckBox(
-            "Flash only (reuse last built image — faster for testing)"
+        self._disk_combo = VintageComboBox(
+            min_width=320,
+            max_width=640,
+            fixed_height=t.TOOLS_ACTION_BTN_H,
         )
-        self._flash_last_cb.setToolTip(
-            f"If a previous run succeeded in building an image, it is kept at:\n{self._last_img_path}"
-        )
-        self._flash_last_cb.stateChanged.connect(self._on_flash_last_changed)
-        self._refresh_flash_last_available()
-        layout.addWidget(self._flash_last_cb)
+        body_lay.addWidget(self._disk_combo)
 
-        disk_title = (
-            "Target disk:" if sys.platform == "darwin" else "Target disk (Windows):"
-        )
-        layout.addWidget(QtWidgets.QLabel(disk_title))
-        self._disk_combo = QtWidgets.QComboBox()
-        self._disk_combo.setMinimumWidth(480)
-        layout.addWidget(self._disk_combo)
+        shell.add_widget(body)
+
+        footer = ModalFooter()
+        cancel_btn = ModalButton("Cancel", variant="secondary")
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = ModalButton("Continue", variant="primary")
+        ok_btn.clicked.connect(self._on_accept)
+        footer.add_button(cancel_btn)
+        footer.add_button(ok_btn)
+        shell.add_widget(footer)
+
+        outer.addWidget(shell)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(48)
+        shadow.setOffset(0, 12)
+        shadow.setColor(QtGui.QColor(24, 12, 4, 112))
+        shell.setGraphicsEffect(shadow)
+
+        apply_modal_rounded_mask(self)
 
         self._populate_disks(default_disk_number, default_darwin_bsd_disk)
-
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
         self._refresh_admin()
-
-    def showEvent(self, event: QtGui.QShowEvent) -> None:
-        super().showEvent(event)
-        self._refresh_flash_last_available()
-
-    def _refresh_flash_last_available(self) -> None:
-        try:
-            ok = self._last_img_path.is_file() and self._last_img_path.stat().st_size > 0
-        except OSError:
-            ok = False
-        self._flash_last_cb.setEnabled(ok)
-        if not ok:
-            self._flash_last_cb.setChecked(False)
-            self._prepare_on_pc_cb.setEnabled(True)
-
-    def _on_flash_last_changed(self) -> None:
-        if self._flash_last_cb.isChecked():
-            self._prepare_on_pc_cb.setChecked(False)
-            self._prepare_on_pc_cb.setEnabled(False)
-        else:
-            self._prepare_on_pc_cb.setEnabled(True)
 
     def _refresh_admin(self) -> None:
         if sys.platform == "darwin":
@@ -118,7 +141,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
                 self._admin_label.hide()
             else:
                 self._admin_label.setText(
-                    "Writing requires your macOS password or Touch ID."
+                    "You may be asked for your password to write to the card."
                 )
                 self._admin_label.show()
         elif is_windows_admin():
@@ -126,7 +149,7 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
             self._admin_label.hide()
         else:
             self._admin_label.setText(
-                "Writing requires Windows administrator (UAC) approval."
+                "You may see a security prompt asking permission to write to the card."
             )
             self._admin_label.show()
 
@@ -151,11 +174,9 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
                 label = f"{bsd} — {format_disk_size(size)}"
                 if vol:
                     label += f" — {vol}"
-                else:
-                    label += " — (no mounted volumes / no label)"
                 rows.append((bsd, label))
             if not rows:
-                self._disk_combo.addItem("(No external physical disks found)", None)
+                self._disk_combo.addItem("(No removable cards found)", None)
                 return
             default_idx = 0
             for i, (bsd, label) in enumerate(rows):
@@ -174,27 +195,15 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
                 size = int(d["Size"])
             except (KeyError, TypeError, ValueError):
                 size = 0
-            name = str(d.get("FriendlyName") or "Disk")
-            bus = str(d.get("BusType") or "")
+            name = str(d.get("FriendlyName") or "SD card")
             vol = str(d.get("VolumeSummary") or "").strip()
-            removable = d.get("IsRemovable")
-            rem_txt = ""
-            if removable is True:
-                rem_txt = " — removable"
-            elif removable is False:
-                rem_txt = " — not marked removable"
-            label = f"PhysicalDrive{num} — {format_disk_size(size)} — {name}"
-            if bus:
-                label += f" ({bus})"
-            label += rem_txt
+            label = f"Drive {num} — {format_disk_size(size)} — {name}"
             if vol:
-                label += f" — volumes: {vol}"
-            else:
-                label += " — volumes: (none mounted / no label)"
+                label += f" — {vol}"
             rows.append((num, label))
 
         if not rows:
-            self._disk_combo.addItem("(No disks found — run as Administrator?)", None)
+            self._disk_combo.addItem("(No cards found)", None)
             return
 
         default_idx = 0
@@ -203,14 +212,6 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
             if default_disk_number is not None and num == default_disk_number:
                 default_idx = i
         self._disk_combo.setCurrentIndex(default_idx)
-
-    @property
-    def prepare_on_pc(self) -> bool:
-        return self._prepare_on_pc_cb.isChecked()
-
-    @property
-    def flash_last_image_only(self) -> bool:
-        return self._flash_last_cb.isChecked() and self._flash_last_cb.isEnabled()
 
     @property
     def selected_disk_number(self) -> Optional[int]:
@@ -225,25 +226,12 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
     def _on_accept(self) -> None:
         data = self._disk_combo.currentData()
         if data is None:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
-                "No disk",
-                "Select a target physical disk.",
+                "No card selected",
+                "Choose the SD card you want to install your music on.",
             )
             return
-        if self._flash_last_cb.isChecked():
-            try:
-                ok_img = self._last_img_path.is_file() and self._last_img_path.stat().st_size > 0
-            except OSError:
-                ok_img = False
-            if not ok_img:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "No cached image",
-                    f"Cached disk image not found or empty:\n{self._last_img_path}\n\n"
-                    "Run a full SD image sync once to build it.",
-                )
-                return
         if sys.platform == "darwin":
             self._darwin_bsd_disk = str(data)
             self._disk_number = None

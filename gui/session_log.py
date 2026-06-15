@@ -72,12 +72,14 @@ def log_gui_error(title: str, message: str) -> None:
 
 
 def install_messagebox_session_logging() -> None:
-    """Route QMessageBox.critical / .warning through the session log (GUI-ERROR).
+    """Route GUI alert boxes through the session log (GUI-ERROR).
 
     Call once after init_session_logging() so user-visible warnings and errors
     are always captured even when no TaskProgressDialog is involved.
     """
     from PyQt6.QtWidgets import QMessageBox
+
+    from gui.widgets.dialogs.vintage_message import VintageMessageBox
 
     _orig_critical = QMessageBox.critical
     _orig_warning = QMessageBox.warning
@@ -94,6 +96,22 @@ def install_messagebox_session_logging() -> None:
 
     QMessageBox.critical = critical  # type: ignore[assignment]
     QMessageBox.warning = warning  # type: ignore[assignment]
+
+    _v_critical = VintageMessageBox.critical
+    _v_warning = VintageMessageBox.warning
+
+    @staticmethod
+    def vintage_critical(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _v_critical(parent, title, text, *args, **kwargs)
+
+    @staticmethod
+    def vintage_warning(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _v_warning(parent, title, text, *args, **kwargs)
+
+    VintageMessageBox.critical = vintage_critical  # type: ignore[assignment]
+    VintageMessageBox.warning = vintage_warning  # type: ignore[assignment]
 
 
 def write_session_line(message: str, *, prefix: str = "SETUP") -> None:

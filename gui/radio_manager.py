@@ -31,11 +31,14 @@ from .library_manager import LibraryRegistry
 from .pin_config_editor import BoardSelectorWidget, PinConfigDialog
 from .profile_manager import ProfileSelectorBar
 from .resource_paths import app_data_dir, project_root, resource_path
+from .release_config import ZBVR_FIRMWARE_ENTRY_ID, is_official_firmware_visible
 from .sd_manager import SDManager, SYNC_TARGET_VOLUME_LABEL
+from .conversion_prefetch import ConversionPrefetchController
 from .experimental_sd_image import (
     pyfatfs_dependency_message,
     run_experimental_sd_disk_image_export,
     suggest_image_size_bytes,
+    estimate_folder_bytes,
 )
 from .sd_disk_image_flash import (
     LAST_CACHED_SD_IMAGE_FILENAME,
@@ -43,6 +46,8 @@ from .sd_disk_image_flash import (
     darwin_get_disk_size_bytes,
     format_disk_size,
     is_windows_admin,
+    load_cached_sd_image_manifest,
+    save_cached_sd_image_manifest,
     windows_disk_number_for_drive_letter,
     windows_drive_letter_from_path,
     windows_get_disk_size_bytes,
@@ -53,20 +58,44 @@ from .sd_disk_image_flash import (
 from .widgets.dialogs.sd_disk_image_wizard import SdDiskImageFlashWizardDialog
 from .session_log import write_session_line, get_session_log_path
 import gui.theme as _theme
+from gui import ui_scale as _ui_scale
+from gui.theme_presets import apply_ui_theme, normalize_theme_id
 from .widgets.common.delegates import (
     StationItemDelegate as _StationItemDelegateNew,
     TrackItemDelegate as _TrackItemDelegateNew,
+    configure_track_title_item,
     STATION_NUM_ROLE as _STATION_NUM_ROLE_NEW,
     STATION_NAME_ROLE as _STATION_NAME_ROLE_NEW,
     STATION_COUNT_ROLE as _STATION_COUNT_ROLE_NEW,
 )
 from .widgets.common.mockup_scrollbar import sync_track_table_column_widths
+from .widgets.common.vintage_chrome import (
+    configure_vintage_app_rendering,
+    install_vintage_popup_styles,
+)
+from .widgets.help.page               import HelpPage as _HelpPage
 from .widgets.load_music.page           import LoadMusicPage  as _LoadMusicPage
+from .widgets.install_firmware.page     import InstallFirmwarePage as _InstallFirmwarePage
+from .widgets.tools.page                import ToolsPage as _ToolsPage
+from .widgets.settings.page             import SettingsPage as _SettingsPage
 from .widgets.library_bar.library_bar   import LibraryBar     as _LibraryBar
 from .widgets.sidebar.sidebar           import Sidebar        as _Sidebar, _NAV_ITEMS as _SIDEBAR_NAV_ITEMS
 from .test_mode import TestModeWidget
 from .debug_mcp_server import DebugMcpServerManager
-from .widgets.dialogs.task_progress import TaskProgressDialog, _BackgroundWorker
+from .widgets.dialogs.vintage_message import VintageMessageBox
+from .widgets.dialogs.vintage_input import get_item, get_multiline_text, get_text
+from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
+from .widgets.common.styled_combo import VintageComboBox
+from .widgets.common.styled_checkbox import VintageCheckBox
+from .widgets.common.styled_spin import VintageSpinBox
+from .widgets.dialogs.vintage_text_dialog import VintageTextDialog
+from .widgets.dialogs.task_progress import IndeterminateProgressDialog, TaskProgressDialog, _BackgroundWorker
+from .widgets.dialogs.sync import (
+    ReplaceConfirmDialog,
+    ScrollableListConfirmDialog,
+    SyncChoiceDialog,
+)
+from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
 from . import __version__, sd_manager as sd_manager_module, updater
 from .update_dialog import UpdateAvailableDialog
 
@@ -317,47 +346,49 @@ class SettingsDialog(QtWidgets.QDialog):
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Preferences")
-        self.setModal(True)
 
-        self.auto_backup_checkbox = QtWidgets.QCheckBox("Enable automatic backups")
+        body_lay, footer = begin_sync_modal_dialog(
+            self,
+            title="Preferences",
+            subtitle="Library backup and SD card defaults.",
+            min_width=480,
+        )
+
+        self.auto_backup_checkbox = VintageCheckBox("Enable automatic backups")
         self.auto_backup_checkbox.setChecked(auto_backup)
-
-        self.retention_spin = QtWidgets.QSpinBox()
-        self.retention_spin.setRange(1, 100)
-        self.retention_spin.setValue(backup_retention)
+        body_lay.addWidget(self.auto_backup_checkbox)
 
         retention_layout = QtWidgets.QHBoxLayout()
         retention_layout.addWidget(QtWidgets.QLabel("Backup retention (count):"))
+        self.retention_spin = VintageSpinBox()
+        self.retention_spin.setRange(1, 100)
+        self.retention_spin.setValue(backup_retention)
         retention_layout.addWidget(self.retention_spin)
+        retention_layout.addStretch(1)
+        body_lay.addLayout(retention_layout)
 
+        body_lay.addWidget(QtWidgets.QLabel("SD card root folder:"))
         self.sd_root_edit = QtWidgets.QLineEdit(sd_root)
         self.sd_root_edit.setPlaceholderText("Select SD card root folder")
-        self.sd_browse_btn = QtWidgets.QPushButton("Browse")
+        self.sd_browse_btn = ModalButton("Browse", variant="secondary")
         self.sd_browse_btn.clicked.connect(self.select_sd_root)
         sd_root_layout = QtWidgets.QHBoxLayout()
-        sd_root_layout.addWidget(self.sd_root_edit)
+        sd_root_layout.addWidget(self.sd_root_edit, 1)
         sd_root_layout.addWidget(self.sd_browse_btn)
+        body_lay.addLayout(sd_root_layout)
 
-        self.sd_auto_detect_checkbox = QtWidgets.QCheckBox(
+        self.sd_auto_detect_checkbox = VintageCheckBox(
             "Auto-detect SD card root (Windows)"
         )
         self.sd_auto_detect_checkbox.setChecked(sd_auto_detect)
+        body_lay.addWidget(self.sd_auto_detect_checkbox)
 
-        button_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self.auto_backup_checkbox)
-        layout.addLayout(retention_layout)
-        layout.addWidget(QtWidgets.QLabel("SD card root folder:"))
-        layout.addLayout(sd_root_layout)
-        layout.addWidget(self.sd_auto_detect_checkbox)
-        layout.addWidget(button_box)
+        cancel_btn = ModalButton("Cancel", variant="secondary")
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = ModalButton("OK", variant="primary")
+        ok_btn.clicked.connect(self.accept)
+        footer.add_button(cancel_btn)
+        footer.add_button(ok_btn)
 
     def select_sd_root(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(
@@ -384,32 +415,32 @@ class MetadataDialog(QtWidgets.QDialog):
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Edit Metadata")
-        self.setModal(True)
+
+        body_lay, footer = begin_sync_modal_dialog(
+            self,
+            title="Edit Metadata",
+            subtitle="Leave fields blank to keep existing values.",
+            min_width=420,
+        )
 
         self.title_edit = QtWidgets.QLineEdit()
         self.title_edit.setPlaceholderText("Leave blank to keep existing")
         self.artist_edit = QtWidgets.QLineEdit()
         self.artist_edit.setPlaceholderText("Leave blank to keep existing")
-        self.clear_empty_checkbox = QtWidgets.QCheckBox(
-            "Clear fields when empty"
-        )
+        self.clear_empty_checkbox = VintageCheckBox("Clear fields when empty")
 
         form = QtWidgets.QFormLayout()
         form.addRow("Title:", self.title_edit)
         form.addRow("Artist:", self.artist_edit)
+        body_lay.addLayout(form)
+        body_lay.addWidget(self.clear_empty_checkbox)
 
-        button_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(self.clear_empty_checkbox)
-        layout.addWidget(button_box)
+        cancel_btn = ModalButton("Cancel", variant="secondary")
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = ModalButton("OK", variant="primary")
+        ok_btn.clicked.connect(self.accept)
+        footer.add_button(cancel_btn)
+        footer.add_button(ok_btn)
 
     def get_values(self) -> dict:
         title = self.title_edit.text().strip()
@@ -431,7 +462,7 @@ def _show_install_error(parent: QtWidgets.QWidget, msg: str, after_firmware: boo
     text = f"Error:\n\n{msg}"
     if after_firmware:
         text += "\n\nClick Setup Pico again to install the app once the Pico is connected."
-    QtWidgets.QMessageBox.warning(parent, "Install to Pico", text)
+    VintageMessageBox.warning(parent, "Install to Pico", text)
 
 
 def _run_install_main_thread(
@@ -450,26 +481,12 @@ def _run_install_main_thread(
     dfplayer_eq: str = "normal",
 ) -> None:
     """Run install on main thread with progress dialog. Status bar updates via processEvents()."""
-    dlg = QtWidgets.QDialog(parent)
     title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
-    dlg.setWindowTitle(title)
-    dlg.setModal(True)
-    dlg.setMinimumWidth(400)
-    layout = QtWidgets.QVBoxLayout(dlg)
-    status = QtWidgets.QLabel("Starting...")
-    status.setWordWrap(True)
-    layout.addWidget(status)
-    progress = QtWidgets.QProgressBar()
-    progress.setRange(0, 0)
-    layout.addWidget(progress)
-    dlg.show()
-    QtWidgets.QApplication.processEvents()
+    dlg = IndeterminateProgressDialog(parent, title, "Starting...")
+    dlg.show_and_raise()
 
     def report(step: int, total: int, msg: str):
-        progress.setRange(0, max(1, total))
-        progress.setValue(step)
-        status.setText(msg)
-        QtWidgets.QApplication.processEvents()
+        dlg.set_progress(step, total, msg)
 
     try:
         write_session_line(
@@ -786,7 +803,7 @@ class ReorderTable(QtWidgets.QTableWidget):
                     self.setItem(new_row, c, item)
         finally:
             self.blockSignals(False)
-            self.setSortingEnabled(True)
+            # Preserve track order — sorting would reorder rows and break SD sync.
 
     # -- drop indicator painting -------------------------------------------
 
@@ -901,10 +918,47 @@ class ReorderTable(QtWidgets.QTableWidget):
 
 class CollectionDropTable(ReorderTable):
     files_dropped = QtCore.pyqtSignal(list)
+    edit_track_requested = QtCore.pyqtSignal(int)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+
+    def _pencil_hit(self, pos: QtCore.QPoint) -> Optional[int]:
+        from gui.widgets.common.delegates import track_pencil_hit_rect
+
+        idx = self.indexAt(pos)
+        if not idx.isValid():
+            return None
+        rect = self.visualRect(idx)
+        if track_pencil_hit_rect(rect).contains(pos):
+            return idx.row()
+        return None
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        pos = event.position().toPoint()
+        if self._pencil_hit(pos) is not None:
+            self.viewport().setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        else:
+            self.viewport().unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self.viewport().unsetCursor()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            row = self._pencil_hit(pos)
+            if row is not None:
+                self.selectRow(row)
+                self.edit_track_requested.emit(row)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
@@ -1106,6 +1160,12 @@ class StationImportListWidget(ReorderListWidget):
     """Station list widget that accepts dropped folders for station import."""
 
     folders_dropped = QtCore.pyqtSignal(list)
+    edit_station_requested = QtCore.pyqtSignal(object)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
@@ -1139,6 +1199,36 @@ class StationImportListWidget(ReorderListWidget):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        item = self.itemAt(event.pos())
+        if item is not None and self._pencil_hit(event.pos(), item):
+            self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.pos())
+            if item is not None and self._pencil_hit(event.pos(), item):
+                self.setCurrentItem(item)
+                self.edit_station_requested.emit(item)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
+
+    def _pencil_hit(self, pos: QtCore.QPoint, item: QtWidgets.QListWidgetItem) -> bool:
+        from gui.widgets.common.delegates import station_pencil_hit_rect
+
+        delegate = self.itemDelegate()
+        max_tracks = getattr(delegate, "_max", 255)
+        rect = self.visualItemRect(item)
+        return station_pencil_hit_rect(rect, self.font(), max_tracks).contains(pos)
 
 
 # Data roles used by _StationItemDelegate to render station rows. Kept well above
@@ -1395,11 +1485,14 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None, preselect_rpi_rp2: bool = False) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Install MicroPython on Pico")
-        self.setModal(True)
-        self.setMinimumWidth(520)
         self._downloaded_path: Optional[Path] = None
         self._preselect_rpi_rp2 = preselect_rpi_rp2
+        self._body_lay, _footer = begin_sync_modal_dialog(
+            self,
+            title="Install MicroPython on Pico",
+            subtitle="One-time setup — copy a MicroPython .uf2 to the Pico in BOOTSEL mode.",
+            min_width=520,
+        )
         self._build_ui()
         self._refresh_drives()
         if preselect_rpi_rp2:
@@ -1413,7 +1506,7 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         self._start_firmware_fetch()
 
     def _build_ui(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
+        layout = self._body_lay
         instructions = (
             "1. Hold the BOOTSEL button on the Pico.\n"
             "2. Plug the Pico into USB. It will appear as a drive (e.g. RPI-RP2).\n"
@@ -1424,14 +1517,22 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
 
         # ── Board selector ──
         form = QtWidgets.QFormLayout()
-        self.board_combo = QtWidgets.QComboBox()
+        self.board_combo = VintageComboBox(
+            min_width=160,
+            max_width=320,
+            fixed_height=_theme.TOOLS_ACTION_BTN_H,
+        )
         self.board_combo.addItem("Pico", "Pico")
         self.board_combo.addItem("Pico W", "Pico W")
         self.board_combo.currentIndexChanged.connect(self._on_board_changed)
         form.addRow("Board:", self.board_combo)
 
         # ── Firmware version selector ──
-        self.firmware_combo = QtWidgets.QComboBox()
+        self.firmware_combo = VintageComboBox(
+            min_width=220,
+            max_width=9999,
+            fixed_height=_theme.TOOLS_ACTION_BTN_H,
+        )
         self.firmware_combo.setToolTip("Select a firmware version to download and install")
         self.firmware_combo.addItem("Fetching latest firmware...", None)
         self.firmware_combo.setEnabled(False)
@@ -1454,7 +1555,11 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         form.addRow("Local file:", uf2_row)
 
         # ── Pico drive ──
-        self.drive_combo = QtWidgets.QComboBox()
+        self.drive_combo = VintageComboBox(
+            min_width=220,
+            max_width=9999,
+            fixed_height=_theme.TOOLS_ACTION_BTN_H,
+        )
         self.drive_combo.setToolTip("Select the Pico drive (shown when BOOTSEL is held and Pico is connected)")
         refresh_drives_btn = QtWidgets.QPushButton("Refresh")
         refresh_drives_btn.clicked.connect(self._refresh_drives)
@@ -1654,7 +1759,7 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         if manual_path:
             uf2_path = Path(manual_path)
             if not uf2_path.is_file() or uf2_path.suffix.lower() != ".uf2":
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self, "Install MicroPython on Pico",
                     "The file path entered is not a valid .uf2 file.",
                 )
@@ -1665,7 +1770,7 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         # Use selected firmware from combo — need to download first
         fw_data = self.firmware_combo.currentData()
         if not fw_data or not isinstance(fw_data, dict):
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Install MicroPython on Pico",
                 "No firmware selected. Either select a version from the dropdown or browse for a local .uf2 file.",
             )
@@ -1674,7 +1779,7 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         # Verify drive first before downloading
         drive_data = self.drive_combo.currentData()
         if drive_data is None or not Path(drive_data).is_dir():
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Install MicroPython on Pico",
                 "No Pico drive selected. Hold BOOTSEL, plug in the Pico, then click Refresh.",
             )
@@ -1745,14 +1850,14 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         """Copy a .uf2 file to the selected Pico drive."""
         drive_data = self.drive_combo.currentData()
         if drive_data is None:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Install MicroPython on Pico",
                 "No Pico drive selected. Hold BOOTSEL, plug in the Pico, then click Refresh.",
             )
             return
         dest_dir = Path(drive_data)
         if not dest_dir.is_dir():
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Install MicroPython on Pico",
                 f"Drive not found: {dest_dir}. Unplug and replug the Pico (with BOOTSEL held), then Refresh.",
             )
@@ -1761,7 +1866,7 @@ class InstallMicroPythonDialog(QtWidgets.QDialog):
         try:
             shutil.copy2(uf2_path, dest_file)
         except OSError as e:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Install MicroPython on Pico",
                 f"Could not copy to Pico: {e}",
             )
@@ -1825,6 +1930,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._undo_stack: List[dict] = []
         self._redo_stack: List[dict] = []
         self.sd_manager = SDManager(self.db)
+        self._conversion_prefetch = ConversionPrefetchController(self)
 
         self.library_table = LibraryTable()
         self.library_table.files_dropped.connect(self.import_files)
@@ -1881,6 +1987,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_debug_widget = None  # Lazy-load to avoid crash during init (macOS/pyserial)
 
         self._apply_saved_settings()
+        self._normalize_sidebar_view_mode()
 
         self._build_menu()
         self._build_library_toolbar()
@@ -1891,6 +1998,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_ui_zoom()
         self._maybe_auto_start_mcp()
         QtCore.QTimer.singleShot(1200, self._check_for_updates_on_startup)
+        from gui.window_chrome import install_caption_color_filter
+
+        install_caption_color_filter(self)
+        QtCore.QTimer.singleShot(0, self._sync_startup_chrome)
+        QtCore.QTimer.singleShot(250, self._sync_startup_chrome)
+        install_vintage_popup_styles()
+
+    def _normalize_sidebar_view_mode(self) -> None:
+        """Sidebar UI runs in basic mode unless the user switches view mode this session.
+
+        Older library DBs often still have ``view_mode=advanced`` from when the View
+        menu was visible. That silently turned on advanced-only sync behavior (e.g.
+        firmware reflash prompts) with no UI affordance to switch back.
+        """
+        if self.devices_view_mode == "advanced":
+            self.devices_view_mode = "basic"
+            self.db.set_setting("view_mode", "basic")
 
     def _apply_default_window_geometry(self) -> None:
         """Size and centre the window at 1200×780 (clamped to available screen)."""
@@ -1994,16 +2118,23 @@ class MainWindow(QtWidgets.QMainWindow):
         sb.addWidget(container)
 
         # Version label — pinned to the right via addPermanentWidget
-        ver_label = QtWidgets.QLabel(f"v{__version__}")
-        ver_label.setStyleSheet(
-            f"color: {_theme.FOOTER_TEXT}; "
-            f"font-size: {_theme.FOOTER_FONT_SIZE - 1}px; "
-            "margin-right: 14px;"
-        )
+        ver_label = QtWidgets.QLabel(__version__)
+        self._footer_version_label = ver_label
+        ver_label.setStyleSheet(self._footer_version_stylesheet())
         sb.addPermanentWidget(ver_label)
 
+    @staticmethod
+    def _footer_version_stylesheet() -> str:
+        return (
+            f"color: {_theme.FOOTER_TEXT}; "
+            f"font-size: {_ui_scale.px(_theme.FOOTER_FONT_SIZE - 1)}px; "
+            "margin-right: 14px;"
+        )
+
     def _apply_ui_zoom(self) -> None:
-        """Apply UI zoom level via application font scale. Uses a fixed base point size so direction stays correct."""
+        """Apply UI zoom level. Styled widgets refresh via reload_theme / u.px(); avoid
+        forcing point sizes on every child — that breaks sidebar nav and page layout."""
+        _ui_scale.set_zoom_percent(self._ui_zoom_level)
         app = QtWidgets.QApplication.instance()
         if not app:
             return
@@ -2017,22 +2148,6 @@ class MainWindow(QtWidgets.QMainWindow):
         new_font.setPointSize(new_pt)
         app.setFont(new_font)
 
-        # Propagate the new font to all child widgets so zoom takes effect everywhere.
-        # Skip the debug console (QPlainTextEdit) which uses its own Ctrl+scroll zoom.
-        from gui.device_debug import DeviceDebugWidget
-        for widget in self.findChildren(QtWidgets.QWidget):
-            if isinstance(widget, QtWidgets.QPlainTextEdit):
-                if isinstance(widget.parent(), DeviceDebugWidget) or (
-                    hasattr(widget, "objectName") and widget.objectName() == "console_output"
-                ):
-                    continue
-            wf = widget.font()
-            scaled = QFont(wf)
-            scaled.setPointSize(new_pt)
-            if wf.bold():
-                scaled.setBold(True)
-            widget.setFont(scaled)
-
         fm = QtGui.QFontMetrics(app.font())
         if hasattr(self, "_library_heading_label") and self._library_heading_label is not None:
             label_font = QFont(app.font())
@@ -2040,12 +2155,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._library_heading_label.setFont(label_font)
         if hasattr(self, "_lib_combo") and self._lib_combo is not None:
             self._lib_combo.setMinimumWidth(max(180, fm.averageCharWidth() * 22))
-        min_w = min(1200, max(700, int(650 * self._ui_zoom_level // 100)))
+        min_w = min(1600, max(700, int(650 * self._ui_zoom_level // 100)))
         min_h = min(900, max(500, int(450 * self._ui_zoom_level // 100)))
         self.setMinimumSize(min_w, min_h)
         cw = self.centralWidget()
         if cw is not None:
-            cw.setMinimumWidth(max(650, fm.averageCharWidth() * 72))
+            cw.setMinimumWidth(0)
             if isinstance(cw, QtWidgets.QTabWidget):
                 cw.tabBar().setExpanding(False)
         if hasattr(self, "library_table") and self.library_table is not None:
@@ -2054,16 +2169,75 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         if hasattr(self, "_library_controls_widget") and self._library_controls_widget is not None:
             self._library_controls_widget.setMinimumWidth(max(400, fm.averageCharWidth() * 55))
+        self._relayout_basic_station_rows()
+        self._apply_ui_zoom_to_themed_pages()
+        footer_ver = getattr(self, "_footer_version_label", None)
+        if _qt_widget_alive(footer_ver):
+            footer_ver.setStyleSheet(self._footer_version_stylesheet())
+
+    def _apply_ui_zoom_to_themed_pages(self) -> None:
+        """Refresh pages that bake font sizes into stylesheets (Settings, Help, etc.)."""
+        for attr in (
+            "_settings_page",
+            "_help_page",
+            "_load_music_page",
+            "_install_firmware_page",
+            "_tools_page",
+            "_library_bar",
+            "_sidebar",
+        ):
+            page = getattr(self, attr, None)
+            if not _qt_widget_alive(page):
+                continue
+            if hasattr(page, "apply_ui_zoom"):
+                page.apply_ui_zoom()
+            elif hasattr(page, "reload_theme"):
+                page.reload_theme()
+        install_vintage_popup_styles()
+
+    def _relayout_basic_station_rows(self) -> None:
+        """Refresh station row heights after font/zoom changes."""
+        lst = getattr(self, "_basic_station_list", None)
+        if not _qt_widget_alive(lst):
+            return
+        delegate = lst.itemDelegate()
+        model = lst.model()
+        if model is None:
+            return
+        option = QtWidgets.QStyleOptionViewItem()
+        lst.initViewItemOption(option)
+        vw = max(lst.viewport().width(), 100)
+        for i in range(lst.count()):
+            item = lst.item(i)
+            if item is None:
+                continue
+            option.rect = QtCore.QRect(0, 0, vw, 0)
+            idx = model.index(i, 0)
+            item.setSizeHint(delegate.sizeHint(option, idx))
+        lst.doItemsLayout()
+        lst.viewport().update()
+
+    def _sync_settings_ui_zoom_display(self) -> None:
+        page = getattr(self, "_settings_page", None)
+        if not _qt_widget_alive(page):
+            return
+        spin = page.ui_zoom_spin
+        if spin.value() != self._ui_zoom_level:
+            spin.blockSignals(True)
+            spin.setValue(self._ui_zoom_level)
+            spin.blockSignals(False)
 
     def _on_zoom_in(self) -> None:
         self._ui_zoom_level = min(200, self._ui_zoom_level + 10)
         self.db.set_setting("ui_zoom_level", str(self._ui_zoom_level))
         self._apply_ui_zoom()
+        self._sync_settings_ui_zoom_display()
 
     def _on_zoom_out(self) -> None:
         self._ui_zoom_level = max(80, self._ui_zoom_level - 10)
         self.db.set_setting("ui_zoom_level", str(self._ui_zoom_level))
         self._apply_ui_zoom()
+        self._sync_settings_ui_zoom_display()
 
     def _set_button_cursors(self) -> None:
         """Set pointing hand cursor for all buttons in the application."""
@@ -2924,7 +3098,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not folder or not str(folder).strip():
             return
         folder = str(folder).strip()
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self,
             "Name this source",
             "Name (shown in Saved custom sources):",
@@ -2953,14 +3127,14 @@ class MainWindow(QtWidgets.QMainWindow):
         profiles = self._advanced_custom_profiles_ensure()
         if idx < 0 or idx >= len(profiles):
             return
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "Remove custom source",
             f"Remove “{profiles[idx].get('name', '')}” from this library?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.No,
         )
-        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply != VintageMessageBox.StandardButton.Yes:
             return
         del profiles[idx]
         self._advanced_custom_profiles_save(profiles)
@@ -3575,15 +3749,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._developer_mode:
             # Reset check state immediately; this is only a prompt in non-dev mode.
             self._mcp_toggle_action.setChecked(False)
-            reply = QtWidgets.QMessageBox.question(
+            reply = VintageMessageBox.question(
                 self,
                 "Developer mode",
                 "The MCP debug server is under the Developer menu.\n\n"
                 "Turn on Developer mode (saved in preferences) and start the MCP server?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.Yes,
+                VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+                VintageMessageBox.StandardButton.Yes,
             )
-            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            if reply == VintageMessageBox.StandardButton.Yes:
                 self._set_developer_mode(True)
                 self._toggle_mcp_server_from_ui(True)
             else:
@@ -3599,7 +3773,7 @@ class MainWindow(QtWidgets.QMainWindow):
             res = self._mcp_manager.start(port=self._mcp_port)
             if not res.get("ok"):
                 self._refresh_mcp_toggle_action_ui()
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self,
                     "MCP Debug Server",
                     "Could not start MCP debug server:\n{}".format(res),
@@ -3616,7 +3790,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_mcp_status(self) -> None:
         st = self._mcp_manager.status()
-        QtWidgets.QMessageBox.information(
+        VintageMessageBox.information(
             self,
             "MCP Debug Status",
             json.dumps(st, indent=2),
@@ -3625,7 +3799,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _run_mcp_smoke_script(self) -> None:
         res = self._mcp_manager.run_script("basic_smoke")
         self._mcp_log("MCP smoke script result: {}".format(res))
-        QtWidgets.QMessageBox.information(self, "MCP Smoke Script", json.dumps(res, indent=2))
+        VintageMessageBox.information(self, "MCP Smoke Script", json.dumps(res, indent=2))
 
     def _mcp_show_acceptance_report_dialog(
         self, suite: Dict[str, Any], *, window_title: str
@@ -3637,20 +3811,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().clearMessage()
         except Exception:
             pass
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle(window_title)
-        dlg.resize(720, 520)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        txt = QtWidgets.QPlainTextEdit()
-        txt.setReadOnly(True)
-        txt.setPlainText(str(suite.get("report_markdown", "")))
-        lay.addWidget(txt)
-        bb = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Close
+        dlg = VintageTextDialog(
+            self,
+            title=window_title,
+            text=str(suite.get("report_markdown", "")),
+            read_only=True,
+            min_height=360,
+            width=_theme.SYNC_MDL_CONFIRM_W + 120,
+            buttons=[("Close", "secondary")],
+            monospace=True,
         )
-        bb.rejected.connect(dlg.reject)
-        bb.accepted.connect(dlg.accept)
-        lay.addWidget(bb)
         ok = bool(suite.get("ok"))
         self._mcp_log(
             "MCP acceptance finished: ok={} (see report dialog)".format(ok)
@@ -3661,7 +3831,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Quick/standard/full scripted suite — must not run on the GUI thread (deadlock)."""
         from .mcp_device_acceptance import run_acceptance_suite
 
-        profile, ok = QtWidgets.QInputDialog.getItem(
+        profile, ok = get_item(
             self,
             "Acceptance suite",
             "Profile:",
@@ -3671,7 +3841,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not ok:
             return
-        target, ok2 = QtWidgets.QInputDialog.getItem(
+        target, ok2 = get_item(
             self,
             "Acceptance suite",
             "Target:",
@@ -3719,7 +3889,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Comprehensive physical-device suite; logs stream to MCP / Device tab."""
         from .mcp_device_acceptance import run_device_acceptance_full
 
-        confirm = QtWidgets.QMessageBox.question(
+        confirm = VintageMessageBox.question(
             self,
             "Full device acceptance",
             "Runs the full on-device regression suite — typically 15–35+ minutes "
@@ -3729,14 +3899,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "(same place as [MCP] lines). Line-in steps pause logging for several seconds "
             "while the PC records audio — that is normal.\n\n"
             "Keep this window open. Continue?",
-            QtWidgets.QMessageBox.StandardButton.Yes
-            | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.Yes,
+            VintageMessageBox.StandardButton.Yes
+            | VintageMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes,
         )
-        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+        if confirm != VintageMessageBox.StandardButton.Yes:
             return
 
-        target, ok = QtWidgets.QInputDialog.getItem(
+        target, ok = get_item(
             self,
             "Full device acceptance",
             "Target:",
@@ -3787,7 +3957,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pico_root = self._project_root() / "firmware" / "pico"
         ipc = pico_root / "components" / "vintage_radio_ipc.py"
         if not ipc.is_file():
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Deploy MCP / VRTEST support",
                 "Could not find firmware file:\n{}".format(ipc),
@@ -3799,21 +3969,29 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = "mpremote is not available. Install with:\n\npip install mpremote"
             if bundle_err:
                 msg += "\n\n({})".format(bundle_err)
-            QtWidgets.QMessageBox.information(self, "Deploy MCP / VRTEST support", msg)
+            VintageMessageBox.information(self, "Deploy MCP / VRTEST support", msg)
             return
 
         choice = QtWidgets.QDialog(self)
-        choice.setWindowTitle("Deploy MCP / VRTEST support to Pico")
-        choice.setMinimumWidth(520)
-        v = QtWidgets.QVBoxLayout(choice)
+        choice_lay, choice_footer = begin_sync_modal_dialog(
+            choice,
+            title="Deploy MCP / VRTEST support to Pico",
+            subtitle="Choose what to copy to the connected Pico.",
+            min_width=520,
+        )
         intro = QtWidgets.QLabel(
-                "The MCP debug server runs on this computer. For serial automation (VRTEST), "
-                "the Pico needs components/vintage_radio_ipc.py on its flash. "
-                "Flashing a UF2 image alone often does not add new components/*.py files."
+            "The MCP debug server runs on this computer. For serial automation (VRTEST), "
+            "the Pico needs components/vintage_radio_ipc.py on its flash. "
+            "Flashing a UF2 image alone often does not add new components/*.py files."
         )
         intro.setWordWrap(True)
-        v.addWidget(intro)
-        combo = QtWidgets.QComboBox()
+        intro.setStyleSheet("background: transparent;")
+        choice_lay.addWidget(intro)
+        combo = VintageComboBox(
+            min_width=280,
+            max_width=9999,
+            fixed_height=_theme.TOOLS_ACTION_BTN_H,
+        )
         combo.addItem(
             "IPC only — components/vintage_radio_ipc.py (fixes ImportError)",
             False,
@@ -3822,20 +4000,20 @@ class MainWindow(QtWidgets.QMainWindow):
             "Full — IPC + main.py + main_basic.py from this app (poll_ipc in loop)",
             True,
         )
-        v.addWidget(combo)
+        choice_lay.addWidget(combo)
         foot = QtWidgets.QLabel(
             "Pico must be connected via USB (mpremote connect auto). "
             "The device will soft-reset after copy."
         )
         foot.setWordWrap(True)
-        v.addWidget(foot)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(choice.accept)
-        buttons.rejected.connect(choice.reject)
-        v.addWidget(buttons)
+        foot.setStyleSheet("background: transparent;")
+        choice_lay.addWidget(foot)
+        cancel_btn = ModalButton("Cancel", variant="secondary")
+        cancel_btn.clicked.connect(choice.reject)
+        deploy_btn = ModalButton("Deploy", variant="primary")
+        deploy_btn.clicked.connect(choice.accept)
+        choice_footer.add_button(cancel_btn)
+        choice_footer.add_button(deploy_btn)
         if choice.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         include_main = bool(combo.currentData())
@@ -3849,14 +4027,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def on_ok(msg: str) -> None:
             self.statusBar().showMessage(str(msg), 8000)
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "Deploy MCP / VRTEST support",
                 str(msg),
             )
 
         def on_err(msg: str) -> None:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Deploy MCP / VRTEST support",
                 msg,
@@ -4063,7 +4241,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._switch_library(slug)
 
     def _new_library(self) -> None:
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self, "New Library", "Library name:"
         )
         if not ok or not name.strip():
@@ -4071,7 +4249,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             slug = self._lib_registry.create_library(name.strip())
         except ValueError as e:
-            QtWidgets.QMessageBox.warning(self, "New Library", str(e))
+            VintageMessageBox.warning(self, "New Library", str(e))
             return
         self._populate_lib_combo()
         self._switch_library(slug)
@@ -4079,7 +4257,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _rename_library(self) -> None:
         slug = self._lib_registry.active_library()
         old_name = self._lib_registry.active_library_name()
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self, "Rename Library", "New name:", text=old_name
         )
         if not ok or not name.strip() or name.strip() == old_name:
@@ -4093,18 +4271,18 @@ class MainWindow(QtWidgets.QMainWindow):
         name = self._lib_registry.active_library_name()
         libs = self._lib_registry.list_libraries()
         if len(libs) <= 1:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self, "Delete Library", "Cannot delete the only library."
             )
             return
-        reply = QtWidgets.QMessageBox.warning(
+        reply = VintageMessageBox.warning(
             self,
             "Delete Library",
             f"Permanently delete library \"{name}\" and all its data?\n\nThis cannot be undone.",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Cancel,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+            VintageMessageBox.StandardButton.Cancel,
         )
-        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply != VintageMessageBox.StandardButton.Yes:
             return
         with self._wait_cursor_scope():
             self.db.close()
@@ -4114,6 +4292,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._propagate_db()
             self._populate_lib_combo()
             self._apply_saved_settings()
+            self._normalize_sidebar_view_mode()
             self._refresh_all()
             self._update_window_title()
             if hasattr(self, "test_mode_widget") and self.test_mode_widget:
@@ -4148,6 +4327,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._undo_stack.clear()
             self._redo_stack.clear()
             self._apply_saved_settings()
+            self._normalize_sidebar_view_mode()
             self._refresh_all()
             self._update_window_title()
             if hasattr(self, "test_mode_widget") and self.test_mode_widget:
@@ -4173,6 +4353,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_window_title(self) -> None:
         name = self._lib_registry.active_library_name()
         self.setWindowTitle(f"Vintage Radio Music Manager - {name}")
+
+    def _sync_startup_chrome(self) -> None:
+        """Refresh title bar, SD path label, and Windows caption tint after first layout."""
+        self._update_window_title()
+        self._update_sd_root_label()
+        if _qt_widget_alive(getattr(self, "_basic_sd_capacity_bar", None)):
+            self._refresh_basic_sd_capacity()
+        from gui.window_chrome import ensure_native_caption_colors
+
+        ensure_native_caption_colors(self)
 
     def _build_tabs(self) -> None:
         if self.devices_view_mode in ("basic", "advanced"):
@@ -4244,8 +4434,81 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reload_dev_theme_ui()
         print("[DEV] Theme reload complete.")
 
+    def _reload_app_theme_ui(self) -> None:
+        """Rebuild chrome and pages after the user selects a different colour theme."""
+        self._reload_dev_theme_ui()
+        self._apply_ui_zoom_to_themed_pages()
+        self._refresh_status_bar_theme()
+        footer_ver = getattr(self, "_footer_version_label", None)
+        if _qt_widget_alive(footer_ver):
+            footer_ver.setStyleSheet(self._footer_version_stylesheet())
+        from gui.window_chrome import schedule_native_caption_colors
+
+        schedule_native_caption_colors(self)
+
+    def _refresh_status_bar_theme(self) -> None:
+        """Re-apply footer / zoom control colours after a palette change."""
+        sb = self.statusBar()
+        if sb is None:
+            return
+        sb.setFixedHeight(_theme.FOOTER_H)
+        sb.setStyleSheet(f"""
+            QStatusBar {{
+                background: {_theme.FOOTER_BG};
+                border-top: 1px solid {_theme.FOOTER_BORDER};
+                color: {_theme.FOOTER_TEXT};
+                font-size: {_ui_scale.px(_theme.FOOTER_FONT_SIZE)}px;
+            }}
+            QStatusBar::item {{
+                border: none;
+            }}
+        """)
+        zoom_qss = f"""
+            QPushButton {{
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 {_theme.ZOOM_BTN_GRAD_TOP},
+                    stop:1 {_theme.ZOOM_BTN_GRAD_BOT});
+                border: 1px solid {_theme.ZOOM_BTN_BORDER};
+                border-radius: {_theme.ZOOM_BTN_RADIUS}px;
+                color: {_theme.FOOTER_TEXT};
+                font-weight: bold;
+                font-size: {_ui_scale.px(_theme.FOOTER_FONT_SIZE)}px;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 {_theme.ZOOM_BTN_GRAD_BOT},
+                    stop:1 {_theme.ZOOM_BTN_GRAD_TOP});
+            }}
+            QPushButton:pressed {{
+                background: {_theme.ZOOM_BTN_GRAD_BOT};
+            }}
+        """
+        label_qss = (
+            f"color: {_theme.FOOTER_TEXT}; "
+            f"font-size: {_ui_scale.px(_theme.FOOTER_FONT_SIZE)}px;"
+        )
+        for w in sb.findChildren(QtWidgets.QPushButton):
+            w.setStyleSheet(zoom_qss)
+            w.setFixedSize(_theme.ZOOM_BTN_W, _theme.ZOOM_BTN_H)
+        for w in sb.findChildren(QtWidgets.QLabel):
+            if w is not getattr(self, "_footer_version_label", None):
+                w.setStyleSheet(label_qss)
+
+    def _reload_dev_theme_open_modals(self) -> None:
+        """Refresh any open sync modals and the native caption bar."""
+        from gui.window_chrome import apply_native_caption_colors, schedule_native_caption_colors
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            for w in app.topLevelWidgets():
+                if w is self or not w.isVisible():
+                    continue
+                if hasattr(w, "reload_theme"):
+                    w.reload_theme()
+        schedule_native_caption_colors(self)
+
     def _reload_dev_theme_ui(self) -> None:
-        """Rebuild sidebar, library bar, page backgrounds, and the current page."""
+        """Rebuild sidebar, library bar, all pages, and popup styles."""
         central = self.centralWidget()
         if _qt_widget_alive(central):
             central.setStyleSheet(f"#appRoot {{ background: {_theme.C_BG}; }}")
@@ -4254,9 +4517,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if _qt_widget_alive(right):
             right.setStyleSheet(f"#rightPane {{ background: {_theme.C_BG}; }}")
 
+        stack = getattr(self, "_page_stack", None)
+        if _qt_widget_alive(stack):
+            stack.setStyleSheet(f"QStackedWidget {{ background: {_theme.C_BG}; }}")
+
+        lib_wrap = central.findChild(QtWidgets.QWidget, "libBarWrap") if _qt_widget_alive(central) else None
+        if _qt_widget_alive(lib_wrap):
+            lib_wrap.setStyleSheet("#libBarWrap { background: transparent; }")
+            lay = lib_wrap.layout()
+            if lay is not None:
+                lay.setContentsMargins(
+                    _theme.LIBBAR_WRAP_L, _theme.LIBBAR_WRAP_T,
+                    _theme.LIBBAR_WRAP_R, _theme.LIBBAR_WRAP_B,
+                )
+
         self._dev_rebuild_sidebar()
         self._dev_rebuild_library_bar()
-        self._dev_rebuild_current_page()
+        self._dev_rebuild_all_pages()
+        install_vintage_popup_styles()
+        self._reload_dev_theme_open_modals()
 
     def _dev_rebuild_sidebar(self) -> None:
         """Swap in a fresh Sidebar widget (picks up SIDEBAR_* / S_* from theme)."""
@@ -4322,6 +4601,8 @@ class MainWindow(QtWidgets.QMainWindow):
         rebuilders = {
             self._PAGE_LOAD_MUSIC: self._build_basic_sd_card_tab,
             self._PAGE_INSTALL_FW: self._build_basic_mcu_tab,
+            self._PAGE_TOOLS: self._build_tools_page,
+            self._PAGE_SETTINGS: self._build_settings_page,
         }
         builder = rebuilders.get(page_idx)
         if builder is None:
@@ -4340,6 +4621,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Refresh data on the rebuilt Load Music page.
         if page_idx == self._PAGE_LOAD_MUSIC:
+            self._refresh_basic_station_list()
+            self._update_basic_stations_size()
+            self._refresh_basic_sd_capacity()
+
+    def _dev_rebuild_all_pages(self) -> None:
+        """Rebuild every page in the stack so all cached styles pick up the new palette."""
+        stack = getattr(self, "_page_stack", None)
+        if not _qt_widget_alive(stack):
+            return
+
+        current = stack.currentIndex()
+        rebuilders = {
+            self._PAGE_LOAD_MUSIC: self._build_basic_sd_card_tab,
+            self._PAGE_INSTALL_FW: self._build_basic_mcu_tab,
+            self._PAGE_TOOLS: self._build_tools_page,
+            self._PAGE_SETTINGS: self._build_settings_page,
+            self._PAGE_HELP: self._build_help_page,
+        }
+        for page_idx, builder in rebuilders.items():
+            old = stack.widget(page_idx)
+            new = builder()
+            stack.insertWidget(page_idx, new)
+            if old is not None:
+                stack.removeWidget(old)
+                old.deleteLater()
+        stack.setCurrentIndex(current)
+        if current == self._PAGE_LOAD_MUSIC:
             self._refresh_basic_station_list()
             self._update_basic_stations_size()
             self._refresh_basic_sd_capacity()
@@ -4390,6 +4698,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         stack = QtWidgets.QStackedWidget()
         self._page_stack = stack
+        self._apply_page_stack_background(stack)
+        stack.setStyleSheet(f"QStackedWidget {{ background: {_theme.C_BG}; }}")
         self._tabs_widget = stack  # keep downstream references working
         stack.addWidget(self._build_basic_sd_card_tab())   # 0 Load Music
         stack.addWidget(self._build_basic_mcu_tab())        # 1 Install Firmware
@@ -4477,47 +4787,107 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.page_changed.connect(self._on_sidebar_nav)
         return bar
 
+    def _apply_page_stack_background(self, stack: QtWidgets.QStackedWidget) -> None:
+        """Opaque page-stack fill avoids 1px hairlines when switching views."""
+        pal = stack.palette()
+        bg = QtGui.QColor(_theme.C_BG)
+        pal.setColor(QtGui.QPalette.ColorRole.Window, bg)
+        pal.setColor(QtGui.QPalette.ColorRole.Base, bg)
+        stack.setPalette(pal)
+        stack.setAutoFillBackground(True)
+
     def _on_sidebar_nav(self, index: int) -> None:
         """Switch the page stack and toggle library-bar visibility."""
         stack = getattr(self, "_page_stack", None)
         if stack is None:
             return
         stack.setCurrentIndex(index)
+        current = stack.currentWidget()
+        if current is not None:
+            current.update()
+        stack.update()
+        right = getattr(self, "_right_pane", None)
+        if _qt_widget_alive(right):
+            right.update()
         bar = getattr(self, "_library_bar", None)
         if _qt_widget_alive(bar):
             bar.setVisible(index not in (self._PAGE_SETTINGS, self._PAGE_HELP))
 
     def _build_tools_page(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(page)
-        label = QtWidgets.QLabel("Tools \u2014 coming soon")
-        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #6b6560; font-size: 16px;")
-        lay.addStretch(1)
-        lay.addWidget(label)
-        lay.addStretch(1)
+        page = _ToolsPage()
+        page.embed_debug_widget(self._ensure_device_debug_widget())
+        self._tools_page = page
         return page
 
+    def _ensure_device_debug_widget(self) -> DeviceDebugWidget:
+        """Single DeviceDebugWidget instance — embedded on the Tools tab."""
+        w = getattr(self, "_basic_debug_widget", None)
+        if _qt_widget_alive(w):
+            return w
+        holder = getattr(self, "_basic_debug_widget_holder", None)
+        if not _qt_widget_alive(holder):
+            holder = QtWidgets.QWidget(self)
+            holder.setVisible(False)
+            holder.setFixedSize(0, 0)
+            self._basic_debug_widget_holder = holder
+        w = DeviceDebugWidget(
+            parent=holder,
+            basic_mode=True,
+            db=self.db,
+            db_getter=lambda: self.db,
+        )
+        self._basic_debug_widget = w
+        w.device_presence_changed.connect(self._set_basic_device_presence_indicator)
+        return w
+
     def _build_settings_page(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(page)
-        label = QtWidgets.QLabel("Settings \u2014 coming soon")
-        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #6b6560; font-size: 16px;")
-        lay.addStretch(1)
-        lay.addWidget(label)
-        lay.addStretch(1)
+        page = _SettingsPage(
+            auto_eject_checked=self.db.get_setting("auto_eject_after_sync", "0") == "1",
+            conversion_profile=self._selected_conversion_profile(),
+            retain_conversion_cache=self._retain_conversion_cache(),
+            experimental_fast_sync=self._experimental_fast_sync_enabled(),
+            sd_image_reuse_when_unchanged=self._sd_image_reuse_when_unchanged_enabled(),
+            auto_backup=self.db.auto_backup,
+            backup_retention=self.db.backup_retention,
+            sd_auto_detect=self.sd_auto_detect,
+            ui_zoom_level=self._ui_zoom_level,
+            ui_theme=getattr(self, "_ui_theme", "vintage"),
+        )
+        self._settings_page = page
+        self._settings_auto_eject_cb = page.auto_eject_checkbox
+        self._settings_conversion_profile_combo = page.conversion_profile_combo
+        page.conversion_profile_combo.currentIndexChanged.connect(
+            self._on_conversion_profile_changed
+        )
+        page.retain_conversion_cache_changed.connect(
+            self._on_retain_conversion_cache_changed
+        )
+        page.clear_conversion_cache_clicked.connect(
+            self._on_clear_conversion_cache_clicked
+        )
+        page.experimental_fast_sync_changed.connect(
+            self._on_experimental_fast_sync_changed
+        )
+        page.sd_image_reuse_when_unchanged_changed.connect(
+            self._on_sd_image_reuse_when_unchanged_changed
+        )
+        page.auto_eject_changed.connect(self._on_auto_eject_after_sync_changed)
+        page.auto_backup_changed.connect(self._on_settings_auto_backup_changed)
+        page.backup_retention_changed.connect(self._on_settings_backup_retention_changed)
+        page.sd_auto_detect_changed.connect(self._on_settings_sd_auto_detect_changed)
+        page.ui_zoom_changed.connect(self._on_settings_ui_zoom_changed)
+        page.ui_theme_changed.connect(self._on_settings_ui_theme_changed)
         return page
 
     def _build_help_page(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(page)
-        label = QtWidgets.QLabel("Help \u2014 coming soon")
-        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #6b6560; font-size: 16px;")
-        lay.addStretch(1)
-        lay.addWidget(label)
-        lay.addStretch(1)
+        page = _HelpPage(app_version=__version__)
+        self._help_page = page
+        page.view_session_log_clicked.connect(self._view_session_log)
+        page.open_logs_folder_clicked.connect(self._open_logs_folder)
+        page.copy_log_path_clicked.connect(self._copy_log_path)
+        page.reenable_track_warning_clicked.connect(self._reenable_basic_track_count_warning)
+        page.check_updates_clicked.connect(self._check_for_updates_menu)
+        page.about_clicked.connect(self._show_about)
         return page
 
     def _ensure_test_mode_widget(self) -> TestModeWidget:
@@ -4542,183 +4912,42 @@ class MainWindow(QtWidgets.QMainWindow):
         return container
 
     def _build_basic_mcu_tab(self) -> QtWidgets.QWidget:
-        """Install Firmware tab: centered firmware install card.
+        """Install Firmware tab — device status, software list, notes, install actions."""
+        page = _InstallFirmwarePage()
 
-        The device debug console (Connection / Console / Send Command / Now Playing)
-        is hosted in a separate Advanced Tools window opened from this tab. The card
-        itself shows the device-presence state, an optional Choose Device picker for
-        when multiple RP2040s are attached, the install button, and (in advanced view)
-        a list of firmware versions to install.
-        """
-        _CARD_BG = "white"
-        _BTN_CARD_SS = (
-            "QPushButton {"
-            "  background-color: white;"
-            "  border: 1px solid #e0e0e0;"
-            "  border-radius: 10px;"
-            "  padding: 18px 20px;"
-            "  text-align: center;"
-            "}"
-            "QPushButton:hover { background-color: #f5f5f5; border-color: #bbb; }"
-            "QPushButton:pressed { background-color: #ebebeb; }"
-            "QPushButton:disabled { color: #aaa; background-color: #f9f9f9; }"
-        )
+        # Device debugger lives on the Tools tab; ensure it exists for presence polling.
+        self._ensure_device_debug_widget()
 
-        widget = QtWidgets.QWidget()
-        widget.setStyleSheet(f"background-color: {_CARD_BG};")
-        outer = QtWidgets.QVBoxLayout(widget)
-        outer.setContentsMargins(36, 32, 36, 32)
-        outer.setSpacing(0)
+        # Aliases for presence + device picker updates.
+        dev = page.device_section
+        self._basic_device_title_label = dev.title_label
+        self._basic_device_meta_label = dev.meta_label
+        self._basic_device_status_pill = dev.status_pill
+        self._basic_choose_device_btn = dev.choose_device_btn
+        self._basic_install_firmware_btn = page.detail_panel.install_btn
+        self._install_firmware_page = page
 
-        # Always create the underlying debug widget so existing references and the
-        # device_presence_changed signal keep working. Park it on a hidden parent
-        # until Advanced Tools opens — that dialog will re-parent it into its layout.
-        self._basic_debug_widget_host = QtWidgets.QWidget()
-        self._basic_debug_widget_host.setVisible(False)
-        host_layout = QtWidgets.QVBoxLayout(self._basic_debug_widget_host)
-        host_layout.setContentsMargins(0, 0, 0, 0)
-        self._basic_debug_widget = DeviceDebugWidget(
-            basic_mode=True,
-            db=self.db,
-            db_getter=lambda: self.db,
+        dev.refresh_clicked.connect(self._on_refresh_device_clicked)
+        dev.choose_device_clicked.connect(self._on_choose_device_clicked)
+        page.mode_tabs.mode_changed.connect(self._on_firmware_mode_changed)
+        page.firmware_list.add_custom_clicked.connect(self._on_add_custom_firmware_menu)
+        page.firmware_list.selection_changed.connect(self._on_firmware_selection_changed)
+        page.detail_panel.view_firmware_notes_clicked.connect(
+            self._on_view_firmware_notes_clicked
         )
-        host_layout.addWidget(self._basic_debug_widget)
-        self._basic_debug_widget.device_presence_changed.connect(
-            self._set_basic_device_presence_indicator
-        )
-        # Keep references for compatibility with the old layout-based access patterns.
-        self._basic_debug_container = self._basic_debug_widget_host
-        self._basic_debug_layout = host_layout
+        page.detail_panel.edit_user_notes_clicked.connect(self._on_edit_user_notes_clicked)
+        page.detail_panel.remove_clicked.connect(self._on_firmware_remove_selected)
+        page.detail_panel.add_custom_clicked.connect(self._on_add_custom_firmware_menu)
+        page.detail_panel.install_clicked.connect(self._on_install_selected_firmware)
 
-        # ── Content column — max width so it doesn't stretch across 4K monitors ──
-        content_row = QtWidgets.QHBoxLayout()
-        content_col = QtWidgets.QWidget()
-        content_col.setStyleSheet(f"background-color: {_CARD_BG};")
-        content_col.setMaximumWidth(680)
-        col_layout = QtWidgets.QVBoxLayout(content_col)
-        col_layout.setContentsMargins(0, 0, 0, 0)
-        col_layout.setSpacing(0)
-        content_row.addWidget(content_col, 1)
+        saved_mode = (self.db.get_setting("install_firmware_tab_mode", "") or "official").strip()
+        page.set_firmware_mode(saved_mode if saved_mode in ("official", "custom") else "official")
+        self._refresh_firmware_list_ui()
+        self._set_basic_device_presence_indicator(self._basic_device_usb_present())
+        self._refresh_basic_choose_device_visibility()
+        return page
 
-        # ── Title and subtitle ──
-        self._basic_device_title_label = QtWidgets.QLabel("Waiting for device...")
-        self._basic_device_title_label.setStyleSheet(
-            f"background-color: {_CARD_BG}; font-size: 22px; font-weight: bold; color: #1a1a1a;"
-        )
-        col_layout.addWidget(self._basic_device_title_label)
-        col_layout.addSpacing(6)
-
-        self._basic_device_subtitle_label = QtWidgets.QLabel(
-            "Plug your Vintage Radio device into a USB port to begin."
-        )
-        self._basic_device_subtitle_label.setWordWrap(True)
-        self._basic_device_subtitle_label.setStyleSheet(
-            f"background-color: {_CARD_BG}; font-size: 13px; color: #6b6560;"
-        )
-        col_layout.addWidget(self._basic_device_subtitle_label)
-        col_layout.addSpacing(20)
-
-        # ── USB LED row ──
-        led_row = QtWidgets.QHBoxLayout()
-        usb_lbl = QtWidgets.QLabel("USB")
-        usb_lbl.setStyleSheet(f"background-color: {_CARD_BG}; color: #555; font-size: 13px;")
-        led_row.addWidget(usb_lbl)
-        led_row.addSpacing(6)
-        self._basic_device_detected_led = QtWidgets.QLabel()
-        self._basic_device_detected_led.setFixedSize(14, 14)
-        led_row.addWidget(self._basic_device_detected_led)
-        led_row.addSpacing(6)
-        self._basic_device_detected_label = QtWidgets.QLabel("No serial device detected")
-        self._basic_device_detected_label.setStyleSheet(
-            f"background-color: {_CARD_BG}; font-size: 13px;"
-        )
-        led_row.addWidget(self._basic_device_detected_label)
-        led_row.addStretch(1)
-        col_layout.addLayout(led_row)
-        col_layout.addSpacing(24)
-
-        # ── Advanced-mode firmware version selector ──
-        if self._is_advanced_mode():
-            fw_header = QtWidgets.QLabel("Choose firmware to install")
-            fw_header.setStyleSheet(
-                f"background-color: {_CARD_BG}; font-weight: bold; font-size: 13px; color: #333;"
-            )
-            col_layout.addWidget(fw_header)
-            col_layout.addSpacing(8)
-            self._advanced_firmware_list_widget = self._build_advanced_firmware_list_widget()
-            col_layout.addWidget(self._advanced_firmware_list_widget)
-            browse_row = QtWidgets.QHBoxLayout()
-            browse_row.addStretch(1)
-            browse_btn = QtWidgets.QPushButton("Browse local file...")
-            browse_btn.setStyleSheet(f"background-color: {_CARD_BG};")
-            browse_btn.setToolTip(
-                "Select a .uf2 or MicroPython (.py/.mpy) file. .uf2 files install "
-                "directly without a MicroPython prompt. The selection is saved to your "
-                "custom firmware list."
-            )
-            browse_btn.clicked.connect(self._on_browse_custom_firmware_local)
-            browse_row.addWidget(browse_btn)
-            col_layout.addLayout(browse_row)
-            col_layout.addSpacing(12)
-
-        # ── Choose Device button (basic: only if >1 RP2040; advanced: always) ──
-        self._basic_choose_device_btn = QtWidgets.QPushButton("Choose Device")
-        self._basic_choose_device_btn.setStyleSheet(f"background-color: {_CARD_BG};")
-        self._basic_choose_device_btn.setToolTip(
-            "Pick a specific RP2040 serial port when more than one is connected."
-        )
-        self._basic_choose_device_btn.clicked.connect(self._on_choose_device_clicked)
-        col_layout.addWidget(
-            self._basic_choose_device_btn, alignment=QtCore.Qt.AlignmentFlag.AlignLeft
-        )
-        col_layout.addSpacing(16)
-
-        # ── Install firmware on device — primary card button ──
-        self._basic_install_firmware_btn = QtWidgets.QPushButton("Install firmware on device")
-        self._basic_install_firmware_btn.setStyleSheet(
-            _BTN_CARD_SS
-            + "QPushButton { font-size: 15px; font-weight: bold; color: #2563eb; }"
-            + "QPushButton:disabled { color: #9db5e8; }"
-        )
-        self._basic_install_firmware_btn.setMinimumHeight(64)
-        self._basic_install_firmware_btn.setCursor(
-            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        )
-        if self._is_advanced_mode():
-            self._basic_install_firmware_btn.setToolTip(
-                "Install the selected firmware. .uf2 files copy to the BOOTSEL drive; "
-                "MicroPython files install MicroPython if needed, then copy the source."
-            )
-            self._basic_install_firmware_btn.clicked.connect(
-                self._on_install_firmware_advanced_clicked
-            )
-        else:
-            self._basic_install_firmware_btn.setToolTip(
-                "One-click install: installs MicroPython if needed, then copies the "
-                "Vintage Radio basic-mode firmware, pin configuration, and AM overlay sound."
-            )
-            self._basic_install_firmware_btn.clicked.connect(self._on_setup_basic_device_clicked)
-        col_layout.addWidget(self._basic_install_firmware_btn)
-        col_layout.addSpacing(10)
-
-        # ── Advanced tools — secondary card button ──
-        advanced_tools_btn = QtWidgets.QPushButton("Advanced tools")
-        advanced_tools_btn.setStyleSheet(_BTN_CARD_SS + "QPushButton { font-size: 14px; }")
-        advanced_tools_btn.setMinimumHeight(56)
-        advanced_tools_btn.setCursor(
-            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        )
-        advanced_tools_btn.setToolTip(
-            "Open the device console: connect, view serial output, send commands, "
-            "and inspect the currently playing track."
-        )
-        advanced_tools_btn.clicked.connect(self._open_advanced_tools_dialog)
-        col_layout.addWidget(advanced_tools_btn)
-
-        outer.addLayout(content_row)
-        outer.addStretch(1)
-
-        # ── Initial device presence + button enable state ──
+    def _basic_device_usb_present(self) -> bool:
         has_usb = SDManager.is_rp2040_bootsel_present()
         try:
             import serial.tools.list_ports as list_ports
@@ -4729,64 +4958,73 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             pass
-        self._set_basic_device_presence_indicator(bool(has_usb))
-        # In basic mode, the Choose Device button only appears when multiple RP2040
-        # ports are detected; in advanced mode it is always shown.
-        self._refresh_basic_choose_device_visibility()
-        return widget
+        return bool(has_usb)
 
     def _set_basic_device_presence_indicator(self, detected: bool) -> None:
-        """Green LED when a Pico shows up as serial, console connected, or BOOTSEL (RPI-RP2 drive).
-
-        Also updates the centered card header ("Waiting for device..." vs device name),
-        enables/disables the install button, and refreshes the Choose Device visibility
-        (basic mode only shows it when more than one RP2040 is connected).
-        """
-        led = getattr(self, "_basic_device_detected_led", None)
-        lbl = getattr(self, "_basic_device_detected_label", None)
-        if _qt_widget_alive(led):
-            if detected:
-                led.setStyleSheet(
-                    "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
-                    "border-radius: 7px; background-color: #2ecc40; border: 1px solid #1a9930;"
-                )
-                led.setToolTip(
-                    "USB: MicroPython serial port, connected Device Console, or unflashed Pico in "
-                    "BOOTSEL mode (RPI-RP2 removable drive)."
-                )
-                if _qt_widget_alive(lbl):
-                    lbl.setText("Device detected")
-                    lbl.setStyleSheet("font-size: 13px; font-weight: bold;")
-            else:
-                led.setStyleSheet(
-                    "min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px; "
-                    "border-radius: 7px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
-                )
-                led.setToolTip(
-                    "No Pico detected. Plug in USB, or hold BOOTSEL while plugging in (RPI-RP2 drive)."
-                )
-                if _qt_widget_alive(lbl):
-                    lbl.setText("No serial device detected")
-                    lbl.setStyleSheet("font-size: 13px;")
+        """Update device banner, install button, and Choose Device visibility."""
+        page = getattr(self, "_install_firmware_page", None)
+        if _qt_widget_alive(page):
+            page.device_section.set_detected(detected)
+            page.device_section.set_meta_text(self._basic_detected_device_meta_line(detected))
 
         title = getattr(self, "_basic_device_title_label", None)
-        subtitle = getattr(self, "_basic_device_subtitle_label", None)
-        if _qt_widget_alive(title) and _qt_widget_alive(subtitle):
+        if _qt_widget_alive(title):
             if detected:
-                title.setText(self._basic_detected_device_name() or "RP2040 device")
-                subtitle.setText("Ready to install firmware on the connected device.")
+                title.setText("Raspberry Pi Pico detected")
             else:
                 title.setText("Waiting for device...")
-                subtitle.setText(
-                    "Plug your Vintage Radio device into a USB port to begin."
-                )
 
         install_btn = getattr(self, "_basic_install_firmware_btn", None)
         if _qt_widget_alive(install_btn):
-            install_btn.setEnabled(bool(detected))
+            page = getattr(self, "_install_firmware_page", None)
+            entry = page.firmware_list.selected_entry() if _qt_widget_alive(page) else None
+            status, enabled = self._firmware_install_status(entry, detected=detected)
+            install_btn.setEnabled(enabled)
+            if _qt_widget_alive(page):
+                page.detail_panel.set_status(status)
 
-        # Choose Device visibility depends on the number of RP2040 ports detected.
         self._refresh_basic_choose_device_visibility()
+
+    def _on_refresh_device_clicked(self) -> None:
+        w = getattr(self, "_basic_debug_widget", None)
+        if _qt_widget_alive(w) and hasattr(w, "_scan_ports"):
+            try:
+                w._scan_ports()
+            except Exception:
+                pass
+        self._set_basic_device_presence_indicator(self._basic_device_usb_present())
+        self.statusBar().showMessage("Device list refreshed.", 3000)
+
+    def _basic_detected_device_meta_line(self, detected: bool) -> str:
+        if not detected:
+            return "Plug in USB to detect your Pico."
+        parts: List[str] = []
+        port_label = ""
+        w = getattr(self, "_basic_debug_widget", None)
+        if _qt_widget_alive(w) and hasattr(w, "port_combo"):
+            port = w.port_combo.currentData()
+            if port:
+                port_label = str(port)
+        if not port_label:
+            try:
+                import serial.tools.list_ports as list_ports
+
+                for port_info in list_ports.comports():
+                    if DeviceDebugWidget._is_rp2040_port(port_info):
+                        port_label = str(getattr(port_info, "device", "") or "")
+                        break
+            except Exception:
+                pass
+        if port_label:
+            parts.append(port_label)
+        if SDManager.is_rp2040_bootsel_present() and not port_label:
+            parts.append("BOOTSEL")
+        else:
+            parts.append("RP2040")
+            if port_label:
+                parts.append("MicroPython")
+        parts.append("DFPlayer")
+        return " · ".join(parts)
 
     def _basic_detected_device_name(self) -> str:
         """Best-effort human-readable label for the first detected RP2040 USB device."""
@@ -4800,8 +5038,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 product = (getattr(port_info, "product", "") or "").strip()
                 device = getattr(port_info, "device", "") or ""
                 friendly = product or desc or "RP2040 device"
-                if device:
-                    return f"{friendly}  ({device})"
+                if device and device not in friendly:
+                    return f"{friendly} ({device})"
                 return friendly
         except Exception:
             pass
@@ -4810,58 +5048,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return "RP2040 device"
 
     def _refresh_basic_choose_device_visibility(self) -> None:
-        """Show Choose Device only when needed: basic = multiple RP2040s; advanced = always."""
+        """Show Choose Device on the Install Firmware banner (mock always shows both)."""
         btn = getattr(self, "_basic_choose_device_btn", None)
         if not _qt_widget_alive(btn):
             return
-        if self._is_advanced_mode():
-            btn.setVisible(True)
-            return
-        try:
-            import serial.tools.list_ports as list_ports
-
-            count = sum(
-                1
-                for p in list_ports.comports()
-                if DeviceDebugWidget._is_rp2040_port(p)
-            )
-        except Exception:
-            count = 0
-        btn.setVisible(count > 1)
+        btn.setVisible(True)
 
     # ── Advanced Tools window (debug console) ──────────────────────────────
 
     def _open_advanced_tools_dialog(self) -> None:
-        """Open the non-modal Advanced Tools window hosting the DeviceDebugWidget."""
-        dlg = getattr(self, "_advanced_tools_dialog", None)
-        if not _qt_widget_alive(dlg):
-            dlg = QtWidgets.QDialog(self)
-            dlg.setWindowTitle("Advanced tools — Device console")
-            dlg.setModal(False)
-            # Inherit the parent's stylesheet so no dark background leaks in from
-            # any sub-widget; explicit stylesheet resets to the application default.
-            dlg.setStyleSheet("")
-            v = QtWidgets.QVBoxLayout(dlg)
-            v.setContentsMargins(8, 8, 8, 8)
-            # Re-parent the debug widget from its hidden host into this dialog.
-            w = getattr(self, "_basic_debug_widget", None)
-            if _qt_widget_alive(w):
-                w.setParent(dlg)
-                w.setStyleSheet("")
-                v.addWidget(w)
-            close_row = QtWidgets.QHBoxLayout()
-            close_row.addStretch(1)
-            close_btn = QtWidgets.QPushButton("Close")
-            close_btn.clicked.connect(dlg.close)
-            close_row.addWidget(close_btn)
-            v.addLayout(close_row)
-            self._advanced_tools_dialog = dlg
-            # Size to roughly match the parent window and show maximized by default.
-            parent_rect = self.geometry()
-            dlg.resize(max(820, int(parent_rect.width() * 0.8)), max(580, int(parent_rect.height() * 0.8)))
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        """Open the Tools tab with the Debugger folder selected."""
+        sidebar = getattr(self, "_sidebar", None)
+        if _qt_widget_alive(sidebar):
+            sidebar.set_active(self._PAGE_TOOLS)
+        self._on_sidebar_nav(self._PAGE_TOOLS)
+        page = getattr(self, "_tools_page", None)
+        if _qt_widget_alive(page):
+            page.set_mode("debugger")
+        w = getattr(self, "_basic_debug_widget", None)
+        if _qt_widget_alive(w) and hasattr(w, "reload_vintage_theme"):
+            w.reload_vintage_theme()
 
     # ── Choose Device picker ──────────────────────────────
 
@@ -4876,7 +5082,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             ports = []
         if not ports:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "Choose Device",
                 "No RP2040 devices detected. Plug in your Pico and try again.",
@@ -4894,7 +5100,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(labels) == 1:
             chosen, ok = labels[0], True
         else:
-            chosen, ok = QtWidgets.QInputDialog.getItem(
+            chosen, ok = get_item(
                 self,
                 "Choose Device",
                 "Select the RP2040 device to use:",
@@ -4916,6 +5122,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Advanced firmware list ──────────────────────────────
 
+    def _firmware_entry_installable(self, entry: Optional[Dict[str, Any]]) -> bool:
+        if not entry or entry.get("disabled"):
+            return False
+        if entry.get("installable") is False:
+            return False
+        return bool(entry.get("available", True))
+
+    def _firmware_install_status(self, entry: Optional[Dict[str, Any]], *, detected: bool) -> tuple[str, bool]:
+        if not entry:
+            return "Select firmware to install.", False
+        if not self._firmware_entry_installable(entry):
+            return "Install is not available for this firmware yet.", False
+        if not detected:
+            return "Connect a device to install.", False
+        return "Ready to install.", True
+
     def _builtin_firmware_entries(self) -> List[Dict[str, Any]]:
         """Hardcoded built-in firmware entries shown at the top of the Advanced list.
 
@@ -4925,8 +5147,20 @@ class MainWindow(QtWidgets.QMainWindow):
         return [
             {
                 "id": "v1.1_stable",
-                "name": "V1.1 - stable release",
-                "description": "Current stable build. Works with all hardware.",
+                "name": "Vintage Radio Basic Firmware",
+                "listName": "Default RP2040",
+                "listSubtitle": "Official Vintage Radio Music Manager firmware",
+                "description": (
+                    "Official firmware made with this app in mind - an improved version of Zion's original firmware with station browsing, playback control, "
+                    "AM tuning overlay, shuffle modes, and the full gesture set for DFPlayer + RP2040 hardware."
+                ),
+                "badge": "Official",
+                "version": "v1.0",
+                "microcontroller": "RP2040",
+                "mp3Controller": "DFPlayer",
+                "device": "DFPlayer + RP2040",
+                "author": updater.GITHUB_REPO_SLUG.split("/", 1)[0],
+                "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
                 "notes": (
                     "Vintage Radio basic-mode firmware (main_basic.py + radio_core).\n\n"
                     "Includes DFPlayer playback, AM tuning overlay, and the full gesture set.\n\n"
@@ -4943,120 +5177,256 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
                 "recommended": True,
                 "available": True,
+                "custom": False,
+            },
+            {
+                "id": ZBVR_FIRMWARE_ENTRY_ID,
+                "name": "Zbvr-Firmware RP2040",
+                "listName": "Zbvr-Firmware RP2040",
+                "listSubtitle": "Refactored DFPlayer firmware",
+                "description": (
+                    "Community refactor of Zion's baseline firmware for RP2040 + DFPlayer "
+                    "Mini — modular layout, shuffle modes, fade in/out, and improved "
+                    "DFPlayer communication."
+                ),
+                "badge": "Community",
+                "version": "v26.0.1",
+                "microcontroller": "RP2040",
+                "mp3Controller": "DFPlayer",
+                "device": "DFPlayer + RP2040",
+                "author": "mloit",
+                "repoUrl": "https://github.com/mloit/zbvr-firmware",
+                "notes": (
+                    "Zbvr-Firmware 26.0.1 (Theraformed) — RP2040 + DFPlayer Mini.\n\n"
+                    "Highlights from the release:\n"
+                    "  Bi-directional DFPlayer communication with timeout handling\n"
+                    "  Playlist built at boot from valid folders only\n"
+                    "  Track/album shuffle, full-disk shuffle, and auto-reshuffle\n"
+                    "  Fade in/out for MP3 and WAV playback\n"
+                    "  Live SD card insert/remove handling\n"
+                    "  LED colour feedback and quickstart boot mode\n\n"
+                    "Releases: https://github.com/mloit/zbvr-firmware/releases"
+                ),
+                "recommended": False,
+                "available": True,
+                "installable": True,
+                "kind": "remote_uf2",
+                "cacheKey": "zbvr_26_0_1",
+                "githubRepo": "mloit/zbvr-firmware",
+                "githubTag": "26.0.1",
+                "downloadUrl": (
+                    "https://github.com/mloit/zbvr-firmware/releases/download/"
+                    "26.0.1/zbvr-firmware-26_0_1.uf2.zip"
+                ),
+                "custom": False,
             },
         ]
+
+    def _official_firmware_entries_for_ui(self) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for entry in self._builtin_firmware_entries():
+            row = dict(entry)
+            entry_id = str(row.get("id", ""))
+            if not is_official_firmware_visible(entry_id):
+                continue
+            if row.get("disabled") or row.get("available", True):
+                entries.append(row)
+        return entries
+
+    def _custom_firmware_entries_for_ui(self) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for entry in self._custom_firmware_entries_load():
+            row = dict(entry)
+            kind = str(row.get("kind") or "micropython").lower()
+            if kind == "uf2":
+                row["badge"] = "UF2"
+                row["listSubtitle"] = "BOOTSEL install"
+                row["description"] = row.get("description") or "Installs directly in BOOTSEL mode"
+            elif kind == "folder":
+                row["badge"] = "Folder"
+                row["listSubtitle"] = "Source folder"
+                row["description"] = row.get("description") or "MicroPython source folder"
+            else:
+                row["badge"] = "Custom"
+                row["listSubtitle"] = "MicroPython file"
+                row["description"] = row.get("description") or "MicroPython source file"
+            row["listName"] = row.get("name") or "Custom"
+            row["version"] = "Custom"
+            row["device"] = "RP2040"
+            row["author"] = "You"
+            row["custom"] = True
+            entries.append(row)
+        return entries
+
+    def _firmware_entries_for_ui(self) -> List[Dict[str, Any]]:
+        """Built-in + custom entries with display badges for the Install Firmware tab."""
+        return self._official_firmware_entries_for_ui() + self._custom_firmware_entries_for_ui()
+
+    def _current_firmware_tab_mode(self) -> str:
+        page = getattr(self, "_install_firmware_page", None)
+        if _qt_widget_alive(page):
+            return page.mode_tabs.mode
+        raw = (self.db.get_setting("install_firmware_tab_mode", "") or "official").strip()
+        return raw if raw in ("official", "custom") else "official"
+
+    def _on_firmware_mode_changed(self, mode: str) -> None:
+        norm = "custom" if str(mode).lower() == "custom" else "official"
+        self.db.set_setting("install_firmware_tab_mode", norm)
+        page = getattr(self, "_install_firmware_page", None)
+        if _qt_widget_alive(page):
+            page.set_firmware_mode(norm)
+        self._refresh_firmware_list_ui()
+
+    def _firmware_user_notes_load(self) -> Dict[str, str]:
+        raw = (self.db.get_setting("install_firmware_user_notes_json", "") or "").strip()
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
+
+    def _firmware_user_notes_save(self, notes: Dict[str, str]) -> None:
+        self.db.set_setting("install_firmware_user_notes_json", json.dumps(notes))
+
+    def _firmware_user_note_for(self, entry_id: str) -> str:
+        return self._firmware_user_notes_load().get(str(entry_id), "")
+
+    def _set_firmware_user_note_for(self, entry_id: str, text: str) -> None:
+        notes = self._firmware_user_notes_load()
+        key = str(entry_id)
+        if text.strip():
+            notes[key] = text
+        elif key in notes:
+            del notes[key]
+        self._firmware_user_notes_save(notes)
+
+    def _refresh_firmware_list_ui(self) -> None:
+        page = getattr(self, "_install_firmware_page", None)
+        if not _qt_widget_alive(page):
+            return
+        mode = self._current_firmware_tab_mode()
+        if mode == "custom":
+            entries = self._custom_firmware_entries_for_ui()
+        else:
+            entries = self._official_firmware_entries_for_ui()
+        selected_id = self._selected_firmware_entry_id()
+        if selected_id and not any(str(e.get("id", "")) == selected_id for e in entries):
+            selected_id = str(entries[0].get("id", "")) if entries else ""
+            if selected_id:
+                self._set_selected_firmware_entry_id(selected_id)
+        page.firmware_list.set_entries(
+            entries,
+            selected_id=selected_id,
+            show_filter=len(entries) > 1,
+        )
+        entry = page.firmware_list.selected_entry()
+        self._apply_firmware_detail_panel(entry, custom_empty=(mode == "custom" and not entries))
+
+    def _apply_firmware_detail_panel(
+        self,
+        entry: Optional[Dict[str, Any]],
+        *,
+        custom_empty: bool = False,
+    ) -> None:
+        page = getattr(self, "_install_firmware_page", None)
+        if not _qt_widget_alive(page):
+            return
+        user_notes = ""
+        if entry and not entry.get("custom"):
+            user_notes = self._firmware_user_note_for(str(entry.get("id", "")))
+        page.detail_panel.set_entry(
+            entry,
+            user_notes=user_notes,
+            custom_empty=custom_empty,
+        )
+        detected = self._basic_device_usb_present()
+        status, enabled = self._firmware_install_status(entry, detected=detected)
+        if custom_empty or not entry:
+            page.detail_panel.set_status("Add a custom firmware source to continue.")
+            page.detail_panel.install_btn.setEnabled(False)
+        else:
+            page.detail_panel.set_status(status)
+            page.detail_panel.install_btn.setEnabled(enabled)
+
+    def _on_firmware_selection_changed(self, entry: object) -> None:
+        if entry is None:
+            mode = self._current_firmware_tab_mode()
+            custom_entries = self._custom_firmware_entries_for_ui()
+            self._apply_firmware_detail_panel(
+                None,
+                custom_empty=(mode == "custom" and not custom_entries),
+            )
+            return
+        if not isinstance(entry, dict):
+            return
+        self._set_selected_firmware_entry_id(str(entry.get("id", "")))
+        self._apply_firmware_detail_panel(entry)
+
+    def _on_view_firmware_notes_clicked(self) -> None:
+        page = getattr(self, "_install_firmware_page", None)
+        entry = page.firmware_list.selected_entry() if _qt_widget_alive(page) else None
+        if entry and not entry.get("custom"):
+            self._show_firmware_notes_dialog(entry, custom=False, editable=False)
+
+    def _on_edit_user_notes_clicked(self) -> None:
+        page = getattr(self, "_install_firmware_page", None)
+        if not _qt_widget_alive(page):
+            return
+        entry = page.firmware_list.selected_entry()
+        if not entry:
+            return
+        if entry.get("custom"):
+            self._show_firmware_notes_dialog(entry, custom=True, editable=True)
+        else:
+            self._show_official_user_notes_dialog(entry)
+
+    def _show_official_user_notes_dialog(self, entry: Dict[str, Any]) -> None:
+        entry_id = str(entry.get("id", ""))
+        dlg = VintageTextDialog(
+            self,
+            title=f"Your Notes — {entry.get('name', 'Firmware')}",
+            text=self._firmware_user_note_for(entry_id),
+            read_only=False,
+            buttons=[("Cancel", "secondary"), ("Save", "primary")],
+        )
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._set_firmware_user_note_for(entry_id, dlg.text())
+            self._apply_firmware_detail_panel(entry)
+
+    def _on_firmware_remove_selected(self) -> None:
+        page = getattr(self, "_install_firmware_page", None)
+        if not _qt_widget_alive(page):
+            return
+        entry = page.firmware_list.selected_entry()
+        if entry and entry.get("custom"):
+            self._remove_custom_firmware_entry(entry)
+
+    def _on_add_custom_firmware_menu(self) -> None:
+        page = getattr(self, "_install_firmware_page", None)
+        anchor = page.firmware_list if _qt_widget_alive(page) else self
+        menu = QtWidgets.QMenu(self)
+        act_uf2 = menu.addAction("Add .uf2 file…")
+        act_file = menu.addAction("Add MicroPython file…")
+        act_folder = menu.addAction("Add source folder…")
+        chosen = menu.exec(QtGui.QCursor.pos())
+        if chosen == act_uf2:
+            self._on_browse_custom_firmware_local(uf2_only=True)
+        elif chosen == act_file:
+            self._on_browse_custom_firmware_local(mpy_only=True)
+        elif chosen == act_folder:
+            self._on_browse_custom_firmware_folder()
+
+    def _on_install_selected_firmware(self) -> None:
+        """Install the software selected on the Install Firmware tab."""
+        self._on_install_firmware_advanced_clicked()
 
     def _selected_firmware_entry_id(self) -> str:
         return (self.db.get_setting("install_firmware_selected_entry", "") or "").strip()
 
     def _set_selected_firmware_entry_id(self, entry_id: str) -> None:
         self.db.set_setting("install_firmware_selected_entry", str(entry_id or ""))
-
-    def _build_advanced_firmware_list_widget(self) -> QtWidgets.QWidget:
-        """Build the radio-button list of firmware versions (built-in + custom)."""
-        container = QtWidgets.QFrame()
-        container.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-        layout = QtWidgets.QVBoxLayout(container)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(2)
-        self._advanced_firmware_button_group = QtWidgets.QButtonGroup(container)
-        self._advanced_firmware_button_group.setExclusive(True)
-        # Map button → entry dict so install / ellipsis menu can look up the selection.
-        self._advanced_firmware_button_to_entry: Dict[QtWidgets.QAbstractButton, Dict[str, Any]] = {}
-
-        self._populate_advanced_firmware_list(layout)
-        return container
-
-    def _populate_advanced_firmware_list(self, layout: QtWidgets.QVBoxLayout) -> None:
-        """(Re)populate the firmware radio list inside *layout*."""
-        # Clear existing rows.
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._advanced_firmware_button_to_entry.clear()
-        for b in list(self._advanced_firmware_button_group.buttons()):
-            self._advanced_firmware_button_group.removeButton(b)
-
-        selected_id = self._selected_firmware_entry_id()
-        first_button: Optional[QtWidgets.QRadioButton] = None
-        selected_button: Optional[QtWidgets.QRadioButton] = None
-
-        for entry in self._builtin_firmware_entries():
-            if not entry.get("available", True):
-                continue
-            row = self._build_firmware_row(entry, custom=False)
-            layout.addWidget(row)
-            btn = row.findChild(QtWidgets.QRadioButton)
-            if btn is not None:
-                if first_button is None:
-                    first_button = btn
-                if entry.get("id") == selected_id:
-                    selected_button = btn
-
-        custom_entries = self._custom_firmware_entries_load()
-        if custom_entries:
-            sep = QtWidgets.QFrame()
-            sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-            sep.setStyleSheet("color: #2a2a2c;")
-            layout.addWidget(sep)
-        for entry in custom_entries:
-            row = self._build_firmware_row(entry, custom=True)
-            layout.addWidget(row)
-            btn = row.findChild(QtWidgets.QRadioButton)
-            if btn is not None:
-                if entry.get("id") == selected_id:
-                    selected_button = btn
-
-        target = selected_button or first_button
-        if target is not None:
-            target.setChecked(True)
-            entry = self._advanced_firmware_button_to_entry.get(target)
-            if entry:
-                self._set_selected_firmware_entry_id(str(entry.get("id", "")))
-
-    def _build_firmware_row(self, entry: Dict[str, Any], *, custom: bool) -> QtWidgets.QWidget:
-        """Build a single row: [○ name + description] [...]."""
-        row = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(row)
-        h.setContentsMargins(2, 2, 2, 2)
-        h.setSpacing(6)
-        rb = QtWidgets.QRadioButton()
-        name = str(entry.get("name") or "Firmware")
-        if entry.get("recommended"):
-            label_html = (
-                f"<b>{name}</b> &nbsp;<span style='color:#ffcc44;'>&#9733; Recommended</span>"
-            )
-        else:
-            label_html = f"<b>{name}</b>"
-        desc = str(entry.get("description") or "").strip()
-        if desc:
-            label_html += f"<br><span style='color:#b0b0b4; font-size:11px;'>{desc}</span>"
-        label = QtWidgets.QLabel(label_html)
-        label.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        label.setWordWrap(True)
-        rb.toggled.connect(
-            lambda checked, e=entry: checked
-            and self._set_selected_firmware_entry_id(str(e.get("id", "")))
-        )
-        # Clicking the label should also select the radio (improves UX a lot).
-        def _label_click(_event, _rb=rb):
-            _rb.setChecked(True)
-
-        label.mousePressEvent = _label_click  # type: ignore[assignment]
-        h.addWidget(rb)
-        h.addWidget(label, 1)
-        ellipsis = QtWidgets.QToolButton()
-        ellipsis.setText("...")
-        ellipsis.setToolTip("Firmware actions: notes, edit, remove")
-        ellipsis.clicked.connect(
-            lambda _checked=False, e=entry, c=custom, src=ellipsis: self._show_firmware_ellipsis_menu(e, c, src)
-        )
-        h.addWidget(ellipsis)
-        self._advanced_firmware_button_group.addButton(rb)
-        self._advanced_firmware_button_to_entry[rb] = entry
-        return row
 
     # ── Custom firmware persistence ──────────────────────────────
 
@@ -5076,8 +5446,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not isinstance(e, dict):
                     continue
                 kind = str(e.get("kind") or "micropython").strip().lower()
-                if kind not in ("uf2", "micropython"):
-                    kind = "micropython"
+                if kind not in ("uf2", "micropython", "folder"):
+                    path_val = str(e.get("path") or "")
+                    if path_val and Path(path_val).is_dir():
+                        kind = "folder"
+                    else:
+                        kind = "micropython"
+                desc = "Local file"
+                if kind == "uf2":
+                    desc = "Installs directly in BOOTSEL mode"
+                elif kind == "folder":
+                    desc = "MicroPython source folder"
+                else:
+                    desc = "Local MicroPython source"
                 out.append(
                     {
                         "id": str(e.get("id") or e.get("path") or e.get("name") or "custom"),
@@ -5085,9 +5466,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "path": str(e.get("path") or ""),
                         "kind": kind,
                         "notes": str(e.get("notes") or e.get("description") or ""),
-                        "description": "Local file"
-                        if kind == "uf2"
-                        else "Local MicroPython source",
+                        "description": desc,
                         "custom": True,
                     }
                 )
@@ -5106,33 +5485,47 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         self.db.set_setting("custom_firmware_entries_json", json.dumps(serializable))
 
-    def _on_browse_custom_firmware_local(self) -> None:
+    def _on_browse_custom_firmware_local(
+        self,
+        *,
+        uf2_only: bool = False,
+        mpy_only: bool = False,
+    ) -> None:
+        if uf2_only:
+            caption = "Select UF2 firmware"
+            flt = "UF2 firmware (*.uf2);;All files (*)"
+        elif mpy_only:
+            caption = "Select MicroPython source file"
+            flt = "MicroPython (*.py *.mpy);;All files (*)"
+        else:
+            caption = "Select firmware file"
+            flt = "Firmware files (*.uf2 *.py *.mpy);;UF2 (*.uf2);;MicroPython (*.py *.mpy);;All files (*)"
         path_str, _flt = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Select firmware file",
+            caption,
             "",
-            "Firmware files (*.uf2 *.py *.mpy);;UF2 (*.uf2);;MicroPython (*.py *.mpy);;All files (*)",
+            flt,
         )
         if not path_str:
             return
         path = Path(path_str)
         if not path.is_file():
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Browse firmware", f"Not a file: {path}"
             )
             return
         ext = path.suffix.lower()
-        if ext not in (".uf2", ".py", ".mpy"):
-            QtWidgets.QMessageBox.warning(
+        allowed = (".uf2",) if uf2_only else ((".py", ".mpy") if mpy_only else (".uf2", ".py", ".mpy"))
+        if ext not in allowed:
+            VintageMessageBox.warning(
                 self,
                 "Browse firmware",
-                "Only .uf2, .py, or .mpy files are accepted.",
+                "That file type is not supported here.",
             )
             return
         kind = "uf2" if ext == ".uf2" else "micropython"
         entries = self._custom_firmware_entries_load()
         new_id = f"custom:{path.resolve()}"
-        # Replace any existing entry with the same path.
         entries = [e for e in entries if e.get("id") != new_id]
         entries.append(
             {
@@ -5145,15 +5538,46 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._custom_firmware_entries_save(entries)
         self._set_selected_firmware_entry_id(new_id)
-        self._rebuild_advanced_firmware_list()
+        page = getattr(self, "_install_firmware_page", None)
+        if _qt_widget_alive(page):
+            page.set_firmware_mode("custom")
+            self.db.set_setting("install_firmware_tab_mode", "custom")
+        self._refresh_firmware_list_ui()
+
+    def _on_browse_custom_firmware_folder(self) -> None:
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose custom software folder",
+            str(Path.home()),
+        )
+        if not folder or not str(folder).strip():
+            return
+        path = Path(folder.strip())
+        if not path.is_dir():
+            VintageMessageBox.warning(self, "Browse firmware", f"Not a folder: {path}")
+            return
+        entries = self._custom_firmware_entries_load()
+        new_id = f"custom:{path.resolve()}"
+        entries = [e for e in entries if e.get("id") != new_id]
+        entries.append(
+            {
+                "id": new_id,
+                "name": path.name,
+                "path": str(path),
+                "kind": "folder",
+                "notes": "",
+            }
+        )
+        self._custom_firmware_entries_save(entries)
+        self._set_selected_firmware_entry_id(new_id)
+        page = getattr(self, "_install_firmware_page", None)
+        if _qt_widget_alive(page):
+            page.set_firmware_mode("custom")
+            self.db.set_setting("install_firmware_tab_mode", "custom")
+        self._refresh_firmware_list_ui()
 
     def _rebuild_advanced_firmware_list(self) -> None:
-        container = getattr(self, "_advanced_firmware_list_widget", None)
-        if not _qt_widget_alive(container):
-            return
-        layout = container.layout()
-        if isinstance(layout, QtWidgets.QVBoxLayout):
-            self._populate_advanced_firmware_list(layout)
+        self._refresh_firmware_list_ui()
 
     def _show_firmware_ellipsis_menu(
         self,
@@ -5186,52 +5610,45 @@ class MainWindow(QtWidgets.QMainWindow):
         custom: bool,
         editable: bool,
     ) -> None:
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle(f"Notes — {entry.get('name', 'Firmware')}")
-        dlg.setMinimumSize(420, 320)
-        v = QtWidgets.QVBoxLayout(dlg)
-        text = QtWidgets.QTextEdit()
-        text.setPlainText(str(entry.get("notes") or ""))
-        text.setReadOnly(not editable)
-        v.addWidget(text)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch(1)
-        close_btn = QtWidgets.QPushButton("Save" if (custom and editable) else "Close")
-        if custom and not editable:
-            edit_btn = QtWidgets.QPushButton("Edit")
-
-            def _begin_edit() -> None:
-                text.setReadOnly(False)
-                edit_btn.setEnabled(False)
-                close_btn.setText("Save")
-
-            edit_btn.clicked.connect(_begin_edit)
-            btn_row.addWidget(edit_btn)
-
-        def _on_close() -> None:
-            if custom and not text.isReadOnly():
+        title = f"Notes — {entry.get('name', 'Firmware')}"
+        notes = str(entry.get("notes") or "")
+        if custom and editable:
+            dlg = VintageTextDialog(
+                self,
+                title=title,
+                text=notes,
+                read_only=False,
+                buttons=[("Save", "primary")],
+            )
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
                 entries = self._custom_firmware_entries_load()
                 for e in entries:
                     if e.get("id") == entry.get("id"):
-                        e["notes"] = text.toPlainText()
+                        e["notes"] = dlg.text()
                         break
                 self._custom_firmware_entries_save(entries)
-            dlg.accept()
+                page = getattr(self, "_install_firmware_page", None)
+                if _qt_widget_alive(page):
+                    sel = page.firmware_list.selected_entry()
+                    if sel and sel.get("id") == entry.get("id"):
+                        self._apply_firmware_detail_panel(sel)
+            return
 
-        close_btn.clicked.connect(_on_close)
-        btn_row.addWidget(close_btn)
-        v.addLayout(btn_row)
-        dlg.exec()
+        VintageTextDialog.show_read_only(
+            self,
+            title=title,
+            text=notes,
+        )
 
     def _remove_custom_firmware_entry(self, entry: Dict[str, Any]) -> None:
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "Remove custom firmware",
             f"Remove '{entry.get('name', 'this entry')}' from your custom firmware list?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.No,
         )
-        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply != VintageMessageBox.StandardButton.Yes:
             return
         entries = self._custom_firmware_entries_load()
         entries = [e for e in entries if e.get("id") != entry.get("id")]
@@ -5241,71 +5658,127 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rebuild_advanced_firmware_list()
 
     def _on_install_firmware_advanced_clicked(self) -> None:
-        """Install the currently selected firmware in the Advanced list."""
+        """Install the software selected on the Install Firmware tab."""
         if getattr(self, "_rebuilding_tabs", False):
             return
-        group = getattr(self, "_advanced_firmware_button_group", None)
-        if group is None:
-            return
-        checked = group.checkedButton()
-        entry = self._advanced_firmware_button_to_entry.get(checked) if checked else None
+        page = getattr(self, "_install_firmware_page", None)
+        entry = page.firmware_list.selected_entry() if _qt_widget_alive(page) else None
         if not entry:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "Install firmware",
-                "Select a firmware version first.",
+                "Select a software entry first.",
             )
             return
         entry_id = str(entry.get("id", ""))
         if entry_id == "v1.1_stable":
-            # Bundled basic firmware path.
             self._setup_basic_device(
                 install_callback=lambda: self.install_to_pico(basic_mode=True),
-                install_label="basic firmware (V1.1)",
+                install_label="Vintage Radio Basic",
                 require_builtin_firmware=True,
             )
             return
-        # Custom entry: install based on file kind.
         kind = str(entry.get("kind") or "micropython").lower()
+        if kind == "remote_uf2":
+            self._install_remote_uf2_firmware(entry)
+            return
+        if not self._firmware_entry_installable(entry):
+            VintageMessageBox.information(
+                self,
+                "Install firmware",
+                "Install is not available for this firmware yet.\n\n"
+                "Select Vintage Radio Basic, or add a custom firmware source.",
+            )
+            return
         path_str = str(entry.get("path") or "")
         if not path_str:
-            QtWidgets.QMessageBox.warning(
-                self, "Install firmware", "This entry has no file path on disk."
+            VintageMessageBox.warning(
+                self, "Install firmware", "This entry has no path on disk."
             )
             return
         path = Path(path_str)
-        if not path.is_file():
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Install firmware",
-                f"File not found: {path}\n\nUse the ellipsis menu to remove or replace it.",
-            )
-            return
         if kind == "uf2":
-            # .uf2 installs directly to the Pico's BOOTSEL drive — no MicroPython prompt.
+            if not path.is_file():
+                VintageMessageBox.warning(
+                    self, "Install firmware", f"File not found: {path}"
+                )
+                return
             self._install_custom_uf2_to_pico(path)
             return
-        # MicroPython source: point the legacy custom-install path setting at the file
-        # and reuse the existing custom-install pipeline.
+        if not path.exists():
+            VintageMessageBox.warning(
+                self,
+                "Install firmware",
+                f"Path not found: {path}\n\nRemove this entry or choose a new path.",
+            )
+            return
+        label = str(entry.get("name") or path.name)
         self.db.set_setting("advanced_custom_software_path", str(path))
-        self.install_custom_software_to_pico()
+        self._setup_basic_device(
+            install_callback=lambda: self.install_custom_software_to_pico(),
+            install_label=label,
+            require_builtin_firmware=False,
+        )
+
+    def _install_remote_uf2_firmware(self, entry: Dict[str, Any]) -> None:
+        """Download a community .uf2 release (if needed) and flash via BOOTSEL."""
+        from gui.services.remote_firmware import ensure_entry_uf2
+
+        label = str(entry.get("name") or "Firmware")
+        progress = IndeterminateProgressDialog(
+            self, "Install firmware", f"Downloading {label}…",
+        )
+        progress.show_and_raise()
+
+        result: Dict[str, Any] = {"path": None, "error": None}
+
+        def _worker() -> None:
+            try:
+                result["path"] = ensure_entry_uf2(entry)
+            except Exception as exc:
+                result["error"] = str(exc)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            QtWidgets.QApplication.processEvents()
+            time.sleep(0.05)
+        progress.close()
+
+        if result["error"]:
+            VintageMessageBox.warning(
+                self,
+                "Install firmware",
+                f"Could not download {label}:\n\n{result['error']}",
+            )
+            return
+        uf2_path = result["path"]
+        if uf2_path is None:
+            VintageMessageBox.warning(
+                self,
+                "Install firmware",
+                f"Download finished but no .uf2 file was produced for {label}.",
+            )
+            return
+        write_session_line(f"Remote UF2 ready: {uf2_path}", prefix="SETUP")
+        self._install_custom_uf2_to_pico(Path(uf2_path))
 
     def _install_custom_uf2_to_pico(self, uf2_path: Path) -> None:
         """Copy a .uf2 directly to a Pico in BOOTSEL mode (no MicroPython prompt)."""
         if not self._is_rpi_rp2_present():
-            reply = QtWidgets.QMessageBox.question(
+            reply = VintageMessageBox.question(
                 self,
                 "BOOTSEL required",
                 "No RPI-RP2 drive detected.\n\n"
                 "Hold the BOOTSEL button while plugging in the Pico so it appears as "
                 "a USB drive, then click OK to try again.",
-                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
-                QtWidgets.QMessageBox.StandardButton.Ok,
+                VintageMessageBox.StandardButton.Ok | VintageMessageBox.StandardButton.Cancel,
+                VintageMessageBox.StandardButton.Ok,
             )
-            if reply != QtWidgets.QMessageBox.StandardButton.Ok:
+            if reply != VintageMessageBox.StandardButton.Ok:
                 return
             if not self._is_rpi_rp2_present():
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self,
                     "BOOTSEL required",
                     "Still no RPI-RP2 drive detected. Aborting install.",
@@ -5330,7 +5803,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     except OSError:
                         continue
         if dest_dir is None:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Install firmware",
                 "Could not locate the RPI-RP2 drive. Replug the Pico (BOOTSEL held) and retry.",
@@ -5340,13 +5813,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             shutil.copy2(uf2_path, dest_file)
         except OSError as e:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Install firmware",
                 f"Could not copy .uf2 to {dest_dir}: {e}",
             )
             return
-        QtWidgets.QMessageBox.information(
+        VintageMessageBox.information(
             self,
             "Install firmware",
             f"Copied {uf2_path.name} to {dest_dir}.\n\nThe Pico should reboot automatically.",
@@ -5412,7 +5885,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
         vol = self._basic_sd_path_volume_tag(sd_path_str)
         vol_line = vol if vol else "(unknown)"
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "Confirm SD card",
             "This library has not completed a basic-mode sync to an SD card yet.\n\n"
@@ -5421,10 +5894,75 @@ class MainWindow(QtWidgets.QMainWindow):
             "Make sure this is the correct SD card or USB drive. Writing to the "
             "wrong device can erase important data.\n\n"
             "Proceed with sync to this location?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.No,
         )
-        return reply == QtWidgets.QMessageBox.StandardButton.Yes
+        return reply == VintageMessageBox.StandardButton.Yes
+
+    def _collect_basic_broken_source_paths(self) -> List[Dict[str, str]]:
+        """Tracks whose source file is missing on disk (uses the path-missing cache when warm)."""
+        broken: List[Dict[str, str]] = []
+        try:
+            stations = self.db.list_basic_stations()
+        except Exception:
+            return broken
+        for station in stations:
+            station_name = (station["name"] or "").strip() or f"Station {station['folder_number']}"
+            try:
+                tracks = self.db.list_basic_station_songs(station["id"])
+            except Exception:
+                continue
+            for song in tracks:
+                fp_raw = (song["file_path"] or "").strip()
+                if not fp_raw:
+                    continue
+                if not self._song_source_path_missing(song):
+                    continue
+                title = (
+                    (song["title"] or "").strip()
+                    or (song["original_filename"] or "").strip()
+                    or Path(fp_raw).name
+                )
+                broken.append({"title": title, "path": fp_raw, "station": station_name})
+        return broken
+
+    def _basic_confirm_broken_sources_before_sync(self) -> bool:
+        """Warn about missing source files after the user picks a sync mode."""
+        broken = self._collect_basic_broken_source_paths()
+        if not broken:
+            return True
+        n = len(broken)
+        path_phrase = "its stored path" if n == 1 else "their stored paths"
+        headline = (
+            f"{n} track{'s' if n != 1 else ''} in your library can't be found at {path_phrase}."
+        )
+        explanation = (
+            "These tracks will be skipped during sync. To include them, fix the paths "
+            "(right-click a track in the station list and choose Replace source file…), "
+            "or remove the tracks, then sync again.\n\n"
+            "Full list:"
+        )
+        proceed = self._show_scrollable_broken_paths_dialog(
+            window_title="Broken file paths detected",
+            headline=headline,
+            explanation=explanation,
+            entries=broken,
+            line_fmt=lambda e: f"{e['title']}  ({e['station']})\n{e['path']}",
+            proceed_text="Sync anyway (skip missing tracks)",
+            cancel_text="Cancel",
+        )
+        QtCore.QTimer.singleShot(0, self._refresh_library_source_health_ui)
+        return proceed
+
+    def _basic_volume_mismatch_pair(self, new_root: str) -> Optional[tuple[str, str]]:
+        """Return (trusted_volume, current_volume) when the SD target differs from last sync."""
+        if not self._basic_should_warn_different_card(new_root):
+            return None
+        trusted = (self.db.get_setting("basic_trusted_sd_volume") or "").strip()
+        cur = self._basic_sd_path_volume_tag(new_root).strip()
+        if not trusted or not cur:
+            return None
+        return trusted, cur
 
     def _basic_confirm_different_card(self, new_root: str, *, for_sync: bool) -> bool:
         """If the volume differs from the last basic sync target, confirm. Returns False to abort."""
@@ -5435,17 +5973,17 @@ class MainWindow(QtWidgets.QMainWindow):
         trusted = (self.db.get_setting("basic_trusted_sd_volume") or "").strip()
         cur = self._basic_sd_path_volume_tag(new_root)
         verb = "sync stations to" if for_sync else "use"
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "Different SD card",
             f'Your last successful basic-mode sync used the volume named "{trusted}".\n\n'
             f'The selected path looks like "{cur}".\n\n'
             "If this is the wrong card, you could overwrite the wrong device.\n\n"
             f'Do you want to {verb} this volume anyway?',
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.No,
         )
-        return reply == QtWidgets.QMessageBox.StandardButton.Yes
+        return reply == VintageMessageBox.StandardButton.Yes
 
     def _basic_sd_label_match_set(self) -> set:
         """Normalized uppercase volume keys we use to recognize the user's SD card across reconnects."""
@@ -5523,7 +6061,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         candidates = self.sd_manager.detect_sd_roots()
         if not candidates:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self, "SD Detect", "No removable drives detected."
             )
             return
@@ -5550,7 +6088,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             if len(sync_matched) > 1:
-                QtWidgets.QMessageBox.information(
+                VintageMessageBox.information(
                     self,
                     "SD Detect",
                     "Several removable drives match your last sync target.\n\n"
@@ -5596,7 +6134,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
         if sync_id and not sync_matched:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "SD Detect",
                 "Could not find the SD card used for your last sync "
@@ -5625,7 +6163,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if len(matched) > 1:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "SD Detect",
                 "Several removable drives match your saved volume name.\n\n"
@@ -5648,7 +6186,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if not identity:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "SD Detect",
                 "Multiple removable drives are connected, and no saved SD identity is set yet.\n\n"
@@ -5657,7 +6195,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        QtWidgets.QMessageBox.information(
+        VintageMessageBox.information(
             self,
             "SD Detect",
             "Could not match any detected removable drive to your saved SD card "
@@ -5752,29 +6290,22 @@ class MainWindow(QtWidgets.QMainWindow):
         msgs = getattr(self, "_basic_sd_sync_issues", [])
         if not msgs:
             return
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("SD Card Differences")
-        dlg.resize(560, 380)
-        layout = QtWidgets.QVBoxLayout(dlg)
-        text = QtWidgets.QTextEdit()
-        text.setReadOnly(True)
+        body = "\n".join(f"  - {m}" for m in msgs)
         if len(msgs) > 30:
-            text.setPlainText(
+            body = (
                 "Your SD card differs from your library in many places "
                 "(first 30 shown below).\nSyncing will bring the card up to date.\n\n"
                 + "\n".join(f"  - {m}" for m in msgs[:30])
                 + f"\n  ... and {len(msgs) - 30} more."
             )
-        else:
-            text.setPlainText("\n".join(f"  - {m}" for m in msgs))
-        layout.addWidget(text)
-        close_btn = QtWidgets.QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch()
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-        dlg.exec()
+        VintageTextDialog(
+            self,
+            title="SD Card Differences",
+            text=body,
+            read_only=True,
+            min_height=280,
+            buttons=[("Close", "secondary")],
+        ).exec()
 
     def _release_serial_if_connected_for_mpremote(self, *, log_prefix: str = "SERIAL") -> bool:
         """Close the app's serial session so ``mpremote`` can open the COM port (Windows: exclusive)."""
@@ -5851,7 +6382,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 msg = "mpremote is not available. Install it with: pip install mpremote"
                 if bundle_err:
                     msg += "\n\n(Bundled mpremote failed:\n" + str(bundle_err) + ")"
-                QtWidgets.QMessageBox.information(self, "Setup Device", msg)
+                VintageMessageBox.information(self, "Setup Device", msg)
                 return
 
             if self._release_serial_if_connected_for_mpremote(log_prefix="SETUP"):
@@ -5869,7 +6400,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not main_basic_path.exists():
                     write_session_line(f"Missing firmware file: {main_basic_path}", prefix="SETUP")
                     print(f"[Setup Basic Device] Missing firmware file: {main_basic_path}")
-                    QtWidgets.QMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
+                    VintageMessageBox.warning(self, "Setup Device", "firmware/pico/main_basic.py not found.")
                     return
 
             install_now = install_callback or (lambda: self.install_to_pico(basic_mode=True))
@@ -6005,8 +6536,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     prefix="SETUP",
                 )
                 print("[Setup Basic Device] RP2040 port(s) present without verified MicroPython")
-                msg = QtWidgets.QMessageBox(self)
-                msg.setIcon(QtWidgets.QMessageBox.Icon.Information)
+                msg = VintageMessageBox(self)
+                msg.setIcon(VintageMessageBox.Icon.Information)
                 msg.setWindowTitle("Setup Device — MicroPython required")
                 msg.setText(
                     "A Raspberry Pi Pico USB serial port was found, but MicroPython did not respond.\n\n"
@@ -6019,9 +6550,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     "If MicroPython is already installed, close other apps using the serial port and retry."
                 )
                 install_btn = msg.addButton(
-                    "Install MicroPython…", QtWidgets.QMessageBox.ButtonRole.ActionRole
+                    "Install MicroPython…", VintageMessageBox.ButtonRole.ActionRole
                 )
-                msg.addButton("Close", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+                msg.addButton("Close", VintageMessageBox.ButtonRole.RejectRole)
                 msg.exec()
                 if msg.clickedButton() == install_btn:
                     dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
@@ -6040,7 +6571,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             write_session_line("No compatible Pico detected (user message)", prefix="SETUP")
             print("[Setup Basic Device] No compatible Pico detected")
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self, "Setup Device",
                 "No Pico detected (mpremote could not open a MicroPython session).\n\n"
                 "1. Connect the Pico via USB.\n"
@@ -6056,7 +6587,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             print("[Setup Basic Device] FATAL exception in setup flow:")
             print(traceback.format_exc())
-            QtWidgets.QMessageBox.critical(
+            VintageMessageBox.critical(
                 self,
                 "Setup Device Error",
                 "An unexpected error occurred during Setup Device.\n\n"
@@ -6078,22 +6609,176 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.db.set_setting("advanced_dfplayer_eq", str(combo.currentData() or "normal"))
 
+    def _retain_conversion_cache(self) -> bool:
+        return self.db.get_setting("retain_conversion_cache", "1") == "1"
+
+    def _schedule_conversion_prefetch(self, song_ids: Optional[List[int]] = None) -> None:
+        """Queue idle background MP3 conversion for faster future syncs."""
+        if not self._retain_conversion_cache():
+            return
+        self._conversion_prefetch.schedule(song_ids=song_ids)
+
+    def _on_retain_conversion_cache_changed(self, *_args) -> None:
+        page = getattr(self, "_settings_page", None)
+        if not _qt_widget_alive(page):
+            return
+        checked = page.retain_conversion_cache_checkbox.isChecked()
+        self.db.set_setting("retain_conversion_cache", "1" if checked else "0")
+
+    def _on_clear_conversion_cache_clicked(self) -> None:
+        mb = VintageMessageBox(self)
+        mb.setWindowTitle("Clear conversion cache?")
+        mb.setIcon(VintageMessageBox.Icon.Question)
+        mb.setText(
+            "Delete all locally cached converted MP3s for this library?"
+        )
+        mb.setInformativeText(
+            "This only affects files stored on your PC to speed up sync. "
+            "Your music library and SD card are not changed.\n\n"
+            "The next sync will re-encode tracks from source files (slower)."
+        )
+        btn_clear = mb.addButton(
+            "Clear cache",
+            VintageMessageBox.ButtonRole.DestructiveRole,
+        )
+        mb.addButton(VintageMessageBox.StandardButton.Cancel)
+        mb.setDefaultButton(btn_clear)
+        mb.exec()
+        if mb.clickedButton() is not btn_clear:
+            return
+        ok, err = self.sd_manager.clear_basic_sync_mp3_cache_for_library()
+        if ok:
+            self.statusBar().showMessage("Conversion cache cleared.", 5000)
+        else:
+            VintageMessageBox.warning(
+                self,
+                "Could not clear conversion cache",
+                f"The cache folder could not be removed:\n\n{err}",
+            )
+
+    def _experimental_fast_sync_enabled(self) -> bool:
+        if self.db.get_setting("experimental_fast_sync", "0") == "1":
+            return True
+        page = getattr(self, "_settings_page", None)
+        if _qt_widget_alive(page):
+            return page.experimental_fast_sync_checkbox.isChecked()
+        return False
+
+    def _sd_image_reuse_when_unchanged_enabled(self) -> bool:
+        return self.db.get_setting("sd_image_reuse_when_unchanged", "1") == "1"
+
+    def _on_experimental_fast_sync_changed(self, *_args) -> None:
+        page = getattr(self, "_settings_page", None)
+        if not _qt_widget_alive(page):
+            return
+        checked = page.experimental_fast_sync_checkbox.isChecked()
+        self.db.set_setting("experimental_fast_sync", "1" if checked else "0")
+
+    def _on_sd_image_reuse_when_unchanged_changed(self, *_args) -> None:
+        page = getattr(self, "_settings_page", None)
+        if not _qt_widget_alive(page):
+            return
+        checked = page.sd_image_reuse_when_unchanged_checkbox.isChecked()
+        self.db.set_setting("sd_image_reuse_when_unchanged", "1" if checked else "0")
+
+    def _can_reuse_cached_sd_image(
+        self,
+        *,
+        conv_profile: str,
+        dfplayer_eq: str,
+        disk_size_bytes: Optional[int],
+    ) -> bool:
+        if not self._sd_image_reuse_when_unchanged_enabled():
+            return False
+        cache_dir = app_data_dir() / "sd_image_cache"
+        img_path = cache_dir / LAST_CACHED_SD_IMAGE_FILENAME
+        try:
+            if not img_path.is_file() or img_path.stat().st_size <= 0:
+                return False
+            cached_sz = int(img_path.stat().st_size)
+        except OSError:
+            return False
+        manifest = load_cached_sd_image_manifest(cache_dir)
+        if not manifest:
+            return False
+        if str(manifest.get("conversion_profile") or "") != conv_profile:
+            return False
+        if str(manifest.get("dfplayer_eq") or "") != dfplayer_eq:
+            return False
+        if self.sd_manager.basic_library_manifest_diff(manifest.get("stations") or {}):
+            return False
+        ds = disk_size_bytes
+        if ds is None:
+            return True
+        if cached_sz > ds:
+            overage = cached_sz - ds
+            tolerance = max(256 * 1024 * 1024, int(ds * 0.02))
+            return overage <= tolerance
+        if cached_sz < ds:
+            return False
+        return True
+
     def _selected_conversion_profile(self) -> str:
-        if not self._is_advanced_mode():
-            return "dfplayer_safe"
-        profile = (self.db.get_setting("advanced_conversion_profile", "dfplayer_safe") or "").strip().lower()
+        profile = (
+            self.db.get_setting("conversion_profile")
+            or self.db.get_setting("advanced_conversion_profile", "dfplayer_safe")
+            or ""
+        ).strip().lower()
         if profile not in {"dfplayer_safe", "high_quality"}:
             return "dfplayer_safe"
         return profile
 
-    def _on_advanced_conversion_profile_changed(self, *_args) -> None:
-        combo = getattr(self, "_advanced_conversion_profile_combo", None)
+    def _on_conversion_profile_changed(self, *_args) -> None:
+        combo = getattr(self, "_settings_conversion_profile_combo", None)
+        if combo is None:
+            combo = getattr(self, "_advanced_conversion_profile_combo", None)
         if combo is None:
             return
-        self.db.set_setting(
-            "advanced_conversion_profile",
-            str(combo.currentData() or "dfplayer_safe"),
-        )
+        value = str(combo.currentData() or "dfplayer_safe")
+        self.db.set_setting("conversion_profile", value)
+        self.db.set_setting("advanced_conversion_profile", value)
+
+    def _on_advanced_conversion_profile_changed(self, *_args) -> None:
+        """Legacy alias for advanced-tab combo wiring."""
+        self._on_conversion_profile_changed()
+
+    def _on_settings_auto_backup_changed(self, *_args) -> None:
+        page = getattr(self, "_settings_page", None)
+        if not _qt_widget_alive(page):
+            return
+        checked = page.auto_backup_checkbox.isChecked()
+        self.db.set_setting("auto_backup", "1" if checked else "0")
+        self.db.auto_backup = checked
+
+    def _on_settings_backup_retention_changed(self, value: int) -> None:
+        retention = max(1, int(value))
+        self.db.set_setting("backup_retention", str(retention))
+        self.db.backup_retention = retention
+
+    def _on_settings_sd_auto_detect_changed(self, *_args) -> None:
+        page = getattr(self, "_settings_page", None)
+        if not _qt_widget_alive(page):
+            return
+        checked = page.sd_auto_detect_checkbox.isChecked()
+        self.db.set_setting("sd_auto_detect", "1" if checked else "0")
+        self.sd_auto_detect = checked
+
+    def _on_settings_ui_zoom_changed(self, value: int) -> None:
+        self._ui_zoom_level = max(80, min(200, int(value)))
+        self.db.set_setting("ui_zoom_level", str(self._ui_zoom_level))
+        self._apply_ui_zoom()
+
+    def _on_settings_ui_theme_changed(self, *_args) -> None:
+        page = getattr(self, "_settings_page", None)
+        if not _qt_widget_alive(page):
+            return
+        theme_id = normalize_theme_id(str(page.ui_theme_combo.currentData() or "vintage"))
+        if theme_id == getattr(self, "_ui_theme", "vintage"):
+            return
+        self._ui_theme = theme_id
+        self.db.set_setting("ui_theme", theme_id)
+        apply_ui_theme(theme_id)
+        self._reload_app_theme_ui()
 
     def _read_pico_install_mode(self) -> Optional[str]:
         mpremote_cmd = self._resolve_mpremote_cmd()
@@ -6151,9 +6836,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_sd_sync_issues: List[str] = []
 
         page = _LoadMusicPage(
-            is_advanced=self._is_advanced_mode(),
-            auto_eject_checked=self.db.get_setting("auto_eject_after_sync", "0") == "1",
-            conversion_profile=self._selected_conversion_profile(),
             sd_root=self.sd_root or "",
             max_tracks=BASIC_MAX_TRACKS_PER_STATION,
         )
@@ -6164,6 +6846,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._basic_sd_sync_details_btn.clicked.connect(self._show_basic_sd_sync_details)
 
         # ── StorageSection aliases and signals ────────────────────────────────
+        self._basic_storage_section   = page.storage_section
         self._basic_sd_root_label     = page.storage_section.sd_root_label
         self._basic_sd_capacity_bar   = page.storage_section.capacity_bar
         self._basic_sd_percent_label  = page.storage_section.percent_label
@@ -6190,21 +6873,14 @@ class MainWindow(QtWidgets.QMainWindow):
         page.track_panel.context_menu_requested.connect(self._show_station_track_context_menu)
 
         # ── SyncBar aliases and signals ───────────────────────────────────────
-        self._basic_auto_eject_cb = page.sync_bar.auto_eject_checkbox
-        if page.sync_bar.conversion_profile_combo is not None:
-            self._advanced_conversion_profile_combo = page.sync_bar.conversion_profile_combo
-            self._advanced_conversion_profile_combo.currentIndexChanged.connect(
-                self._on_advanced_conversion_profile_changed
-            )
         page.sync_bar.sync_clicked.connect(self._sync_basic_to_sd)
         page.sync_bar.eject_clicked.connect(self.safely_remove_sd)
-        page.sync_bar.auto_eject_changed.connect(self._on_auto_eject_after_sync_changed)
 
         self._refresh_basic_station_list()
         self._update_basic_stations_size()
-        # Populate the capacity bar immediately on build so it shows without
-        # requiring the user to click Detect first.
-        QtCore.QTimer.singleShot(0, self._refresh_basic_sd_capacity)
+        self._update_sd_root_label()
+        self._refresh_basic_sd_capacity()
+        QtCore.QTimer.singleShot(0, self._sync_startup_chrome)
         return page
 
     # ── Basic-mode SD capacity ──
@@ -6222,6 +6898,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 pct_label.setText(text)
 
         sd_root = self._resolve_sd_root(interactive=False)
+        storage = getattr(self, "_basic_storage_section", None)
+        if _qt_widget_alive(storage):
+            storage.set_has_sd_card(bool(sd_root))
         if not sd_root:
             bar.setValue(0)
             _set_pct("")
@@ -6379,11 +7058,13 @@ class MainWindow(QtWidgets.QMainWindow):
         table = self._basic_station_tracks_table
         table.setUpdatesEnabled(False)
         table.blockSignals(True)
+        table.setSortingEnabled(False)
         try:
             table.setRowCount(len(songs))
             for row_idx, song in enumerate(songs):
                 title = song.get("title") or song.get("original_filename") or ""
                 title_item = QtWidgets.QTableWidgetItem(title)
+                configure_track_title_item(title_item)
                 title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song.get("id"))
                 title_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, song.get("bst_id"))
                 table.setItem(row_idx, 0, title_item)
@@ -6428,14 +7109,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._schedule_track_source_health_checks(songs)
 
     def _create_basic_station(self) -> None:
-        name, ok = QtWidgets.QInputDialog.getText(self, "New Station", "Station name:")
+        name, ok = get_text(self, "New Station", "Station name:")
         if not ok or not name.strip():
             return
         try:
             folder = self.db.next_basic_station_folder(max_folder=99)
         except ValueError:
             max_station_folders = 99
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Limit Reached",
                 f"All {max_station_folders} station folders are in use.",
@@ -6453,7 +7134,7 @@ class MainWindow(QtWidgets.QMainWindow):
         station = self.db.get_basic_station(station_id)
         if station is None:
             return
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self, "Rename Station", "New name:", text=station["name"]
         )
         if ok and name.strip():
@@ -6465,11 +7146,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if item is None:
             return
         station_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self, "Delete Station",
             f"Delete station '{item.text().split('  (')[0]}'?\nThis will remove the station and its track list.",
         )
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply == VintageMessageBox.StandardButton.Yes:
             self.db.delete_basic_station(station_id)
             self._refresh_basic_station_list()
             self._basic_station_tracks_table.setRowCount(0)
@@ -6500,8 +7181,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Warn when a station would exceed 255 tracks (custom firmware); optional 'don't show again'."""
         if self.db.get_setting("basic_suppress_track_count_over_255_warning", "0") == "1":
             return
-        box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        box = VintageMessageBox(self)
+        box.setIcon(VintageMessageBox.Icon.Information)
         box.setWindowTitle("Track Count Warning")
         box.setText(
             "This station exceeds 255 tracks. Custom software may support this, "
@@ -6509,7 +7190,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         cb = QtWidgets.QCheckBox("Don't show again")
         box.setCheckBox(cb)
-        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+        box.setStandardButtons(VintageMessageBox.StandardButton.Ok)
         box.exec()
         if cb.isChecked():
             self.db.set_setting("basic_suppress_track_count_over_255_warning", "1")
@@ -6518,13 +7199,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """Browse for audio files from file explorer, import to library, and add to selected station."""
         station_id = self._get_selected_basic_station_id()
         if station_id is None:
-            QtWidgets.QMessageBox.information(self, "No Station", "Select a station first.")
+            VintageMessageBox.information(self, "No Station", "Select a station first.")
             return
 
         current_count = len(self.db.list_basic_station_tracks(station_id))
         max_tracks = self._current_max_tracks_per_station()
         if self._is_track_limit_enforced() and current_count >= max_tracks:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Track Limit",
                 f"This station already has {current_count} tracks (max {max_tracks} per folder in this mode).",
             )
@@ -6541,7 +7222,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         remaining = max_tracks - current_count
         if self._is_track_limit_enforced() and len(files) > remaining:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Track Limit",
                 f"Only {remaining} more track(s) can be added (max {max_tracks} per station). "
                 f"Adding the first {remaining}.",
@@ -6559,19 +7240,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_basic_station_tracks(station_id)
             self._refresh_basic_station_list()
             self._update_basic_stations_size()
+            self._schedule_conversion_prefetch(song_ids)
 
     def _import_files_to_basic_station(self, paths: list) -> None:
         """Handle file drop onto the station tracks table: import and add to current station."""
         station_id = self._get_selected_basic_station_id()
         if station_id is None:
-            QtWidgets.QMessageBox.information(self, "No Station", "Select a station first, then drop files.")
+            VintageMessageBox.information(self, "No Station", "Select a station first, then drop files.")
             return
 
         current_count = len(self.db.list_basic_station_tracks(station_id))
         max_tracks = self._current_max_tracks_per_station()
         remaining = max_tracks - current_count
         if self._is_track_limit_enforced() and remaining <= 0:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Track Limit",
                 f"This station already has {current_count} tracks (max {max_tracks} per folder in this mode).",
             )
@@ -6580,7 +7262,7 @@ class MainWindow(QtWidgets.QMainWindow):
         song_ids = self.import_files(paths, silent=True)
         if song_ids:
             if self._is_track_limit_enforced() and len(song_ids) > remaining:
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self, "Track Limit",
                     f"Only {remaining} more track(s) can be added. Adding the first {remaining}.",
                 )
@@ -6594,6 +7276,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_basic_station_tracks(station_id)
             self._refresh_basic_station_list()
             self._update_basic_stations_size()
+            self._schedule_conversion_prefetch(song_ids)
 
     def _import_folders_as_basic_stations(self, folders: list[Path]) -> None:
         """Create one station per dropped folder and import its files as tracks."""
@@ -6604,7 +7287,7 @@ class MainWindow(QtWidgets.QMainWindow):
         max_station_folders = 99 if self._uses_custom_software() else 98
         free_station_slots = max(0, max_station_folders - current_stations)
         if free_station_slots <= 0:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Station Limit",
                 f"All {max_station_folders} station folders are already in use.",
@@ -6625,7 +7308,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if len(unique_folders) > free_station_slots:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Station Limit",
                 f"Only {free_station_slots} station slot(s) are available. "
@@ -6674,7 +7357,7 @@ class MainWindow(QtWidgets.QMainWindow):
             detail_text = ""
             if details:
                 detail_text = "\n" + "\n".join(f"- {line}" for line in details)
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "Stations Imported",
                 f"Created {created} station(s) with {imported_tracks} track(s).{detail_text}",
@@ -6684,7 +7367,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.refresh_library()
             self._refresh_basic_station_list()
             self._update_basic_stations_size()
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Station Import Error", f"Error during station import:\n\n{msg}"
             )
 
@@ -6931,188 +7614,54 @@ class MainWindow(QtWidgets.QMainWindow):
         """Sync basic-mode stations to SD card."""
         sd_root = self._resolve_sd_root()
         if not sd_root:
-            QtWidgets.QMessageBox.warning(self, "No SD Card", "Select an SD card first.")
+            VintageMessageBox.warning(self, "No SD Card", "Select an SD card first.")
             return
 
         stations = self.db.list_basic_stations()
         if not stations:
-            QtWidgets.QMessageBox.information(self, "No Stations", "Create at least one station with tracks first.")
+            VintageMessageBox.information(self, "No Stations", "Create at least one station with tracks first.")
             return
 
         if not self._basic_confirm_first_sd_sync_target(str(sd_root)):
             return
 
-        if not self._basic_confirm_different_card(str(sd_root), for_sync=True):
+        sd_display = self._basic_sd_display_text()
+        library_name = self._lib_registry.active_library_name() or "this library"
+
+        choice_dlg = SyncChoiceDialog(
+            self,
+            sd_display=sd_display,
+            library_name=library_name,
+            show_fast_sync=self._experimental_fast_sync_enabled(),
+            volume_mismatch=self._basic_volume_mismatch_pair(str(sd_root)),
+        )
+        if choice_dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        choice = choice_dlg.choice
+        if not choice:
             return
 
-        broken = self.sd_manager.get_basic_broken_source_paths()
-        # Re-stat every source path before any sync dialog so fixes outside the app
-        # (e.g. file restored in Explorer) clear warning icons even when ``broken`` is now empty.
-        self._refresh_library_source_health_ui()
-        if broken:
-            n = len(broken)
-            path_phrase = "its stored path" if n == 1 else "their stored paths"
-            headline = (
-                f"{n} track{'s' if n != 1 else ''} in your library can't be found at {path_phrase}."
-            )
-            explanation = (
-                "These tracks will be skipped during sync. To include them, fix the paths "
-                "(right-click a track in the station list and choose Replace source file…), "
-                "or remove the tracks, then sync again.\n\n"
-                "Full list:"
-            )
-            if not self._show_scrollable_broken_paths_dialog(
-                window_title="Broken file paths detected",
-                headline=headline,
-                explanation=explanation,
-                entries=broken,
-                line_fmt=lambda e: f"{e['title']}  ({e['station']})\n{e['path']}",
-                proceed_text="Sync anyway (skip missing tracks)",
-                cancel_text="Cancel",
-            ):
-                self._refresh_library_source_health_ui()
+        if choice == "fast":
+            if not self._basic_confirm_broken_sources_before_sync():
                 return
-
-        software_source = self._software_source_for_sync()
-        if self._is_advanced_mode() and software_source == "our":
-            pico_mode = self._read_pico_install_mode()
-            if pico_mode == "basic":
-                reply = QtWidgets.QMessageBox.question(
-                    self,
-                    "Reflash Required",
-                    "Advanced mode is using our software, but the connected Pico appears to run basic firmware.\n\n"
-                    "Reflash now before syncing?",
-                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                    QtWidgets.QMessageBox.StandardButton.Yes,
-                )
-                if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-                    self._on_setup_advanced_device_clicked()
-                    return
-
-        force_clean = False
-        # ── Simplified sync dialog ──────────────────────────────────────────
-        # Show only the two action buttons up front. Detail text is behind a "?" button.
-        sync_dlg = QtWidgets.QDialog(self)
-        sync_dlg.setWindowTitle("Sync Stations to SD")
-        sync_dlg.setMinimumWidth(360)
-        sync_dlg.setWindowFlags(
-            sync_dlg.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint
-        )
-        _sdv = QtWidgets.QVBoxLayout(sync_dlg)
-        _sdv.setSpacing(12)
-        _sdv.setContentsMargins(20, 20, 20, 16)
-
-        # Title row with "?" info button
-        _title_row = QtWidgets.QHBoxLayout()
-        _title_lbl = QtWidgets.QLabel("<b>How do you want to sync?</b>")
-        _title_row.addWidget(_title_lbl, 1)
-        _info_btn = QtWidgets.QToolButton()
-        _info_btn.setText("?")
-        _info_btn.setToolTip("Click for more information")
-        _info_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        _info_btn.setStyleSheet(
-            "QToolButton { border: 1px solid gray; border-radius: 10px; "
-            "min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px; "
-            "font-weight: bold; }"
-        )
-
-        def _show_sync_info() -> None:
-            QtWidgets.QMessageBox.information(
-                sync_dlg,
-                "Sync options explained",
-                "Sync Changes — copies only new or changed tracks to the SD card. "
-                "Faster for day-to-day use.\n\n"
-                "Full Sync — quick-formats the SD card and writes every track fresh. "
-                "Use this to clean up leftover files or start from scratch.\n\n"
-                "Fast Full Sync — builds a FAT32 disk image and writes it directly to "
-                "the SD card. Fastest clean install, but replaces the entire disk contents.\n\n"
-                "Converted MP3s are cached on this computer so later syncs can skip "
-                "re-encoding. You can clear the cache during a Full Sync if you want a "
-                "full re-encode from your source files.",
-            )
-
-        _info_btn.clicked.connect(_show_sync_info)
-        _title_row.addWidget(_info_btn)
-        _sdv.addLayout(_title_row)
-
-        # Experimental fast-sync checkbox
-        cb_experimental = QtWidgets.QCheckBox("Fast Full Sync (experimental)")
-        cb_experimental.setToolTip(
-            "Build a FAT32 disk image and write it directly to the SD card. "
-            "Faster than a normal full sync but overwrites the entire disk."
-        )
-        _sdv.addWidget(cb_experimental)
-
-        # Button row: Full Sync | Sync Changes | Cancel
-        _btn_row = QtWidgets.QHBoxLayout()
-        _btn_row.addStretch(1)
-        _btn_full = QtWidgets.QPushButton("Full Sync")
-        _btn_full.setToolTip(
-            "Quick-format the SD card and re-copy every track fresh. "
-            "Use to clean up leftover files or start over."
-        )
-        _btn_changes = QtWidgets.QPushButton("Sync Changes")
-        _btn_changes.setToolTip("Copy only new or changed tracks. Fast and non-destructive.")
-        _btn_cancel = QtWidgets.QPushButton("Cancel")
-        _btn_row.addWidget(_btn_full)
-        _btn_row.addWidget(_btn_changes)
-        _btn_row.addWidget(_btn_cancel)
-        _sdv.addLayout(_btn_row)
-
-        _sync_result: List[str] = []
-        _btn_full.clicked.connect(lambda: (_sync_result.append("full"), sync_dlg.accept()))
-        _btn_changes.clicked.connect(lambda: (_sync_result.append("changes"), sync_dlg.accept()))
-        _btn_cancel.clicked.connect(sync_dlg.reject)
-        _btn_changes.setDefault(True)
-
-        if sync_dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        if not _sync_result:
-            return
-
-        # If the user chose the experimental fast sync, delegate entirely.
-        if cb_experimental.isChecked():
             self._on_experimental_sd_disk_image()
             return
 
-        if _sync_result[0] == "full":
-            force_clean = True
-            clean_opts = QtWidgets.QMessageBox(self)
-            clean_opts.setWindowTitle("Clean install — local cache")
-            clean_opts.setIcon(QtWidgets.QMessageBox.Icon.Information)
-            clean_opts.setText(
-                "For this library, Vintage Radio keeps converted MP3s in your user cache folder "
-                "so future syncs can skip re-encoding and run faster."
+        force_clean = False
+        if choice == "replace":
+            confirm_dlg = ReplaceConfirmDialog(
+                self,
+                sd_display=sd_display,
+                library_name=library_name,
             )
-            clean_opts.setInformativeText(
-                "The SD card will still be wiped and every slot rewritten.\n\n"
-                "Optionally delete the local cache first so this sync re-encodes everything from "
-                "your source files (much slower). Leave unchecked to reuse cached conversions "
-                "when possible."
-            )
-            cb_delete_cache = QtWidgets.QCheckBox(
-                "Delete local converted MP3 cache before syncing (full re-encode)"
-            )
-            clean_opts.setCheckBox(cb_delete_cache)
-            btn_continue = clean_opts.addButton(
-                "Continue",
-                QtWidgets.QMessageBox.ButtonRole.AcceptRole,
-            )
-            clean_opts.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-            clean_opts.setDefaultButton(btn_continue)
-            clean_opts.exec()
-            if clean_opts.clickedButton() != btn_continue:
+            if confirm_dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 return
-            if cb_delete_cache.isChecked():
-                ok_del, err_del = self.sd_manager.clear_basic_sync_mp3_cache_for_library()
-                if not ok_del:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Could not delete conversion cache",
-                        f"The cache folder could not be removed:\n\n{err_del}\n\n"
-                        "Sync will continue; existing cache files may still be reused.",
-                    )
+            force_clean = True
 
+        if not self._basic_confirm_broken_sources_before_sync():
+            return
+
+        software_source = self._software_source_for_sync()
         dlg = TaskProgressDialog(
             parent=self,
             title="Sync Stations to SD" + (" (clean)" if force_clean else ""),
@@ -7122,6 +7671,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "force_clean": force_clean,
                 "conversion_profile": self._selected_conversion_profile(),
                 "dfplayer_eq": self._selected_dfplayer_eq() if software_source == "our" else "normal",
+                "use_conversion_cache": self._retain_conversion_cache(),
             },
             cancelable=True,
             cancel_callback_kwarg="should_cancel",
@@ -7179,7 +7729,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 tail = ""
                 if len(conversion_failures) > show_n:
                     tail = f"\n\n… and {len(conversion_failures) - show_n} more (full paths in log)."
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self,
                     "Some files failed to convert",
                     "These library files could not be converted to MP3 and were not copied "
@@ -7188,7 +7738,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     + tail,
                 )
             else:
-                QtWidgets.QMessageBox.information(
+                VintageMessageBox.information(
                     self,
                     "Sync complete",
                     f"Library synced to the SD card.\n\nCopied: {copied}\nSkipped: {skipped}",
@@ -7237,7 +7787,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if "Sync cancelled by user" in str(msg):
                 self.statusBar().showMessage("Basic sync cancelled.", 4000)
                 return
-            QtWidgets.QMessageBox.critical(
+            VintageMessageBox.critical(
                 self,
                 "Sync Error",
                 f"Error during basic sync:\n\n{msg}",
@@ -7253,7 +7803,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         sd_root = self._resolve_sd_root()
         if not sd_root or not Path(sd_root).is_dir():
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "No SD folder",
                 "Select an SD card mount point or folder to use as the sync target.",
@@ -7261,16 +7811,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         stations = self.db.list_basic_stations()
         if not stations:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "No stations",
-                "Create at least one station with tracks before building an SD image.",
+                "Create at least one station with tracks before installing to an SD card.",
             )
             return
 
         missing_pyfatfs = pyfatfs_dependency_message()
         if missing_pyfatfs:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Missing dependency",
                 missing_pyfatfs,
@@ -7280,18 +7830,18 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_p = Path(sd_root)
 
         if platform.system() not in ("Windows", "Darwin"):
-            intro = QtWidgets.QMessageBox(self)
+            intro = VintageMessageBox(self)
             intro.setWindowTitle("Experimental: SD disk image (export only)")
-            intro.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            intro.setIcon(VintageMessageBox.Icon.Information)
             intro.setText(
                 "Raw disk flashing from this app is only implemented on Windows and macOS.\n\n"
                 "You can still save a FAT32 .img built with pyfatfs and flash it with Etcher, "
                 "Pi Imager, or dd on this platform."
             )
             intro.setStandardButtons(
-                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel
+                VintageMessageBox.StandardButton.Ok | VintageMessageBox.StandardButton.Cancel
             )
-            if intro.exec() != QtWidgets.QMessageBox.StandardButton.Ok:
+            if intro.exec() != VintageMessageBox.StandardButton.Ok:
                 return
             out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
@@ -7332,14 +7882,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
             def on_ok_export(_result: object) -> None:
                 self.statusBar().showMessage(f"Disk image saved: {out_p}", 8000)
-                QtWidgets.QMessageBox.information(
+                VintageMessageBox.information(
                     self,
                     "Disk image",
                     f"Image saved to:\n{out_p}\n\nFlash it with your preferred tool, then eject safely.",
                 )
 
             dlg.on_success = on_ok_export
-            dlg.on_error = lambda msg: QtWidgets.QMessageBox.critical(
+            dlg.on_error = lambda msg: VintageMessageBox.critical(
                 self,
                 "Disk image failed",
                 msg,
@@ -7384,141 +7934,99 @@ class MainWindow(QtWidgets.QMainWindow):
                 return darwin_get_disk_size_bytes(bsd_disk) if bsd_disk else None
             return windows_get_disk_size_bytes(disk_number) if disk_number is not None else None
 
-        prepare_on_pc = wiz.prepare_on_pc
-        flash_last = wiz.flash_last_image_only
-        last_img = app_data_dir() / "sd_image_cache" / LAST_CACHED_SD_IMAGE_FILENAME
-
-        if flash_last:
-            try:
-                if not last_img.is_file() or last_img.stat().st_size <= 0:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "No cached image",
-                        f"No reusable disk image at:\n{last_img}\n\n"
-                        "Run a full SD image sync once to build it.",
-                    )
-                    return
-            except OSError:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "No cached image",
-                    f"Could not read cached image:\n{last_img}",
-                )
-                return
-            ds = _selected_disk_size_bytes()
-            _cached_sz = last_img.stat().st_size
-            if ds is not None and _cached_sz > ds:
-                _overage = _cached_sz - ds
-                _tolerance = max(256 * 1024 * 1024, int(ds * 0.02))
-                if _overage > _tolerance:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "SD card too small",
-                        f"The cached image is about {format_disk_size(_cached_sz)}, but the "
-                        f"selected disk is {format_disk_size(ds)}. The difference "
-                        f"({format_disk_size(_overage)}) is too large to trim safely. "
-                        "Use a larger card, or uncheck 'Flash cached image only' to rebuild.",
-                    )
-                    return
-                # Small overage (≤ 256 MiB / 2%) — same-nominal-size card with slightly
-                # different actual capacity.  The write will be capped at the disk boundary;
-                # the last few MB of empty FAT32 space will not be written (safe for DFPlayer).
-            if ds is not None and _cached_sz < ds:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Rebuild required — card size changed",
-                    f"The cached image ({format_disk_size(_cached_sz)}) is smaller than "
-                    f"the selected card ({format_disk_size(ds)}).\n\n"
-                    "The SD card would not show its full capacity after flashing, "
-                    "preventing normal syncs from using the remaining space.\n\n"
-                    "Uncheck 'Flash cached image only' to rebuild the image for this card size.",
-                )
-                return
-        else:
-            ds = _selected_disk_size_bytes()
-            if not prepare_on_pc:
-                est = suggest_image_size_bytes(sd_p)
-                if ds is not None and est > ds:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "SD card too small",
-                        f"This library needs about {format_disk_size(est)} for the image, but the selected "
-                        f"disk is {format_disk_size(ds)}. Use a larger card or reduce stations/tracks.",
-                    )
-                    return
+        software_source = self._software_source_for_sync()
+        dfplayer_eq = self._selected_dfplayer_eq() if software_source == "our" else "normal"
+        conv_profile = self._selected_conversion_profile()
+        ds = _selected_disk_size_bytes()
+        reuse_cached = self._can_reuse_cached_sd_image(
+            conv_profile=conv_profile,
+            dfplayer_eq=dfplayer_eq,
+            disk_size_bytes=ds,
+        )
+        cache_dir = app_data_dir() / "sd_image_cache"
+        last_img = cache_dir / LAST_CACHED_SD_IMAGE_FILENAME
 
         if use_darwin and bsd_disk:
-            target_label = f"whole disk {bsd_disk} (raw /dev/r{bsd_disk})"
+            target_label = bsd_disk
         else:
-            target_label = f"PhysicalDrive{disk_number}"
+            target_label = f"Drive {disk_number}"
         confirm_lines = [
-            f"Write a fresh FAT32 image to {target_label}?",
+            f"Install your music library on {target_label}?",
             "",
-            f"{'Disk size: ' + format_disk_size(ds) if ds else 'Size: unknown'}",
+            f"Card size: {format_disk_size(ds) if ds else 'unknown'}",
             "",
-            "ALL DATA on that physical disk will be permanently erased.",
+            "Everything already on that card will be erased.",
         ]
+        if reuse_cached:
+            confirm_lines.extend(
+                [
+                    "",
+                    "Your library has not changed — the saved install image will be reused.",
+                ]
+            )
         if use_darwin:
             euid = os.geteuid() if hasattr(os, "geteuid") else 0
             if euid != 0:
                 confirm_lines.extend(
                     [
                         "",
-                        "After the image is built, macOS will ask for your password or Touch ID to allow "
-                        "writing to the raw SD device.",
+                        "You may be asked for your password to write to the card.",
                     ]
                 )
         elif not is_windows_admin():
             confirm_lines.extend(
                 [
                     "",
-                    "After the image is built, Windows will show a security prompt (UAC) to allow "
-                    "writing to the card. Approve it to continue. You do not need to restart this "
-                    "app as Administrator.",
+                    "You may see a security prompt asking permission to write to the card.",
                 ]
             )
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
-            "Confirm disk erase",
+            "Confirm install",
             "\n".join(confirm_lines),
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.No,
         )
-        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply != VintageMessageBox.StandardButton.Yes:
             return
-
-        software_source = self._software_source_for_sync()
-        dfplayer_eq = self._selected_dfplayer_eq() if software_source == "our" else "normal"
-        conv_profile = self._selected_conversion_profile()
 
         def _worker_sd_image(
             *,
             progress_callback: Optional[Callable] = None,
             should_cancel: Optional[Callable[[], bool]] = None,
         ) -> dict:
-            cache_dir = app_data_dir() / "sd_image_cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
             staging_root = cache_dir / "staging"
-            used_staging = False
-            img_path = cache_dir / LAST_CACHED_SD_IMAGE_FILENAME
+            img_path = last_img
 
             def _export_cb(_c: int, _t: int, m: str) -> None:
-                if progress_callback:
-                    if _t > 0:
-                        progress_callback(_c, _t, f"Image: {m}")
-                    else:
-                        progress_callback(0, 0, f"Image: {m}")
+                if progress_callback and _t > 0:
+                    progress_callback(_c, _t, m)
+
+            def _manifest_data_bytes() -> Optional[int]:
+                manifest = load_cached_sd_image_manifest(cache_dir)
+                if not manifest:
+                    return None
+                try:
+                    raw = manifest.get("data_bytes")
+                    if raw is None:
+                        return None
+                    val = int(raw)
+                    return val if val > 0 else None
+                except (TypeError, ValueError):
+                    return None
 
             try:
-                if flash_last:
+                if reuse_cached:
                     if progress_callback:
                         progress_callback(
                             0,
                             0,
-                            "Using cached disk image (skipping prepare and build)…",
+                            "Library unchanged — using saved install image…",
                         )
                     if not img_path.is_file() or img_path.stat().st_size <= 0:
-                        raise RuntimeError(f"Missing cached image: {img_path}")
+                        raise RuntimeError(f"Missing saved install image: {img_path}")
+                    known_data = _manifest_data_bytes()
                     if use_darwin:
                         assert bsd_disk is not None
                         ok2, err2 = write_image_to_physical_disk_darwin(
@@ -7526,6 +8034,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             bsd_disk,
                             progress_callback=progress_callback,
                             should_cancel=should_cancel,
+                            known_data_bytes=known_data,
                         )
                     else:
                         assert disk_number is not None
@@ -7534,59 +8043,46 @@ class MainWindow(QtWidgets.QMainWindow):
                             disk_number,
                             progress_callback=progress_callback,
                             should_cancel=should_cancel,
+                            known_data_bytes=known_data,
                         )
                     if not ok2:
-                        raise RuntimeError(err2 or "Disk write failed.")
-                    return {"ok": True}
+                        raise RuntimeError(err2 or "Could not write to the SD card.")
+                    return {"ok": True, "reused": True}
 
-                if prepare_on_pc:
-                    used_staging = True
-                    if progress_callback:
-                        progress_callback(
-                            0,
-                            0,
-                            "Preparing DFPlayer layout on your PC (not writing files to the SD card)...",
-                        )
-                    shutil.rmtree(staging_root, ignore_errors=True)
-                    staging_root.mkdir(parents=True, exist_ok=True)
-
-                    def _sync_cb(c: int, t: int, m: str) -> None:
-                        if progress_callback:
-                            progress_callback(c, t if t else 0, f"Prepare: {m}")
-
-                    self.sd_manager.sync_library_basic(
-                        staging_root,
-                        force_clean=False,
-                        progress_callback=_sync_cb,
-                        should_cancel=should_cancel,
-                        conversion_profile=conv_profile,
-                        dfplayer_eq=dfplayer_eq,
-                        copy_destination_label="PC staging folder (for disk image)",
-                        sync_log_prefix="Prepare (PC staging)",
-                    )
-                    est2 = suggest_image_size_bytes(staging_root)
-                    _disk_bytes = _selected_disk_size_bytes()
-                    if _disk_bytes is not None and est2 > _disk_bytes:
-                        raise RuntimeError(
-                            f"SD card too small: need about {format_disk_size(est2)} for this image, "
-                            f"but the selected disk is {format_disk_size(_disk_bytes)}."
-                        )
-                    source_root = staging_root
-                else:
-                    _disk_bytes = _selected_disk_size_bytes()
-                    source_root = sd_p
-
-                disk_size_label = (
-                    format_disk_size(_disk_bytes) if _disk_bytes else "unknown size"
-                )
                 if progress_callback:
                     progress_callback(
                         0,
                         0,
-                        f"Building FAT32 disk image ({disk_size_label} — full card capacity)...",
+                        "Preparing your music on this computer…",
                     )
+                shutil.rmtree(staging_root, ignore_errors=True)
+                staging_root.mkdir(parents=True, exist_ok=True)
+
+                def _sync_cb(c: int, t: int, m: str) -> None:
+                    if progress_callback:
+                        progress_callback(c, t if t else 0, f"Prepare: {m}")
+
+                self.sd_manager.sync_library_basic(
+                    staging_root,
+                    force_clean=False,
+                    progress_callback=_sync_cb,
+                    should_cancel=should_cancel,
+                    conversion_profile=conv_profile,
+                    dfplayer_eq=dfplayer_eq,
+                    copy_destination_label="PC staging folder (for disk image)",
+                    sync_log_prefix="Prepare (PC staging)",
+                    use_conversion_cache=self._retain_conversion_cache(),
+                )
+                est2 = suggest_image_size_bytes(staging_root)
+                _disk_bytes = _selected_disk_size_bytes()
+                if _disk_bytes is not None and est2 > _disk_bytes:
+                    raise RuntimeError(
+                        f"SD card is too small: need about {format_disk_size(est2)}, "
+                        f"but the selected card is {format_disk_size(_disk_bytes)}."
+                    )
+
                 ok, err = run_experimental_sd_disk_image_export(
-                    source_root,
+                    staging_root,
                     img_path,
                     size_bytes=_disk_bytes,
                     progress_callback=_export_cb,
@@ -7597,8 +8093,25 @@ class MainWindow(QtWidgets.QMainWindow):
                         img_path.unlink(missing_ok=True)
                     except OSError:
                         pass
-                    raise RuntimeError(err or "Disk image build failed.")
+                    raise RuntimeError(err or "Could not create the install image.")
 
+                staging_manifest = SDManager._read_sync_manifest(staging_root)
+                known_data = estimate_folder_bytes(staging_root)
+                if staging_manifest and staging_manifest.get("stations"):
+                    try:
+                        save_cached_sd_image_manifest(
+                            cache_dir,
+                            stations=staging_manifest["stations"],
+                            conversion_profile=conv_profile,
+                            dfplayer_eq=dfplayer_eq,
+                            image_size_bytes=int(img_path.stat().st_size),
+                            data_bytes=known_data,
+                        )
+                    except OSError:
+                        pass
+
+                if progress_callback:
+                    progress_callback(0, 0, "Writing to SD card…")
                 if use_darwin:
                     assert bsd_disk is not None
                     ok2, err2 = write_image_to_physical_disk_darwin(
@@ -7606,6 +8119,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         bsd_disk,
                         progress_callback=progress_callback,
                         should_cancel=should_cancel,
+                        known_data_bytes=known_data,
                     )
                 else:
                     assert disk_number is not None
@@ -7614,17 +8128,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         disk_number,
                         progress_callback=progress_callback,
                         should_cancel=should_cancel,
+                        known_data_bytes=known_data,
                     )
                 if not ok2:
-                    raise RuntimeError(err2 or "Disk write failed.")
-                return {"ok": True}
+                    raise RuntimeError(err2 or "Could not write to the SD card.")
+                return {"ok": True, "reused": False}
             finally:
-                if used_staging:
-                    shutil.rmtree(staging_root, ignore_errors=True)
+                shutil.rmtree(staging_root, ignore_errors=True)
 
         dlg = TaskProgressDialog(
             parent=self,
-            title="SD image sync (experimental)",
+            title="Installing to SD card",
             func=_worker_sd_image,
             args=(),
             kwargs={},
@@ -7633,25 +8147,25 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         def on_ok_sd(_result: object) -> None:
-            self.statusBar().showMessage("SD card image written. Safely remove the card if needed.", 8000)
-            QtWidgets.QMessageBox.information(
+            self.statusBar().showMessage("SD card install finished.", 8000)
+            VintageMessageBox.information(
                 self,
                 "Done",
-                "The FAT32 image was written to the selected disk.\n\n"
-                "Safely remove the SD card, insert it in the radio, and power on.",
+                "Your music is on the SD card.\n\n"
+                "Safely remove the card, put it in the radio, and turn the radio on.",
             )
 
         def on_error_sd(msg: str) -> None:
             if use_darwin and DARWIN_FDA_REQUIRED_MARKER in msg:
                 display_msg = msg.replace(DARWIN_FDA_REQUIRED_MARKER + "\n", "")
-                dlg_fda = QtWidgets.QMessageBox(self)
-                dlg_fda.setWindowTitle("Full Disk Access Required")
+                dlg_fda = VintageMessageBox(self)
+                dlg_fda.setWindowTitle("Permission needed")
                 dlg_fda.setText(display_msg)
-                dlg_fda.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+                dlg_fda.setIcon(VintageMessageBox.Icon.Warning)
                 open_btn = dlg_fda.addButton(
-                    "Open System Settings", QtWidgets.QMessageBox.ButtonRole.ActionRole
+                    "Open System Settings", VintageMessageBox.ButtonRole.ActionRole
                 )
-                dlg_fda.addButton(QtWidgets.QMessageBox.StandardButton.Ok)
+                dlg_fda.addButton(VintageMessageBox.StandardButton.Ok)
                 dlg_fda.exec()
                 if dlg_fda.clickedButton() is open_btn:
                     import subprocess as _sp
@@ -7662,8 +8176,11 @@ class MainWindow(QtWidgets.QMainWindow):
                             "?Privacy_AllFiles",
                         ]
                     )
-            else:
-                QtWidgets.QMessageBox.critical(self, "SD image sync failed", msg)
+                return
+            if "cancelled by user" in str(msg).lower():
+                self.statusBar().showMessage("SD card install cancelled.", 4000)
+                return
+            VintageMessageBox.critical(self, "SD card install failed", msg)
 
         dlg.on_success = on_ok_sd
         dlg.on_error = on_error_sd
@@ -8298,6 +8815,8 @@ class MainWindow(QtWidgets.QMainWindow):
             checked = self._auto_eject_after_sync_cb.isChecked()
         elif _qt_widget_alive(getattr(self, "_basic_auto_eject_cb", None)):
             checked = self._basic_auto_eject_cb.isChecked()
+        elif _qt_widget_alive(getattr(self, "_settings_auto_eject_cb", None)):
+            checked = self._settings_auto_eject_cb.isChecked()
         else:
             checked = False
         self.db.set_setting("auto_eject_after_sync", "1" if checked else "0")
@@ -8317,6 +8836,11 @@ class MainWindow(QtWidgets.QMainWindow):
             cb_basic.blockSignals(True)
             cb_basic.setChecked(checked)
             cb_basic.blockSignals(False)
+        cb_settings = getattr(self, "_settings_auto_eject_cb", None)
+        if _qt_widget_alive(cb_settings) and sender is not cb_settings:
+            cb_settings.blockSignals(True)
+            cb_settings.setChecked(checked)
+            cb_settings.blockSignals(False)
 
     def _create_song_table(self, reorderable: bool = False) -> QtWidgets.QTableWidget:
         table: QtWidgets.QTableWidget
@@ -8352,6 +8876,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ui_zoom_level = max(80, min(200, int(self.db.get_setting("ui_zoom_level", "100") or "100")))
         except (ValueError, TypeError):
             self._ui_zoom_level = 100
+        _ui_scale.set_zoom_percent(self._ui_zoom_level)
+        self._ui_theme = normalize_theme_id(self.db.get_setting("ui_theme", "vintage"))
+        apply_ui_theme(self._ui_theme)
         try:
             retention = max(1, int(retention_raw))
         except ValueError:
@@ -8454,59 +8981,17 @@ class MainWindow(QtWidgets.QMainWindow):
         cancel_text: str = "Cancel",
     ) -> bool:
         """List every broken entry in a scrollable view. Return True if user proceeds (or OK-only)."""
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle(window_title)
-        dlg.resize(560, 420)
-        layout = QtWidgets.QVBoxLayout(dlg)
-        head_lbl = QtWidgets.QLabel(headline)
-        head_lbl.setWordWrap(True)
-        layout.addWidget(head_lbl)
-        intro_lbl = QtWidgets.QLabel(explanation)
-        intro_lbl.setWordWrap(True)
-        layout.addWidget(intro_lbl)
-        body = QtWidgets.QPlainTextEdit()
-        body.setReadOnly(True)
-        body.setPlainText("\n\n".join(line_fmt(e) for e in entries))
-        body.setMinimumHeight(200)
-        body.setMaximumHeight(320)
-        mono = QtGui.QFont("Consolas") if sys.platform == "win32" else QtGui.QFontDatabase.systemFont(
-            QtGui.QFontDatabase.SystemFont.FixedFont
+        dlg = ScrollableListConfirmDialog(
+            self,
+            window_title=window_title,
+            headline=headline,
+            explanation=explanation,
+            entries=entries,
+            line_fmt=line_fmt,
+            proceed_text=proceed_text,
+            cancel_text=cancel_text,
         )
-        body.setFont(mono)
-        layout.addWidget(body, 1)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch()
-        accepted = {"ok": False}
-        if proceed_text:
-            btn_proceed = QtWidgets.QPushButton(proceed_text)
-            btn_proceed.setDefault(True)
-            btn_cancel = QtWidgets.QPushButton(cancel_text)
-
-            def _do_proceed() -> None:
-                accepted["ok"] = True
-                dlg.accept()
-
-            def _do_cancel() -> None:
-                accepted["ok"] = False
-                dlg.reject()
-
-            btn_proceed.clicked.connect(_do_proceed)
-            btn_cancel.clicked.connect(_do_cancel)
-            btn_row.addWidget(btn_proceed)
-            btn_row.addWidget(btn_cancel)
-        else:
-            btn_ok = QtWidgets.QPushButton("OK")
-            btn_ok.setDefault(True)
-
-            def _do_ok() -> None:
-                accepted["ok"] = True
-                dlg.accept()
-
-            btn_ok.clicked.connect(_do_ok)
-            btn_row.addWidget(btn_ok)
-        layout.addLayout(btn_row)
-        dlg.exec()
-        return bool(accepted["ok"])
+        return dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted
 
     def _replace_song_source_path(self, song_id: int) -> None:
         """Point an existing library track at a new audio file on disk."""
@@ -8530,7 +9015,7 @@ class MainWindow(QtWidgets.QMainWindow):
             metadata = extract_metadata(file_path)
             file_hash = compute_file_hash(file_path)
         except Exception as e:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Could not read file", str(e) or "Unknown error reading audio file."
             )
             return
@@ -8538,7 +9023,7 @@ class MainWindow(QtWidgets.QMainWindow):
         conflict = self.db.get_song_by_path(new_path)
         if conflict is not None and int(conflict["id"]) != song_id:
             t = conflict["title"] or conflict["original_filename"] or new_path
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Already in library",
                 "This file is already linked to another track:\n\n"
@@ -8725,13 +9210,14 @@ class MainWindow(QtWidgets.QMainWindow):
             added, skipped, added_ids = result
             self._pending_import_ids = added_ids
             self.refresh_library()
+            self._schedule_conversion_prefetch(added_ids)
             self.statusBar().showMessage(
                 f"Import complete. Added: {added}, Skipped: {skipped}", 5000
             )
 
         def on_error(msg):
             self.refresh_library()
-            QtWidgets.QMessageBox.warning(self, "Import Error", f"Error during import:\n\n{msg}")
+            VintageMessageBox.warning(self, "Import Error", f"Error during import:\n\n{msg}")
 
         dlg.on_success = on_success
         dlg.on_error = on_error
@@ -8773,13 +9259,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.refresh_library()
         if errors:
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self, "Import Error", f"Error during import:\n\n{errors[0]}"
             )
             return []
         if not results:
             return []
         _added, _skipped, added_ids = results[0]
+        self._schedule_conversion_prefetch(added_ids)
         return added_ids
 
     @staticmethod
@@ -8872,8 +9359,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_library()
         if show_status:
             self.statusBar().showMessage(
-                f"Import complete. Added: {added}, skipped: {skipped}", 5000
+                f"Import complete. Added: {added}, Skipped: {skipped}", 5000
             )
+        if added_ids:
+            self._schedule_conversion_prefetch(added_ids)
         return added_ids
 
     def edit_selected_metadata(self) -> None:
@@ -8911,12 +9400,12 @@ class MainWindow(QtWidgets.QMainWindow):
         song_ids = self._selected_library_song_ids()
         if not song_ids:
             return
-        confirm = QtWidgets.QMessageBox.question(
+        confirm = VintageMessageBox.question(
             self,
             "Remove Songs",
             f"Remove {len(song_ids)} song(s) from the library? Files stay on disk.",
         )
-        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+        if confirm != VintageMessageBox.StandardButton.Yes:
             return
         song_rows = self.db.get_songs_by_ids(song_ids)
         album_links = []
@@ -8948,7 +9437,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_library()
 
     def create_album(self) -> None:
-        name, ok = QtWidgets.QInputDialog.getText(self, "New Album", "Album name:")
+        name, ok = get_text(self, "New Album", "Album name:")
         if not ok or not name.strip():
             return
         self.db.create_album(name.strip())
@@ -8959,10 +9448,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if item is None:
             return
         album_id = int(item.data(QtCore.Qt.ItemDataRole.UserRole))
-        confirm = QtWidgets.QMessageBox.question(
+        confirm = VintageMessageBox.question(
             self, "Delete Album", f"Delete album '{item.text()}'?"
         )
-        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+        if confirm != VintageMessageBox.StandardButton.Yes:
             return
         self.db.delete_album(album_id)
         self.refresh_albums()
@@ -8973,7 +9462,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if item is None:
             return
         album_id = int(item.data(QtCore.Qt.ItemDataRole.UserRole))
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self, "Rename Album", "Album name:", text=item.text()
         )
         if not ok or not name.strip():
@@ -8990,8 +9479,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "SELECT description FROM albums WHERE id = ?;", (album_id,)
         ).fetchone()
         existing_text = existing["description"] if existing and existing["description"] else ""
-        text, ok = QtWidgets.QInputDialog.getMultiLineText(
-            self, "Album Description", "Description:", existing_text
+        text, ok = get_multiline_text(
+            self, "Album Description", "Description:", text=existing_text
         )
         if not ok:
             return
@@ -9032,12 +9521,12 @@ class MainWindow(QtWidgets.QMainWindow):
         song_ids = self._selected_table_song_ids(self.album_songs_table)
         if not song_ids:
             return
-        confirm = QtWidgets.QMessageBox.question(
+        confirm = VintageMessageBox.question(
             self,
             "Remove Tracks",
             f"Remove {len(song_ids)} track(s) from this album?",
         )
-        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+        if confirm != VintageMessageBox.StandardButton.Yes:
             return
         removed = [
             row
@@ -9062,7 +9551,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_album_songs()
 
     def create_playlist(self) -> None:
-        name, ok = QtWidgets.QInputDialog.getText(self, "New Playlist", "Playlist name:")
+        name, ok = get_text(self, "New Playlist", "Playlist name:")
         if not ok or not name.strip():
             return
         self.db.create_playlist(name.strip())
@@ -9073,10 +9562,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if item is None:
             return
         playlist_id = int(item.data(QtCore.Qt.ItemDataRole.UserRole))
-        confirm = QtWidgets.QMessageBox.question(
+        confirm = VintageMessageBox.question(
             self, "Delete Playlist", f"Delete playlist '{item.text()}'?"
         )
-        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+        if confirm != VintageMessageBox.StandardButton.Yes:
             return
         self.db.delete_playlist(playlist_id)
         self.refresh_playlists()
@@ -9087,7 +9576,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if item is None:
             return
         playlist_id = int(item.data(QtCore.Qt.ItemDataRole.UserRole))
-        name, ok = QtWidgets.QInputDialog.getText(
+        name, ok = get_text(
             self, "Rename Playlist", "Playlist name:", text=item.text()
         )
         if not ok or not name.strip():
@@ -9106,8 +9595,8 @@ class MainWindow(QtWidgets.QMainWindow):
         existing_text = (
             existing["description"] if existing and existing["description"] else ""
         )
-        text, ok = QtWidgets.QInputDialog.getMultiLineText(
-            self, "Playlist Description", "Description:", existing_text
+        text, ok = get_multiline_text(
+            self, "Playlist Description", "Description:", text=existing_text
         )
         if not ok:
             return
@@ -9148,12 +9637,12 @@ class MainWindow(QtWidgets.QMainWindow):
         song_ids = self._selected_table_song_ids(self.playlist_songs_table)
         if not song_ids:
             return
-        confirm = QtWidgets.QMessageBox.question(
+        confirm = VintageMessageBox.question(
             self,
             "Remove Tracks",
             f"Remove {len(song_ids)} track(s) from this playlist?",
         )
-        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+        if confirm != VintageMessageBox.StandardButton.Yes:
             return
         removed = [
             row
@@ -9178,28 +9667,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_playlist_songs()
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(
-            auto_backup=self.db.auto_backup,
-            backup_retention=self.db.backup_retention,
-            sd_root=self.sd_root,
-            sd_auto_detect=self.sd_auto_detect,
-            parent=self,
-        )
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        auto_backup, retention, sd_root, sd_auto_detect = dialog.get_values()
-        self.db.set_setting("auto_backup", "1" if auto_backup else "0")
-        self.db.set_setting("backup_retention", str(retention))
-        self.db.set_setting("sd_root", sd_root)
-        self.db.set_setting("sd_auto_detect", "1" if sd_auto_detect else "0")
-        self.db.auto_backup = auto_backup
-        self.db.backup_retention = retention
-        self.sd_root = sd_root
-        self.sd_auto_detect = sd_auto_detect
-        if self.sd_root:
-            self.sd_label = self._get_volume_label(Path(self.sd_root))
-            self.db.set_setting("sd_label", self.sd_label)
-        self._update_sd_root_label()
+        sidebar = getattr(self, "_sidebar", None)
+        if _qt_widget_alive(sidebar):
+            sidebar.set_active(self._PAGE_SETTINGS)
+        self._on_sidebar_nav(self._PAGE_SETTINGS)
 
     def _update_sd_root_label(self) -> None:
         """Update advanced Devices tab label and/or basic SD Card tab label."""
@@ -9219,6 +9690,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if _qt_widget_alive(getattr(self, "_basic_sd_root_label", None)):
             self._basic_sd_root_label.setText(basic_text)
 
+    def _basic_sd_display_text(self) -> str:
+        """Human-readable SD target for sync modal subtitles."""
+        if not self.sd_root:
+            return "(no SD card selected)"
+        vol = self.sd_label or self._get_volume_label(Path(self.sd_root))
+        if vol:
+            return f"{self.sd_root} ({vol})"
+        return str(self.sd_root)
+
     def _get_volume_label(self, path: Path) -> str:
         if hasattr(self.sd_manager, "volume_label"):
             return self.sd_manager.volume_label(path)
@@ -9236,19 +9716,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sd_album_combo.blockSignals(False)
         self.sd_playlist_combo.blockSignals(False)
 
-    def _manual_select_sd_root_dialog(
+    def _sd_root_default_index(
         self,
         candidates: List[Tuple[Path, str]],
         identity: set,
-    ) -> Optional[Tuple[str, str]]:
-        """Basic-mode **Select**: combo dropdown of detected roots (one or many). Cancel returns ``None``."""
-        choices: List[str] = []
-        mapping: Dict[str, str] = {}
-        for path, label in candidates:
-            display = f"{path} ({label})" if label else str(path)
-            choices.append(display)
-            mapping[display] = str(path)
-
+    ) -> int:
         default_idx = 0
         if self.sd_root:
             try:
@@ -9256,31 +9728,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 for i, (path, _label) in enumerate(candidates):
                     try:
                         if path.resolve() == saved:
-                            default_idx = i
-                            break
+                            return i
                     except OSError:
                         continue
             except OSError:
                 pass
-        if default_idx == 0 and identity:
+        if identity:
             for i, (path, label) in enumerate(candidates):
                 if self._basic_candidate_matches_identity(path, label, identity):
-                    default_idx = i
-                    break
+                    return i
+        return default_idx
 
-        dlg_flags = (
-            QtCore.Qt.WindowType.Dialog
-            | QtCore.Qt.WindowType.WindowStaysOnTopHint
-            | QtCore.Qt.WindowType.WindowCloseButtonHint
-        )
-        selection, ok = QtWidgets.QInputDialog.getItem(
+    def _pick_sd_root_from_candidates(
+        self,
+        candidates: List[Tuple[Path, str]],
+        *,
+        default_idx: int = 0,
+    ) -> Optional[Tuple[str, str]]:
+        """Sync-styled combo to pick a detected SD root."""
+        choices: List[str] = []
+        mapping: Dict[str, str] = {}
+        for path, label in candidates:
+            display = f"{path} ({label})" if label else str(path)
+            choices.append(display)
+            mapping[display] = str(path)
+
+        selection, ok = get_item(
             self,
             "Select SD Root",
             "Choose SD card root:",
             choices,
             default_idx,
-            False,
-            dlg_flags,
         )
         if not ok or not selection:
             return None
@@ -9291,6 +9769,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 new_label = label or ""
                 break
         return new_root, new_label
+
+    def _manual_select_sd_root_dialog(
+        self,
+        candidates: List[Tuple[Path, str]],
+        identity: set,
+    ) -> Optional[Tuple[str, str]]:
+        """Basic-mode **Select**: combo dropdown of detected roots (one or many)."""
+        default_idx = self._sd_root_default_index(candidates, identity)
+        return self._pick_sd_root_from_candidates(candidates, default_idx=default_idx)
 
     def select_sd_root(self, *, manual: bool = False) -> None:
         """Pick SD root from detected removable volumes (dropdown if several).
@@ -9303,8 +9790,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         candidates = self.sd_manager.detect_sd_roots()
         if not candidates:
-            mb = QtWidgets.QMessageBox(self)
-            mb.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            mb = VintageMessageBox(self)
+            mb.setIcon(VintageMessageBox.Icon.Information)
             mb.setWindowTitle("SD card")
             mb.setText("No removable drives were detected automatically.")
             mb.setInformativeText(
@@ -9373,54 +9860,11 @@ class MainWindow(QtWidgets.QMainWindow):
             new_root = str(candidates[0][0])
             new_label = candidates[0][1] or ""
         else:
-            choices: List[str] = []
-            mapping: Dict[str, str] = {}
-            for path, label in candidates:
-                display = f"{path} ({label})" if label else str(path)
-                choices.append(display)
-                mapping[display] = str(path)
-
-            default_idx = 0
-            if self.sd_root:
-                try:
-                    saved = Path(self.sd_root).expanduser().resolve()
-                    for i, (path, label) in enumerate(candidates):
-                        try:
-                            if path.resolve() == saved:
-                                default_idx = i
-                                break
-                        except OSError:
-                            continue
-                except OSError:
-                    pass
-            if default_idx == 0 and identity:
-                for i, (path, label) in enumerate(candidates):
-                    if self._basic_candidate_matches_identity(path, label, identity):
-                        default_idx = i
-                        break
-
-            dlg_flags = (
-                QtCore.Qt.WindowType.Dialog
-                | QtCore.Qt.WindowType.WindowStaysOnTopHint
-                | QtCore.Qt.WindowType.WindowCloseButtonHint
-            )
-            selection, ok = QtWidgets.QInputDialog.getItem(
-                self,
-                "Select SD Root",
-                "Choose SD card root:",
-                choices,
-                default_idx,
-                False,
-                dlg_flags,
-            )
-            if not ok or not selection:
+            default_idx = self._sd_root_default_index(candidates, identity)
+            picked = self._pick_sd_root_from_candidates(candidates, default_idx=default_idx)
+            if picked is None:
                 return
-            new_root = mapping.get(selection, selection)
-            new_label = ""
-            for path, label in candidates:
-                if str(path) == new_root:
-                    new_label = label or ""
-                    break
+            new_root, new_label = picked
         self.sd_root = new_root
         self.sd_label = new_label or ""
         self.db.set_setting("sd_root", self.sd_root)
@@ -9474,17 +9918,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if recoverable_from_sd:
             names = "\n".join(f"  - {title}" for _, title, _ in recoverable_from_sd[:10])
             more = f"\n  ... and {len(recoverable_from_sd) - 10} more" if len(recoverable_from_sd) > 10 else ""
-            reply = QtWidgets.QMessageBox.question(
+            reply = VintageMessageBox.question(
                 self,
                 "Recover from SD card",
                 f"{len(recoverable_from_sd)} song(s) have missing source files on this PC, "
                 f"but copies already exist on the SD card:\n\n{names}{more}\n\n"
                 "Link library to the SD card copies so they can be synced in the future?\n"
                 "(This updates the library paths to point to the SD card.)",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.Yes,
+                VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+                VintageMessageBox.StandardButton.Yes,
             )
-            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            if reply == VintageMessageBox.StandardButton.Yes:
                 for song_id, title, slot_path in recoverable_from_sd:
                     self.db.update_song(song_id, {"file_path": slot_path})
                     self.db.update_song_sd_path(song_id, slot_path)
@@ -9509,7 +9953,7 @@ class MainWindow(QtWidgets.QMainWindow):
             names = "\n".join(f"  - {t}" for t in missing_source_songs[:10])
             more = f"\n  ... and {n_missing - 10} more" if n_missing > 10 else ""
             if n_missing == total:
-                QtWidgets.QMessageBox.critical(
+                VintageMessageBox.critical(
                     self,
                     "Cannot Sync — All Source Files Missing",
                     f"None of the {total} song(s) in your library can be found on this computer.\n\n"
@@ -9523,34 +9967,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             else:
-                reply = QtWidgets.QMessageBox.warning(
+                reply = VintageMessageBox.warning(
                     self,
                     "Missing Source Files",
                     f"{n_missing} of {total} song(s) have missing source files and will NOT be copied:\n\n"
                     f"{names}{more}\n\n"
                     "Continue syncing the remaining songs?\n\n"
                     "(Fix missing songs: Library → Remove broken entries, then re-import from this PC.)",
-                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
-                    QtWidgets.QMessageBox.StandardButton.Yes,
+                    VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+                    VintageMessageBox.StandardButton.Yes,
                 )
-                if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
+                if reply == VintageMessageBox.StandardButton.Cancel:
                     return
 
         # ── Ask for normal vs clean sync ──
         force_clean = False
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "SD Card Sync",
             "Sync library to SD card?\n\n"
             "Files that already exist and match will be skipped.\n\n"
             "Click 'Yes' for normal sync (skips existing files).\n"
             "Click 'No' for clean install (re-syncs all files).",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Yes,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No | VintageMessageBox.StandardButton.Cancel,
+            VintageMessageBox.StandardButton.Yes,
         )
-        if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
+        if reply == VintageMessageBox.StandardButton.Cancel:
             return
-        if reply == QtWidgets.QMessageBox.StandardButton.No:
+        if reply == VintageMessageBox.StandardButton.No:
             force_clean = True
         
         effective_audio_target = "dfplayer_rp2040" if self._is_basic_like_mode() else self.audio_target
@@ -9569,7 +10013,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def on_success(result):
             copied, skipped = result
             if skipped > 0 and copied == 0:
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self,
                     "Sync Complete — No Files Copied",
                     f"No music files were copied to the SD card.\n"
@@ -9600,7 +10044,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.test_mode_widget.refresh_from_db()
 
         def on_error(msg):
-            QtWidgets.QMessageBox.critical(self, "Sync Error", f"An error occurred during SD sync:\n\n{msg}")
+            VintageMessageBox.critical(self, "Sync Error", f"An error occurred during SD sync:\n\n{msg}")
 
         dlg.on_success = on_success
         dlg.on_error = on_error
@@ -9622,7 +10066,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sd_root = self._resolve_sd_root()
         if not sd_root:
             if not auto:
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self,
                     "No SD Card",
                     "No SD card root selected. Please select an SD card first."
@@ -9634,7 +10078,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if auto:
                 self.statusBar().showMessage(msg, 6000)
             else:
-                QtWidgets.QMessageBox.information(self, "SD Card Ejected", msg)
+                VintageMessageBox.information(self, "SD Card Ejected", msg)
 
         def _report_failure(title: str, msg: str) -> None:
             if auto and attempt < 3:
@@ -9644,7 +10088,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if auto:
                 self.statusBar().showMessage(f"Auto-eject failed: {msg}", 8000)
             else:
-                QtWidgets.QMessageBox.warning(self, title, msg)
+                VintageMessageBox.warning(self, title, msg)
 
         # Last pass: OSes recreate .Spotlight-V100 / .fseventsd while the volume
         # stays mounted; strip them again right before flush + eject. On macOS,
@@ -10018,14 +10462,14 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = "mpremote is not available. Install it with: pip install mpremote\n\nThen connect the device via USB and try again."
             if bundle_err:
                 msg += "\n\n(Bundled mpremote failed to load:\n" + str(bundle_err) + ")"
-            QtWidgets.QMessageBox.information(self, "Install Firmware", msg)
+            VintageMessageBox.information(self, "Install Firmware", msg)
             return
         root = self._project_root()
         if not (root / "firmware" / "pico" / "main.py").exists() or not (root / "firmware" / "radio_core.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Install Firmware", "Project files not found.")
+            VintageMessageBox.warning(self, "Install Firmware", "Project files not found.")
             return
         if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Install Firmware", "firmware/pico/dfplayer_hardware.py not found.")
+            VintageMessageBox.warning(self, "Install Firmware", "firmware/pico/dfplayer_hardware.py not found.")
             return
 
         # Quick test: can we connect to Pico (MicroPython already installed)?
@@ -10152,7 +10596,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 msg += f"\n\nConnection attempt output:\n{conn_err.strip()}"
             elif conn_err:
                 msg += f"\n\nConnection attempt output:\n{conn_err[:500].strip()}..."
-            QtWidgets.QMessageBox.information(self, "Install Firmware", msg)
+            VintageMessageBox.information(self, "Install Firmware", msg)
 
     def _is_rpi_rp2_present(self) -> bool:
         """True if a drive with label RPI-RP2 (Pico in BOOTSEL) is present."""
@@ -10623,7 +11067,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    "See README_RP2040.md for how to install MicroPython on the Pico (one-time).")
             if getattr(self, "_mpremote_bundle_error", None):
                 msg += "\n\n(Bundled mpremote failed to load:\n" + str(self._mpremote_bundle_error) + ")"
-            QtWidgets.QMessageBox.information(self, "Install to Pico", msg)
+            VintageMessageBox.information(self, "Install to Pico", msg)
             return
 
         if self._release_serial_if_connected_for_mpremote(log_prefix="INSTALL"):
@@ -10642,13 +11086,13 @@ class MainWindow(QtWidgets.QMainWindow):
         root = self._project_root()
         main_source = "firmware/pico/main_basic.py" if basic_mode else "firmware/pico/main.py"
         if not (root / main_source).exists():
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", f"{main_source} not found.")
+            VintageMessageBox.warning(self, "Install to Pico", f"{main_source} not found.")
             return
         if not (root / "firmware" / "radio_core.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", "Project files not found.")
+            VintageMessageBox.warning(self, "Install to Pico", "Project files not found.")
             return
         if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
-            QtWidgets.QMessageBox.warning(self, "Install to Pico", "firmware/pico/dfplayer_hardware.py not found.")
+            VintageMessageBox.warning(self, "Install to Pico", "firmware/pico/dfplayer_hardware.py not found.")
             return
 
         profile_params = self._get_active_profile_install_params()
@@ -10947,7 +11391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         source_raw = (self.db.get_setting("advanced_custom_software_path", "") or "").strip()
         source_path = Path(source_raw) if source_raw else None
         if not source_path or not source_path.exists():
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Custom Software",
                 "Choose a valid local custom software folder or file first.",
@@ -10955,7 +11399,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         mpremote_cmd = self._resolve_mpremote_cmd()
         if not mpremote_cmd:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "Custom Software",
                 "mpremote is not available. Install it with:\n\npip install mpremote",
@@ -10981,12 +11425,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def deploy_to_pi(self) -> None:
         """Copy application files to Raspberry Pi via SCP (requires SSH access)."""
-        ip, ok = QtWidgets.QInputDialog.getText(
+        ip, ok = get_text(
             self,
             "Deploy to Pi",
             "Enter Raspberry Pi IP address:",
-            QtWidgets.QLineEdit.EchoMode.Normal,
-            "",
         )
         if not ok or not ip.strip():
             return
@@ -11010,12 +11452,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if docs_pi.exists():
             shutil.copy2(docs_pi, deploy_dir / "README_Pi.md")
         parent = deploy_dir.parent
-        progress = QtWidgets.QProgressDialog("Deploying to Pi...", None, 0, 0, self)
-        progress.setWindowTitle("Deploy to Pi")
-        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
-        QtWidgets.QApplication.processEvents()
+        progress = IndeterminateProgressDialog(self, "Deploy to Pi", "Deploying to Pi...")
+        progress.show_and_raise()
         try:
             r = subprocess.run(
                 ["scp", "-r", "-o", "StrictHostKeyChecking=no", "vintage_radio", f"{user}@{ip}:/home/{user}/"],
@@ -11026,7 +11464,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if r.returncode != 0:
                 progress.close()
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self,
                     "Deploy to Pi",
                     f"SCP failed. Ensure the Pi is on the network and SSH is enabled.\n\n{r.stderr or r.stdout or ''}",
@@ -11048,17 +11486,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage("Deployed to Pi successfully.", 5000)
         except subprocess.TimeoutExpired:
             progress.close()
-            QtWidgets.QMessageBox.warning(self, "Deploy to Pi", "Timed out. Check Pi IP and SSH.")
+            VintageMessageBox.warning(self, "Deploy to Pi", "Timed out. Check Pi IP and SSH.")
         except FileNotFoundError:
             progress.close()
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Deploy to Pi",
                 "scp/ssh not found. On Windows enable OpenSSH client (Settings > Apps > Optional features).",
             )
         except Exception as e:
             progress.close()
-            QtWidgets.QMessageBox.warning(self, "Deploy to Pi", f"Error: {e}")
+            VintageMessageBox.warning(self, "Deploy to Pi", f"Error: {e}")
 
     def export_pi_firmware(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(
@@ -11118,14 +11556,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not folder:
             return
         sd_root = Path(folder)
-        progress = QtWidgets.QProgressDialog(
-            "Exporting SD contents...", "Cancel", 0, 0, self
+        progress = IndeterminateProgressDialog(
+            self, "Export SD Contents", "Exporting SD contents...",
         )
-        progress.setWindowTitle("Export SD Contents")
-        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
-        QtWidgets.QApplication.processEvents()
+        progress.show_and_raise()
         try:
             copied, skipped = self.sd_manager.sync_library(
                 sd_root,
@@ -11139,7 +11573,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception as e:
             progress.close()
-            QtWidgets.QMessageBox.critical(
+            VintageMessageBox.critical(
                 self,
                 "Export Error",
                 f"An error occurred:\n{str(e)}",
@@ -11201,36 +11635,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if len(candidates) > 1:
                 if not interactive:
                     return None
-                choices = []
-                mapping = {}
-                for path, label in candidates:
-                    display = f"{path} ({label})" if label else str(path)
-                    choices.append(display)
-                    mapping[display] = str(path)
-                _sd_pick_flags = (
-                    QtCore.Qt.WindowType.Dialog
-                    | QtCore.Qt.WindowType.WindowStaysOnTopHint
-                    | QtCore.Qt.WindowType.WindowCloseButtonHint
-                )
-                selection, ok = QtWidgets.QInputDialog.getItem(
-                    self,
-                    "Select SD Root",
-                    "Choose SD card root:",
-                    choices,
-                    0,
-                    False,
-                    _sd_pick_flags,
-                )
-                if ok and selection:
-                    self.sd_root = mapping.get(selection, selection)
-                    self.db.set_setting("sd_root", self.sd_root)
-                    self.sd_label = ""
-                    for path, label in candidates:
-                        if str(path) == self.sd_root:
-                            self.sd_label = label
-                    self.db.set_setting("sd_label", self.sd_label)
-                    self._update_sd_root_label()
-                    return Path(self.sd_root)
+                picked = self._pick_sd_root_from_candidates(candidates, default_idx=0)
+                if picked is None:
+                    return None
+                self.sd_root = picked[0]
+                self.sd_label = picked[1]
+                self.db.set_setting("sd_root", self.sd_root)
+                self.db.set_setting("sd_label", self.sd_label)
+                self._update_sd_root_label()
+                return Path(self.sd_root)
         if not self.sd_auto_detect:
             if not interactive:
                 return None
@@ -11614,13 +12027,23 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def _view_session_log(self) -> None:
-        """Open the current session log in the system's default text editor."""
+        """Show the session log on the Tools tab (basic) or open in the system editor."""
+        if self.devices_view_mode in ("basic", "advanced"):
+            sidebar = getattr(self, "_sidebar", None)
+            if _qt_widget_alive(sidebar):
+                sidebar.set_active(self._PAGE_TOOLS)
+            self._on_sidebar_nav(self._PAGE_TOOLS)
+            page = getattr(self, "_tools_page", None)
+            if _qt_widget_alive(page):
+                page.set_mode("session_logs")
+                page.session_logs_panel._refresh_full()
+                return
         from .session_log import get_session_log_path
         log_path = get_session_log_path()
         if log_path and log_path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
         else:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 None, "Session Log", "No session log found for this session."
             )
 
@@ -11647,7 +12070,7 @@ class MainWindow(QtWidgets.QMainWindow):
         was_suppressed = self.db.get_setting(key, "0") == "1"
         self.db.set_setting(key, "0")
         if was_suppressed:
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "Track count warning",
                 "The warning for stations over 255 tracks will be shown again "
@@ -11669,7 +12092,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _check_for_updates(self, *, manual: bool) -> None:
         if self._update_check_in_flight:
             if manual:
-                QtWidgets.QMessageBox.information(
+                VintageMessageBox.information(
                     self,
                     "Check for Updates",
                     "An update check is already in progress.",
@@ -11680,11 +12103,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def _worker() -> None:
             try:
-                info = updater.check_latest_release(
+                result = updater.run_update_check(
                     user_agent=f"VintageRadio/{__version__}",
                     current_version=__version__,
                 )
-                self.update_check_finished.emit(info, manual, "")
+                self.update_check_finished.emit(result, manual, "")
             except Exception as e:
                 self.update_check_finished.emit(None, manual, str(e))
 
@@ -11695,49 +12118,74 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if error:
             if manual:
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self,
                     "Check for Updates",
                     f"Could not check for updates:\n{error}",
                 )
             return
 
-        release = info if isinstance(info, updater.ReleaseInfo) else None
-        if release is None:
+        if isinstance(info, updater.UpdateCheckResult):
+            result = info
+        elif isinstance(info, updater.ReleaseInfo):
+            result = updater.UpdateCheckResult(
+                status="update_available",
+                release=info,
+            )
+        else:
+            result = updater.UpdateCheckResult(status="unavailable")
+
+        if result.status == "unavailable":
             if manual:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Check for Updates",
-                    "Could not fetch release information from GitHub.\n\n"
-                    "If your connection is fine, the API may be rate-limited or "
-                    "temporarily unavailable. You can open the releases page manually:\n"
-                    f"{updater.GITHUB_RELEASES_URL}",
+                detail = (result.error or "").strip()
+                body = "Could not fetch release information from GitHub."
+                if detail:
+                    body = f"{body}\n\n{detail}"
+                body = (
+                    f"{body}\n\nIf your connection is fine, the API may be rate-limited or "
+                    f"temporarily unavailable. You can open the releases page manually:\n"
+                    f"{updater.GITHUB_RELEASES_URL}"
                 )
+                VintageMessageBox.warning(self, "Check for Updates", body)
             return
 
-        if updater.is_newer(release.advertised_version(), __version__):
-            self._show_update_dialog(release)
-            return
+        if result.status == "update_available" and result.release is not None:
+            if updater.is_newer(result.release.advertised_version(), __version__):
+                self._show_update_dialog(result.release)
+                return
 
         if manual:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Check for Updates",
-                f"You're up to date.\nCurrent version: {__version__}",
-            )
+            msg = f"You're up to date.\nCurrent version: {__version__}"
+            latest = (result.latest_published or "").strip()
+            if latest and updater.is_newer(__version__, latest):
+                msg += f"\nLatest on GitHub: {latest}"
+            VintageMessageBox.information(self, "Check for Updates", msg)
 
     def _show_update_dialog(self, release: updater.ReleaseInfo) -> None:
         dlg = UpdateAvailableDialog(release, __version__, self)
         dlg.exec()
 
     def _show_about(self) -> None:
-        QtWidgets.QMessageBox.information(
+        VintageMessageBox.information(
             self,
             "About Vintage Radio",
             "Vintage Radio Music Manager\n"
             f"Version: {__version__}\n\n"
             f"Releases: {updater.GITHUB_RELEASES_URL}",
         )
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        from gui.window_chrome import ensure_native_caption_colors
+
+        ensure_native_caption_colors(self)
+        super().showEvent(event)
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.WindowStateChange:
+            from gui.window_chrome import apply_native_caption_colors
+
+            apply_native_caption_colors(self)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         try:
@@ -11799,11 +12247,16 @@ def run_app() -> None:
     install_messagebox_session_logging()
     print(f"Vintage Radio GUI starting...")
 
+    QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        QtCore.Qt.HighDpiScaleFactorRoundingPolicy.RoundPreferFloor
+    )
     app = QtWidgets.QApplication(sys.argv)
+    configure_vintage_app_rendering(app)
     try:
         app.setStyle(_VintageRadioTooltipStyle(app.style()))
     except Exception:
         pass
+    install_vintage_popup_styles(app)
 
     # Set application icon (radio icon; taskbar/dock)
     icon_path = resource_path("vintage_radio.png")
@@ -11839,7 +12292,7 @@ def run_app() -> None:
                     "Install ffmpeg (e.g. apt install ffmpeg)\n"
                     "Then: pip install python-vlc pydub certifi"
                 )
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 None,
                 "Conversion tools not found",
                 "No audio conversion tools were detected on your system.\n\n"
@@ -11853,6 +12306,9 @@ def run_app() -> None:
     _dev_mode = "--dev" in sys.argv
     window = MainWindow(dev_mode=_dev_mode)
     window.show()
+    from gui.window_chrome import ensure_native_caption_colors
+
+    ensure_native_caption_colors(window)
     sys.exit(app.exec())
 
 

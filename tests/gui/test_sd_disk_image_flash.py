@@ -6,7 +6,10 @@ from gui.sd_disk_image_flash import (
     darwin_normalize_bsd_whole_disk,
     darwin_rdisk_path,
     dd_stderr_records_out_bytes,
+    disk_write_eta_seconds,
+    disk_write_estimated_data_bytes,
     format_disk_size,
+    parse_disk_write_progress_message,
 )
 from gui.sd_disk_write_helper import parse_sd_disk_write_cli_args
 
@@ -121,3 +124,49 @@ def test_dd_stderr_records_out_bytes_last_match_wins() -> None:
 
 def test_dd_stderr_records_out_bytes_none_when_missing() -> None:
     assert dd_stderr_records_out_bytes("no stats here\n") is None
+
+
+def test_disk_write_estimated_data_bytes_uses_manifest() -> None:
+    gib = 1024**3
+    image_size = 32 * gib
+    known = int(1.5 * gib)
+    est = disk_write_estimated_data_bytes(
+        image_size=image_size,
+        written_from_file=68 * 1024 * 1024,
+        bytes_data_written=68 * 1024 * 1024,
+        bytes_zero_skipped=0,
+        known_data_bytes=known,
+    )
+    assert est == known
+
+
+def test_disk_write_eta_sparse_library_not_full_volume() -> None:
+    gib = 1024**3
+    image_size = 32 * gib
+    known = int(1.5 * gib)
+    scanned = 68 * 1024 * 1024
+    time_data = 60.0
+    eta = disk_write_eta_seconds(
+        image_size=image_size,
+        written_from_file=scanned,
+        bytes_data_written=scanned,
+        bytes_zero_skipped=0,
+        time_data=time_data,
+        time_zero=0.0,
+        est_data_bytes=known,
+    )
+    assert eta is not None
+    # Full-volume naive ETA at this scan rate would be ~8+ hours; sparse should be far less.
+    assert eta < 3600 * 2
+
+
+def test_parse_disk_write_progress_message_splits_eta() -> None:
+    msg = (
+        "Writing to SD card (450 MB of 1.5 GB)…"
+        "\x1cInstall image: 868 MB of 29.0 GB"
+        "\x1e900.5"
+    )
+    partition, image, eta = parse_disk_write_progress_message(msg)
+    assert "Writing to SD card" in partition
+    assert "Install image" in (image or "")
+    assert eta == 900.5

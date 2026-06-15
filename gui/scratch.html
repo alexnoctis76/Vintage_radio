@@ -9,26 +9,16 @@
   :root {
     --title-dark: #1a1208;
     --title-dark-2: #2b1e14;
-
     --workspace: #faf1e4;
     --floating: #f1dfc8;
-
-    --header: #3b2917;
-    --header-2: #4a341f;
-
-    --station-pane: #6b5a43;
-    --station-pane-2: #5a4b37;
-
+    --left-panel: #5c4d38;
+    --left-panel-2: #4d402f;
     --accent: #d46f1a;
-    --selected-2: #ffc475;
-
+    --selected-top: #ffc978;
+    --selected-bottom: #b65a12;
     --border: #9b6a36;
     --text: #2c1f14;
-    --text-soft: #5e4b38;
-    --text-light: #fff6e9;
-
-    --danger: #9e321d;
-    --danger-2: #c04a29;
+    --soft-text: #5e4b38;
   }
 
   * {
@@ -38,25 +28,31 @@
   body {
     margin: 0;
     min-height: 100vh;
-    background:
-      radial-gradient(circle at top, #4b2d13 0, #1b1108 42%, #0d0804 100%);
     display: grid;
     place-items: center;
+    overflow: auto;
     font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
     color: var(--text);
-    overflow: auto;
+    background:
+      radial-gradient(circle at top, #4b2d13 0, #1b1108 42%, #0d0804 100%);
+  }
+
+  button,
+  select,
+  textarea {
+    font-family: inherit;
   }
 
   .scale-shell {
     transform-origin: center center;
-    transition: transform 180ms ease;
+    transition: transform 160ms ease;
   }
 
   .app {
     width: 1448px;
     height: 1086px;
-    overflow: hidden;
     position: relative;
+    overflow: hidden;
     border-radius: 9px;
     background: var(--workspace);
     box-shadow:
@@ -65,8 +61,13 @@
   }
 
   .title-bar {
+    position: absolute;
+    inset: 0 0 auto 0;
     height: 58px;
-    width: 100%;
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    color: white;
     background:
       linear-gradient(180deg, rgba(255,255,255,0.05), rgba(0,0,0,0.16)),
       repeating-linear-gradient(
@@ -77,13 +78,6 @@
         transparent 8px
       ),
       linear-gradient(90deg, var(--title-dark), var(--title-dark-2), var(--title-dark));
-    color: white;
-    display: flex;
-    align-items: center;
-    padding: 0 24px;
-    position: absolute;
-    top: 0;
-    left: 0;
   }
 
   .app-title {
@@ -91,15 +85,13 @@
     align-items: center;
     gap: 13px;
     font-size: 22px;
-    font-weight: 600;
-    letter-spacing: 0.1px;
+    font-weight: 700;
   }
 
   .radio-icon {
     width: 36px;
     height: 36px;
-    flex: 0 0 36px;
-    filter: drop-shadow(0 1px 0 rgba(0,0,0,0.4));
+    flex: 0 0 auto;
   }
 
   .window-controls {
@@ -115,7 +107,6 @@
   .win-control {
     width: 23px;
     text-align: center;
-    opacity: 0.96;
     cursor: pointer;
     user-select: none;
   }
@@ -139,6 +130,7 @@
     top: 58px;
     bottom: 58px;
     width: 164px;
+    color: #fff4e3;
     background:
       radial-gradient(circle at 55% 20%, rgba(255,255,255,0.06), transparent 27%),
       repeating-linear-gradient(
@@ -152,61 +144,6 @@
     box-shadow:
       inset -1px 0 0 rgba(255,255,255,0.08),
       inset -5px 0 16px rgba(0,0,0,0.24);
-    color: var(--text-light);
-  }
-
-  .main {
-    position: absolute;
-    left: 164px;
-    right: 0;
-    top: 58px;
-    bottom: 58px;
-    background:
-      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.82), transparent 40%),
-      linear-gradient(180deg, #fff8ee 0, var(--workspace) 34%, #fbf2e6 100%);
-    border-left: 1px solid rgba(255,255,255,0.08);
-  }
-
-  .bottom-bar {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    height: 58px;
-    background: #f5eadc;
-    border-top: 1px solid #d8c6ad;
-    display: flex;
-    align-items: center;
-    padding: 0 30px;
-    color: #35271a;
-    font-size: 20px;
-  }
-
-  .zoom-controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .zoom-btn {
-    width: 42px;
-    height: 36px;
-    border-radius: 11px;
-    border: 1px solid #d3b995;
-    background: linear-gradient(180deg, #fff8ef, #eadcc9);
-    display: grid;
-    place-items: center;
-    box-shadow:
-      0 2px 4px rgba(81,45,13,0.15),
-      inset 0 1px 0 rgba(255,255,255,0.9);
-    font-weight: 700;
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .version {
-    margin-left: auto;
-    font-size: 19px;
   }
 
   .nav {
@@ -225,10 +162,8 @@
     align-items: center;
     justify-content: center;
     gap: 8px;
-    color: #fff4e3;
     font-size: 23px;
     text-align: center;
-    position: relative;
     cursor: pointer;
     user-select: none;
   }
@@ -259,9 +194,9 @@
 
   .nav-divider {
     height: 1px;
+    margin: 14px 0 25px;
     background: rgba(255,255,255,0.13);
     box-shadow: 0 1px 0 rgba(0,0,0,0.4);
-    margin: 14px 0 25px;
   }
 
   .spacer {
@@ -270,7 +205,70 @@
 
   .small-nav {
     min-height: 110px;
-    margin-bottom: 8px;
+  }
+
+  .main {
+    position: absolute;
+    left: 164px;
+    right: 0;
+    top: 58px;
+    bottom: 58px;
+    background:
+      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.82), transparent 40%),
+      linear-gradient(180deg, #fff8ee 0, var(--workspace) 34%, #fbf2e6 100%);
+    border-left: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .bottom-bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 58px;
+    display: flex;
+    align-items: center;
+    padding: 0 30px;
+    color: #35271a;
+    font-size: 20px;
+    background: #f5eadc;
+    border-top: 1px solid #d8c6ad;
+  }
+
+  .zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .zoom-btn {
+    width: 42px;
+    height: 36px;
+    border-radius: 11px;
+    border: 1px solid #d3b995;
+    background: linear-gradient(180deg, #fff8ef, #eadcc9);
+    display: grid;
+    place-items: center;
+    font-weight: 800;
+    cursor: pointer;
+    user-select: none;
+    box-shadow:
+      0 2px 4px rgba(81,45,13,0.15),
+      inset 0 1px 0 rgba(255,255,255,0.9);
+  }
+
+  .version {
+    margin-left: auto;
+    font-size: 19px;
+  }
+
+  .page {
+    position: absolute;
+    inset: 0;
+    display: none;
+  }
+
+  .page.active {
+    display: block;
   }
 
   .library-bar {
@@ -297,7 +295,7 @@
 
   .library-label {
     font-size: 22px;
-    font-weight: 700;
+    font-weight: 800;
     text-align: right;
   }
 
@@ -305,8 +303,7 @@
     height: 52px;
     border-radius: 8px;
     border: 1px solid #c6a77e;
-    background:
-      linear-gradient(180deg, #fff9f1, #f2e5d2);
+    background: linear-gradient(180deg, #fff9f1, #f2e5d2);
     padding: 0 24px;
     font-size: 21px;
     color: #2b2117;
@@ -316,12 +313,12 @@
   }
 
   .top-button,
-  .outline-button {
+  .device-button,
+  .small-button {
     height: 52px;
     border-radius: 8px;
     border: 2px solid var(--border);
-    background:
-      linear-gradient(180deg, #fff8ef, #ead6bd);
+    background: linear-gradient(180deg, #fff8ef, #ead6bd);
     color: #302316;
     font-size: 21px;
     box-shadow:
@@ -331,199 +328,615 @@
   }
 
   .top-button:hover,
-  .outline-button:hover,
-  .secondary-action:hover {
+  .device-button:hover,
+  .small-button:hover,
+  .firmware-tab:hover,
+  .firmware-card:hover,
+  .filter-button:hover,
+  .filter-chip:hover {
     filter: brightness(1.035);
   }
 
-  .top-button:active,
-  .outline-button:active,
-  .secondary-action:active,
-  .primary-action:active,
-  .mini-button:active,
-  .modal-button:active {
-    transform: translateY(1px);
-  }
-
-  .page {
-    display: none;
+  .firmware-page-content {
     position: absolute;
-    inset: 0;
-  }
-
-  .page.active {
-    display: block;
-  }
-
-  .storage {
-    position: absolute;
-    left: 32px;
-    right: 45px;
-    top: 116px;
-  }
-
-  .storage h2 {
-    margin: 0 0 4px;
-    font-size: 28px;
-    line-height: 1.1;
-  }
-
-  .storage-row {
+    left: 26px;
+    right: 24px;
+    top: 112px;
+    bottom: 34px;
     display: grid;
-    grid-template-columns: 252px 1fr 89px 120px 102px 102px;
+    grid-template-rows: 124px 48px 1fr;
+    gap: 14px;
+  }
+
+  .device-panel {
+    border: 1px solid #d6bd99;
+    border-radius: 12px;
+    background:
+      radial-gradient(circle at 20% 0%, rgba(255,255,255,0.86), transparent 45%),
+      linear-gradient(180deg, #fff7eb, #f0ddc4);
+    box-shadow:
+      0 7px 18px rgba(75,43,18,0.13),
+      inset 0 1px 0 rgba(255,255,255,0.8);
+    display: grid;
+    grid-template-columns: 82px 1fr 156px 156px;
     align-items: center;
-    gap: 16px;
+    gap: 18px;
+    padding: 18px 24px;
   }
 
-  .drive-text {
-    font-size: 21px;
-  }
-
-  .capacity-bar {
-    height: 30px;
-    border-radius: 13px;
-    border: 2px solid #a8703d;
-    background:
-      linear-gradient(180deg, #f9efe0, #f0dfca);
-    box-shadow:
-      inset 0 2px 4px rgba(73,43,17,0.2);
-    overflow: hidden;
-    position: relative;
-  }
-
-  .capacity-fill {
-    width: 31%;
-    height: 100%;
-    border-radius: 10px;
-    background:
-      linear-gradient(180deg, #e8994d, #cc6c1f 58%, #a74d12);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,0.28),
-      4px 0 12px rgba(147,70,12,0.28);
-    transition: width 220ms ease;
-  }
-
-  .usage,
-  .capacity-text {
-    font-size: 17px;
-    color: #3b2d20;
-  }
-
-  .storage .outline-button {
-    height: 55px;
-    font-size: 21px;
-  }
-
-  .split-panel {
-    position: absolute;
-    left: 18px;
-    right: 18px;
-    top: 214px;
-    height: 641px;
-    border: 2px solid #5a3b1f;
-    border-radius: 8px;
-    overflow: hidden;
+  .device-icon {
+    width: 72px;
+    height: 72px;
+    border-radius: 18px;
     display: grid;
-    grid-template-columns: 382px 1fr;
+    place-items: center;
+    color: #fff4e6;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.14), rgba(0,0,0,0.18)),
+      linear-gradient(180deg, #d67923, #9c4610);
     box-shadow:
-      0 9px 18px rgba(75,43,18,0.15),
-      inset 0 1px 0 rgba(255,255,255,0.42);
+      inset 0 1px 0 rgba(255,255,255,0.24),
+      0 7px 14px rgba(91,42,5,0.25);
   }
 
-  .pane {
-    position: relative;
-    min-width: 0;
+  .device-icon svg {
+    width: 48px;
+    height: 48px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
-  .stations-pane {
-    background:
-      linear-gradient(180deg, rgba(255,255,255,0.05), transparent 36%),
-      linear-gradient(180deg, var(--station-pane), var(--station-pane-2));
-    border-right: 2px solid #4c321d;
-    color: #fff4df;
+  .device-title {
+    margin: 0 0 7px;
+    font-size: 27px;
+    color: #2b1d11;
   }
 
-  .tracks-pane {
-    background:
-      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.72), transparent 40%),
-      linear-gradient(180deg, #fff3e2, #fbf2e6 72%, #f4e4cd);
-  }
-
-  .pane-header {
-    height: 56px;
-    background:
-      linear-gradient(180deg, rgba(255,255,255,0.07), rgba(0,0,0,0.14)),
-      linear-gradient(180deg, var(--header-2), var(--header));
-    color: #fff4e5;
+  .device-meta {
     display: flex;
     align-items: center;
-    padding: 0 30px;
-    font-size: 28px;
-    font-weight: 700;
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,0.16),
-      inset 0 -1px 0 rgba(0,0,0,0.35);
+    gap: 10px;
+    color: #5c4732;
+    font-size: 18px;
   }
 
-  .pane-header .mini-button {
-    margin-left: auto;
+  .device-status {
+    border-radius: 999px;
+    padding: 5px 11px 6px;
+    color: #fff8ed;
+    background: linear-gradient(180deg, #48a964, #267b43);
+    font-size: 13px;
+    font-weight: 900;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.28);
   }
 
-  .mini-button {
-    height: 40px;
-    min-width: 104px;
-    padding: 0 14px;
-    border-radius: 7px;
-    border: 1px solid #7a4c24;
-    background:
-      linear-gradient(180deg, #6e4826, #3f2715);
-    color: #fff5e7;
-    font-size: 22px;
-    font-weight: 650;
-    box-shadow:
-      0 2px 4px rgba(0,0,0,0.24),
-      inset 0 1px 0 rgba(255,255,255,0.13);
+  .device-button {
+    font-size: 19px;
+    font-weight: 800;
+  }
+
+  .device-button.primary {
+    border-color: #813c09;
+    color: #fff7eb;
+    background: linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
+  }
+
+  .firmware-tabs-wide {
+    height: 48px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border: 2px solid #5a3b1f;
+    border-radius: 7px 7px 0 0;
+    overflow: hidden;
+    background: #f5ead9;
+  }
+
+  .firmware-tab {
+    border: 0;
+    color: #2f2115;
+    background: linear-gradient(180deg, #fff8ed, #ead9c2);
+    font-size: 24px;
+    font-weight: 900;
     cursor: pointer;
   }
 
-  .mini-button.add {
-    min-width: 96px;
+  .firmware-tab:first-child {
+    border-right: 1px solid #7a5128;
   }
 
-  .scroll-wrap {
-    position: absolute;
-    top: 75px;
-    bottom: 0;
+  .firmware-tab.active {
+    color: #fff8ed;
+    background:
+      radial-gradient(circle at 45% 24%, rgba(255,255,255,0.18), transparent 35%),
+      linear-gradient(180deg, #bd6617, #955016);
+  }
+
+  .firmware-main {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 398px 1fr;
+    gap: 0;
+  }
+
+  .firmware-selector-panel {
+    position: relative;
+    min-height: 0;
+    border: 2px solid #5a3b1f;
+    border-top: 0;
+    border-radius: 0 0 7px 7px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.06), transparent 36%),
+      linear-gradient(180deg, var(--left-panel), var(--left-panel-2));
     overflow: hidden;
   }
 
-  .station-scroll-wrap {
-    left: 20px;
-    right: 0;
+  .firmware-filter-strip {
+    position: absolute;
+    left: 0;
+    right: 26px;
+    top: 0;
+    height: 60px;
+    display: flex;
+    align-items: center;
+    padding-left: 18px;
+    background: rgba(44, 34, 22, 0.17);
+    z-index: 4;
   }
 
-  .track-scroll-wrap {
-    left: 38px;
-    right: 0;
+  .filter-button {
+    width: 50px;
+    height: 42px;
+    border-radius: 8px;
+    border: 1px solid #d9b47f;
+    background: linear-gradient(180deg, #fff7ec, #ead8bf);
+    color: #2c1f14;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    box-shadow:
+      0 3px 7px rgba(0,0,0,0.16),
+      inset 0 1px 0 rgba(255,255,255,0.84);
   }
 
-  .content-scroll {
-    height: 100%;
+  .filter-button svg {
+    width: 27px;
+    height: 27px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 3.2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .filter-menu {
+    display: none;
+    position: absolute;
+    left: 18px;
+    right: 44px;
+    top: 52px;
+    border-radius: 12px;
+    border: 1px solid #d2a06a;
+    background:
+      radial-gradient(circle at 22% 0%, rgba(255,255,255,0.8), transparent 45%),
+      linear-gradient(180deg, #fff7eb, #ead7bd);
+    box-shadow: 0 16px 30px rgba(31, 16, 5, 0.32);
+    padding: 16px;
+    z-index: 50;
+  }
+
+  .filter-menu.show {
+    display: block;
+  }
+
+  .filter-section {
+    margin-bottom: 14px;
+  }
+
+  .filter-section:last-child {
+    margin-bottom: 0;
+  }
+
+  .filter-section-title {
+    margin: 0 0 9px;
+    font-size: 13px;
+    font-weight: 900;
+    color: #6b4c2f;
+    letter-spacing: 0.35px;
+    text-transform: uppercase;
+  }
+
+  .filter-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .filter-chip {
+    height: 33px;
+    border-radius: 999px;
+    border: 1px solid #b7884e;
+    background: linear-gradient(180deg, #fff9ef, #ead8c1);
+    color: #3c2a19;
+    padding: 0 12px;
+    font-size: 14px;
+    font-weight: 850;
+    cursor: pointer;
+  }
+
+  .filter-chip.active {
+    color: #fff7ed;
+    border-color: #813c09;
+    background: linear-gradient(180deg, #e27d25, #a94f10);
+  }
+
+  .firmware-list {
+    position: absolute;
+    left: 0;
+    right: 26px;
+    top: 60px;
+    bottom: 0;
+    padding: 18px 14px 22px 20px;
+    display: grid;
+    align-content: start;
+    gap: 16px;
     overflow-y: auto;
     overflow-x: hidden;
-    padding-right: 38px;
     scrollbar-width: none;
     -ms-overflow-style: none;
   }
 
-  .content-scroll::-webkit-scrollbar {
+  .firmware-list::-webkit-scrollbar {
     width: 0;
     height: 0;
   }
 
-  .station-list,
-  .track-list {
-    position: relative;
+  .firmware-card {
+    min-height: 138px;
+    border-radius: 11px;
+    border: 1px solid rgba(255, 229, 190, 0.24);
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)),
+      rgba(77, 60, 42, 0.72);
+    color: #fff4df;
+    padding: 18px;
+    cursor: pointer;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.10),
+      0 2px 5px rgba(0,0,0,0.16);
+  }
+
+  .firmware-card.selected {
+    border: 1px solid #eea54c;
+    background:
+      radial-gradient(circle at 22% 0%, rgba(255,255,255,0.22), transparent 40%),
+      linear-gradient(180deg, var(--selected-top), #cf761f 55%, var(--selected-bottom));
+    color: #fff;
+    box-shadow:
+      0 2px 8px rgba(69,32,5,0.28),
+      inset 0 1px 0 rgba(255,255,255,0.42);
+  }
+
+  .firmware-card-title {
+    font-size: 24px;
+    font-weight: 900;
+    line-height: 1.1;
+  }
+
+  .firmware-card-subtitle {
+    margin-top: 8px;
+    font-size: 16px;
+    line-height: 1.35;
+    color: rgba(255, 246, 229, 0.92);
+  }
+
+  .firmware-card-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 13px;
+  }
+
+  .firmware-card-tag {
+    border-radius: 999px;
+    padding: 4px 9px;
+    background: rgba(255,255,255,0.16);
+    color: rgba(255,255,255,0.96);
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  .firmware-details-panel {
+    min-height: 0;
+    border: 2px solid #5a3b1f;
+    border-top: 0;
+    border-left: 0;
+    border-radius: 0 0 7px 0;
+    background:
+      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.72), transparent 40%),
+      linear-gradient(180deg, #fff3e2, #fbf2e6 72%, #f4e4cd);
+    box-shadow:
+      0 9px 18px rgba(75,43,18,0.12),
+      inset 0 1px 0 rgba(255,255,255,0.42);
+    padding: 20px 22px 20px;
+    display: grid;
+    grid-template-rows: auto minmax(274px, 1fr) 72px;
+    gap: 16px;
+  }
+
+  .software-card,
+  .notes-card,
+  .custom-picker-card {
+    border-radius: 12px;
+    border: 1px solid #d0a875;
+    background:
+      radial-gradient(circle at 25% 0%, rgba(255,255,255,0.82), transparent 44%),
+      linear-gradient(180deg, #fff7eb, #ead7bd);
+    box-shadow:
+      0 7px 16px rgba(75,43,18,0.11),
+      inset 0 1px 0 rgba(255,255,255,0.82);
+  }
+
+  .software-card {
+    padding: 20px;
+  }
+
+  .software-title-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+
+  .software-title {
+    margin: 0;
+    font-size: 30px;
+    color: #2b1d11;
+  }
+
+  .firmware-badge {
+    border-radius: 999px;
+    padding: 5px 11px 6px;
+    font-size: 13px;
+    font-weight: 900;
+    color: #fff6ea;
+    background: linear-gradient(180deg, #df852f, #a94f10);
+  }
+
+  .firmware-badge.soft {
+    background: linear-gradient(180deg, #8b6240, #4a321e);
+  }
+
+  .software-description {
+    font-size: 18px;
+    line-height: 1.38;
+    color: #4f3d2b;
+    margin: 0;
+  }
+
+  .software-meta-grid {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: 160px 230px 1fr;
+    gap: 10px;
+  }
+
+  .software-meta {
+    border-radius: 10px;
+    border: 1px solid #d6bd99;
+    background: rgba(255, 250, 241, 0.62);
+    padding: 10px 12px;
+    min-width: 0;
+  }
+
+  .software-meta-label {
+    font-size: 12px;
+    color: #76604a;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .software-meta-value {
+    margin-top: 5px;
+    font-size: 16px;
+    color: #2d1f13;
+    font-weight: 800;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .repo-author {
+    color: #7b3c0d;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
+  .firmware-detail-middle {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .notes-card,
+  .custom-picker-card {
+    padding: 18px;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .card-title-line {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .detail-card-title {
+    margin: 0;
+    font-size: 23px;
+    color: #2b1d11;
+  }
+
+  .notes-pill {
+    border-radius: 999px;
+    padding: 4px 10px 5px;
+    background: #6e553b;
+    color: #fff4e6;
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  .notes-preview {
+    flex: 1;
+    min-height: 150px;
+    border-radius: 10px;
+    border: 1px solid #d5b287;
+    background: rgba(255, 250, 241, 0.72);
+    padding: 13px 15px;
+    font-size: 15px;
+    line-height: 1.35;
+    color: #4d3927;
+    overflow: auto;
+  }
+
+  .notes-preview ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+
+  .notes-preview li {
+    margin-bottom: 6px;
+  }
+
+  .notes-preview::-webkit-scrollbar {
+    width: 13px;
+  }
+
+  .notes-preview::-webkit-scrollbar-track {
+    background: #f4ead7;
+    border-left: 1px solid rgba(97, 66, 34, 0.28);
+  }
+
+  .notes-preview::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: linear-gradient(180deg, #f0ad5a, #bf5c16);
+    border: 3px solid #f4ead7;
+  }
+
+  .notes-card .small-button,
+  .custom-picker-card .small-button {
+    margin-top: 12px;
+    height: 46px;
+    font-size: 17px;
+    font-weight: 900;
+  }
+
+  .custom-side-stack {
+    display: none;
+    min-height: 0;
+  }
+
+  .custom-side-stack.show {
+    display: block;
+  }
+
+  .custom-picker-card {
+    height: 100%;
+  }
+
+  .custom-picker-copy {
+    margin: 0;
+    font-size: 16px;
+    line-height: 1.38;
+    color: #594431;
+  }
+
+  .choose-firmware-button {
+    width: 100%;
+    margin-top: 18px;
+  }
+
+  .selected-custom-file {
+    margin-top: 14px;
+    border-radius: 10px;
+    border: 1px solid #d2ae7e;
+    background: rgba(255, 250, 241, 0.72);
+    padding: 12px 13px;
+    font-size: 16px;
+    color: #3f2e1e;
+  }
+
+  .firmware-detail-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .firmware-install-status {
+    margin-right: auto;
+    font-size: 18px;
+    color: #5d4732;
+  }
+
+  .firmware-progress {
+    width: 260px;
+    height: 18px;
+    border-radius: 999px;
+    border: 1px solid #a8703d;
+    background: linear-gradient(180deg, #f9efe0, #f0dfca);
+    overflow: hidden;
+    box-shadow: inset 0 2px 4px rgba(73,43,17,0.2);
+    display: none;
+  }
+
+  .firmware-progress.show {
+    display: block;
+  }
+
+  .firmware-progress-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #e8994d, #cc6c1f 58%, #a74d12);
+    transition: width 180ms ease;
+  }
+
+  .firmware-install-button {
+    height: 62px;
+    width: 248px;
+    border-radius: 7px;
+    border: 2px solid #813c09;
+    background: linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
+    color: white;
+    font-size: 21px;
+    font-weight: 900;
+    box-shadow:
+      0 4px 8px rgba(86,41,5,0.28),
+      inset 0 1px 0 rgba(255,255,255,0.32);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 13px;
+    cursor: pointer;
+  }
+
+  .install-firmware-svg {
+    width: 28px;
+    height: 28px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 2.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .custom-scrollbar {
@@ -531,23 +944,14 @@
     top: 0;
     right: 0;
     bottom: 0;
-    width: 30px;
+    width: 26px;
     display: grid;
-    grid-template-rows: 38px 1fr 38px;
-    z-index: 10;
+    grid-template-rows: 36px 1fr 36px;
+    z-index: 12;
     user-select: none;
-  }
-
-  .station-custom-scrollbar {
-    background: #625642;
-    border-left: 1px solid rgba(28, 18, 10, 0.58);
-    border-right: 1px solid rgba(255, 240, 210, 0.14);
-  }
-
-  .track-custom-scrollbar {
-    background: #f7efe3;
-    border-left: 1px solid #d3b995;
-    border-right: 1px solid rgba(83, 52, 24, 0.22);
+    background: #f4ead7;
+    border-left: 1px solid rgba(97, 66, 34, 0.35);
+    border-right: 1px solid rgba(255,255,255,0.55);
   }
 
   .scroll-arrow {
@@ -556,6 +960,7 @@
     position: relative;
     cursor: pointer;
     padding: 0;
+    color: #2d1f13;
   }
 
   .scroll-arrow::before {
@@ -563,35 +968,19 @@
     position: absolute;
     left: 50%;
     top: 50%;
-    width: 13px;
-    height: 13px;
-    border-top: 3px solid currentColor;
-    border-left: 3px solid currentColor;
+    width: 10px;
+    height: 10px;
+    border-top: 2px solid currentColor;
+    border-left: 2px solid currentColor;
     transform-origin: center;
   }
 
   .scroll-up::before {
-    transform: translate(-50%, -32%) rotate(45deg);
+    transform: translate(-50%, -18%) rotate(45deg);
   }
 
   .scroll-down::before {
-    transform: translate(-50%, -68%) rotate(225deg);
-  }
-
-  .station-custom-scrollbar .scroll-arrow {
-    color: #f3dcc0;
-  }
-
-  .track-custom-scrollbar .scroll-arrow {
-    color: #543a23;
-  }
-
-  .scroll-arrow:hover {
-    background: rgba(255, 255, 255, 0.08);
-  }
-
-  .track-custom-scrollbar .scroll-arrow:hover {
-    background: rgba(122, 78, 37, 0.08);
+    transform: translate(-50%, -82%) rotate(225deg);
   }
 
   .scroll-track {
@@ -604,235 +993,21 @@
     position: absolute;
     left: 8px;
     top: 0;
-    width: 14px;
-    min-height: 64px;
+    width: 10px;
+    min-height: 88px;
     border-radius: 999px;
     background:
-      linear-gradient(180deg, #eba04d 0%, #db852e 42%, #c46617 100%);
-    border: 1px solid #9f4c12;
+      linear-gradient(180deg, #f0ad5a 0%, #db852e 45%, #bf5c16 100%);
+    border: 1px solid #a55112;
     box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.42),
-      inset 0 -1px 0 rgba(67, 32, 9, 0.28),
-      0 1px 3px rgba(0, 0, 0, 0.24);
+      inset 0 1px 0 rgba(255,255,255,0.42),
+      inset 0 -1px 0 rgba(67,32,9,0.28),
+      0 1px 2px rgba(0,0,0,0.22);
     cursor: grab;
   }
 
   .scroll-thumb:active {
     cursor: grabbing;
-  }
-
-  .custom-scrollbar.not-scrollable .scroll-thumb {
-    opacity: 0.36;
-  }
-
-  .custom-scrollbar.not-scrollable .scroll-arrow {
-    opacity: 0.45;
-    cursor: default;
-  }
-
-  .station-row {
-    min-height: 84px;
-    display: grid;
-    grid-template-columns: 30px 40px 1fr 75px 32px;
-    align-items: center;
-    padding: 0 13px;
-    margin-right: 4px;
-    border-bottom: 1px solid rgba(255,255,255,0.14);
-    font-size: 21px;
-    color: #fff4df;
-    cursor: pointer;
-  }
-
-  .station-row .drag {
-    font-size: 27px;
-    opacity: 0.88;
-  }
-
-  .station-row .number {
-    font-size: 18px;
-    opacity: 0.92;
-  }
-
-  .station-row .name {
-    font-size: 24px;
-    font-weight: 700;
-  }
-
-  .station-row .count {
-    text-align: right;
-    font-size: 19px;
-  }
-
-  .station-row .edit {
-    display: none;
-    font-size: 24px;
-    cursor: pointer;
-  }
-
-  .station-row.selected {
-    border: 1px solid #eea54c;
-    border-radius: 7px;
-    background:
-      linear-gradient(180deg, var(--selected-2), #cf761f 55%, #ad5514);
-    box-shadow:
-      0 2px 6px rgba(69,32,5,0.26),
-      inset 0 1px 0 rgba(255,255,255,0.42);
-    color: white;
-    margin-bottom: 8px;
-  }
-
-  .station-row.selected .edit {
-    display: block;
-  }
-
-  .track-row {
-    min-height: 78px;
-    display: grid;
-    grid-template-columns: 52px 1fr 92px 78px 34px;
-    align-items: center;
-    border-bottom: 1px solid #dfc9a8;
-    padding: 0 22px;
-    margin-right: 4px;
-    color: #281c12;
-    cursor: pointer;
-  }
-
-  .track-row .num {
-    font-size: 19px;
-    color: #4d3d2c;
-  }
-
-  .track-title {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-  }
-
-  .track-name {
-    font-size: 24px;
-    font-weight: 750;
-    line-height: 1.05;
-  }
-
-  .artist {
-    margin-top: 5px;
-    font-size: 17px;
-    color: #4f3e2c;
-  }
-
-  .duration,
-  .format {
-    font-size: 18px;
-    color: #3f3022;
-  }
-
-  .track-row .edit {
-    display: none;
-    font-size: 23px;
-    cursor: pointer;
-  }
-
-  .track-row.selected {
-    border: 1px solid #eca34a;
-    border-radius: 7px;
-    background:
-      linear-gradient(180deg, #fff0d7, #ffdfaa);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,0.72);
-    margin-bottom: 7px;
-  }
-
-  .track-row.selected .edit {
-    display: block;
-  }
-
-  .actions {
-    position: absolute;
-    right: 18px;
-    bottom: 28px;
-    display: flex;
-    align-items: center;
-    gap: 17px;
-  }
-
-  .primary-action {
-    height: 62px;
-    width: 246px;
-    border-radius: 7px;
-    border: 2px solid #813c09;
-    background:
-      linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
-    color: white;
-    font-size: 22px;
-    font-weight: 700;
-    box-shadow:
-      0 4px 8px rgba(86,41,5,0.28),
-      inset 0 1px 0 rgba(255,255,255,0.32);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 13px;
-    cursor: pointer;
-  }
-
-  .secondary-action {
-    height: 62px;
-    width: 248px;
-    border-radius: 7px;
-    border: 2px solid #9b6a36;
-    background:
-      linear-gradient(180deg, #fff7ec, #ead8bf);
-    color: #352516;
-    font-size: 22px;
-    font-weight: 650;
-    box-shadow:
-      0 3px 7px rgba(72,38,10,0.13),
-      inset 0 1px 0 rgba(255,255,255,0.84);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 13px;
-    cursor: pointer;
-  }
-
-  .sd-icon {
-    width: 22px;
-    height: 26px;
-    border: 2px solid currentColor;
-    border-radius: 3px;
-    position: relative;
-  }
-
-  .sd-icon::before {
-    content: "";
-    position: absolute;
-    left: 4px;
-    top: 4px;
-    width: 4px;
-    height: 5px;
-    background: currentColor;
-    box-shadow: 6px 0 0 currentColor, 12px 0 0 currentColor;
-  }
-
-  .eject-icon {
-    width: 0;
-    height: 0;
-    border-left: 11px solid transparent;
-    border-right: 11px solid transparent;
-    border-bottom: 16px solid currentColor;
-    position: relative;
-    transform: translateY(-3px);
-  }
-
-  .eject-icon::after {
-    content: "";
-    position: absolute;
-    left: -13px;
-    top: 21px;
-    width: 26px;
-    height: 4px;
-    background: currentColor;
-    border-radius: 2px;
   }
 
   .placeholder-page {
@@ -843,7 +1018,6 @@
     border: 1px solid #d6bd99;
     border-radius: 12px;
     background: rgba(255, 248, 238, 0.72);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
     text-align: center;
   }
 
@@ -858,7 +1032,7 @@
 
   .placeholder-card p {
     font-size: 21px;
-    color: var(--text-soft);
+    color: var(--soft-text);
     line-height: 1.45;
   }
 
@@ -866,14 +1040,13 @@
     position: absolute;
     right: 32px;
     bottom: 78px;
-    z-index: 20;
+    z-index: 80;
     min-width: 300px;
     max-width: 520px;
     padding: 16px 20px;
     border-radius: 10px;
     border: 1px solid #b8874e;
-    background:
-      linear-gradient(180deg, #fff8ee, #f0ddc2);
+    background: linear-gradient(180deg, #fff8ee, #f0ddc2);
     box-shadow: 0 10px 25px rgba(54, 27, 5, 0.22);
     color: #2c1f14;
     font-size: 18px;
@@ -891,7 +1064,7 @@
   .modal-backdrop {
     position: absolute;
     inset: 0;
-    z-index: 30;
+    z-index: 70;
     display: none;
     place-items: center;
     background:
@@ -905,7 +1078,7 @@
   }
 
   .modal-window {
-    width: 890px;
+    width: 760px;
     border-radius: 16px;
     border: 1px solid #b98a55;
     background:
@@ -917,10 +1090,6 @@
     overflow: hidden;
   }
 
-  .confirm-window {
-    width: 650px;
-  }
-
   .modal-header {
     height: 78px;
     padding: 0 28px 0 32px;
@@ -930,10 +1099,6 @@
       linear-gradient(180deg, rgba(255,255,255,0.07), rgba(0,0,0,0.14)),
       linear-gradient(180deg, #4a341f, #2d1d10);
     color: #fff5e6;
-  }
-
-  .modal-title-group {
-    min-width: 0;
   }
 
   .modal-title {
@@ -965,109 +1130,23 @@
     padding: 30px 32px 28px;
   }
 
-  .sync-options {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 22px;
-  }
-
-  .sync-card {
-    min-height: 322px;
-    border-radius: 14px;
-    border: 1px solid #c7a06d;
-    background:
-      radial-gradient(circle at 25% 0%, rgba(255,255,255,0.9), transparent 42%),
-      linear-gradient(180deg, #fff7eb, #ead7bd);
-    box-shadow:
-      0 8px 20px rgba(90, 49, 14, 0.13),
-      inset 0 1px 0 rgba(255,255,255,0.84);
-    padding: 24px 24px 22px;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .sync-card.full-refresh {
-    border-color: #b87a46;
-    background:
-      radial-gradient(circle at 25% 0%, rgba(255,255,255,0.9), transparent 42%),
-      linear-gradient(180deg, #fff4e5, #ecd1b5);
-  }
-
-  .card-topline {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 16px;
-    flex-wrap: wrap;
-  }
-
-  .sync-card h3 {
-    margin: 0;
-    font-size: 28px;
-    color: #2b1d11;
-  }
-
-  .badge {
-    border-radius: 999px;
-    padding: 5px 11px 6px;
-    font-size: 13px;
-    font-weight: 800;
-    letter-spacing: 0.2px;
-    color: #fff6ea;
-    background: linear-gradient(180deg, #df852f, #a94f10);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.28);
-  }
-
-  .badge.alt {
-    background: linear-gradient(180deg, #8b6240, #4a321e);
-  }
-
-  .sync-card p {
-    margin: 0;
-    font-size: 19px;
-    line-height: 1.42;
-    color: #4f3d2b;
-  }
-
-  .helper-text {
-    margin-top: auto;
-    padding-top: 18px;
-    font-size: 16px;
-    color: #705640;
-  }
-
-  .modal-button {
-    height: 54px;
-    margin-top: 18px;
-    border-radius: 9px;
-    border: 2px solid #813c09;
-    background:
-      linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
-    color: white;
-    font-size: 20px;
-    font-weight: 750;
-    box-shadow:
-      0 4px 8px rgba(86,41,5,0.23),
-      inset 0 1px 0 rgba(255,255,255,0.32);
-    cursor: pointer;
-  }
-
-  .sync-card .modal-button {
+  .notes-editor {
     width: 100%;
+    min-height: 290px;
+    border-radius: 12px;
+    border: 1px solid #c7a06d;
+    background: rgba(255, 250, 241, 0.82);
+    padding: 18px 20px;
+    font-size: 18px;
+    line-height: 1.45;
+    color: #3d2b1c;
+    resize: none;
+    outline: none;
   }
 
-  .modal-button.secondary {
-    border-color: #9b6a36;
-    background:
-      linear-gradient(180deg, #fff7ec, #ead8bf);
-    color: #352516;
-  }
-
-  .modal-button.danger {
-    border-color: #752617;
-    background:
-      linear-gradient(180deg, #cf5a38, #a83a22 58%, #802715);
-    color: #fff7ed;
+  .notes-editor[readonly] {
+    color: #4d3927;
+    background: rgba(255, 250, 241, 0.58);
   }
 
   .modal-footer {
@@ -1077,46 +1156,22 @@
     padding: 0 32px 30px;
   }
 
-  .modal-footer .modal-button {
-    width: 160px;
-    margin-top: 0;
-  }
-
-  .confirm-body {
-    padding: 30px 34px 8px;
-  }
-
-  .confirm-body p {
-    margin: 0 0 18px;
-    font-size: 20px;
-    line-height: 1.45;
-    color: #45311f;
-  }
-
-  .safety-note {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    margin-top: 18px;
-    padding: 16px 18px;
-    border-radius: 12px;
-    border: 1px solid #d1a979;
-    background: rgba(255, 246, 232, 0.72);
-    color: #5c4128;
-    font-size: 17px;
-    line-height: 1.35;
-  }
-
-  .safety-icon {
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    flex: 0 0 26px;
-    display: grid;
-    place-items: center;
-    background: #d46f1a;
+  .modal-button {
+    height: 54px;
+    min-width: 160px;
+    border-radius: 9px;
+    border: 2px solid #813c09;
+    background: linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
     color: white;
+    font-size: 20px;
     font-weight: 800;
+    cursor: pointer;
+  }
+
+  .modal-button.secondary {
+    border-color: #9b6a36;
+    background: linear-gradient(180deg, #fff7ec, #ead8bf);
+    color: #352516;
   }
 
   .hidden-file {
@@ -1131,406 +1186,430 @@
 </head>
 
 <body>
-  <div class="scale-shell" id="scaleShell">
-    <div class="app" id="app">
+<div class="scale-shell" id="scaleShell">
+  <div class="app" id="app">
 
-      <header class="title-bar">
-        <div class="app-title">
-          <svg class="radio-icon" viewBox="0 0 64 64" aria-hidden="true">
-            <defs>
-              <linearGradient id="radioGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0" stop-color="#ffb357"/>
-                <stop offset="1" stop-color="#c45b11"/>
-              </linearGradient>
-            </defs>
-            <rect x="7" y="19" width="48" height="34" rx="6" fill="url(#radioGrad)" stroke="#f6c07a" stroke-width="2"/>
-            <path d="M18 18 L39 8" stroke="#ffd18e" stroke-width="4" stroke-linecap="round"/>
-            <circle cx="44" cy="40" r="6" fill="#4a2e16"/>
-            <path d="M15 29h23M15 36h20M15 43h17" stroke="#4a2e16" stroke-width="3" stroke-linecap="round"/>
-            <rect x="12" y="23" width="11" height="7" rx="2" fill="#ffe0a8"/>
+    <header class="title-bar">
+      <div class="app-title">
+        <svg class="radio-icon" viewBox="0 0 64 64" aria-hidden="true">
+          <defs>
+            <linearGradient id="radioGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#ffb357"/>
+              <stop offset="1" stop-color="#c45b11"/>
+            </linearGradient>
+          </defs>
+          <rect x="7" y="19" width="48" height="34" rx="6" fill="url(#radioGrad)" stroke="#f6c07a" stroke-width="2"/>
+          <path d="M18 18 L39 8" stroke="#ffd18e" stroke-width="4" stroke-linecap="round"/>
+          <circle cx="44" cy="40" r="6" fill="#4a2e16"/>
+          <path d="M15 29h23M15 36h20M15 43h17" stroke="#4a2e16" stroke-width="3" stroke-linecap="round"/>
+          <rect x="12" y="23" width="11" height="7" rx="2" fill="#ffe0a8"/>
+        </svg>
+        <span>Vintage Radio Music Manager</span>
+      </div>
+
+      <div class="window-controls">
+        <div class="win-control min" id="minimizeBtn">−</div>
+        <div class="win-control max" id="maximizeBtn">□</div>
+        <div class="win-control close" id="closeBtn">×</div>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <nav class="nav">
+        <div class="nav-item" data-page="loadMusic">
+          <svg viewBox="0 0 80 80" aria-hidden="true">
+            <path d="M24 17v30" />
+            <path d="M24 17l22-6v30" />
+            <circle cx="18" cy="50" r="6" />
+            <circle cx="40" cy="44" r="6" />
+            <rect x="48" y="34" width="18" height="27" rx="3" />
+            <path d="M53 39h8M53 45h8M53 51h8" />
+            <path d="M56 15c9 5 15 13 16 23" />
+            <path d="M72 38l-6-5" />
+            <path d="M72 38l5-6" />
           </svg>
-          <span>Vintage Radio Music Manager</span>
+          <div>Load Music</div>
         </div>
 
-        <div class="window-controls">
-          <div class="win-control min" id="minimizeBtn">−</div>
-          <div class="win-control max" id="maximizeBtn">□</div>
-          <div class="win-control close" id="closeBtn">×</div>
+        <div class="nav-item active" data-page="firmware">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="19" y="17" width="26" height="30" rx="3"/>
+            <path d="M24 9v8M32 9v8M40 9v8M24 47v8M32 47v8M40 47v8"/>
+            <path d="M11 23h8M11 32h8M11 41h8M45 23h8M45 32h8M45 41h8"/>
+            <path d="M32 22v17"/>
+            <path d="M24 32l8 8 8-8"/>
+          </svg>
+          <div>Install Firmware</div>
         </div>
-      </header>
 
-      <aside class="sidebar">
-        <nav class="nav">
-          <div class="nav-item active" data-page="loadMusic">
-            <svg viewBox="0 0 80 80" aria-hidden="true">
-              <path d="M24 17v30" />
-              <path d="M24 17l22-6v30" />
-              <circle cx="18" cy="50" r="6" />
-              <circle cx="40" cy="44" r="6" />
-              <rect x="48" y="34" width="18" height="27" rx="3" />
-              <path d="M53 39h8M53 45h8M53 51h8" />
-              <path d="M56 15c9 5 15 13 16 23" />
-              <path d="M72 38l-6-5" />
-              <path d="M72 38l5-6" />
-              <path d="M24 66C14 62 8 53 8 42" />
-              <path d="M8 42l5 6" />
-              <path d="M8 42l-5 6" />
-            </svg>
-            <div>Load Music</div>
+        <div class="nav-divider"></div>
+
+        <div class="nav-item" data-page="tools">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <path d="M22 12l8 8-9 9-8-8z"/>
+            <path d="M20 30L8 42l14 14 12-12"/>
+            <path d="M45 9a11 11 0 0 0-9 16L13 48l6 6 23-23a11 11 0 0 0 16-12l-8 8-7-7 8-8a11 11 0 0 0-6-3z"/>
+          </svg>
+          <div>Tools</div>
+        </div>
+
+        <div class="spacer"></div>
+
+        <div class="nav-item small-nav" data-page="settings">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="32" r="8"/>
+            <path d="M32 6v8M32 50v8M6 32h8M50 32h8"/>
+            <path d="M13.6 13.6l5.7 5.7M44.7 44.7l5.7 5.7M50.4 13.6l-5.7 5.7M19.3 44.7l-5.7 5.7"/>
+          </svg>
+          <div>Settings</div>
+        </div>
+
+        <div class="nav-divider"></div>
+
+        <div class="nav-item small-nav" data-page="help">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="32" r="24"/>
+            <path d="M25 25a8 8 0 1 1 13 6c-4 3-6 5-6 10"/>
+            <path d="M32 50h.1"/>
+          </svg>
+          <div>Help</div>
+        </div>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <section class="library-bar">
+        <div class="library-label">Library:</div>
+        <select class="library-select" id="librarySelect"></select>
+        <button class="top-button" id="newLibraryBtn">New</button>
+        <button class="top-button" id="renameLibraryBtn">Rename</button>
+        <button class="top-button" id="deleteLibraryBtn">Delete</button>
+      </section>
+
+      <section class="page" id="loadMusicPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Load Music</h1>
+            <p>The music loading layout can stay wired here while we refine the firmware tab.</p>
           </div>
+        </div>
+      </section>
 
-          <div class="nav-item" data-page="firmware">
-            <svg viewBox="0 0 64 64" aria-hidden="true">
-              <rect x="19" y="17" width="26" height="30" rx="3"/>
-              <path d="M24 9v8M32 9v8M40 9v8M24 47v8M32 47v8M40 47v8"/>
-              <path d="M11 23h8M11 32h8M11 41h8M45 23h8M45 32h8M45 41h8"/>
-              <path d="M32 22v17"/>
-              <path d="M24 32l8 8 8-8"/>
-            </svg>
-            <div>Install Firmware</div>
-          </div>
-
-          <div class="nav-divider"></div>
-
-          <div class="nav-item" data-page="tools">
-            <svg viewBox="0 0 64 64" aria-hidden="true">
-              <path d="M22 12l8 8-9 9-8-8z"/>
-              <path d="M20 30L8 42l14 14 12-12"/>
-              <path d="M45 9a11 11 0 0 0-9 16L13 48l6 6 23-23a11 11 0 0 0 16-12l-8 8-7-7 8-8a11 11 0 0 0-6-3z"/>
-            </svg>
-            <div>Tools</div>
-          </div>
-
-          <div class="spacer"></div>
-
-          <div class="nav-item small-nav" data-page="settings">
-            <svg viewBox="0 0 64 64" aria-hidden="true">
-              <circle cx="32" cy="32" r="8"/>
-              <path d="M32 6v8M32 50v8M6 32h8M50 32h8"/>
-              <path d="M13.6 13.6l5.7 5.7M44.7 44.7l5.7 5.7M50.4 13.6l-5.7 5.7M19.3 44.7l-5.7 5.7"/>
-            </svg>
-            <div>Settings</div>
-          </div>
-
-          <div class="nav-divider"></div>
-
-          <div class="nav-item small-nav" data-page="help">
-            <svg viewBox="0 0 64 64" aria-hidden="true">
-              <circle cx="32" cy="32" r="24"/>
-              <path d="M25 25a8 8 0 1 1 13 6c-4 3-6 5-6 10"/>
-              <path d="M32 50h.1"/>
-            </svg>
-            <div>Help</div>
-          </div>
-        </nav>
-      </aside>
-
-      <main class="main">
-        <section class="library-bar">
-          <div class="library-label">Library:</div>
-
-          <select class="library-select" id="librarySelect"></select>
-
-          <button class="top-button" id="newLibraryBtn">New</button>
-          <button class="top-button" id="renameLibraryBtn">Rename</button>
-          <button class="top-button" id="deleteLibraryBtn">Delete</button>
-        </section>
-
-        <section class="page active" id="loadMusicPage">
-          <section class="storage">
-            <h2>Storage</h2>
-
-            <div class="storage-row">
-              <div class="drive-text" id="driveText">SD Drive: G:\ (VINTAGER)</div>
-
-              <div class="capacity-bar">
-                <div class="capacity-fill" id="capacityFill"></div>
-              </div>
-
-              <div class="usage" id="usageText">31% used</div>
-              <div class="capacity-text" id="capacityText">9.3/29.0 GB</div>
-
-              <button class="outline-button" id="detectSdBtn">Detect</button>
-              <button class="outline-button" id="selectSdBtn">Select</button>
+      <section class="page active" id="firmwarePage">
+        <div class="firmware-page-content">
+          <section class="device-panel">
+            <div class="device-icon">
+              <svg viewBox="0 0 64 64" aria-hidden="true">
+                <rect x="18" y="14" width="28" height="36" rx="4"/>
+                <path d="M24 7v7M32 7v7M40 7v7M24 50v7M32 50v7M40 50v7"/>
+                <path d="M10 24h8M10 32h8M10 40h8M46 24h8M46 32h8M46 40h8"/>
+                <path d="M32 20v19"/>
+                <path d="M24 31l8 8 8-8"/>
+              </svg>
             </div>
+
+            <div>
+              <h2 class="device-title" id="deviceTitle">Raspberry Pi Pico detected</h2>
+              <div class="device-meta">
+                <span class="device-status" id="deviceStatus">Connected</span>
+                <span id="deviceMetaText">COM6 · RP2040 · DFPlayer · MicroPython detected</span>
+              </div>
+            </div>
+
+            <button class="device-button primary" id="detectDeviceBtn" type="button">Autodetect</button>
+            <button class="device-button" id="chooseDeviceBtn" type="button">Choose Device</button>
           </section>
 
-          <section class="split-panel">
-            <div class="pane stations-pane">
-              <div class="pane-header">
-                <span>Stations</span>
-                <button class="mini-button" id="newStationBtn">＋ New</button>
-              </div>
+          <section class="firmware-tabs-wide">
+            <button class="firmware-tab active" id="officialFirmwareTab" type="button">Official Firmware</button>
+            <button class="firmware-tab" id="customFirmwareTab" type="button">Custom Firmware</button>
+          </section>
 
-              <div class="scroll-wrap station-scroll-wrap">
-                <div class="station-list content-scroll" id="stationList"></div>
+          <section class="firmware-main">
+            <aside class="firmware-selector-panel">
+              <div class="firmware-filter-strip">
+                <button class="filter-button" id="filterButton" type="button" aria-label="Filter firmware">
+                  <svg viewBox="0 0 64 64" aria-hidden="true">
+                    <path d="M13 16h38L37 33v15l-10 6V33z"/>
+                  </svg>
+                </button>
 
-                <div class="custom-scrollbar station-custom-scrollbar" data-target="stationList">
-                  <button class="scroll-arrow scroll-up" type="button" aria-label="Scroll stations up"></button>
-
-                  <div class="scroll-track">
-                    <div class="scroll-thumb"></div>
+                <div class="filter-menu" id="filterMenu">
+                  <div class="filter-section">
+                    <div class="filter-section-title">Microcontroller</div>
+                    <div class="filter-chip-row" id="microcontrollerChips"></div>
                   </div>
 
-                  <button class="scroll-arrow scroll-down" type="button" aria-label="Scroll stations down"></button>
-                </div>
-              </div>
-            </div>
-
-            <div class="pane tracks-pane">
-              <div class="pane-header">
-                <span>Tracks</span>
-                <button class="mini-button add" id="addTracksBtn">＋ Add</button>
-              </div>
-
-              <div class="scroll-wrap track-scroll-wrap">
-                <div class="track-list content-scroll" id="trackList"></div>
-
-                <div class="custom-scrollbar track-custom-scrollbar" data-target="trackList">
-                  <button class="scroll-arrow scroll-up" type="button" aria-label="Scroll tracks up"></button>
-
-                  <div class="scroll-track">
-                    <div class="scroll-thumb"></div>
+                  <div class="filter-section">
+                    <div class="filter-section-title">MP3 Controller</div>
+                    <div class="filter-chip-row" id="mp3ControllerChips"></div>
                   </div>
-
-                  <button class="scroll-arrow scroll-down" type="button" aria-label="Scroll tracks down"></button>
                 </div>
               </div>
-            </div>
-          </section>
 
-          <section class="actions">
-            <button class="primary-action" id="syncBtn">
-              <span class="sd-icon"></span>
-              <span id="syncBtnText">Sync to SD Card</span>
-            </button>
+              <div class="firmware-list" id="firmwareList"></div>
 
-            <button class="secondary-action" id="removeSdBtn">
-              <span class="eject-icon"></span>
-              <span>Safely Remove SD</span>
-            </button>
-          </section>
-        </section>
+              <div class="custom-scrollbar firmware-custom-scrollbar" data-target="firmwareList">
+                <button class="scroll-arrow scroll-up" type="button" aria-label="Scroll firmware up"></button>
+                <div class="scroll-track">
+                  <div class="scroll-thumb"></div>
+                </div>
+                <button class="scroll-arrow scroll-down" type="button" aria-label="Scroll firmware down"></button>
+              </div>
+            </aside>
 
-        <section class="page" id="firmwarePage">
-          <div class="placeholder-page">
-            <div class="placeholder-card">
-              <h1>Install Firmware</h1>
-              <p>This is a placeholder firmware screen. Replace it with the firmware card layout once you wire up device detection and MicroPython firmware installation.</p>
-            </div>
-          </div>
-        </section>
+            <section class="firmware-details-panel">
+              <article class="software-card">
+                <div class="software-title-row">
+                  <h2 class="software-title" id="softwareTitle">Vintage Radio Basic Firmware</h2>
+                  <span class="firmware-badge" id="softwareBadge">Official</span>
+                </div>
 
-        <section class="page" id="toolsPage">
-          <div class="placeholder-page">
-            <div class="placeholder-card">
-              <h1>Tools</h1>
-              <p>Future utilities, conversion tools, SD diagnostics, and repair actions can live here.</p>
-            </div>
-          </div>
-        </section>
-
-        <section class="page" id="settingsPage">
-          <div class="placeholder-page">
-            <div class="placeholder-card">
-              <h1>Settings</h1>
-              <p>Theme, conversion profile defaults, sync behavior, and device preferences can live here.</p>
-            </div>
-          </div>
-        </section>
-
-        <section class="page" id="helpPage">
-          <div class="placeholder-page">
-            <div class="placeholder-card">
-              <h1>Help</h1>
-              <p>Guides, button controls, firmware notes, and troubleshooting can live here.</p>
-            </div>
-          </div>
-        </section>
-
-        <div class="modal-backdrop" id="syncChoiceModal" aria-hidden="true">
-          <div class="modal-window" role="dialog" aria-modal="true" aria-labelledby="syncChoiceTitle">
-            <header class="modal-header">
-              <div class="modal-title-group">
-                <h2 class="modal-title" id="syncChoiceTitle">Sync music to SD card</h2>
-                <p class="modal-subtitle" id="syncChoiceSubtitle">
-                  Choose how you want to update G:\ (VINTAGER) from My Jazz Collection.
+                <p class="software-description" id="softwareDescription">
+                  A clean starter firmware for the Vintage Radio player.
                 </p>
-              </div>
 
-              <button class="modal-close" id="closeSyncChoiceBtn" type="button" aria-label="Close">×</button>
-            </header>
-
-            <div class="modal-body">
-              <div class="sync-options">
-                <article class="sync-card">
-                  <div class="card-topline">
-                    <h3>Sync Changes</h3>
-                    <span class="badge">Update</span>
+                <div class="software-meta-grid">
+                  <div class="software-meta">
+                    <div class="software-meta-label">Version</div>
+                    <div class="software-meta-value" id="softwareVersion">v1.0</div>
                   </div>
 
-                  <p>
-                    Update only the stations and tracks that changed since your last sync.
-                    Existing music stays in place, so this usually finishes faster.
-                  </p>
-
-                  <div class="helper-text">Best for regular updates.</div>
-
-                  <button class="modal-button" id="syncChangesBtn" type="button">
-                    Sync Changes
-                  </button>
-                </article>
-
-                <article class="sync-card full-refresh">
-                  <div class="card-topline">
-                    <h3>Replace All Music</h3>
-                    <span class="badge alt">Full refresh</span>
+                  <div class="software-meta">
+                    <div class="software-meta-label">Device</div>
+                    <div class="software-meta-value" id="softwareDevice">DFPlayer + RP2040</div>
                   </div>
 
-                  <p>
-                    Formats the SD card, then reloads the entire selected library from scratch.
-                    Use this when loading a new library, making many changes, or starting fresh.
-                  </p>
+                  <div class="software-meta">
+                    <div class="software-meta-label">Author</div>
+                    <div class="software-meta-value">
+                      <a class="repo-author" id="softwareAuthor" href="#" target="_blank" rel="noopener noreferrer">Vintage Radio Project</a>
+                    </div>
+                  </div>
+                </div>
+              </article>
 
-                  <div class="helper-text">Best for new libraries, big changes, or a clean start.</div>
+              <div class="firmware-detail-middle" id="firmwareDetailMiddle">
+                <article class="notes-card" id="firmwareNotesCard">
+                  <div class="card-title-line">
+                    <h3 class="detail-card-title">Firmware Notes</h3>
+                    <span class="notes-pill">Read-only</span>
+                  </div>
 
-                  <button class="modal-button secondary" id="replaceAllMusicBtn" type="button">
-                    Replace All Music
-                  </button>
+                  <div class="notes-preview" id="firmwareNotesPreview"></div>
+                  <button class="small-button" id="viewFirmwareNotesBtn" type="button">View Details</button>
                 </article>
-              </div>
-            </div>
 
-            <footer class="modal-footer">
-              <button class="modal-button secondary" id="cancelSyncChoiceBtn" type="button">Cancel</button>
-            </footer>
+                <article class="notes-card" id="userNotesCard">
+                  <div class="card-title-line">
+                    <h3 class="detail-card-title" id="userNotesTitle">User Notes</h3>
+                    <span class="notes-pill">Editable</span>
+                  </div>
+
+                  <div class="notes-preview" id="userNotesPreview"></div>
+                  <button class="small-button" id="editUserNotesBtn" type="button">Edit Notes</button>
+                </article>
+
+                <div class="custom-side-stack" id="customSideStack">
+                  <article class="custom-picker-card">
+                    <div class="card-title-line">
+                      <h3 class="detail-card-title">Choose custom firmware</h3>
+                    </div>
+
+                    <p class="custom-picker-copy">
+                      Select a firmware folder path or a UF2 file. UF2 files install directly; folders copy firmware files after MicroPython setup if needed.
+                    </p>
+
+                    <button class="small-button choose-firmware-button" id="chooseCustomFirmwareBtn" type="button">
+                      Choose Firmware
+                    </button>
+
+                    <div class="selected-custom-file" id="selectedCustomFile">No custom firmware selected yet.</div>
+                  </article>
+                </div>
+              </div>
+
+              <div class="firmware-detail-actions">
+                <div class="firmware-install-status" id="firmwareInstallStatus">Ready to install.</div>
+
+                <div class="firmware-progress" id="firmwareProgress">
+                  <div class="firmware-progress-fill" id="firmwareProgressFill"></div>
+                </div>
+
+                <button class="firmware-install-button" id="installFirmwareBtn" type="button">
+                  <svg class="install-firmware-svg" viewBox="0 0 64 64" aria-hidden="true">
+                    <rect x="14" y="12" width="36" height="40" rx="5"/>
+                    <path d="M24 7v5M32 7v5M40 7v5M24 52v5M32 52v5M40 52v5"/>
+                    <path d="M8 24h6M8 32h6M8 40h6M50 24h6M50 32h6M50 40h6"/>
+                    <path d="M32 20v18"/>
+                    <path d="M24 31l8 8 8-8"/>
+                  </svg>
+                  <span>Install Firmware</span>
+                </button>
+              </div>
+            </section>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="toolsPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Tools</h1>
+            <p>Future utilities, conversion tools, SD diagnostics, and repair actions can live here.</p>
           </div>
         </div>
+      </section>
 
-        <div class="modal-backdrop" id="replaceConfirmModal" aria-hidden="true">
-          <div class="modal-window confirm-window" role="dialog" aria-modal="true" aria-labelledby="replaceConfirmTitle">
-            <header class="modal-header">
-              <div class="modal-title-group">
-                <h2 class="modal-title" id="replaceConfirmTitle">Replace all music on this SD card?</h2>
-                <p class="modal-subtitle">This action refreshes the SD card from the beginning.</p>
-              </div>
-
-              <button class="modal-close" id="closeReplaceConfirmBtn" type="button" aria-label="Close">×</button>
-            </header>
-
-            <div class="confirm-body">
-              <p id="replaceConfirmText">
-                This will remove the music currently on <strong>G:\ (VINTAGER)</strong> and copy
-                <strong>My Jazz Collection</strong> to the SD card from the beginning.
-              </p>
-
-              <div class="safety-note">
-                <span class="safety-icon">!</span>
-                <span>Your music library on this computer will not be changed.</span>
-              </div>
-            </div>
-
-            <footer class="modal-footer">
-              <button class="modal-button secondary" id="cancelReplaceConfirmBtn" type="button">Cancel</button>
-              <button class="modal-button danger" id="confirmReplaceAllMusicBtn" type="button">Replace All Music</button>
-            </footer>
+      <section class="page" id="settingsPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Settings</h1>
+            <p>Theme, conversion profile defaults, sync behavior, and device preferences can live here.</p>
           </div>
         </div>
+      </section>
 
-        <div class="toast" id="toast"></div>
-
-        <input class="hidden-file" id="trackFileInput" type="file" accept="audio/*" multiple />
-        <input class="hidden-file" id="sdFileInput" type="file" webkitdirectory directory multiple />
-      </main>
-
-      <footer class="bottom-bar">
-        <div class="zoom-controls">
-          <span>Zoom</span>
-          <span class="zoom-btn" id="zoomOutBtn">−</span>
-          <span class="zoom-btn" id="zoomInBtn">＋</span>
+      <section class="page" id="helpPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Help</h1>
+            <p>Guides, button controls, firmware notes, and troubleshooting can live here.</p>
+          </div>
         </div>
+      </section>
 
-        <div class="version">v1.0</div>
-      </footer>
-    </div>
+      <div class="modal-backdrop" id="notesModal" aria-hidden="true">
+        <div class="modal-window notes-window" role="dialog" aria-modal="true" aria-labelledby="notesModalTitle">
+          <header class="modal-header">
+            <div>
+              <h2 class="modal-title" id="notesModalTitle">Notes</h2>
+              <p class="modal-subtitle" id="notesModalSubtitle">View or edit notes.</p>
+            </div>
+            <button class="modal-close" id="closeNotesBtn" type="button" aria-label="Close">×</button>
+          </header>
+
+          <div class="modal-body">
+            <textarea class="notes-editor" id="notesEditor"></textarea>
+          </div>
+
+          <footer class="modal-footer">
+            <button class="modal-button secondary" id="cancelNotesBtn" type="button">Close</button>
+            <button class="modal-button" id="saveNotesBtn" type="button">Save Notes</button>
+          </footer>
+        </div>
+      </div>
+
+      <div class="toast" id="toast"></div>
+
+      <input class="hidden-file" id="customFirmwareInput" type="file" accept=".uf2,.py,.mpy,.json,.txt" multiple />
+    </main>
+
+    <footer class="bottom-bar">
+      <div class="zoom-controls">
+        <span>Zoom</span>
+        <span class="zoom-btn" id="zoomOutBtn">−</span>
+        <span class="zoom-btn" id="zoomInBtn">＋</span>
+      </div>
+      <div class="version">v1.0</div>
+    </footer>
   </div>
+</div>
 
 <script>
   const state = {
     zoom: 1,
-    selectedPage: "loadMusic",
-    sdConnected: true,
-    syncing: false,
-    sdDriveName: "G:\\ (VINTAGER)",
+    selectedPage: "firmware",
     libraries: ["My Jazz Collection", "Stress Test", "Road Trip Mix"],
     selectedLibrary: "My Jazz Collection",
-    selectedStationId: 1,
-    selectedTrackId: 1,
-    stations: [
+
+    firmwareMode: "custom",
+    selectedFirmwareId: "default-rp2040-dfplayer",
+    selectedNoteType: "firmware",
+    installingFirmware: false,
+
+    filters: {
+      microcontroller: "all",
+      mp3Controller: "all"
+    },
+
+    filterOptions: {
+      microcontrollers: ["all", "RP2040", "ESP32"],
+      mp3Controllers: ["all", "DFPlayer", "VS1053"]
+    },
+
+    officialFirmware: [
       {
-        id: 1,
-        name: "Jazz",
-        tracks: [
-          { id: 1, title: "God Bless the Child", artist: "Sonny Rollins", duration: "3:54", format: "mp3" },
-          { id: 2, title: "Take Five", artist: "Dave Brubeck", duration: "5:24", format: "mp3" },
-          { id: 3, title: "Blue in Green", artist: "Miles Davis", duration: "5:38", format: "flac" },
-          { id: 4, title: "In a Sentimental Mood", artist: "Duke Ellington & John Coltrane", duration: "4:15", format: "wav" },
-          { id: 5, title: "My Favorite Things", artist: "John Coltrane", duration: "13:41", format: "flac" },
-          { id: 6, title: "Round Midnight", artist: "Thelonious Monk", duration: "3:12", format: "mp3" },
-          { id: 7, title: "Autumn Leaves", artist: "Cannonball Adderley", duration: "10:59", format: "mp3" },
-          { id: 8, title: "So What", artist: "Miles Davis", duration: "9:22", format: "flac" },
-          { id: 9, title: "Naima", artist: "John Coltrane", duration: "4:24", format: "wav" },
-          { id: 10, title: "Misty", artist: "Erroll Garner", duration: "2:48", format: "mp3" },
-          { id: 11, title: "Cantaloupe Island", artist: "Herbie Hancock", duration: "5:32", format: "mp3" },
-          { id: 12, title: "Strange Meadow Lark", artist: "Dave Brubeck", duration: "7:22", format: "flac" }
-        ]
+        id: "default-rp2040-dfplayer",
+        name: "Vintage Radio Basic Firmware",
+        listName: "Default RP2040",
+        version: "v1.0",
+        microcontroller: "RP2040",
+        mp3Controller: "DFPlayer",
+        device: "DFPlayer + RP2040",
+        author: "Vintage Radio Project",
+        repoUrl: "https://github.com/example/vintage-radio-basic",
+        description: "A clean starter firmware for the Vintage Radio player with basic button controls, SD card playback, and station selection.",
+        firmwareNotes: [
+          "Power: short press wakes or starts playback.",
+          "Station: short press cycles stations. Long press opens station select.",
+          "Track: short press skips to the next track. Long press returns to the previous track.",
+          "Volume knob: turn to adjust volume. Press to mute or unmute.",
+          "Designed for RP2040 boards using a DFPlayer Mini audio module."
+        ].join("\\n"),
+        userNotes: "Add personal setup notes here, like wiring changes, case revisions, or preferred button behavior."
       },
       {
-        id: 2,
-        name: "Soul",
-        tracks: [
-          { id: 1, title: "A Change Is Gonna Come", artist: "Sam Cooke", duration: "3:11", format: "mp3" },
-          { id: 2, title: "Respect", artist: "Aretha Franklin", duration: "2:28", format: "mp3" },
-          { id: 3, title: "Let's Stay Together", artist: "Al Green", duration: "3:18", format: "wav" }
-        ]
+        id: "zbvr-rp2040-vs1053",
+        name: "Zbvr-Firmware RP2040",
+        listName: "Zbvr-Firmware RP2040",
+        version: "v1.0",
+        microcontroller: "RP2040",
+        mp3Controller: "VS1053",
+        device: "VS1053 + RP2040",
+        author: "Zbvr",
+        repoUrl: "https://github.com/example/zbvr-firmware-rp2040",
+        description: "An alternate official firmware build for RP2040 projects using the VS1053 audio controller.",
+        firmwareNotes: [
+          "Designed for RP2040 boards using a VS1053 audio module.",
+          "Button behavior follows the Vintage Radio layout unless changed in configuration.",
+          "Use this build when your audio board is VS1053 instead of DFPlayer.",
+          "Check wiring before installing, since VS1053 pin usage differs from DFPlayer."
+        ].join("\\n"),
+        userNotes: "Add personal notes for this firmware here."
       },
       {
-        id: 3,
-        name: "Funk",
-        tracks: [
-          { id: 1, title: "Flash Light", artist: "Parliament", duration: "5:46", format: "mp3" },
-          { id: 2, title: "Give Up the Funk", artist: "Parliament", duration: "5:44", format: "mp3" }
-        ]
-      },
-      {
-        id: 4,
-        name: "Blues",
-        tracks: [
-          { id: 1, title: "The Thrill Is Gone", artist: "B.B. King", duration: "5:25", format: "mp3" },
-          { id: 2, title: "Born Under a Bad Sign", artist: "Albert King", duration: "2:46", format: "mp3" }
-        ]
-      },
-      {
-        id: 5,
-        name: "Lo-fi",
-        tracks: [
-          { id: 1, title: "Evening Tape Hiss", artist: "Vintage Radio", duration: "2:14", format: "mp3" }
-        ]
-      },
-      {
-        id: 6,
-        name: "Oldies",
-        tracks: [
-          { id: 1, title: "Stand by Me", artist: "Ben E. King", duration: "2:57", format: "mp3" }
-        ]
-      },
-      { id: 7, name: "Ambient", tracks: [] },
-      { id: 8, name: "Classical", tracks: [] },
-      { id: 9, name: "Rock", tracks: [] },
-      { id: 10, name: "Afrobeats", tracks: [] },
-      { id: 11, name: "City Pop", tracks: [] },
-      { id: 12, name: "Soundtracks", tracks: [] }
-    ]
+        id: "future-esp32-dfplayer",
+        name: "Vintage Radio ESP32 Firmware",
+        listName: "ESP32 DFPlayer",
+        version: "planned",
+        microcontroller: "ESP32",
+        mp3Controller: "DFPlayer",
+        device: "DFPlayer + ESP32",
+        author: "Vintage Radio Project",
+        repoUrl: "https://github.com/example/vintage-radio-esp32",
+        description: "Placeholder entry for a future ESP32 build.",
+        firmwareNotes: "Future firmware entry. Not ready to install yet.",
+        userNotes: "Add personal notes for the future ESP32 build here.",
+        disabled: true
+      }
+    ],
+
+    customFirmware: {
+      id: "custom-local",
+      name: "No custom firmware selected",
+      listName: "Local Custom Firmware",
+      version: "Custom",
+      microcontroller: "RP2040",
+      mp3Controller: "DFPlayer",
+      device: "DFPlayer + RP2040",
+      author: "User added",
+      repoUrl: "",
+      description: "Choose a custom firmware folder path or UF2 file to preview install details.",
+      notes: "Add notes for your custom firmware here. You can document button mappings, setup steps, wiring notes, or known issues.",
+      selected: false,
+      type: "None"
+    }
   };
 
   const els = {
@@ -1539,38 +1618,47 @@
     toast: document.getElementById("toast"),
 
     librarySelect: document.getElementById("librarySelect"),
-    newLibraryBtn: document.getElementById("newLibraryBtn"),
-    renameLibraryBtn: document.getElementById("renameLibraryBtn"),
-    deleteLibraryBtn: document.getElementById("deleteLibraryBtn"),
 
-    driveText: document.getElementById("driveText"),
-    capacityFill: document.getElementById("capacityFill"),
-    usageText: document.getElementById("usageText"),
-    capacityText: document.getElementById("capacityText"),
-    detectSdBtn: document.getElementById("detectSdBtn"),
-    selectSdBtn: document.getElementById("selectSdBtn"),
-    removeSdBtn: document.getElementById("removeSdBtn"),
-    syncBtn: document.getElementById("syncBtn"),
-    syncBtnText: document.getElementById("syncBtnText"),
+    officialFirmwareTab: document.getElementById("officialFirmwareTab"),
+    customFirmwareTab: document.getElementById("customFirmwareTab"),
+    filterButton: document.getElementById("filterButton"),
+    filterMenu: document.getElementById("filterMenu"),
+    microcontrollerChips: document.getElementById("microcontrollerChips"),
+    mp3ControllerChips: document.getElementById("mp3ControllerChips"),
+    firmwareList: document.getElementById("firmwareList"),
 
-    stationList: document.getElementById("stationList"),
-    trackList: document.getElementById("trackList"),
-    newStationBtn: document.getElementById("newStationBtn"),
-    addTracksBtn: document.getElementById("addTracksBtn"),
-    trackFileInput: document.getElementById("trackFileInput"),
-    sdFileInput: document.getElementById("sdFileInput"),
+    softwareTitle: document.getElementById("softwareTitle"),
+    softwareBadge: document.getElementById("softwareBadge"),
+    softwareDescription: document.getElementById("softwareDescription"),
+    softwareVersion: document.getElementById("softwareVersion"),
+    softwareDevice: document.getElementById("softwareDevice"),
+    softwareAuthor: document.getElementById("softwareAuthor"),
 
-    syncChoiceModal: document.getElementById("syncChoiceModal"),
-    replaceConfirmModal: document.getElementById("replaceConfirmModal"),
-    syncChoiceSubtitle: document.getElementById("syncChoiceSubtitle"),
-    replaceConfirmText: document.getElementById("replaceConfirmText"),
-    closeSyncChoiceBtn: document.getElementById("closeSyncChoiceBtn"),
-    cancelSyncChoiceBtn: document.getElementById("cancelSyncChoiceBtn"),
-    syncChangesBtn: document.getElementById("syncChangesBtn"),
-    replaceAllMusicBtn: document.getElementById("replaceAllMusicBtn"),
-    closeReplaceConfirmBtn: document.getElementById("closeReplaceConfirmBtn"),
-    cancelReplaceConfirmBtn: document.getElementById("cancelReplaceConfirmBtn"),
-    confirmReplaceAllMusicBtn: document.getElementById("confirmReplaceAllMusicBtn"),
+    firmwareNotesCard: document.getElementById("firmwareNotesCard"),
+    firmwareNotesPreview: document.getElementById("firmwareNotesPreview"),
+    viewFirmwareNotesBtn: document.getElementById("viewFirmwareNotesBtn"),
+
+    userNotesTitle: document.getElementById("userNotesTitle"),
+    userNotesPreview: document.getElementById("userNotesPreview"),
+    editUserNotesBtn: document.getElementById("editUserNotesBtn"),
+
+    customSideStack: document.getElementById("customSideStack"),
+    chooseCustomFirmwareBtn: document.getElementById("chooseCustomFirmwareBtn"),
+    selectedCustomFile: document.getElementById("selectedCustomFile"),
+    customFirmwareInput: document.getElementById("customFirmwareInput"),
+
+    firmwareInstallStatus: document.getElementById("firmwareInstallStatus"),
+    firmwareProgress: document.getElementById("firmwareProgress"),
+    firmwareProgressFill: document.getElementById("firmwareProgressFill"),
+    installFirmwareBtn: document.getElementById("installFirmwareBtn"),
+
+    notesModal: document.getElementById("notesModal"),
+    notesModalTitle: document.getElementById("notesModalTitle"),
+    notesModalSubtitle: document.getElementById("notesModalSubtitle"),
+    notesEditor: document.getElementById("notesEditor"),
+    closeNotesBtn: document.getElementById("closeNotesBtn"),
+    cancelNotesBtn: document.getElementById("cancelNotesBtn"),
+    saveNotesBtn: document.getElementById("saveNotesBtn"),
 
     zoomInBtn: document.getElementById("zoomInBtn"),
     zoomOutBtn: document.getElementById("zoomOutBtn"),
@@ -1586,23 +1674,325 @@
     els.toast.textContent = message;
     els.toast.classList.add("show");
 
-    window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => {
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => {
       els.toast.classList.remove("show");
-    }, 2600);
+    }, 2400);
   }
 
-  function updateModalCopy() {
-    els.syncChoiceSubtitle.textContent =
-      `Choose how you want to update ${state.sdDriveName} from ${state.selectedLibrary}.`;
+  function renderLibraries() {
+    els.librarySelect.innerHTML = "";
 
-    els.replaceConfirmText.innerHTML =
-      `This will remove the music currently on <strong>${escapeHtml(state.sdDriveName)}</strong> and copy ` +
-      `<strong>${escapeHtml(state.selectedLibrary)}</strong> to the SD card from the beginning.`;
+    state.libraries.forEach(name => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      option.selected = name === state.selectedLibrary;
+      els.librarySelect.appendChild(option);
+    });
+  }
+
+  function getFilteredOfficialFirmware() {
+    return state.officialFirmware.filter(firmware => {
+      const microMatches =
+        state.filters.microcontroller === "all" ||
+        firmware.microcontroller === state.filters.microcontroller;
+
+      const mp3Matches =
+        state.filters.mp3Controller === "all" ||
+        firmware.mp3Controller === state.filters.mp3Controller;
+
+      return microMatches && mp3Matches;
+    });
+  }
+
+  function getCurrentFirmware() {
+    if (state.firmwareMode === "custom") {
+      return state.customFirmware;
+    }
+
+    return (
+      state.officialFirmware.find(firmware => firmware.id === state.selectedFirmwareId) ||
+      getFilteredOfficialFirmware()[0] ||
+      state.officialFirmware[0]
+    );
+  }
+
+  function renderFilterChips() {
+    els.microcontrollerChips.innerHTML = "";
+    els.mp3ControllerChips.innerHTML = "";
+
+    state.filterOptions.microcontrollers.forEach(option => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "filter-chip";
+      button.textContent = option === "all" ? "All" : option;
+      button.classList.toggle("active", state.filters.microcontroller === option);
+
+      button.addEventListener("click", () => {
+        state.filters.microcontroller = option;
+        renderFirmware();
+      });
+
+      els.microcontrollerChips.appendChild(button);
+    });
+
+    state.filterOptions.mp3Controllers.forEach(option => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "filter-chip";
+      button.textContent = option === "all" ? "All" : option;
+      button.classList.toggle("active", state.filters.mp3Controller === option);
+
+      button.addEventListener("click", () => {
+        state.filters.mp3Controller = option;
+        renderFirmware();
+      });
+
+      els.mp3ControllerChips.appendChild(button);
+    });
+  }
+
+  function renderFirmwareTabs() {
+    els.officialFirmwareTab.classList.toggle("active", state.firmwareMode === "official");
+    els.customFirmwareTab.classList.toggle("active", state.firmwareMode === "custom");
+  }
+
+  function renderFirmwareList() {
+    els.firmwareList.innerHTML = "";
+
+    if (state.firmwareMode === "custom") {
+      const custom = state.customFirmware;
+      const card = document.createElement("article");
+      card.className = "firmware-card selected";
+      card.innerHTML = `
+        <div class="firmware-card-title">${escapeHtml(custom.listName)}</div>
+        <div class="firmware-card-subtitle">${escapeHtml(custom.name)}</div>
+        <div class="firmware-card-tags">
+          <span class="firmware-card-tag">${escapeHtml(custom.version)}</span>
+          <span class="firmware-card-tag">${escapeHtml(custom.device)}</span>
+          <span class="firmware-card-tag">${escapeHtml(custom.type)}</span>
+        </div>
+      `;
+      els.firmwareList.appendChild(card);
+      refreshCustomScrollbars();
+      return;
+    }
+
+    const firmwareList = getFilteredOfficialFirmware();
+
+    if (firmwareList.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-firmware-list";
+      empty.textContent = "No official firmware matches these filters yet.";
+      els.firmwareList.appendChild(empty);
+      refreshCustomScrollbars();
+      return;
+    }
+
+    if (!firmwareList.some(firmware => firmware.id === state.selectedFirmwareId)) {
+      state.selectedFirmwareId = firmwareList[0].id;
+    }
+
+    firmwareList.forEach(firmware => {
+      const card = document.createElement("article");
+      card.className = "firmware-card";
+
+      if (firmware.id === state.selectedFirmwareId) {
+        card.classList.add("selected");
+      }
+
+      card.innerHTML = `
+        <div class="firmware-card-title">${escapeHtml(firmware.listName)}</div>
+        <div class="firmware-card-subtitle">${escapeHtml(firmware.name)}</div>
+        <div class="firmware-card-tags">
+          <span class="firmware-card-tag">${escapeHtml(firmware.version)}</span>
+          <span class="firmware-card-tag">${escapeHtml(firmware.device)}</span>
+        </div>
+      `;
+
+      card.addEventListener("click", () => {
+        if (firmware.disabled) {
+          showToast("This firmware option is not available yet.");
+          return;
+        }
+
+        state.selectedFirmwareId = firmware.id;
+        renderFirmware();
+      });
+
+      els.firmwareList.appendChild(card);
+    });
+
+    refreshCustomScrollbars();
+  }
+
+  function renderFirmwareDetails() {
+    const firmware = getCurrentFirmware();
+    const isCustom = state.firmwareMode === "custom";
+
+    els.softwareTitle.textContent = firmware.name;
+    els.softwareBadge.textContent = isCustom ? "Custom" : "Official";
+    els.softwareBadge.classList.toggle("soft", isCustom);
+    els.softwareDescription.textContent = firmware.description;
+    els.softwareVersion.textContent = firmware.version;
+    els.softwareDevice.textContent = firmware.device;
+    els.softwareAuthor.textContent = firmware.author;
+    els.softwareAuthor.href = firmware.repoUrl || "#";
+
+    els.firmwareNotesCard.style.display = isCustom ? "none" : "flex";
+    els.customSideStack.classList.toggle("show", isCustom);
+    els.userNotesTitle.textContent = isCustom ? "Custom Notes" : "User Notes";
+
+    if (isCustom) {
+      renderNotesPreview(els.userNotesPreview, firmware.notes);
+      els.selectedCustomFile.textContent = firmware.selected
+        ? `${firmware.type}: ${firmware.name}`
+        : "No custom firmware selected yet.";
+      els.installFirmwareBtn.disabled = state.installingFirmware || !firmware.selected;
+    } else {
+      renderNotesPreview(els.firmwareNotesPreview, firmware.firmwareNotes);
+      renderNotesPreview(els.userNotesPreview, firmware.userNotes);
+      els.installFirmwareBtn.disabled = state.installingFirmware || !!firmware.disabled;
+    }
+  }
+
+  function renderNotesPreview(target, text) {
+    const lines = String(text || "No notes yet.").split("\\n").filter(Boolean);
+
+    if (lines.length === 0) {
+      target.textContent = "No notes yet.";
+      return;
+    }
+
+    target.innerHTML = `<ul>${lines.map(line => `<li>${escapeHtml(line)}</li>`).join("")}</ul>`;
+  }
+
+  function renderFirmware() {
+    renderFirmwareTabs();
+    renderFilterChips();
+    renderFirmwareList();
+    renderFirmwareDetails();
+  }
+
+  function openNotesModal(noteType) {
+    const firmware = getCurrentFirmware();
+    const isCustom = state.firmwareMode === "custom";
+    state.selectedNoteType = noteType;
+
+    if (isCustom) {
+      els.notesModalTitle.textContent = "Custom Firmware Notes";
+      els.notesModalSubtitle.textContent = "Add or edit notes for this custom firmware.";
+      els.notesEditor.value = firmware.notes;
+      els.notesEditor.readOnly = false;
+      els.saveNotesBtn.style.display = "block";
+      openModal(els.notesModal);
+      return;
+    }
+
+    if (noteType === "firmware") {
+      els.notesModalTitle.textContent = "Firmware Notes";
+      els.notesModalSubtitle.textContent = "Official firmware notes are read-only.";
+      els.notesEditor.value = firmware.firmwareNotes;
+      els.notesEditor.readOnly = true;
+      els.saveNotesBtn.style.display = "none";
+    } else {
+      els.notesModalTitle.textContent = "User Notes";
+      els.notesModalSubtitle.textContent = "Add or edit your personal notes for this firmware.";
+      els.notesEditor.value = firmware.userNotes;
+      els.notesEditor.readOnly = false;
+      els.saveNotesBtn.style.display = "block";
+    }
+
+    openModal(els.notesModal);
+  }
+
+  function saveNotes() {
+    const firmware = getCurrentFirmware();
+    const nextNotes = els.notesEditor.value.trim() || "No notes yet.";
+
+    if (state.firmwareMode === "custom") {
+      state.customFirmware.notes = nextNotes;
+      showToast("Custom firmware notes saved.");
+    } else if (state.selectedNoteType === "user") {
+      firmware.userNotes = nextNotes;
+      showToast("User notes saved.");
+    }
+
+    closeModal(els.notesModal);
+    renderFirmware();
+  }
+
+  function chooseCustomFirmware() {
+    els.customFirmwareInput.click();
+  }
+
+  function updateCustomFirmwareFromFiles(files) {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+
+    const first = list[0];
+    const isUf2 = first.name.toLowerCase().endsWith(".uf2");
+    const label = list.length === 1 ? first.name : `${list.length} firmware files selected`;
+
+    state.customFirmware.selected = true;
+    state.customFirmware.name = label;
+    state.customFirmware.listName = "Local Custom Firmware";
+    state.customFirmware.type = isUf2 ? "UF2 file" : "Path / files";
+    state.customFirmware.description = isUf2
+      ? "A custom UF2 firmware file selected from your computer. UF2 files install directly."
+      : "A custom firmware path or file set selected from your computer.";
+    
+    renderFirmware();
+    showToast(`Custom firmware selected: ${label}.`);
+    els.customFirmwareInput.value = "";
+  }
+
+  function installFirmware() {
+    if (state.installingFirmware) return;
+
+    const firmware = getCurrentFirmware();
+
+    if (state.firmwareMode === "custom" && !state.customFirmware.selected) {
+      showToast("Choose custom firmware first.");
+      return;
+    }
+
+    if (firmware.disabled) {
+      showToast("This firmware option is not available yet.");
+      return;
+    }
+
+    state.installingFirmware = true;
+    let progress = 0;
+
+    els.installFirmwareBtn.disabled = true;
+    els.firmwareProgress.classList.add("show");
+    els.firmwareProgressFill.style.width = "0%";
+    els.firmwareInstallStatus.textContent = "Installing firmware...";
+
+    const timer = setInterval(() => {
+      progress += Math.floor(Math.random() * 10) + 7;
+      progress = Math.min(progress, 100);
+      els.firmwareProgressFill.style.width = `${progress}%`;
+
+      if (progress >= 100) {
+        clearInterval(timer);
+        state.installingFirmware = false;
+        els.firmwareInstallStatus.textContent = "Firmware install complete.";
+        showToast("Firmware installed.");
+
+        setTimeout(() => {
+          els.firmwareProgress.classList.remove("show");
+          els.firmwareProgressFill.style.width = "0%";
+          els.firmwareInstallStatus.textContent = "Ready to install.";
+          renderFirmware();
+        }, 1400);
+      }
+    }, 260);
   }
 
   function openModal(modal) {
-    updateModalCopy();
     modal.classList.add("show");
     modal.setAttribute("aria-hidden", "false");
   }
@@ -1610,258 +2000,6 @@
   function closeModal(modal) {
     modal.classList.remove("show");
     modal.setAttribute("aria-hidden", "true");
-  }
-
-  function closeAllModals() {
-    closeModal(els.syncChoiceModal);
-    closeModal(els.replaceConfirmModal);
-  }
-
-  function openSyncChoiceModal() {
-    if (!state.sdConnected) {
-      showToast("Connect or select an SD card before syncing.");
-      return;
-    }
-
-    if (state.syncing) {
-      showToast("A sync is already running.");
-      return;
-    }
-
-    openModal(els.syncChoiceModal);
-  }
-
-  function getSelectedStation() {
-    return state.stations.find(station => station.id === state.selectedStationId);
-  }
-
-  function renderLibraries() {
-    els.librarySelect.innerHTML = "";
-
-    state.libraries.forEach(libraryName => {
-      const option = document.createElement("option");
-      option.value = libraryName;
-      option.textContent = libraryName;
-      option.selected = libraryName === state.selectedLibrary;
-      els.librarySelect.appendChild(option);
-    });
-  }
-
-  function renderStations() {
-    els.stationList.innerHTML = "";
-
-    state.stations.forEach((station, index) => {
-      const row = document.createElement("div");
-      row.className = "station-row";
-
-      if (station.id === state.selectedStationId) {
-        row.classList.add("selected");
-      }
-
-      row.innerHTML = `
-        <div class="drag">≡</div>
-        <div class="number">${String(index + 1).padStart(2, "0")}</div>
-        <div class="name">${escapeHtml(station.name)}</div>
-        <div class="count">${station.tracks.length}/255</div>
-        <div class="edit pencil" title="Rename station">✎</div>
-      `;
-
-      row.addEventListener("click", () => {
-        state.selectedStationId = station.id;
-        state.selectedTrackId = station.tracks[0]?.id ?? null;
-        renderStations();
-        renderTracks();
-      });
-
-      row.querySelector(".edit").addEventListener("click", event => {
-        event.stopPropagation();
-
-        const newName = prompt("Rename station:", station.name);
-        if (!newName || !newName.trim()) return;
-
-        station.name = newName.trim();
-        renderStations();
-        showToast("Station renamed.");
-      });
-
-      els.stationList.appendChild(row);
-    });
-
-    refreshCustomScrollbars();
-  }
-
-  function renderTracks() {
-    els.trackList.innerHTML = "";
-
-    const station = getSelectedStation();
-
-    if (!station || station.tracks.length === 0) {
-      const empty = document.createElement("div");
-      empty.style.padding = "24px";
-      empty.style.fontSize = "22px";
-      empty.style.color = "#6f5c48";
-      empty.textContent = "No tracks in this station yet. Click + Add to add music.";
-      els.trackList.appendChild(empty);
-      refreshCustomScrollbars();
-      return;
-    }
-
-    station.tracks.forEach((track, index) => {
-      const row = document.createElement("div");
-      row.className = "track-row";
-
-      if (track.id === state.selectedTrackId) {
-        row.classList.add("selected");
-      }
-
-      row.innerHTML = `
-        <div class="num">${String(index + 1).padStart(2, "0")}</div>
-        <div class="track-title">
-          <div class="track-name">${escapeHtml(track.title)}</div>
-          <div class="artist">${escapeHtml(track.artist || "Unknown Artist")}</div>
-        </div>
-        <div class="duration">${escapeHtml(track.duration || "0:00")}</div>
-        <div class="format">${escapeHtml(track.format || "mp3")}</div>
-        <div class="edit pencil" title="Edit track">✎</div>
-      `;
-
-      row.addEventListener("click", () => {
-        state.selectedTrackId = track.id;
-        renderTracks();
-      });
-
-      row.querySelector(".edit").addEventListener("click", event => {
-        event.stopPropagation();
-
-        const title = prompt("Track title:", track.title);
-        if (!title || !title.trim()) return;
-
-        const artist = prompt("Artist:", track.artist || "");
-        track.title = title.trim();
-        track.artist = artist?.trim() || "Unknown Artist";
-
-        renderTracks();
-        showToast("Track updated.");
-      });
-
-      els.trackList.appendChild(row);
-    });
-
-    refreshCustomScrollbars();
-  }
-
-  function renderStorage() {
-    if (state.sdConnected) {
-      els.driveText.textContent = `SD Drive: ${state.sdDriveName}`;
-      els.usageText.textContent = "31% used";
-      els.capacityText.textContent = "9.3/29.0 GB";
-      els.capacityFill.style.width = "31%";
-      els.syncBtn.disabled = false;
-      els.removeSdBtn.disabled = false;
-    } else {
-      els.driveText.textContent = "SD Drive: Not connected";
-      els.usageText.textContent = "0% used";
-      els.capacityText.textContent = "No SD card";
-      els.capacityFill.style.width = "0%";
-      els.syncBtn.disabled = true;
-      els.removeSdBtn.disabled = true;
-    }
-  }
-
-  function renderPages() {
-    document.querySelectorAll(".nav-item").forEach(item => {
-      item.classList.toggle("active", item.dataset.page === state.selectedPage);
-    });
-
-    document.querySelectorAll(".page").forEach(page => {
-      page.classList.remove("active");
-    });
-
-    const pageMap = {
-      loadMusic: "loadMusicPage",
-      firmware: "firmwarePage",
-      tools: "toolsPage",
-      settings: "settingsPage",
-      help: "helpPage"
-    };
-
-    document.getElementById(pageMap[state.selectedPage]).classList.add("active");
-    refreshCustomScrollbars();
-  }
-
-  function syncToSdCard(mode) {
-    if (!state.sdConnected || state.syncing) return;
-
-    state.syncing = true;
-    let progress = 31;
-
-    const isReplaceAll = mode === "replace-all";
-
-    els.syncBtn.disabled = true;
-    els.syncBtnText.textContent = isReplaceAll ? "Replacing..." : "Syncing...";
-
-    showToast(
-      isReplaceAll
-        ? "Replace All Music started. Refreshing the SD card from the beginning..."
-        : "Sync Changes started. Copying recent library changes..."
-    );
-
-    const timer = window.setInterval(() => {
-      progress += Math.floor(Math.random() * 8) + 4;
-
-      if (progress >= 100) {
-        progress = 31;
-        window.clearInterval(timer);
-        state.syncing = false;
-        els.syncBtn.disabled = false;
-        els.syncBtnText.textContent = "Sync to SD Card";
-        els.capacityFill.style.width = "31%";
-        els.usageText.textContent = "31% used";
-        els.capacityText.textContent = "9.3/29.0 GB";
-
-        showToast(
-          isReplaceAll
-            ? "Replace All Music complete. SD card is ready."
-            : "Sync Changes complete. SD card is ready."
-        );
-
-        return;
-      }
-
-      els.capacityFill.style.width = `${progress}%`;
-      els.usageText.textContent = `${progress}% used`;
-    }, isReplaceAll ? 340 : 250);
-  }
-
-  function addTracksFromFiles(files) {
-    const station = getSelectedStation();
-    if (!station) return;
-
-    const fileList = Array.from(files);
-    if (fileList.length === 0) return;
-
-    const nextIdStart = station.tracks.reduce((max, track) => Math.max(max, track.id), 0) + 1;
-
-    fileList.forEach((file, index) => {
-      const cleanName = file.name.replace(/\.[^/.]+$/, "");
-      const extension = file.name.includes(".")
-        ? file.name.split(".").pop().toLowerCase()
-        : "mp3";
-
-      station.tracks.push({
-        id: nextIdStart + index,
-        title: titleCase(cleanName.replace(/[-_]+/g, " ")),
-        artist: "Unknown Artist",
-        duration: "0:00",
-        format: extension
-      });
-    });
-
-    state.selectedTrackId = station.tracks[station.tracks.length - 1].id;
-    renderStations();
-    renderTracks();
-
-    showToast(`${fileList.length} track${fileList.length === 1 ? "" : "s"} added to ${station.name}.`);
   }
 
   function setupCustomScrollbars() {
@@ -1885,12 +2023,9 @@
       }
 
       function updateThumb() {
-        const canScroll = scroller.scrollHeight > scroller.clientHeight + 1;
-        scrollbar.classList.toggle("not-scrollable", !canScroll);
-
         const trackHeight = track.clientHeight;
         const visibleRatio = scroller.clientHeight / Math.max(scroller.scrollHeight, 1);
-        const thumbHeight = Math.max(64, Math.min(trackHeight, trackHeight * visibleRatio));
+        const thumbHeight = Math.max(88, Math.min(trackHeight, trackHeight * visibleRatio));
 
         thumb.style.height = `${thumbHeight}px`;
 
@@ -1910,14 +2045,8 @@
       }
 
       scroller.addEventListener("scroll", updateThumb);
-
-      upButton.addEventListener("click", () => {
-        scrollByAmount(-140);
-      });
-
-      downButton.addEventListener("click", () => {
-        scrollByAmount(140);
-      });
+      upButton.addEventListener("click", () => scrollByAmount(-140));
+      downButton.addEventListener("click", () => scrollByAmount(140));
 
       track.addEventListener("click", event => {
         if (event.target !== track) return;
@@ -1954,7 +2083,6 @@
 
       window.addEventListener("mouseup", () => {
         if (!isDragging) return;
-
         isDragging = false;
         document.body.style.userSelect = "";
       });
@@ -1989,171 +2117,72 @@
       .replaceAll("'", "&#039;");
   }
 
-  function titleCase(value) {
-    return value
-      .split(" ")
-      .filter(Boolean)
-      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(" ");
-  }
-
   function initEvents() {
     document.querySelectorAll(".nav-item").forEach(item => {
       item.addEventListener("click", () => {
         state.selectedPage = item.dataset.page;
-        renderPages();
 
-        if (state.selectedPage !== "loadMusic") {
-          showToast(`${item.textContent.trim()} selected.`);
-        }
+        document.querySelectorAll(".nav-item").forEach(nav => {
+          nav.classList.toggle("active", nav.dataset.page === state.selectedPage);
+        });
+
+        document.querySelectorAll(".page").forEach(page => page.classList.remove("active"));
+
+        const pageMap = {
+          loadMusic: "loadMusicPage",
+          firmware: "firmwarePage",
+          tools: "toolsPage",
+          settings: "settingsPage",
+          help: "helpPage"
+        };
+
+        document.getElementById(pageMap[state.selectedPage]).classList.add("active");
+        refreshCustomScrollbars();
       });
     });
 
     els.librarySelect.addEventListener("change", () => {
       state.selectedLibrary = els.librarySelect.value;
-      updateModalCopy();
       showToast(`Library changed to ${state.selectedLibrary}.`);
     });
 
-    els.newLibraryBtn.addEventListener("click", () => {
-      const name = prompt("New library name:");
-      if (!name || !name.trim()) return;
-
-      state.libraries.push(name.trim());
-      state.selectedLibrary = name.trim();
-      renderLibraries();
-      updateModalCopy();
-      showToast("Library created.");
+    els.officialFirmwareTab.addEventListener("click", () => {
+      state.firmwareMode = "official";
+      renderFirmware();
     });
 
-    els.renameLibraryBtn.addEventListener("click", () => {
-      const currentName = state.selectedLibrary;
-      const newName = prompt("Rename library:", currentName);
-      if (!newName || !newName.trim()) return;
-
-      state.libraries = state.libraries.map(name =>
-        name === currentName ? newName.trim() : name
-      );
-
-      state.selectedLibrary = newName.trim();
-      renderLibraries();
-      updateModalCopy();
-      showToast("Library renamed.");
+    els.customFirmwareTab.addEventListener("click", () => {
+      state.firmwareMode = "custom";
+      renderFirmware();
     });
 
-    els.deleteLibraryBtn.addEventListener("click", () => {
-      if (state.libraries.length <= 1) {
-        showToast("You need at least one library.");
-        return;
-      }
-
-      const ok = confirm(`Delete "${state.selectedLibrary}"?`);
-      if (!ok) return;
-
-      state.libraries = state.libraries.filter(name => name !== state.selectedLibrary);
-      state.selectedLibrary = state.libraries[0];
-      renderLibraries();
-      updateModalCopy();
-      showToast("Library deleted.");
+    els.filterButton.addEventListener("click", event => {
+      event.stopPropagation();
+      els.filterMenu.classList.toggle("show");
     });
 
-    els.detectSdBtn.addEventListener("click", () => {
-      state.sdConnected = true;
-      renderStorage();
-      updateModalCopy();
-      showToast(`SD card detected: ${state.sdDriveName}.`);
-    });
-
-    els.selectSdBtn.addEventListener("click", () => {
-      els.sdFileInput.click();
-    });
-
-    els.sdFileInput.addEventListener("change", () => {
-      state.sdConnected = true;
-      renderStorage();
-      updateModalCopy();
-      showToast("SD card folder selected.");
-    });
-
-    els.removeSdBtn.addEventListener("click", () => {
-      state.sdConnected = false;
-      renderStorage();
-      showToast("SD card safely removed.");
-    });
-
-    els.syncBtn.addEventListener("click", openSyncChoiceModal);
-
-    els.closeSyncChoiceBtn.addEventListener("click", () => closeModal(els.syncChoiceModal));
-    els.cancelSyncChoiceBtn.addEventListener("click", () => closeModal(els.syncChoiceModal));
-
-    els.syncChangesBtn.addEventListener("click", () => {
-      closeModal(els.syncChoiceModal);
-      syncToSdCard("changes");
-    });
-
-    els.replaceAllMusicBtn.addEventListener("click", () => {
-      closeModal(els.syncChoiceModal);
-      openModal(els.replaceConfirmModal);
-    });
-
-    els.closeReplaceConfirmBtn.addEventListener("click", () => closeModal(els.replaceConfirmModal));
-    els.cancelReplaceConfirmBtn.addEventListener("click", () => closeModal(els.replaceConfirmModal));
-
-    els.confirmReplaceAllMusicBtn.addEventListener("click", () => {
-      closeModal(els.replaceConfirmModal);
-      syncToSdCard("replace-all");
-    });
-
-    [els.syncChoiceModal, els.replaceConfirmModal].forEach(modal => {
-      modal.addEventListener("click", event => {
-        if (event.target === modal) {
-          closeModal(modal);
-        }
-      });
-    });
-
-    window.addEventListener("keydown", event => {
-      if (event.key === "Escape") {
-        closeAllModals();
+    document.addEventListener("click", event => {
+      if (!els.filterMenu.contains(event.target) && event.target !== els.filterButton) {
+        els.filterMenu.classList.remove("show");
       }
     });
 
-    els.newStationBtn.addEventListener("click", () => {
-      const name = prompt("New station name:");
-      if (!name || !name.trim()) return;
+    els.viewFirmwareNotesBtn.addEventListener("click", () => openNotesModal("firmware"));
+    els.editUserNotesBtn.addEventListener("click", () => openNotesModal("user"));
 
-      const nextId = state.stations.reduce((max, station) => Math.max(max, station.id), 0) + 1;
+    els.closeNotesBtn.addEventListener("click", () => closeModal(els.notesModal));
+    els.cancelNotesBtn.addEventListener("click", () => closeModal(els.notesModal));
+    els.saveNotesBtn.addEventListener("click", saveNotes);
 
-      state.stations.push({
-        id: nextId,
-        name: name.trim(),
-        tracks: []
-      });
-
-      state.selectedStationId = nextId;
-      state.selectedTrackId = null;
-
-      renderStations();
-      renderTracks();
-      showToast("Station created.");
+    els.chooseCustomFirmwareBtn.addEventListener("click", chooseCustomFirmware);
+    els.customFirmwareInput.addEventListener("change", () => {
+      updateCustomFirmwareFromFiles(els.customFirmwareInput.files);
     });
 
-    els.addTracksBtn.addEventListener("click", () => {
-      els.trackFileInput.click();
-    });
+    els.installFirmwareBtn.addEventListener("click", installFirmware);
 
-    els.trackFileInput.addEventListener("change", () => {
-      addTracksFromFiles(els.trackFileInput.files);
-      els.trackFileInput.value = "";
-    });
-
-    els.zoomInBtn.addEventListener("click", () => {
-      setZoom(state.zoom + 0.05);
-    });
-
-    els.zoomOutBtn.addEventListener("click", () => {
-      setZoom(state.zoom - 0.05);
-    });
+    els.zoomInBtn.addEventListener("click", () => setZoom(state.zoom + 0.05));
+    els.zoomOutBtn.addEventListener("click", () => setZoom(state.zoom - 0.05));
 
     els.closeBtn.addEventListener("click", () => {
       els.app.style.display = "none";
@@ -2165,19 +2194,22 @@
     });
 
     els.minimizeBtn.addEventListener("click", () => {
-      showToast("Minimize would be handled by PyQt or Electron in the desktop app.");
+      showToast("Minimize would be handled by the desktop app.");
+    });
+
+    window.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        closeModal(els.notesModal);
+        els.filterMenu.classList.remove("show");
+      }
     });
   }
 
   function init() {
     renderLibraries();
-    renderStations();
-    renderTracks();
-    renderStorage();
-    renderPages();
+    renderFirmware();
     initEvents();
     setupCustomScrollbars();
-    updateModalCopy();
     refreshCustomScrollbars();
   }
 

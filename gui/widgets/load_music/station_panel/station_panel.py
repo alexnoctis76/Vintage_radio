@@ -17,7 +17,7 @@ HOW TO EDIT
   • Header height            → t.LM_PANEL_HEADER_H  (px)
   • Header inner margins     → t.LM_PANEL_HDR_MARGINS  (left, top, right, bottom)
   • Header element gap       → t.LM_PANEL_HDR_SPACING  (px)
-  • Header label font        → t.LM_PANEL_HDR_FONT_SIZE  (pt, bold)
+  • Header label font        → t.LM_PANEL_HDR_FONT_SIZE / LM_PANEL_HDR_FONT_WEIGHT
   • "+ New" button gradient  → t.MINI_BTN_GRAD_TOP / BOT
   • "+ New" button height    → t.LM_PANEL_NEW_BTN_H  (px)
   • "+ New" button radius    → t.LM_PANEL_NEW_BTN_RADIUS  (px)
@@ -34,8 +34,10 @@ from PyQt6 import QtCore, QtWidgets
 from PyQt6.QtCore import pyqtSignal
 
 import gui.theme as t
+from gui import ui_scale as u
 from gui.widgets.common.delegates import StationItemDelegate
 from gui.widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from gui.widgets.common.vintage_chrome import apply_widget_tooltip_palette
 
 
 class StationPanel(QtWidgets.QWidget):
@@ -73,10 +75,9 @@ class StationPanel(QtWidgets.QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        v.addWidget(self._make_header())
+        self._header = self._make_header()
+        v.addWidget(self._header)
         v.addWidget(self._make_list(), 1)
-
-        # Hidden legacy buttons — kept for backward-compat signal connections
         for label in ("New Station", "Rename", "Delete"):
             b = QtWidgets.QPushButton(label)
             b.setVisible(False)
@@ -116,16 +117,13 @@ class StationPanel(QtWidgets.QWidget):
         row.setSpacing(t.LM_PANEL_HDR_SPACING)
 
         lbl = QtWidgets.QLabel("Stations")
-        lbl.setStyleSheet(
-            f"color: {t.LM_PANEL_HDR_TEXT_COLOR};"
-            f"font-weight: {'bold' if t.LM_PANEL_HDR_FONT_BOLD else 'normal'};"
-            f"font-size: {t.LM_PANEL_HDR_FONT_SIZE}px;"
-            f"background: transparent;"
-        )
+        self._header_title = lbl
+        lbl.setStyleSheet(self._header_title_style())
         lbl.setToolTip(
             "Drag stations to reorder — each maps to a numbered folder on the SD card.\n"
             "Drop folders here to import them as stations."
         )
+        apply_widget_tooltip_palette(lbl)
         row.addWidget(lbl)
         row.addStretch()
 
@@ -134,24 +132,9 @@ class StationPanel(QtWidgets.QWidget):
         row.addWidget(self._size_label)
 
         new_btn = QtWidgets.QPushButton("+ New")
-        new_btn.setFixedHeight(t.LM_PANEL_NEW_BTN_H)
-        new_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: qlineargradient(
-                    x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {t.MINI_BTN_GRAD_TOP},
-                    stop:1 {t.MINI_BTN_GRAD_BOT}
-                );
-                color: #f5dab5;
-                border: 1px solid {t.MINI_BTN_BORDER};
-                border-radius: {t.LM_PANEL_NEW_BTN_RADIUS}px;
-                padding: {t.LM_PANEL_NEW_BTN_PADDING};
-                font-weight: bold;
-                font-size: {t.LM_PANEL_HDR_FONT_SIZE}px;
-            }}
-            QPushButton:hover   {{ background: {t.MINI_BTN_GRAD_TOP}; }}
-            QPushButton:pressed {{ background: {t.MINI_BTN_GRAD_BOT}; }}
-        """)
+        self._new_btn = new_btn
+        new_btn.setFixedHeight(u.px(t.LM_PANEL_NEW_BTN_H))
+        new_btn.setStyleSheet(self._new_btn_style())
         new_btn.clicked.connect(self.new_station_clicked)
         row.addWidget(new_btn)
         return header
@@ -187,8 +170,18 @@ class StationPanel(QtWidgets.QWidget):
         self._list.folders_dropped.connect(self.folders_dropped)
         self._list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self.context_menu_requested)
+        self._list.edit_station_requested.connect(self._on_edit_station_requested)
 
         return wrap_with_mockup_scrollbar(self._list, variant="station")
+
+    def _on_edit_station_requested(self, item: QtWidgets.QListWidgetItem) -> None:
+        from gui.widgets.common.delegates import station_pencil_hit_rect
+
+        self._list.setCurrentItem(item)
+        rect = self._list.visualItemRect(item)
+        hit = station_pencil_hit_rect(rect, self._list.font(), self._max_tracks)
+        pos = QtCore.QPoint(hit.center().x(), hit.center().y())
+        self.context_menu_requested.emit(pos)
 
     def _on_station_item_changed(
         self,
@@ -197,6 +190,51 @@ class StationPanel(QtWidgets.QWidget):
     ) -> None:
         self.station_selected.emit(current, previous)
 
+    def _header_title_style(self) -> str:
+        return (
+            f"color: {t.LM_PANEL_HDR_TEXT_COLOR};"
+            f"font-weight: {t.LM_PANEL_HDR_FONT_WEIGHT};"
+            f"font-size: {u.px(t.LM_PANEL_HDR_FONT_SIZE)}px;"
+            f"background: transparent;"
+        )
+
+    def _new_btn_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.MINI_BTN_GRAD_TOP},
+                    stop:1 {t.MINI_BTN_GRAD_BOT}
+                );
+                color: #f5dab5;
+                border: 1px solid {t.MINI_BTN_BORDER};
+                border-radius: {u.px(t.LM_PANEL_NEW_BTN_RADIUS)}px;
+                padding: {t.LM_PANEL_NEW_BTN_PADDING};
+                font-weight: bold;
+                font-size: {u.px(t.LM_PANEL_HDR_FONT_SIZE)}px;
+            }}
+            QPushButton:hover   {{ background: {t.MINI_BTN_GRAD_TOP}; }}
+            QPushButton:pressed {{ background: {t.MINI_BTN_GRAD_BOT}; }}
+        """
+
+    def _refresh_header_theme(self) -> None:
+        self._header.setFixedHeight(u.px(t.LM_PANEL_HEADER_H))
+        self._header.setStyleSheet(f"""
+            #stationHeader {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.PANEL_HDR_GRAD_TOP},
+                    stop:1 {t.PANEL_HDR_GRAD_BOT}
+                );
+                border-top: 1px solid rgba(255,255,255,0.16);
+                border-bottom: 1px solid rgba(0,0,0,0.35);
+            }}
+        """)
+        self._header_title.setStyleSheet(self._header_title_style())
+        self._new_btn.setFixedHeight(u.px(t.LM_PANEL_NEW_BTN_H))
+        self._new_btn.setStyleSheet(self._new_btn_style())
+
     def reload_theme(self) -> None:
         self._apply_panel_style()
+        self._refresh_header_theme()
         self._list.update()

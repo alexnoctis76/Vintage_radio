@@ -7,7 +7,22 @@ import time
 import traceback
 from typing import Any, Callable, List, Optional
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+import gui.theme as t
+from gui import ui_scale as u
+from gui.sd_disk_image_flash import parse_disk_write_progress_message
+from gui.widgets.common.vintage_progress import VintageProgressBar
+from gui.widgets.dialogs.vintage_message import VintageMessageBox
+from gui.widgets.dialogs.sync.primitives import (
+    ModalButton,
+    ModalFooter,
+    ModalHeader,
+    SyncModalShell,
+    apply_frameless_modal,
+    apply_modal_rounded_mask,
+    refresh_modal_rounded_mask,
+)
 
 # Keep Python references to threads/workers that are still running after their
 # dialog has been closed.  Without this, Python's GC destroys the QThread wrapper
@@ -32,22 +47,35 @@ class _BackgroundWorker(QtCore.QObject):
         self._args = args
         self._kwargs = kwargs
 
+    @QtCore.pyqtSlot(object, object, str)
+    def _relay_progress(self, current: object, total: object, message: str) -> None:
+        self.progress.emit(current, total, message)
+
+    def _safe_progress(self, current: int, total: int, message: str) -> None:
+        # sync_library_basic reports from ThreadPoolExecutor workers; marshal to this
+        # QObject's thread before emitting so GUI slots always run on the main thread.
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_relay_progress",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(object, current),
+            QtCore.Q_ARG(object, total),
+            QtCore.Q_ARG(str, message),
+        )
+
     @QtCore.pyqtSlot()
     def run(self):
         try:
-            # Never pass a callback that touches TaskProgressDialog (main thread) from here.
-            # Emit only from this QObject (worker's thread) so slots on the dialog get
-            # QueuedConnection delivery — fixes stuck 0/N and "Not Responding" on Windows.
             kw = dict(self._kwargs)
-
-            def _safe_progress(current: int, total: int, message: str) -> None:
-                self.progress.emit(current, total, message)
-
-            kw["progress_callback"] = _safe_progress
+            kw["progress_callback"] = self._safe_progress
             result = self._fn(*self._args, **kw)
             self.finished.emit(result)
         except Exception as exc:
-            self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
+            msg = str(exc)
+            if "cancelled by user" in msg.lower() or msg.strip().lower() == "cancelled":
+                self.error.emit(msg)
+            else:
+                self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
 
 
 class TaskProgressDialog(QtWidgets.QDialog):
@@ -62,45 +90,75 @@ class TaskProgressDialog(QtWidgets.QDialog):
         kwargs: dict | None = None,
         cancelable: bool = False,
         cancel_callback_kwarg: str | None = None,
-        show_byte_detail: bool = True,
+        show_byte_detail: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setMinimumWidth(580)
-        self.setWindowFlags(
-            self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint
-        )
+        self.setFixedWidth(t.SYNC_MDL_PROGRESS_W)
+        apply_frameless_modal(self)
+        self.setStyleSheet("QDialog { background: transparent; }")
 
-        layout = QtWidgets.QVBoxLayout(self)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        shell = SyncModalShell()
+        self._shell = shell
+
+        header = ModalHeader(title)
+        header.closed.connect(self.reject)
+        shell.add_widget(header)
+
+        body = QtWidgets.QWidget()
+        body_lay = QtWidgets.QVBoxLayout(body)
+        self._body_lay = body_lay
+        body_lay.setContentsMargins(
+            t.SYNC_MDL_BODY_PAD,
+            18,
+            t.SYNC_MDL_BODY_PAD,
+            t.SYNC_MDL_FOOTER_PAD_B if cancelable else 20,
+        )
+        body_lay.setSpacing(10)
+
+        self._image_scan_label = QtWidgets.QLabel("")
+        self._image_scan_label.setWordWrap(True)
+        self._image_scan_label.hide()
+        body_lay.addWidget(self._image_scan_label)
+
         self._status_label = QtWidgets.QLabel("Starting...")
         self._status_label.setWordWrap(True)
-        self._status_label.setMinimumWidth(520)
-        self._status_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            self._status_label.sizePolicy().verticalPolicy(),
-        )
-        layout.addWidget(self._status_label)
+        body_lay.addWidget(self._status_label)
 
-        self._progress_bar = QtWidgets.QProgressBar()
+        self._progress_bar = VintageProgressBar()
         self._progress_bar.setRange(0, 0)
-        # Default "%p" shows 0% until ~1% of huge totals (e.g. 200/25000); show counts instead.
-        self._progress_bar.setFormat("%v / %m")
-        layout.addWidget(self._progress_bar)
+        body_lay.addWidget(self._progress_bar)
 
-        self._detail_label = QtWidgets.QLabel("")
-        self._detail_label.setStyleSheet("color: gray; font-size: 11px;")
-        self._detail_label.setWordWrap(True)
-        self._detail_label.setVisible(show_byte_detail)
-        layout.addWidget(self._detail_label)
+        self._eta_label = QtWidgets.QLabel("")
+        self._eta_label.setWordWrap(True)
+        body_lay.addWidget(self._eta_label)
 
+        shell.add_widget(body)
+
+        self._footer: Optional[ModalFooter] = None
+        self._cancel_btn: Optional[ModalButton] = None
         if cancelable:
-            btn_layout = QtWidgets.QHBoxLayout()
-            btn_layout.addStretch()
-            self._cancel_btn = QtWidgets.QPushButton("Cancel")
+            footer = ModalFooter()
+            self._footer = footer
+            self._cancel_btn = ModalButton("Cancel", variant="secondary")
             self._cancel_btn.clicked.connect(self.reject)
-            btn_layout.addWidget(self._cancel_btn)
-            layout.addLayout(btn_layout)
+            footer.add_button(self._cancel_btn)
+            shell.add_widget(footer)
+
+        outer.addWidget(shell)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(48)
+        shadow.setOffset(0, 12)
+        shadow.setColor(QtGui.QColor(24, 12, 4, 112))
+        shell.setGraphicsEffect(shadow)
+
+        apply_modal_rounded_mask(self)
+        self._apply_body_styles()
 
         self.on_success: Optional[Callable[[Any], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
@@ -122,30 +180,118 @@ class TaskProgressDialog(QtWidgets.QDialog):
         self._worker.finished.connect(self._on_finished, qc)
         self._worker.error.connect(self._on_error, qc)
 
-        # ETA / phase tracking (reset when *total* changes between phases).
+        # ETA / phase tracking (reset when phase changes, not mid-phase total tweaks).
+        self._progress_last_phase: Optional[str] = None
         self._progress_last_total: Optional[int] = None
         self._progress_monotonic_start: Optional[float] = None
 
+        # Legacy kwarg — byte detail removed from UI; kept for call-site compatibility.
+        _ = show_byte_detail
+        self._cancelable = cancelable
+
+    def _status_label_min_height(self) -> int:
+        fm = QtGui.QFontMetrics(self._status_label.font())
+        return max(fm.height() + 8, 24)
+
+    def _apply_body_styles(self) -> None:
+        self._status_label.setStyleSheet(
+            f"color: {t.SYNC_MDL_PROGRESS_STATUS_CLR};"
+            f"font-size: {u.px(t.SYNC_MDL_PROGRESS_STATUS_SIZE)}px;"
+            f"background: transparent;"
+            f"padding-top: 2px;"
+            f"padding-bottom: 2px;"
+        )
+        self._status_label.setMinimumHeight(self._status_label_min_height())
+        self._image_scan_label.setStyleSheet(
+            f"color: {t.SYNC_MDL_PROGRESS_ETA_CLR};"
+            f"font-size: {u.px(t.SYNC_MDL_PROGRESS_ETA_SIZE)}px;"
+            f"background: transparent;"
+            f"padding-bottom: 2px;"
+        )
+        self._eta_label.setStyleSheet(
+            f"color: {t.SYNC_MDL_PROGRESS_ETA_CLR};"
+            f"font-size: {u.px(t.SYNC_MDL_PROGRESS_ETA_SIZE)}px;"
+            f"background: transparent;"
+        )
+
+    def reload_theme(self) -> None:
+        """Re-apply SYNC_MDL_* tokens (dev theme live-reload)."""
+        self.setFixedWidth(t.SYNC_MDL_PROGRESS_W)
+        self._body_lay.setContentsMargins(
+            t.SYNC_MDL_BODY_PAD,
+            18,
+            t.SYNC_MDL_BODY_PAD,
+            t.SYNC_MDL_FOOTER_PAD_B if self._cancelable else 20,
+        )
+        self._apply_body_styles()
+        self._progress_bar.reload_theme()
+        self._shell.reload_theme()
+        if self._footer is not None:
+            self._footer.reload_theme()
+        refresh_modal_rounded_mask(self)
+        self.adjustSize()
+        self.update()
+
     @staticmethod
     def _format_bytes_short(n: int) -> str:
+        """Human-readable size for progress (GB / MB — what users see on SD card labels)."""
         n = max(0, n)
-        if n >= 1 << 30:
-            return f"{n / (1 << 30):.2f} GiB"
-        if n >= 1 << 20:
-            return f"{n / (1 << 20):.1f} MiB"
-        if n >= 1 << 10:
-            return f"{n / (1 << 10):.0f} KiB"
+        if n >= 1024**3:
+            return f"{n / (1024**3):.1f} GB"
+        if n >= 1024**2:
+            return f"{n / (1024**2):.0f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.0f} KB"
         return f"{n} B"
 
     @staticmethod
-    def _is_file_count_phase(message: str) -> bool:
-        """True when current/total represent file indices rather than byte counts.
+    def _format_eta_seconds(rem: float) -> str:
+        """Format ETA with largest units plus sub-units down to seconds."""
+        rem_i = max(1, int(rem))
+        days, rem_i = divmod(rem_i, 86400)
+        hours, rem_i = divmod(rem_i, 3600)
+        minutes, seconds = divmod(rem_i, 60)
 
-        The experimental SD image-build phase reports progress as
-        ``"Writing disk image (X/Y files)..."`` (and the lead-in message
-        ``"FAT32 image created - packing files into disk image..."``). Detecting
-        these prevents the detail label from formatting file indices as bytes.
-        """
+        parts: List[str] = []
+        if days:
+            parts.append(f"{days} d")
+        if hours or days:
+            parts.append(f"{hours} h")
+        if minutes or hours or days:
+            parts.append(f"{minutes} min")
+        parts.append(f"{seconds} s")
+        return "~" + " ".join(parts) + " remaining"
+
+    @staticmethod
+    def _progress_phase_key(message: str) -> str:
+        """Stable phase id; totals may adjust within a phase (e.g. sparse disk write)."""
+        if not message:
+            return ""
+        m = message.strip()
+        if m.startswith("Writing to SD card"):
+            return "disk_write"
+        if m.startswith("Install image:"):
+            return "disk_write"
+        if m.startswith("Creating install image"):
+            return "image_create"
+        if m.startswith("Writing disk image") or m.startswith("Image: writing disk image"):
+            return "image_write"
+        if "packing files into disk image" in m.lower():
+            return "image_pack"
+        ml = m.lower()
+        if ml.startswith("preparing "):
+            return "sync_prep"
+        if ml.startswith("converting audio"):
+            return "sync_convert"
+        if ml.startswith("copying"):
+            return "sync_copy"
+        if ml.startswith("removing stale"):
+            return "sync_cleanup"
+        return m[:96]
+
+    @staticmethod
+    def _is_file_count_phase(message: str) -> bool:
+        """True when current/total represent file indices rather than byte counts."""
         if not message:
             return False
         m = message.strip().lower()
@@ -153,6 +299,11 @@ class TaskProgressDialog(QtWidgets.QDialog):
             m.startswith("writing disk image")
             or m.startswith("image: writing disk image")
             or "packing files into disk image" in m
+            or m.startswith("preparing ")
+            or m.startswith("converting audio")
+            or m.startswith("copying")
+            or m.startswith("removing stale")
+            or " files/s" in m
         )
 
     @QtCore.pyqtSlot(object, object, str)
@@ -160,13 +311,30 @@ class TaskProgressDialog(QtWidgets.QDialog):
         # Ensure plain Python ints (signal carries object to avoid Qt int32 truncation).
         current = int(current)  # type: ignore[arg-type]
         total = int(total)  # type: ignore[arg-type]
+        phase = self._progress_phase_key(message)
+        partition_message, image_scan_message, embedded_eta = (
+            parse_disk_write_progress_message(message)
+        )
+        if phase == "disk_write":
+            message = partition_message
 
         # QProgressBar uses int ranges; values above ~2 GiB overflow signed 32-bit on Qt
         # and the bar sticks at 0 or wrong values. Scale huge jobs to 0..10000 + %.
         _QT_SAFE_MAX = 2_100_000_000
 
         if total > 0:
-            if self._progress_last_total != total:
+            phase_changed = phase != self._progress_last_phase
+            if phase_changed:
+                self._progress_last_phase = phase
+                self._progress_last_total = None
+                self._progress_monotonic_start = None
+
+            # Within disk_write the partition total may shrink as we learn sparsity;
+            # do not reset the ETA clock when it adjusts mid-stream.
+            if self._progress_last_total != total and phase != "disk_write":
+                self._progress_last_total = total
+                self._progress_monotonic_start = time.monotonic()
+            elif self._progress_last_total is None:
                 self._progress_last_total = total
                 self._progress_monotonic_start = time.monotonic()
 
@@ -176,64 +344,64 @@ class TaskProgressDialog(QtWidgets.QDialog):
                 scaled_val = min(scaled_max, max(0, cur * scaled_max // max(1, total)))
                 self._progress_bar.setRange(0, scaled_max)
                 self._progress_bar.setValue(scaled_val)
-                # QProgressBar::setFormat does literal substitution of %p/%v/%m only;
-                # it does NOT treat "%%" as an escape, so "%p%%" renders as "1%%".
-                # Use a single percent sign for the trailing literal.
-                self._progress_bar.setFormat("%p%")
+                pct = scaled_val * 100 // scaled_max
+                self._progress_bar.setText(f"{pct}%")
             else:
                 self._progress_bar.setRange(0, total)
                 self._progress_bar.setValue(cur)
-                self._progress_bar.setFormat("%v / %m")
+                if self._is_file_count_phase(message):
+                    self._progress_bar.setText(f"{cur} / {total} files")
+                else:
+                    pct = cur * 100 // max(1, total)
+                    self._progress_bar.setText(f"{pct}%")
 
-            # During the image-build phase ``current``/``total`` are file indices,
-            # not byte counts. Show them as files so the detail label doesn't read
-            # "11 KiB / 24 KiB" for what is really "11321 / 24992 files".
-            if self._is_file_count_phase(message):
-                detail_parts = [f"{cur} / {total} files"]
-            else:
-                detail_parts = [
-                    f"{self._format_bytes_short(cur)} / {self._format_bytes_short(total)}"
-                ]
-            if cur > 0 and cur < total and self._progress_monotonic_start is not None:
+            eta_text = ""
+            if embedded_eta is not None and phase == "disk_write":
+                if embedded_eta < 86400 * 3:
+                    eta_text = self._format_eta_seconds(embedded_eta)
+            elif cur > 0 and cur < total and self._progress_monotonic_start is not None:
                 elapsed = time.monotonic() - self._progress_monotonic_start
                 if elapsed > 0.4:
                     rate = cur / elapsed
                     if rate > 256:  # ignore noise
                         rem = (total - cur) / rate
                         if 1.0 <= rem < 86400 * 3:
-                            if rem >= 3600:
-                                detail_parts.append(
-                                    f"~{int(rem // 3600)} h {int((rem % 3600) // 60)} min remaining"
-                                )
-                            elif rem >= 120:
-                                detail_parts.append(f"~{int(rem // 60)} min remaining")
-                            elif rem >= 60:
-                                detail_parts.append(f"~{int(rem // 60)} min {int(rem % 60)} s remaining")
-                            else:
-                                detail_parts.append(f"~{max(1, int(rem))} s remaining")
-            self._detail_label.setText("  •  ".join(detail_parts))
+                            eta_text = self._format_eta_seconds(rem)
+            self._eta_label.setText(eta_text)
 
             # Disable Cancel once the write is done and we are just cleaning up
             # (remounting disk, etc.).  Cancelling at this point cannot undo the
             # write and only causes a crash from forcibly killing the thread.
             if cur >= total and not self._in_cleanup:
                 self._in_cleanup = True
-                if hasattr(self, "_cancel_btn"):
+                if self._cancel_btn is not None:
                     self._cancel_btn.setEnabled(False)
                     self._cancel_btn.setText("Please wait…")
         else:
             # Message-only update: show busy state instead of leaving a stale max (e.g. 2/2).
             self._progress_bar.setRange(0, 0)
-            self._detail_label.setText("")
+            self._progress_bar.setText("")
+            self._eta_label.setText("")
+            self._image_scan_label.hide()
+            self._progress_last_phase = None
             self._progress_last_total = None
             self._progress_monotonic_start = None
         self._status_label.setText(message)
+        self._status_label.setMinimumHeight(self._status_label_min_height())
+        if phase == "disk_write" and image_scan_message:
+            self._image_scan_label.setText(image_scan_message)
+            self._image_scan_label.show()
+        elif phase != "disk_write":
+            self._image_scan_label.hide()
 
     @QtCore.pyqtSlot(object)
     def _on_finished(self, result):
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(1)
+        self._progress_bar.setText("100%")
         self._status_label.setText("Complete!")
+        self._image_scan_label.hide()
+        self._eta_label.setText("")
         # Flush bar/label so the dialog does not look stuck before nested UI runs.
         QtWidgets.QApplication.processEvents()
         self._cleanup_thread()
@@ -252,11 +420,10 @@ class TaskProgressDialog(QtWidgets.QDialog):
     @QtCore.pyqtSlot(str)
     def _on_error(self, error_msg: str):
         self._cleanup_thread()
-        # Session log: QMessageBox.critical / .warning are patched in run_app to log GUI-ERROR.
         if self.on_error:
             self.on_error(error_msg)
         else:
-            QtWidgets.QMessageBox.critical(self, self.windowTitle(), f"Error:\n\n{error_msg}")
+            VintageMessageBox.critical(self, self.windowTitle(), f"Error:\n\n{error_msg}")
         self.reject()
 
     def _cleanup_thread(self) -> None:
@@ -268,19 +435,7 @@ class TaskProgressDialog(QtWidgets.QDialog):
             pass
 
     def _detach_thread(self) -> None:
-        """Detach the running thread so it outlives the dialog without crashing Qt.
-
-        ``QThread::~QThread()`` calls ``abort()`` if the thread is still running when
-        the C++ object is destroyed.  When the user cancels mid-operation (e.g. while
-        ``dd`` or ``diskutil`` blocks), we cannot safely stop the thread immediately.
-        Instead we:
-
-        1. Keep Python-level references alive in ``_orphaned_threads`` so the GC does
-           not destroy the ``QThread`` wrapper while the C++ thread runs.
-        2. Disconnect all worker signals so they don't fire on a closed dialog.
-        3. Register a ``finished`` callback that removes the references once the thread
-           exits naturally (the cancel event causes it to exit at the next poll tick).
-        """
+        """Detach the running thread so it outlives the dialog without crashing Qt."""
         try:
             self._worker.progress.disconnect(self._on_progress)
         except Exception:
@@ -316,9 +471,10 @@ class TaskProgressDialog(QtWidgets.QDialog):
         QtCore.QTimer.singleShot(100, self._thread.start)
 
     def closeEvent(self, event):
-        if self._thread.isRunning():
-            self._cancel_event.set()
-            self._detach_thread()
+        if self._thread.isRunning() and not self._in_cleanup:
+            event.ignore()
+            self.reject()
+            return
         super().closeEvent(event)
 
     def reject(self):
@@ -327,13 +483,9 @@ class TaskProgressDialog(QtWidgets.QDialog):
         if self._in_cleanup:
             return
 
-        self._cancel_event.set()
-
         if self._thread.isRunning():
-            if hasattr(self, "_cancel_btn"):
-                # Use a plain QMessageBox instance (not the static .warning() method) so
-                # the session-log patch does not record this confirmation as [GUI-ERROR].
-                _mb = QtWidgets.QMessageBox(self)
+            if self._cancel_btn is not None:
+                _mb = VintageMessageBox(self)
                 _mb.setWindowTitle("Cancel?")
                 _mb.setText(
                     "Cancelling now will stop the write mid-way and may leave the "
@@ -345,8 +497,81 @@ class TaskProgressDialog(QtWidgets.QDialog):
                 _mb.addButton("Keep writing", QtWidgets.QMessageBox.ButtonRole.RejectRole)
                 _mb.exec()
                 if _mb.clickedButton() is not _yes:
-                    self._cancel_event.clear()
                     return
+            self._cancel_event.set()
             self._detach_thread()
-
         super().reject()
+
+
+class IndeterminateProgressDialog(QtWidgets.QDialog):
+    """Frameless progress shell for blocking main-thread work (``processEvents`` loops)."""
+
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget],
+        title: str,
+        message: str = "Working...",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setFixedWidth(t.SYNC_MDL_PROGRESS_W)
+        apply_frameless_modal(self)
+        self.setStyleSheet("QDialog { background: transparent; }")
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        shell = SyncModalShell()
+        header = ModalHeader(title)
+        shell.add_widget(header)
+
+        body = QtWidgets.QWidget()
+        body_lay = QtWidgets.QVBoxLayout(body)
+        body_lay.setContentsMargins(
+            t.SYNC_MDL_BODY_PAD, 16, t.SYNC_MDL_BODY_PAD, 20,
+        )
+        body_lay.setSpacing(10)
+
+        self._status_label = QtWidgets.QLabel(message)
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet(
+            f"color: {t.SYNC_MDL_PROGRESS_STATUS_CLR};"
+            f"font-size: {u.px(t.SYNC_MDL_PROGRESS_STATUS_SIZE)}px;"
+            f"background: transparent;"
+        )
+        body_lay.addWidget(self._status_label)
+
+        self._progress_bar = VintageProgressBar()
+        self._progress_bar.setRange(0, 0)
+        body_lay.addWidget(self._progress_bar)
+
+        shell.add_widget(body)
+        outer.addWidget(shell)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(48)
+        shadow.setOffset(0, 12)
+        shadow.setColor(QtGui.QColor(24, 12, 4, 112))
+        shell.setGraphicsEffect(shadow)
+
+        apply_modal_rounded_mask(self)
+
+    def set_message(self, message: str) -> None:
+        self._status_label.setText(message)
+        QtWidgets.QApplication.processEvents()
+
+    def set_progress(self, current: int, total: int, message: str = "") -> None:
+        if total > 0:
+            self._progress_bar.setRange(0, total)
+            self._progress_bar.setValue(current)
+        else:
+            self._progress_bar.setRange(0, 0)
+        if message:
+            self._status_label.setText(message)
+        QtWidgets.QApplication.processEvents()
+
+    def show_and_raise(self) -> None:
+        self.show()
+        self.raise_()
+        QtWidgets.QApplication.processEvents()

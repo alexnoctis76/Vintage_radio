@@ -22,11 +22,16 @@ except ImportError:
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+import gui.theme as t
 from .sd_manager import SDManager
 from .services.serial_debug import (
     append_session_ndjson_from_vrdbg_line,
     is_recoverable_usb_serial_error,
 )
+from .widgets.common.styled_combo import VintageComboBox
+from .widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from .widgets.dialogs.vintage_message import VintageMessageBox
+from .widgets.tools.connection_section import ConnectionSection
 
 
 class DeviceDebugWidget(QtWidgets.QWidget):
@@ -43,6 +48,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         db_getter: Optional[Callable[[], Any]] = None,
     ) -> None:
         super().__init__(parent)
+        self.setObjectName("deviceDebugRoot")
         self._basic_mode = basic_mode
         self._db = db
         #: If set, always read the active library DB from the manager (survives library switch / reconnect).
@@ -110,58 +116,31 @@ class DeviceDebugWidget(QtWidgets.QWidget):
     def _setup_ui(self) -> None:
         """Set up the user interface."""
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(t.TOOLS_DEBUG_ROW_GAP if self._basic_mode else 8)
         
         if not self._basic_mode:
             title = QtWidgets.QLabel("Device Debug Console")
             title.setStyleSheet("font-size: 18px; font-weight: bold;")
             layout.addWidget(title)
         
-        # Connection section
-        conn_group = QtWidgets.QGroupBox("Connection")
-        conn_layout = QtWidgets.QVBoxLayout(conn_group)
-        
-        # Info label about connection method
-        info_label = QtWidgets.QLabel(
-            "ℹ️ Connection uses direct serial port (non-intrusive, like Thonny). "
-            "Firmware continues running. Use 'Restart Firmware' if device stops responding."
-        )
-        info_label.setStyleSheet("color: #555555; font-size: 10px; padding: 4px; font-style: italic;")
-        info_label.setWordWrap(True)
-        conn_layout.addWidget(info_label)
-        
-        port_layout = QtWidgets.QHBoxLayout()
-        port_layout.addWidget(QtWidgets.QLabel("COM Port:"))
-        self.port_combo = QtWidgets.QComboBox()
-        self.port_combo.setEditable(True)
-        self.port_combo.setMinimumWidth(320)
-        port_layout.addWidget(self.port_combo)
-        
-        self.scan_btn = QtWidgets.QPushButton("Scan Ports")
-        self.scan_btn.clicked.connect(self._scan_ports)
-        port_layout.addWidget(self.scan_btn)
-        
-        self.connect_btn = QtWidgets.QPushButton("Connect")
-        self.connect_btn.clicked.connect(self._toggle_connection)
-        port_layout.addWidget(self.connect_btn)
-        
-        self.reset_connection_btn = QtWidgets.QPushButton("Reset Connection")
-        self.reset_connection_btn.setToolTip("Forcefully reset connection (useful if device is stuck or frozen)")
-        self.reset_connection_btn.clicked.connect(self._reset_connection)
+        # Connection banner (matches Install Firmware / Load Music storage bars)
+        self._conn_section = ConnectionSection(compact=self._basic_mode)
+        self._conn_section.scan_clicked.connect(self._scan_ports)
+        self._conn_section.connect_clicked.connect(self._toggle_connection)
+        self._conn_section.reset_clicked.connect(self._reset_connection)
+        self.port_combo = self._conn_section.port_combo
+        self.scan_btn = self._conn_section.scan_btn
+        self.connect_btn = self._conn_section.connect_btn
+        self.reset_connection_btn = self._conn_section.reset_btn
+        self.connection_status = self._conn_section.status_label
         self.reset_connection_btn.setEnabled(False)
-        port_layout.addWidget(self.reset_connection_btn)
-        
-        port_layout.addStretch()
-        conn_layout.addLayout(port_layout)
-        
-        self.connection_status = QtWidgets.QLabel("Not connected")
-        self.connection_status.setStyleSheet("color: gray;")
-        conn_layout.addWidget(self.connection_status)
-        
-        layout.addWidget(conn_group)
+        layout.addWidget(self._conn_section)
         
         # Quick actions
         actions_group = QtWidgets.QGroupBox("Quick Actions")
         actions_layout = QtWidgets.QHBoxLayout(actions_group)
+        actions_layout.setSpacing(t.TOOLS_DEBUG_ROW_GAP)
         
         self.restart_firmware_btn = QtWidgets.QPushButton("Restart Firmware")
         self.restart_firmware_btn.setToolTip("Restart main.py on the device (use this if device stops working after connecting)")
@@ -223,28 +202,13 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._firmware_running = False
         self._set_run_stop_button_state(running=False, enabled=False)
 
-        actions_layout.addWidget(self.restart_firmware_btn)
-        actions_layout.addWidget(self.soft_reset_btn)
-        actions_layout.addWidget(self.get_status_btn)
-        actions_layout.addWidget(self.list_files_btn)
-        actions_layout.addWidget(self.view_debug_log_btn)
-        actions_layout.addWidget(self.check_firmware_btn)
-        actions_layout.addWidget(self.clear_console_btn)
-        actions_layout.addWidget(self.stream_output_btn)
-        actions_layout.addWidget(self.run_stop_btn)
-        actions_layout.addWidget(self.debug_logging_checkbox)
-        actions_layout.addStretch()
-        
-        # Basic mode firmware test button
         self.test_basic_fw_btn = QtWidgets.QPushButton("Flash Basic Mode Firmware")
         self.test_basic_fw_btn.setToolTip(
             "Flash basic-mode firmware (discovers stations from DFPlayer folders via UART queries). "
             "Use this to test DFPlayer 0x4F/0x4E query support on your hardware."
         )
         self.test_basic_fw_btn.clicked.connect(self._flash_basic_firmware)
-        actions_layout.addWidget(self.test_basic_fw_btn)
 
-        # Power sense toggle
         power_layout = QtWidgets.QHBoxLayout()
         self.power_sense_checkbox = QtWidgets.QCheckBox("Skip Power Sense Check (No Potentiometer)")
         self.power_sense_checkbox.setToolTip(
@@ -254,9 +218,36 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self.power_sense_checkbox.stateChanged.connect(self._toggle_power_sense)
         power_layout.addWidget(self.power_sense_checkbox)
         power_layout.addStretch()
-        actions_layout.addLayout(power_layout)
-        
-        layout.addWidget(actions_group)
+
+        power_layout.addWidget(self.power_sense_checkbox)
+        power_layout.addStretch()
+
+        for btn in (
+            self.restart_firmware_btn,
+            self.soft_reset_btn,
+            self.run_stop_btn,
+            self.clear_console_btn,
+            self.view_debug_log_btn,
+        ):
+            actions_layout.addWidget(btn)
+        if not self._basic_mode:
+            for btn in (
+                self.get_status_btn,
+                self.list_files_btn,
+                self.check_firmware_btn,
+            ):
+                actions_layout.addWidget(btn)
+            actions_layout.addWidget(self.stream_output_btn)
+            actions_layout.addWidget(self.debug_logging_checkbox)
+            actions_layout.addWidget(self.test_basic_fw_btn)
+            actions_layout.addLayout(power_layout)
+            actions_layout.addStretch()
+            layout.addWidget(actions_group)
+
+        if self._basic_mode:
+            self.view_debug_log_btn.setText("Save Log")
+        else:
+            self.view_debug_log_btn.setText("Save Session Log")
 
         if self._basic_mode:
             self.list_files_btn.setVisible(False)
@@ -274,6 +265,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         # Now Playing display
         now_playing_group = QtWidgets.QGroupBox("Now Playing")
         now_playing_layout = QtWidgets.QVBoxLayout(now_playing_group)
+        now_playing_layout.setContentsMargins(8, 8, 8, 8)
         
         self.now_playing_label = QtWidgets.QLabel("Not connected")
         self.now_playing_label.setStyleSheet(
@@ -282,31 +274,42 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         )
         self.now_playing_label.setWordWrap(True)
         self.now_playing_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
-        now_playing_layout.addWidget(self.now_playing_label)
-        
-        # Now-playing info is automatically parsed from stream output (non-intrusive)
+        self.now_playing_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        now_playing_layout.addWidget(self.now_playing_label, 1)
         
         # Console output
         console_group = QtWidgets.QGroupBox("Console Output")
         console_layout = QtWidgets.QVBoxLayout(console_group)
+        console_layout.setContentsMargins(8, 8, 8, 8)
         
         self.console_output = QtWidgets.QTextEdit()
+        self.console_output.setObjectName("deviceDebugConsole")
         self.console_output.setReadOnly(True)
-        self.console_output.setFont(QtGui.QFont("Consolas", 9))
-        self.console_output.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
-        console_layout.addWidget(self.console_output)
+        self.console_output.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.console_output.setFont(QtGui.QFont("Consolas", t.TOOLS_LOG_FONT))
+        self._console_scroll_wrap = wrap_with_mockup_scrollbar(
+            self.console_output,
+            variant="station",
+        )
+        console_layout.addWidget(self._console_scroll_wrap, 1)
         
         # Command input
         cmd_group = QtWidgets.QGroupBox("Send Command")
         cmd_layout = QtWidgets.QVBoxLayout(cmd_group)
+        cmd_layout.setSpacing(6)
         
         cmd_input_layout = QtWidgets.QHBoxLayout()
+        cmd_input_layout.setSpacing(t.TOOLS_DEBUG_ROW_GAP)
         self.cmd_input = QtWidgets.QLineEdit()
         self.cmd_input.setPlaceholderText("Enter Python command (e.g., print('Hello')) or 'help' for examples")
         self.cmd_input.returnPressed.connect(self._send_command)
-        cmd_input_layout.addWidget(self.cmd_input)
+        cmd_input_layout.addWidget(self.cmd_input, 1)
         
         self.send_btn = QtWidgets.QPushButton("Send")
+        self.send_btn.setObjectName("deviceDebugPrimaryBtn")
         self.send_btn.clicked.connect(self._send_command)
         self.send_btn.setEnabled(False)
         cmd_input_layout.addWidget(self.send_btn)
@@ -315,7 +318,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         # Example commands
         examples_label = QtWidgets.QLabel("Example commands:")
-        examples_label.setStyleSheet("color: gray; font-size: 10px;")
+        examples_label.setObjectName("deviceDebugMuted")
         cmd_layout.addWidget(examples_label)
         
         examples_text = QtWidgets.QLabel(
@@ -323,35 +326,182 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             "from components.dfplayer_hardware import DFPlayerHardware; hw = DFPlayerHardware() | "
             "check_amplifier (diagnostic command)"
         )
-        examples_text.setStyleSheet("color: gray; font-size: 9px;")
+        examples_text.setObjectName("deviceDebugMutedSmall")
         examples_text.setWordWrap(True)
         cmd_layout.addWidget(examples_text)
-        
-        # Use a QSplitter so the user can drag to resize Now Playing vs Console
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(now_playing_group)
-        
-        # Combine console output and command input into one widget
+        if self._basic_mode:
+            examples_label.setVisible(False)
+            examples_text.setVisible(False)
+
         console_container = QtWidgets.QWidget()
         console_container_layout = QtWidgets.QVBoxLayout(console_container)
         console_container_layout.setContentsMargins(0, 0, 0, 0)
+        console_container_layout.setSpacing(t.TOOLS_DEBUG_ROW_GAP)
         console_container_layout.addWidget(console_group, 1)
         console_container_layout.addWidget(cmd_group)
-        splitter.addWidget(console_container)
-        
-        # Give most space to the console by default
-        splitter.setStretchFactor(0, 0)  # Now Playing: don't stretch
-        splitter.setStretchFactor(1, 1)  # Console: stretch to fill
-        splitter.setSizes([120, 400])    # Initial sizes in pixels
-        
-        # Style the splitter handle so it's visible and easy to grab
-        splitter.setHandleWidth(6)
-        splitter.setStyleSheet(
-            "QSplitter::handle { background-color: #444; border: 1px solid #555; }"
+
+        if self._basic_mode:
+            playback_row = QtWidgets.QWidget()
+            playback_row.setObjectName("deviceDebugPlaybackRow")
+            row_layout = QtWidgets.QHBoxLayout(playback_row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(t.TOOLS_DEBUG_ROW_GAP)
+
+            now_playing_group.setMinimumHeight(t.TOOLS_NOW_PLAYING_MAX_H)
+            now_playing_group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
+            actions_group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Minimum,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
+
+            row_layout.addWidget(now_playing_group, 1)
+            row_layout.addWidget(
+                actions_group,
+                0,
+                QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignRight,
+            )
+
+            layout.addWidget(playback_row)
+            layout.addWidget(console_container, 1)
+        else:
+            splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+            splitter.setChildrenCollapsible(False)
+            splitter.addWidget(now_playing_group)
+            splitter.addWidget(console_container)
+            splitter.setStretchFactor(0, 0)
+            splitter.setStretchFactor(1, 1)
+            splitter.setSizes([120, 400])
+            splitter.setHandleWidth(6)
+            splitter.setStyleSheet(
+                "QSplitter::handle { background-color: #444; border: 1px solid #555; }"
+            )
+            layout.addWidget(splitter, 1)
+
+        if self._basic_mode:
+            self.reload_vintage_theme()
+    
+    def reload_vintage_theme(self) -> None:
+        """Apply Vintage Radio cream/brown styling (basic mode / Tools tab)."""
+        if not self._basic_mode:
+            return
+
+        self.setStyleSheet(f"""
+            #deviceDebugRoot {{
+                background: transparent;
+            }}
+            #deviceDebugRoot QGroupBox {{
+                font-weight: 800;
+                font-size: 13px;
+                color: {t.IF_DEVICE_TITLE_FG};
+                border: 1px solid {t.IF_CARD_BORDER};
+                border-radius: {t.IF_CARD_RADIUS}px;
+                margin-top: 12px;
+                padding: 8px 10px 10px 10px;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.IF_CARD_INNER_TOP}, stop:1 {t.IF_CARD_INNER_BOT}
+                );
+            }}
+            #deviceDebugRoot QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }}
+            #deviceDebugRoot QLabel {{
+                color: {t.IF_DEVICE_TITLE_FG};
+                background: transparent;
+            }}
+            #deviceDebugRoot QPushButton {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.OUTLINE_BTN_GRAD_TOP},
+                    stop:1 {t.OUTLINE_BTN_GRAD_BOT}
+                );
+                color: {t.TEXT_PRI};
+                border: 2px solid {t.LM_SD_BTN_BORDER};
+                border-radius: {t.LM_SD_BTN_RADIUS}px;
+                padding: 0 10px;
+                font-size: {t.IF_DEVICE_BTN_FONT}px;
+                font-weight: 800;
+                min-height: {t.TOOLS_DEBUG_BTN_H}px;
+                max-height: {t.TOOLS_DEBUG_BTN_H}px;
+            }}
+            #deviceDebugRoot QPushButton:hover {{
+                background: {t.LIGHT_BTN_HOVER};
+            }}
+            #deviceDebugRoot QPushButton:pressed {{
+                background: {t.LIGHT_BTN_PRESSED};
+            }}
+            #deviceDebugRoot QPushButton:disabled {{
+                color: #9a8878;
+            }}
+            #deviceDebugRoot QPushButton#deviceDebugPrimaryBtn {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.IF_INSTALL_BTN_TOP}, stop:0.58 {t.IF_INSTALL_BTN_MID},
+                    stop:1 {t.IF_INSTALL_BTN_BOT}
+                );
+                color: {t.IF_INSTALL_BTN_FG};
+                border: 2px solid {t.IF_INSTALL_BTN_BORDER};
+            }}
+            #deviceDebugRoot QPushButton#deviceDebugPrimaryBtn:hover {{
+                background: {t.IF_INSTALL_BTN_MID};
+            }}
+            #deviceDebugRoot QLineEdit {{
+                background: {t.TOOLS_INPUT_BG};
+                color: {t.TOOLS_INPUT_FG};
+                border: 1px solid {t.TOOLS_INPUT_BORDER};
+                border-radius: {t.TOOLS_PATH_FIELD_RADIUS}px;
+                padding: 0 10px;
+                min-height: {t.TOOLS_DEBUG_BTN_H}px;
+                max-height: {t.TOOLS_DEBUG_BTN_H}px;
+                font-size: {t.LIBBAR_COMBO_FONT_SIZE}px;
+            }}
+            #deviceDebugRoot QCheckBox {{
+                color: {t.IF_DEVICE_TITLE_FG};
+                font-size: {t.IF_DEVICE_META_SIZE}px;
+            }}
+            #deviceDebugRoot QLabel#deviceDebugMuted {{
+                color: {t.TOOLS_MUTED_FG};
+                font-size: 10px;
+                padding: 4px;
+                font-style: italic;
+            }}
+            #deviceDebugRoot QLabel#deviceDebugMutedSmall {{
+                color: {t.TOOLS_MUTED_FG};
+                font-size: 9px;
+            }}
+        """)
+
+        if hasattr(self, "_conn_section"):
+            self._conn_section.reload_theme()
+
+        self.run_stop_btn.setStyleSheet(
+            self._run_stop_button_stylesheet(running=self._firmware_running)
         )
-        
-        layout.addWidget(splitter, 1)
+
+        console_style = (
+            f"QTextEdit#deviceDebugConsole {{ "
+            f"background: {t.TOOLS_CONSOLE_BG}; color: {t.TOOLS_CONSOLE_FG}; "
+            f"border: none; padding: 6px; }}"
+        )
+        self.now_playing_label.setStyleSheet(
+            f"font-size: 12px; padding: 6px 8px; background: {t.TOOLS_CONSOLE_BG}; "
+            f"border: 1px solid {t.TOOLS_CONSOLE_BORDER}; border-radius: {t.TOOLS_PATH_FIELD_RADIUS}px; "
+            f"color: {t.TOOLS_CONSOLE_FG};"
+        )
+        self.console_output.setFont(QtGui.QFont("Consolas", t.TOOLS_LOG_FONT))
+        self.console_output.setStyleSheet(console_style)
+        pal = self.console_output.palette()
+        pal.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor(t.TOOLS_CONSOLE_FG))
+        pal.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor(t.TOOLS_CONSOLE_BG))
+        self.console_output.setPalette(pal)
+        self.connection_status.setStyleSheet(
+            f"color: {t.IF_DEVICE_META_FG}; font-size: {t.IF_DEVICE_META_SIZE}px;"
+        )
     
     def _pause_streaming(self):
         """Pause the streaming thread so we can use the serial port for a command."""
@@ -995,8 +1145,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 self._connected = True
                 self.connect_btn.setText("Disconnect")
                 self.connect_btn.setEnabled(True)
-                self.connection_status.setText(f"Connected to {port}")
-                self.connection_status.setStyleSheet("color: green;")
+                self._conn_section.set_connected(True)
+                self._conn_section.set_meta_text(f"Connected to {port}")
                 
                 # Enable all action buttons
                 self.restart_firmware_btn.setEnabled(True)
@@ -1012,7 +1162,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 
                 # Set "now playing" to waiting state (parsed from stream, not from Ctrl+C)
                 self.now_playing_label.setText(
-                    "<span style='color: #9cdcfe;'>Listening for playback info from stream...</span>"
+                    f"<span style='color: {self._now_playing_color('artist')};'>"
+                    "Listening for playback info from stream...</span>"
                 )
                 
                 # Auto-start streaming so user sees logs immediately
@@ -1107,8 +1258,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             
             self.connect_btn.setText("Connect")
             self.connect_btn.setEnabled(True)
-            self.connection_status.setText("Not connected")
-            self.connection_status.setStyleSheet("color: gray;")
+            self._conn_section.set_connected(False)
+            self._conn_section.set_meta_text("Not connected")
             self.restart_firmware_btn.setEnabled(False)
             self.soft_reset_btn.setEnabled(False)
             self.get_status_btn.setEnabled(False)
@@ -1563,6 +1714,30 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         self._stop_output = False  # Reset for next start
 
+    def _run_stop_button_stylesheet(self, *, running: bool) -> str:
+        """Start/Stop styling — rounded like other debugger buttons."""
+        radius = t.LM_SD_BTN_RADIUS
+        btn_h = t.TOOLS_DEBUG_BTN_H
+        font = t.IF_DEVICE_BTN_FONT
+        base = (
+            f"min-height:{btn_h}px; max-height:{btn_h}px; "
+            f"border-radius:{radius}px; font-weight:800; "
+            f"padding:0 10px; font-size:{font}px;"
+        )
+        if running:
+            return (
+                f"QPushButton#vrRunStopBtn {{ background-color:#c62828; color:#fff7eb; "
+                f"border:2px solid #8b1a1a; {base} }}"
+                f"QPushButton#vrRunStopBtn:hover {{ background-color:#b71c1c; }}"
+                f"QPushButton#vrRunStopBtn:disabled {{ background-color:#c62828; color:#fff7eb; }}"
+            )
+        return (
+            f"QPushButton#vrRunStopBtn {{ background-color:#4CAF50; color:#fff7eb; "
+            f"border:2px solid #2e7d32; {base} }}"
+            f"QPushButton#vrRunStopBtn:hover {{ background-color:#43a047; }}"
+            f"QPushButton#vrRunStopBtn:disabled {{ background-color:#4CAF50; color:#fff7eb; }}"
+        )
+
     def _set_run_stop_button_state(self, *, running: bool, enabled: Optional[bool] = None) -> None:
         """Keep Run/Stop button text, style and enablement in sync."""
         self._firmware_running = bool(running)
@@ -1577,20 +1752,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self.run_stop_btn.setEnabled(False)
         if self._firmware_running:
             self.run_stop_btn.setText("Stop")
-            self.run_stop_btn.setStyleSheet(
-                "QPushButton#vrRunStopBtn { background-color: #f44336; color: white; "
-                "font-weight: bold; padding: 6px 16px; border-radius: 3px; border: none; }"
-                "QPushButton#vrRunStopBtn:hover { background-color: #d32f2f; }"
-                "QPushButton#vrRunStopBtn:disabled { background-color: #f44336; color: #f5f5f5; }"
-            )
         else:
             self.run_stop_btn.setText("Start")
-            self.run_stop_btn.setStyleSheet(
-                "QPushButton#vrRunStopBtn { background-color: #4CAF50; color: white; "
-                "font-weight: bold; padding: 6px 16px; border-radius: 3px; border: none; }"
-                "QPushButton#vrRunStopBtn:hover { background-color: #45a049; }"
-                "QPushButton#vrRunStopBtn:disabled { background-color: #4CAF50; color: #f5f5f5; }"
-            )
+        self.run_stop_btn.setStyleSheet(self._run_stop_button_stylesheet(running=self._firmware_running))
     
     def _toggle_run_stop(self) -> None:
         """Start or stop the firmware (basic mode Thonny-style button).
@@ -2199,20 +2363,31 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             else:
                 mode_display = mode.title()
             
-            parts.append(f"<span style='color: #dcdcaa;'>Mode: {mode_display}</span>")
+            parts.append(
+                f"<span style='color: {self._now_playing_color('mode')};'>Mode: {mode_display}</span>"
+            )
             
             # Show source (album/playlist name) for non-shuffle modes
             if mode.lower() != "shuffle" and source:
-                parts.append(f"<span style='color: #c586c0;'>{source}</span>")
+                parts.append(
+                    f"<span style='color: {self._now_playing_color('source')};'>{source}</span>"
+                )
             
             if title:
-                parts.append(f"<b style='color: #4ec9b0;'>&#9835; {title}</b>")
+                parts.append(
+                    f"<b style='color: {self._now_playing_color('title')};'>&#9835; {title}</b>"
+                )
             if artist:
-                parts.append(f"<span style='color: #9cdcfe;'>{artist}</span>")
+                parts.append(
+                    f"<span style='color: {self._now_playing_color('artist')};'>{artist}</span>"
+                )
             
             # Show folder/track location for basic mode
             if self._basic_mode and folder is not None and track_num is not None:
-                parts.append(f"<span style='color: #808080; font-size: smaller;'>Folder {folder:02d} / Track {track_num:03d}</span>")
+                parts.append(
+                    f"<span style='color: {self._now_playing_color('loc')}; font-size: smaller;'>"
+                    f"Folder {folder:02d} / Track {track_num:03d}</span>"
+                )
             
             self.now_playing_label.setText("<br>".join(parts))
         except Exception:
@@ -2478,7 +2653,7 @@ GUI Commands (not sent to device):
         Uses the parent MainWindow's install_to_pico flow but swaps
         main.py for main_basic.py.
         """
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "Flash Basic Mode Firmware",
             "This will install basic-mode firmware on the connected Pico.\n\n"
@@ -2487,10 +2662,10 @@ GUI Commands (not sent to device):
             "No metadata files are needed -- folder structure is the source of truth.\n\n"
             "Make sure your SD card has numbered folders (01/, 02/, etc.) with MP3 files.\n\n"
             "Proceed?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.No,
         )
-        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply != VintageMessageBox.StandardButton.Yes:
             return
 
         main_window = self.window()
@@ -2521,6 +2696,32 @@ GUI Commands (not sent to device):
                 print(f"[DeviceDebug] Failed to queue log message: {e}")
                 print(f"[DeviceDebug] {message}")
     
+    def _console_log_color(self, level: str) -> str:
+        """Return HTML color for a console log line."""
+        colors = {
+            "error": "#f48771",
+            "warning": "#dcdcaa",
+            "success": "#4ec9b0",
+            "command": "#569cd6",
+            "output": "#d4d4d4",
+        }
+        if level in colors:
+            return colors[level]
+        # Default [INFO] — tan in vintage mode, light blue otherwise
+        return t.TOOLS_CONSOLE_FG if self._basic_mode else "#9cdcfe"
+
+    def _now_playing_color(self, role: str) -> str:
+        """Return HTML color for now-playing label parts."""
+        colors = {
+            "mode": "#dcdcaa",
+            "source": "#c586c0",
+            "title": "#4ec9b0",
+            "loc": "#808080",
+        }
+        if role == "artist":
+            return t.TOOLS_CONSOLE_FG if self._basic_mode else "#9cdcfe"
+        return colors.get(role, "#d4d4d4")
+
     @QtCore.pyqtSlot(str, str)
     def _log_impl(self, message: str, level: str = "info") -> None:
         """Internal implementation of log - must be called on main thread."""
@@ -2529,24 +2730,19 @@ GUI Commands (not sent to device):
         timestamp = format_session_timestamp()
         
         if level == "error":
-            color = "#f48771"  # Red
             prefix = "[ERROR]"
         elif level == "warning":
-            color = "#dcdcaa"  # Yellow
             prefix = "[WARN]"
         elif level == "success":
-            color = "#4ec9b0"  # Green
             prefix = "[OK]"
         elif level == "command":
-            color = "#569cd6"  # Blue
             prefix = "[CMD]"
         elif level == "output":
-            color = "#d4d4d4"  # Light gray
             prefix = ""
         else:
-            color = "#9cdcfe"  # Light blue
             prefix = "[INFO]"
         
+        color = self._console_log_color(level)
         formatted = f'<span style="color: {color};">{timestamp} {prefix} {message}</span>'
         # Always echo to stdout so the session log captures it
         print(f"{timestamp} {prefix} {message}")
@@ -2877,8 +3073,8 @@ GUI Commands (not sent to device):
             self._connected = False
             self.connect_btn.setText("Connect")
             self.connect_btn.setEnabled(True)
-            self.connection_status.setText("Connection timed out")
-            self.connection_status.setStyleSheet("color: red;")
+            self._conn_section.set_connected(False)
+            self._conn_section.set_meta_text("Connection timed out")
             self._log("✗ Connection timed out", "error")
             self._restore_disconnected_state()
         except Exception as e:
@@ -2903,8 +3099,8 @@ GUI Commands (not sent to device):
             self.connect_btn.setText("Connect")
             self.connect_btn.setEnabled(True)
             error_display = str(error)[:50] if error else "Unknown error"
-            self.connection_status.setText(f"Error: {error_display}")
-            self.connection_status.setStyleSheet("color: red;")
+            self._conn_section.set_connected(False)
+            self._conn_section.set_meta_text(f"Error: {error_display}")
             self._log(f"✗ Connection error: {error}", "error")
             self._restore_disconnected_state()
         except Exception as e:

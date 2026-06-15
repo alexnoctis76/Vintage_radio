@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 
+from gui.audio_metadata import compute_file_hash
 from gui.database import DatabaseManager
 from gui.sd_manager import (
     SDManager,
@@ -548,3 +549,124 @@ def test_clear_basic_sync_mp3_cache_for_library_noop_when_missing(sd_mgr, tmp_pa
         ok, err = sd_mgr.clear_basic_sync_mp3_cache_for_library()
     assert ok
     assert err == ""
+
+
+def _write_minimal_mp3(path: Path, *, repeat: int = 10) -> None:
+    frame = b"\xff\xfb\x90\x00" + b"\x00" * 413
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(frame * repeat)
+
+
+@pytest.fixture
+def basic_station_setup(tmp_path, sd_db):
+    """One basic station with two MP3 tracks on disk."""
+    music = tmp_path / "music"
+    a = music / "alpha.mp3"
+    b = music / "beta.mp3"
+    _write_minimal_mp3(a)
+    _write_minimal_mp3(b, repeat=20)
+    sid_a = sd_db.add_song(
+        original_filename="alpha.mp3",
+        file_path=str(a),
+        title="Alpha",
+        file_hash=compute_file_hash(a),
+        file_size=a.stat().st_size,
+        format="mp3",
+    )
+    sid_b = sd_db.add_song(
+        original_filename="beta.mp3",
+        file_path=str(b),
+        title="Beta",
+        file_hash=compute_file_hash(b),
+        file_size=b.stat().st_size,
+        format="mp3",
+    )
+    st_id = sd_db.create_basic_station("Station One", 1)
+    sd_db.add_song_to_basic_station(st_id, sid_a, 1)
+    sd_db.add_song_to_basic_station(st_id, sid_b, 2)
+    mgr = SDManager(sd_db)
+    return mgr, sd_db, st_id, sid_a, sid_b, a, b
+
+
+class TestBasicSyncChanges:
+    def test_second_sync_skips_unchanged_tracks(self, basic_station_setup, tmp_path):
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_basic"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            r1 = mgr.sync_library_basic(sd_root)
+            r2 = mgr.sync_library_basic(sd_root)
+        assert int(r1["copied"]) == 2
+        assert int(r2["copied"]) == 0
+        assert int(r2["skipped"]) >= 2
+        assert (sd_root / "01" / "001.mp3").exists()
+        assert (sd_root / "01" / "002.mp3").exists()
+
+    def test_sync_changes_replaces_modified_track(self, basic_station_setup, tmp_path):
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_modified"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root)
+            _write_minimal_mp3(a, repeat=12)
+            new_hash = compute_file_hash(a)
+            db.conn.execute(
+                "UPDATE songs SET file_hash = ?, file_size = ? WHERE id = ?;",
+                (new_hash, a.stat().st_size, sid_a),
+            )
+            db.conn.commit()
+            r2 = mgr.sync_library_basic(sd_root)
+        assert int(r2["copied"]) >= 1
+        assert (sd_root / "01" / "001.mp3").read_bytes() == a.read_bytes()
+
+    def test_sync_without_manifest_verifies_mp3_content(self, basic_station_setup, tmp_path):
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_nomanifest"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root)
+            manifest = sd_root / ".sync_manifest.json"
+            assert manifest.exists()
+            manifest.unlink()
+            local_manifest = SDManager._local_manifest_path(sd_root)
+            if local_manifest is not None:
+                try:
+                    local_manifest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            wrong = sd_root / "01" / "001.mp3"
+            wrong.write_bytes(wrong.read_bytes() + b"corrupt")
+            r2 = mgr.sync_library_basic(sd_root)
+        assert int(r2["copied"]) >= 1
+        assert wrong.read_bytes() == a.read_bytes()
+
+    def test_reordered_tracks_are_recopied(self, basic_station_setup, tmp_path):
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_reorder"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root)
+            for row in db.list_basic_station_tracks(st_id):
+                db.remove_basic_station_track(int(row["id"]))
+            db.add_song_to_basic_station(st_id, sid_b, 1)
+            db.add_song_to_basic_station(st_id, sid_a, 2)
+            r2 = mgr.sync_library_basic(sd_root)
+        assert int(r2["copied"]) >= 2
+        assert (sd_root / "01" / "001.mp3").read_bytes() == b.read_bytes()
+        assert (sd_root / "01" / "002.mp3").read_bytes() == a.read_bytes()
+
+    def test_unchanged_sync_uses_manifest_without_hashing(self, basic_station_setup, tmp_path):
+        """Second Sync Changes pass must not SHA-256 every MP3 when manifest matches."""
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_fast"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root)
+            with mock.patch(
+                "gui.sd_manager.compute_file_hash",
+                side_effect=AssertionError("hash should not run on manifest fast path"),
+            ) as hash_mock:
+                r2 = mgr.sync_library_basic(sd_root)
+            hash_mock.assert_not_called()
+        assert int(r2["copied"]) == 0
+        assert int(r2["skipped"]) >= 2

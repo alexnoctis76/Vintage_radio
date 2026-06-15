@@ -70,6 +70,9 @@ datas = [
     (str(project_dir / 'firmware' / 'pin_config_loader.py'), 'firmware'),
     (str(project_dir / 'docs' / 'CUSTOM_DRIVER.md'), 'docs'),
 ]
+_release_cfg = project_dir / 'release_config.json'
+if _release_cfg.is_file():
+    datas.append((str(_release_cfg), '.'))
 # main_basic.py / main.py import these from components/; without them mpremote install silently skipped
 # missing sources (see radio_manager._install_to_pico_worker) and firmware dies at ImportError.
 _pico_components = project_dir / 'firmware' / 'pico' / 'components'

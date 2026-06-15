@@ -31,6 +31,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainterPath, QPen
 
 import gui.theme as t
+from gui import ui_scale as u
 
 
 # ── Item-data roles used by StationItemDelegate ────────────────────────────────
@@ -39,6 +40,75 @@ STATION_NAME_ROLE  = int(QtCore.Qt.ItemDataRole.UserRole) + 11
 STATION_COUNT_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 12
 
 _BASIC_MAX_TRACKS = 255
+
+
+def _station_row_layout(font: QFont, max_tracks: int) -> dict[str, int]:
+    """Right-rail geometry derived from font metrics (zoom-safe)."""
+    count_font = QFont(font)
+    count_fm = QtGui.QFontMetrics(count_font)
+
+    pencil_font = QFont(font)
+    pencil_font.setBold(True)
+    pencil_fm = QtGui.QFontMetrics(pencil_font)
+
+    name_font = QFont(font)
+    name_font.setBold(True)
+    name_fm = QtGui.QFontMetrics(name_font)
+
+    count_sample = f"{max_tracks}/{max_tracks}"
+    count_w = count_fm.horizontalAdvance(count_sample) + 8
+    pencil_w = pencil_fm.horizontalAdvance("\u270E") + 6
+
+    right_pad = 8
+    count_pencil_gap = 10
+
+    pencil_roff = right_pad + pencil_w
+    count_roff = pencil_roff + count_pencil_gap + count_w
+    name_rsrv = count_roff + 6
+
+    row_h = max(
+        u.px(t.STATION_ROW_H),
+        count_fm.height() + u.px(24),
+        name_fm.height() + u.px(24),
+    )
+
+    return {
+        "count_w": count_w,
+        "count_roff": count_roff,
+        "pencil_roff": pencil_roff,
+        "pencil_w": pencil_w,
+        "name_rsrv": name_rsrv,
+        "row_h": row_h,
+        "right_pad": right_pad,
+    }
+
+
+def station_pencil_hit_rect(
+    row_rect: QtCore.QRect,
+    font: Optional[QFont] = None,
+    max_tracks: int = _BASIC_MAX_TRACKS,
+) -> QtCore.QRect:
+    """Clickable hit target for the station-row edit pencil."""
+    layout = _station_row_layout(font or QFont(), max_tracks)
+    pad = 8
+    pencil_x = row_rect.right() - layout["pencil_roff"]
+    return QtCore.QRect(
+        pencil_x - pad,
+        row_rect.top(),
+        layout["pencil_w"] + pad * 2,
+        row_rect.height(),
+    )
+
+
+def track_pencil_hit_rect(row_rect: QtCore.QRect) -> QtCore.QRect:
+    """Clickable hit target for the track-row edit pencil."""
+    pad = 8
+    return QtCore.QRect(
+        row_rect.right() - t.TRACK_PENCIL_ROFF - pad,
+        row_rect.top(),
+        t.TRACK_PENCIL_W + pad * 2,
+        row_rect.height(),
+    )
 
 
 class StationItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -67,15 +137,16 @@ class StationItemDelegate(QtWidgets.QStyledItemDelegate):
         name_font = QFont(option.font)
         name_font.setBold(True)
         name_w = QtGui.QFontMetrics(name_font).horizontalAdvance(str(name))
+        layout = _station_row_layout(option.font, self._max)
         content_w = (
             t.STATION_PAD_LEFT
             + t.STATION_HANDLE_W
             + t.STATION_NUM_W
             + name_w
-            + t.STATION_NAME_RSVD
+            + layout["name_rsrv"]
             + _SEL_PADDING * 2
         )
-        return QtCore.QSize(max(option.rect.width(), content_w), t.STATION_ROW_H)
+        return QtCore.QSize(max(option.rect.width(), content_w), layout["row_h"])
 
     def paint(self, painter, option, index) -> None:  # type: ignore[override]
         painter.save()
@@ -118,17 +189,23 @@ class StationItemDelegate(QtWidgets.QStyledItemDelegate):
                  or index.data(QtCore.Qt.ItemDataRole.DisplayRole) or "")
         count = index.data(STATION_COUNT_ROLE)
 
+        layout = _station_row_layout(option.font, self._max)
+
         if selected:
             text_color = QColor("#ffffff")
-            dim_color  = QColor(255, 255, 255, 180)
+            count_color = QColor(t.STATION_COUNT_COLOR_SEL)
+            pencil_color = QColor(t.STATION_PENCIL_COLOR_SEL)
+            handle_color = QColor(255, 255, 255, 180)
         else:
             text_color = QColor(t.S_TEXT)
-            dim_color  = QColor(t.BORDER_SOFT)
+            count_color = QColor(t.STATION_COUNT_COLOR)
+            pencil_color = QColor(t.STATION_PENCIL_COLOR)
+            handle_color = QColor(t.BORDER_SOFT)
 
         x = rect.left() + t.STATION_PAD_LEFT
 
         # Drag-handle glyph (≡)
-        painter.setPen(dim_color)
+        painter.setPen(handle_color)
         painter.setFont(QFont(option.font))
         painter.drawText(
             QtCore.QRect(x, rect.top(), t.STATION_HANDLE_W, rect.height()),
@@ -155,7 +232,7 @@ class StationItemDelegate(QtWidgets.QStyledItemDelegate):
         name_rect = QtCore.QRect(
             x + t.STATION_NAME_OFFSET,
             rect.top(),
-            rect.width() - t.STATION_NAME_OFFSET - t.STATION_NAME_RSVD,
+            max(0, rect.width() - t.STATION_NAME_OFFSET - layout["name_rsrv"]),
             rect.height(),
         )
         painter.drawText(
@@ -166,24 +243,33 @@ class StationItemDelegate(QtWidgets.QStyledItemDelegate):
             ),
         )
 
-        # Track count
-        painter.setFont(QFont(option.font))
-        painter.setPen(dim_color)
+        # Track count — width from font metrics so "255/255" never clips at high zoom
+        count_font = QFont(option.font)
+        painter.setFont(count_font)
+        painter.setPen(count_color)
+        count_str = f"{int(count)}/{self._max}" if count is not None else ""
         painter.drawText(
             QtCore.QRect(
-                rect.right() - t.STATION_COUNT_ROFF, rect.top(),
-                t.STATION_COUNT_W, rect.height(),
+                rect.right() - layout["count_roff"],
+                rect.top(),
+                layout["count_w"],
+                rect.height(),
             ),
             QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignRight,
-            f"{int(count)}/{self._max}" if count is not None else "",
+            count_str,
         )
 
         # Edit pencil glyph (✎)
-        painter.setPen(dim_color)
+        pencil_font = QFont(option.font)
+        pencil_font.setBold(True)
+        painter.setFont(pencil_font)
+        painter.setPen(pencil_color)
         painter.drawText(
             QtCore.QRect(
-                rect.right() - t.STATION_PENCIL_ROFF, rect.top(),
-                t.STATION_PENCIL_W, rect.height(),
+                rect.right() - layout["pencil_roff"],
+                rect.top(),
+                layout["pencil_w"],
+                rect.height(),
             ),
             QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
             "\u270E",
@@ -247,6 +333,11 @@ def _draw_track_sel_pill(
     )
 
 
+def configure_track_title_item(item: QtWidgets.QTableWidgetItem) -> None:
+    """Prevent Qt from painting DisplayRole text over the custom title/artist layout."""
+    item.setForeground(QtGui.QBrush(QtCore.Qt.GlobalColor.transparent))
+
+
 class RowBgDelegate(QtWidgets.QStyledItemDelegate):
     """Delegate for non-title columns (Duration, Format) of the track table.
 
@@ -258,6 +349,14 @@ class RowBgDelegate(QtWidgets.QStyledItemDelegate):
     -----------
       Text alignment → the AlignVCenter | AlignHCenter flags below.
     """
+
+    def initStyleOption(
+        self,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        super().initStyleOption(option, index)
+        option.text = ""
 
     def paint(self, painter, option, index) -> None:  # type: ignore[override]
         painter.save()
@@ -297,7 +396,32 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
     """
 
     def sizeHint(self, option, index) -> QtCore.QSize:  # type: ignore[override]
-        return QtCore.QSize(option.rect.width(), t.TRACK_ROW_H)
+        return QtCore.QSize(option.rect.width(), u.px(t.TRACK_ROW_H))
+
+    def initStyleOption(
+        self,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        """Suppress default item text — we paint title/artist ourselves; Qt would
+        center the title over the artist line on unselected rows."""
+        super().initStyleOption(option, index)
+        option.text = ""
+
+    def _artist_for_row(
+        self, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex
+    ) -> str:
+        sib = index.siblingAtColumn(1)
+        if sib.isValid():
+            artist = sib.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+            if artist:
+                return str(artist)
+        view = option.widget
+        if isinstance(view, QtWidgets.QTableWidget):
+            item = view.item(index.row(), 1)
+            if item is not None:
+                return item.text()
+        return ""
 
     def paint(self, painter, option, index) -> None:  # type: ignore[override]
         painter.save()
@@ -313,39 +437,69 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
                 painter.setClipping(False)
                 _draw_track_sel_pill(painter, full_rect, frect, t.TRACK_SEL_RADIUS)
 
+        if selected:
+            handle_color = QColor(t.TRACK_HANDLE_COLOR_SEL)
+            pencil_color = QColor(t.TRACK_PENCIL_COLOR_SEL)
+            text_pri = QColor(t.TEXT_PRI)
+            text_sec = QColor(t.TEXT_SEC)
+        else:
+            handle_color = QColor(t.TRACK_HANDLE_COLOR)
+            pencil_color = QColor(t.TRACK_PENCIL_COLOR)
+            text_pri = QColor(t.TEXT_PRI)
+            text_sec = QColor(t.TEXT_SEC)
+
+        # ── Drag handle (≡) ───────────────────────────────────────────────────
+        x0 = rect.left() + t.TRACK_LEFT_PAD
+        painter.setPen(handle_color)
+        painter.setFont(QFont(option.font))
+        painter.drawText(
+            QtCore.QRect(x0, rect.top(), t.TRACK_HANDLE_W, rect.height()),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            "\u2630",
+        )
+
         # ── Row number ────────────────────────────────────────────────────────
-        row_num  = index.row() + 1
-        num_rect = QtCore.QRect(rect.left(), rect.top(), t.LM_TRACK_NUM_COL_W, rect.height())
+        row_num = index.row() + 1
+        num_rect = QtCore.QRect(
+            x0 + t.TRACK_HANDLE_W,
+            rect.top(),
+            t.TRACK_NUM_W,
+            rect.height(),
+        )
         num_font = QFont(option.font)
         num_font.setBold(False)
         painter.setFont(num_font)
-        num_color = QColor(t.LM_TRACK_NUM_COLOR)
-        painter.setPen(num_color)
+        painter.setPen(QColor(t.LM_TRACK_NUM_COLOR))
         painter.drawText(
             num_rect,
-            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignHCenter,
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignCenter,
             f"{row_num:02d}",
         )
 
         # ── Title + artist ────────────────────────────────────────────────────
-        title  = index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
-        artist = ""
-        sib    = index.siblingAtColumn(1)
-        if sib.isValid():
-            artist = sib.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+        title = index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+        artist = self._artist_for_row(option, index)
 
-        content_x    = rect.left() + t.LM_TRACK_NUM_COL_W + t.TRACK_PAD_X
-        content_w    = rect.width() - t.LM_TRACK_NUM_COL_W - t.TRACK_PAD_X - t.TRACK_PAD_RIGHT
-        mid          = rect.height() // 2
-        title_color  = QColor(t.TEXT_PRI)
-        artist_color = QColor(t.TEXT_SEC)
+        content_x = x0 + t.TRACK_HANDLE_W + t.TRACK_NUM_W + u.px(t.TRACK_PAD_X)
+        content_w = (
+            rect.width()
+            - (content_x - rect.left())
+            - u.px(t.TRACK_RIGHT_RSVD)
+            - u.px(t.TRACK_PAD_RIGHT)
+        )
+        gap = u.px(t.TRACK_ARTIST_GAP)
+        top_bias = u.px(t.TRACK_TITLE_TOP_BIAS)
+        mid = rect.height() // 2
+        title_h = max(1, mid - gap // 2)
+        artist_y = rect.top() + mid + (gap + 1) // 2
+        artist_h = max(1, rect.height() - artist_y - top_bias)
 
         title_font = QFont(option.font)
         title_font.setBold(True)
         painter.setFont(title_font)
-        painter.setPen(title_color)
+        painter.setPen(text_pri)
         painter.drawText(
-            QtCore.QRect(content_x, rect.top() + t.TRACK_TITLE_TOP_BIAS, content_w, mid),
+            QtCore.QRect(content_x, rect.top() + top_bias, content_w, title_h),
             QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignLeft,
             QtGui.QFontMetrics(title_font).elidedText(
                 str(title), QtCore.Qt.TextElideMode.ElideRight, content_w,
@@ -354,17 +508,34 @@ class TrackItemDelegate(QtWidgets.QStyledItemDelegate):
 
         if artist:
             af = QFont(option.font)
-            af.setPointSizeF(max(t.TRACK_ARTIST_MIN_PT,
-                                 af.pointSizeF() - t.TRACK_ARTIST_SIZE_DELTA))
+            title_px = title_font.pixelSize()
+            if title_px <= 0:
+                title_px = u.px(t.LM_TRACK_NUM_FONT_SIZE + 3)
+            af.setPixelSize(max(u.px(8), title_px - u.px(2)))
             painter.setFont(af)
-            painter.setPen(artist_color)
+            painter.setPen(text_sec)
             painter.drawText(
-                QtCore.QRect(content_x, rect.top() + mid,
-                             content_w, rect.height() - mid - t.TRACK_TITLE_TOP_BIAS),
+                QtCore.QRect(content_x, artist_y, content_w, artist_h),
                 QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft,
                 QtGui.QFontMetrics(af).elidedText(
                     str(artist), QtCore.Qt.TextElideMode.ElideRight, content_w,
                 ),
             )
+
+        # ── Edit pencil (✎) ───────────────────────────────────────────────────
+        pencil_font = QFont(option.font)
+        pencil_font.setBold(True)
+        painter.setFont(pencil_font)
+        painter.setPen(pencil_color)
+        painter.drawText(
+            QtCore.QRect(
+                rect.right() - t.TRACK_PENCIL_ROFF,
+                rect.top(),
+                t.TRACK_PENCIL_W,
+                rect.height(),
+            ),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            "\u270E",
+        )
 
         painter.restore()

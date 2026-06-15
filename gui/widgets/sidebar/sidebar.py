@@ -43,6 +43,7 @@ from PyQt6 import QtCore, QtGui, QtSvg, QtWidgets
 from PyQt6.QtCore import pyqtSignal
 
 import gui.theme as t
+from gui import ui_scale as u
 
 
 # ── SVG sources — either an inline string or a Path to a resource file ────────
@@ -55,18 +56,11 @@ def _svg_resource(filename: str) -> Path:
     return gui_dir() / "resources" / filename
 
 
-# These two use the exact SVG files the user supplied.
-# The other three remain as inline strings (sourced from scratch.html).
+# These three use the exact SVG files the user supplied.
+# Settings and Help remain as inline strings (sourced from scratch.html).
 _SVG_LOAD_MUSIC: Union[str, Path] = _svg_resource("Load Music.svg")
 _SVG_FIRMWARE:   Union[str, Path] = _svg_resource("Install Firmware.svg")
-
-_SVG_TOOLS = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    '<path d="M14 50 L38 26" stroke="white" stroke-width="5" stroke-linecap="round"/>'
-    '<circle cx="44" cy="20" r="9" stroke="white" stroke-width="4.5" fill="none"/>'
-    '<path d="M20 44 L10 54" stroke="white" stroke-width="6" stroke-linecap="round"/>'
-    '</svg>'
-)
+_SVG_TOOLS:      Union[str, Path] = _svg_resource("Tools.svg")
 
 _SVG_SETTINGS = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
@@ -144,7 +138,7 @@ class _NavButton(QtWidgets.QToolButton):
         cy = r.center().y()
         glow = QtGui.QRadialGradient(cx, cy, max(r.width(), r.height()) * 0.7)
         glow_col = QtGui.QColor(t.NAV_ACTIVE_RING_COLOR)
-        glow_col.setAlpha(t.NAV_ACTIVE_GLOW_ALPHA)
+        glow_col.setAlpha(int(t.NAV_ACTIVE_GLOW_ALPHA))
         glow.setColorAt(0.0, glow_col)
         glow.setColorAt(1.0, QtGui.QColor(0, 0, 0, 0))
         p.fillRect(r, glow)
@@ -240,7 +234,7 @@ class Sidebar(QtWidgets.QWidget):
     def _make_button(self, idx: int, item: _NavItem) -> _NavButton:
         btn = _NavButton()
         btn.setText(item.label)
-        sz = t.SIDEBAR_ICON_SIZE
+        sz = u.px(t.SIDEBAR_ICON_SIZE)
 
         icon = QtGui.QIcon()
         icon.addPixmap(
@@ -255,7 +249,7 @@ class Sidebar(QtWidgets.QWidget):
         btn.setIconSize(QtCore.QSize(sz, sz))
         btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         btn.setMinimumHeight(
-            t.SIDEBAR_BTN_MIN_H_SMALL if item.small else t.SIDEBAR_BTN_MIN_H
+            u.px(t.SIDEBAR_BTN_MIN_H_SMALL if item.small else t.SIDEBAR_BTN_MIN_H)
         )
         btn.clicked.connect(partial(self.page_changed.emit, idx))
         self._style_button(btn)
@@ -280,7 +274,7 @@ class Sidebar(QtWidgets.QWidget):
                 border: none;
                 border-radius: {t.SIDEBAR_BTN_RADIUS}px;
                 padding: {t.SIDEBAR_BTN_PADDING};
-                font-size: {t.SIDEBAR_BTN_FONT_SIZE}px;
+                font-size: {u.px(t.SIDEBAR_BTN_FONT_SIZE)}px;
                 font-weight: {t.SIDEBAR_BTN_FONT_WEIGHT};
             }}
             QToolButton:checked {{
@@ -302,15 +296,30 @@ class Sidebar(QtWidgets.QWidget):
 
     # ── Theme reload ───────────────────────────────────────────────────────────
 
+    def apply_ui_zoom(self) -> None:
+        self.reload_theme()
+
     def reload_theme(self) -> None:
-        self.setFixedWidth(t.SIDEBAR_WIDTH)
+        self.setFixedWidth(u.px(t.SIDEBAR_WIDTH))
         self._apply_style()
+        sz = u.px(t.SIDEBAR_ICON_SIZE)
         for idx, btn in enumerate(self._buttons):
             self._style_button(btn)
             item = _NAV_ITEMS[idx]
             btn.setMinimumHeight(
-                t.SIDEBAR_BTN_MIN_H_SMALL if item.small else t.SIDEBAR_BTN_MIN_H
+                u.px(t.SIDEBAR_BTN_MIN_H_SMALL if item.small else t.SIDEBAR_BTN_MIN_H)
             )
+            icon = QtGui.QIcon()
+            icon.addPixmap(
+                _render_svg(item.svg, sz, t.S_TEXT),
+                QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.Off,
+            )
+            icon.addPixmap(
+                _render_svg(item.svg, sz, "#ffffff"),
+                QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.On,
+            )
+            btn.setIcon(icon)
+            btn.setIconSize(QtCore.QSize(sz, sz))
         self.update()
 
 
@@ -321,7 +330,7 @@ def _render_svg(svg_source: Union[str, Path], size: int, color: str) -> QtGui.QP
 
     *svg_source* can be either:
       - An inline SVG string  (used for the three simple inline icons)
-      - A ``pathlib.Path``    (used for Load Music and Install Firmware, which
+      - A ``pathlib.Path``    (used for Load Music, Install Firmware, and Tools, which
                                are loaded from gui/resources/ so the exact files
                                supplied by the user are used verbatim)
 

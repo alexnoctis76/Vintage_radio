@@ -14,7 +14,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 from urllib.parse import quote, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -73,6 +73,19 @@ class ReleaseInfo:
     def advertised_version(self) -> str:
         v = (self.platform_version or "").strip()
         return v if v else self.tag_name
+
+
+UpdateStatus = Literal["update_available", "up_to_date", "unavailable"]
+
+
+@dataclass
+class UpdateCheckResult:
+    """Outcome of a GitHub release check (includes up-to-date vs fetch failure)."""
+
+    status: UpdateStatus
+    release: Optional[ReleaseInfo] = None
+    error: Optional[str] = None
+    latest_published: Optional[str] = None
 
 
 def _https_ssl_context() -> ssl.SSLContext:
@@ -280,6 +293,138 @@ def _newest_release_from_list(items: list) -> Optional[ReleaseInfo]:
         body=best.body,
         assets=best.assets,
         platform_version=eff,
+    )
+
+
+def _newest_installable_release(items: list) -> Optional[ReleaseInfo]:
+    """Newest published release that ships an installer for this platform."""
+    best_info: Optional[ReleaseInfo] = None
+    best_eff: Optional[str] = None
+    best_tag: Optional[str] = None
+    for item in items:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        info = _release_info_from_api_dict(item)
+        if info is None or get_platform_asset(info.assets) is None:
+            continue
+        eff = _effective_platform_version(info)
+        candidate = ReleaseInfo(
+            tag_name=info.tag_name,
+            html_url=info.html_url,
+            body=info.body,
+            assets=info.assets,
+            platform_version=eff,
+        )
+        if best_info is None:
+            best_info = candidate
+            best_eff = eff
+            best_tag = info.tag_name
+            continue
+        assert best_eff is not None and best_tag is not None
+        replace = False
+        if is_newer(eff, best_eff):
+            replace = True
+        elif _version_equal(eff, best_eff) and is_newer(info.tag_name, best_tag):
+            replace = True
+        if replace:
+            best_info = candidate
+            best_eff = eff
+            best_tag = info.tag_name
+    return best_info
+
+
+def _fetch_release_list(user_agent: str) -> list:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": user_agent,
+    }
+    req = Request(GITHUB_RELEASES_LIST_URL, headers=headers)
+    with _urlopen_with_certs(req, timeout=20) as resp:
+        raw = resp.read()
+    items = json.loads(raw.decode("utf-8", errors="replace"))
+    return items if isinstance(items, list) else []
+
+
+def run_update_check(
+    *,
+    current_version: str,
+    user_agent: str = "VintageRadio",
+) -> UpdateCheckResult:
+    """Check GitHub for updates; distinguish up-to-date from API / asset failures."""
+    cur = (current_version or "").strip()
+    try:
+        items = _fetch_release_list(user_agent)
+    except HTTPError as e:
+        msg = f"GitHub API HTTP {e.code}"
+        if e.reason:
+            msg = f"{msg}: {e.reason}"
+        return UpdateCheckResult(status="unavailable", error=msg)
+    except Exception as e:
+        return UpdateCheckResult(status="unavailable", error=str(e))
+
+    if items:
+        if cur:
+            update = _best_release_newer_than_for_platform(items, cur)
+            if update is not None:
+                return UpdateCheckResult(status="update_available", release=update)
+        else:
+            update = _newest_installable_release(items) or _newest_release_from_list(items)
+            if update is not None:
+                return UpdateCheckResult(status="update_available", release=update)
+
+        newest = _newest_installable_release(items)
+        if newest is not None:
+            return UpdateCheckResult(
+                status="up_to_date",
+                release=newest,
+                latest_published=newest.advertised_version(),
+            )
+        return UpdateCheckResult(
+            status="unavailable",
+            error="No installer asset found on GitHub for this platform.",
+        )
+
+    try:
+        req = Request(
+            GITHUB_RELEASES_LATEST_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": user_agent,
+            },
+        )
+        with _urlopen_with_certs(req, timeout=20) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            info = _release_info_from_api_dict(data)
+            if info is not None and get_platform_asset(info.assets) is not None:
+                eff = _effective_platform_version(info)
+                full = ReleaseInfo(
+                    tag_name=info.tag_name,
+                    html_url=info.html_url,
+                    body=info.body,
+                    assets=info.assets,
+                    platform_version=eff,
+                )
+                if cur and is_newer(eff, cur):
+                    return UpdateCheckResult(status="update_available", release=full)
+                return UpdateCheckResult(
+                    status="up_to_date",
+                    release=full,
+                    latest_published=full.advertised_version(),
+                )
+    except HTTPError as e:
+        if e.code != 404:
+            msg = f"GitHub API HTTP {e.code}"
+            if e.reason:
+                msg = f"{msg}: {e.reason}"
+            return UpdateCheckResult(status="unavailable", error=msg)
+    except Exception as e:
+        return UpdateCheckResult(status="unavailable", error=str(e))
+
+    return UpdateCheckResult(
+        status="unavailable",
+        error="No published releases found on GitHub.",
     )
 
 

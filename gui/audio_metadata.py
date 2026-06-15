@@ -95,3 +95,33 @@ def _normalize_str(value: Any) -> Optional[str]:
     return text or None
 
 
+def mp3_matches_conversion_profile(file_path: Path, profile: str) -> bool:
+    """Return True when an MP3 already matches the selected sync encode profile."""
+    if file_path.suffix.lower() != ".mp3":
+        return False
+    if profile not in {"dfplayer_safe", "high_quality"}:
+        profile = "dfplayer_safe"
+    try:
+        from mutagen.mp3 import MP3
+
+        info = MP3(file_path).info
+        if info is None:
+            return False
+        bitrate = int(getattr(info, "bitrate", 0) or 0)
+        sample_rate = int(getattr(info, "sample_rate", 0) or 0)
+        channels = int(getattr(info, "channels", 0) or 0)
+    except Exception:
+        return False
+
+    if profile == "high_quality":
+        # ffmpeg -q:a 2 (~170–210 kbps VBR)
+        return bitrate >= 160_000 and channels >= 1 and sample_rate >= 32_000
+
+    # dfplayer_safe: 44.1 kHz stereo CBR ~128 kbps
+    return (
+        sample_rate == 44100
+        and channels == 2
+        and 112_000 <= bitrate <= 144_000
+    )
+
+

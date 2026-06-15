@@ -15,6 +15,12 @@ from typing import Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from gui.widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from gui.widgets.common.styled_combo import VintageComboBox
+import gui.theme as t
+from gui.widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
+from gui.widgets.dialogs.vintage_message import VintageMessageBox
+
 
 def _resource_path(relative: str) -> Path:
     """Return absolute path to a bundled resource (works frozen and from source)."""
@@ -109,38 +115,42 @@ class HardwareTestDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None, default_port: Optional[str] = None):
         super().__init__(parent)
-        self.setWindowTitle("Hardware Diagnostics")
-        self.setMinimumSize(640, 480)
-        self.resize(720, 520)
-
         self._worker: Optional[_FlashAndRunWorker] = None
         self._thread: Optional[QtCore.QThread] = None
 
+        self._body_lay, footer = begin_sync_modal_dialog(
+            self,
+            title="Hardware Diagnostics",
+            subtitle="Flash hw_test.py to a connected Pico and view live output.",
+            min_width=640,
+        )
+        self._footer = footer
         self._build_ui(default_port)
         self._scan_ports()
+        self.resize(720, 520)
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self, default_port: Optional[str]) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout = self._body_lay
 
         # Top row: port selector + scan + run
         top = QtWidgets.QHBoxLayout()
         top.addWidget(QtWidgets.QLabel("Device:"))
-        self._port_combo = QtWidgets.QComboBox()
-        self._port_combo.setMinimumWidth(180)
+        self._port_combo = VintageComboBox(
+            min_width=180,
+            max_width=9999,
+            fixed_height=t.TOOLS_ACTION_BTN_H,
+        )
         top.addWidget(self._port_combo, 1)
 
-        self._scan_btn = QtWidgets.QPushButton("Scan")
+        self._scan_btn = ModalButton("Scan", variant="secondary")
         self._scan_btn.clicked.connect(self._scan_ports)
         top.addWidget(self._scan_btn)
 
-        self._run_btn = QtWidgets.QPushButton("Run Tests")
-        self._run_btn.setDefault(True)
+        self._run_btn = ModalButton("Run Tests", variant="primary")
         self._run_btn.clicked.connect(self._start_tests)
         top.addWidget(self._run_btn)
 
@@ -152,30 +162,28 @@ class HardwareTestDialog(QtWidgets.QDialog):
         self._console.setReadOnly(True)
         self._console.setFont(QtGui.QFont("Courier New", 10))
         self._console.setStyleSheet(
-            "background: #1a1a1a; color: #e0e0e0; border: 1px solid #444;"
+            "background: #1a1a1a; color: #e0e0e0; border: 1px solid #444; border-radius: 8px; padding: 8px;"
         )
-        layout.addWidget(self._console, 1)
+        console_scroll = wrap_with_mockup_scrollbar(self._console, variant="station")
+        layout.addWidget(console_scroll, 1)
 
         # Summary label
         self._summary_label = QtWidgets.QLabel("")
         self._summary_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._summary_label.setStyleSheet("background: transparent;")
         layout.addWidget(self._summary_label)
 
-        # Bottom row: save log + copy + close
-        bottom = QtWidgets.QHBoxLayout()
-        save_btn = QtWidgets.QPushButton("Save Log")
+        save_btn = ModalButton("Save Log", variant="secondary")
         save_btn.clicked.connect(self._save_log)
-        bottom.addWidget(save_btn)
+        self._footer.add_left_widget(save_btn)
 
-        copy_btn = QtWidgets.QPushButton("Copy to Clipboard")
+        copy_btn = ModalButton("Copy to Clipboard", variant="secondary")
         copy_btn.clicked.connect(self._copy_log)
-        bottom.addWidget(copy_btn)
+        self._footer.add_left_widget(copy_btn)
 
-        bottom.addStretch()
-        close_btn = QtWidgets.QPushButton("Close")
+        close_btn = ModalButton("Close", variant="secondary")
         close_btn.clicked.connect(self.close)
-        bottom.addWidget(close_btn)
-        layout.addLayout(bottom)
+        self._footer.add_button(close_btn)
 
     # ------------------------------------------------------------------
     # Port scanning
@@ -222,7 +230,7 @@ class HardwareTestDialog(QtWidgets.QDialog):
     def _start_tests(self) -> None:
         port = self._selected_port()
         if not port:
-            QtWidgets.QMessageBox.warning(self, "No Port", "Select a port first.")
+            VintageMessageBox.warning(self, "No Port", "Select a port first.")
             return
 
         hw_test_path = _resource_path("firmware/pico/hw_test.py")

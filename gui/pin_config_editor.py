@@ -26,6 +26,10 @@ from .board_profiles import (
     get_board_profile,
     get_default_board_profile,
 )
+from .widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
+from .widgets.dialogs.vintage_message import VintageMessageBox
+from .widgets.dialogs.vintage_text_dialog import VintageTextDialog
 
 # Sections that contain GPIO pin numbers (validated for range/conflict)
 _GPIO_SECTIONS = ("pins", "spi", "spi_alt")
@@ -88,8 +92,6 @@ class PinConfigDialog(QtWidgets.QDialog):
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Pin Configuration")
-        self.resize(720, 520)
 
         self._board_profile = board_profile
         self._config = copy.deepcopy(config)
@@ -97,7 +99,12 @@ class PinConfigDialog(QtWidgets.QDialog):
         self._updating = False
         self._accepted = False
 
-        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout, footer = begin_sync_modal_dialog(
+            self,
+            title="Pin Configuration",
+            subtitle="Edit pin assignments and hardware driver settings.",
+            min_width=720,
+        )
 
         # Pin table
         self._table = QtWidgets.QTableWidget()
@@ -153,31 +160,26 @@ class PinConfigDialog(QtWidgets.QDialog):
 
         main_layout.addWidget(driver_group)
 
-        # Bottom buttons
-        btn_layout = QtWidgets.QHBoxLayout()
-        reset_btn = QtWidgets.QPushButton("Reset to Defaults")
+        reset_btn = ModalButton("Reset to Defaults", variant="secondary")
         reset_btn.setToolTip("Reset all pins to the selected board's defaults")
         reset_btn.clicked.connect(self._reset_to_defaults)
-        btn_layout.addWidget(reset_btn)
+        footer.add_left_widget(reset_btn)
 
-        edit_json_btn = QtWidgets.QPushButton("Edit Raw JSON")
+        edit_json_btn = ModalButton("Edit Raw JSON", variant="secondary")
         edit_json_btn.setToolTip("Edit the raw JSON configuration")
         edit_json_btn.clicked.connect(self._open_json_editor)
-        btn_layout.addWidget(edit_json_btn)
+        footer.add_left_widget(edit_json_btn)
 
-        btn_layout.addStretch()
-
-        save_btn = QtWidgets.QPushButton("Save")
-        save_btn.setDefault(True)
-        save_btn.clicked.connect(self._save)
-        btn_layout.addWidget(save_btn)
-
-        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn = ModalButton("Cancel", variant="secondary")
         cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
+        footer.add_button(cancel_btn)
 
-        main_layout.addLayout(btn_layout)
+        save_btn = ModalButton("Save", variant="primary")
+        save_btn.clicked.connect(self._save)
+        footer.add_button(save_btn)
+
         self._rebuild_table()
+        self.resize(720, 520)
 
     def get_config(self) -> Optional[Dict[str, Any]]:
         return self._config if self._accepted else None
@@ -330,13 +332,13 @@ class PinConfigDialog(QtWidgets.QDialog):
     def _reset_to_defaults(self) -> None:
         if not self._board_profile:
             return
-        reply = QtWidgets.QMessageBox.question(
+        reply = VintageMessageBox.question(
             self,
             "Reset Pins",
             f"Reset all pins to {self._board_profile.name} defaults?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
         )
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply == VintageMessageBox.StandardButton.Yes:
             self._config = copy.deepcopy(self._board_profile.default_pin_config)
             self._rebuild_table()
 
@@ -369,7 +371,7 @@ class PinConfigDialog(QtWidgets.QDialog):
 
         src = project_root() / "firmware" / "custom_driver_template.py"
         if not src.exists():
-            QtWidgets.QMessageBox.warning(
+            VintageMessageBox.warning(
                 self,
                 "Template Not Found",
                 f"Could not find the template at:\n{src}\n\n"
@@ -386,7 +388,7 @@ class PinConfigDialog(QtWidgets.QDialog):
         if dest:
             try:
                 shutil.copy2(src, dest)
-                QtWidgets.QMessageBox.information(
+                VintageMessageBox.information(
                     self,
                     "Template Saved",
                     f"Driver template saved to:\n{dest}\n\n"
@@ -394,7 +396,7 @@ class PinConfigDialog(QtWidgets.QDialog):
                     "it with Browse above.",
                 )
             except OSError as e:
-                QtWidgets.QMessageBox.warning(
+                VintageMessageBox.warning(
                     self, "Save Failed", f"Could not save template:\n{e}"
                 )
 
@@ -404,7 +406,7 @@ class PinConfigDialog(QtWidgets.QDialog):
 
         doc_path = project_root() / "docs" / "CUSTOM_DRIVER.md"
         if not doc_path.exists():
-            QtWidgets.QMessageBox.information(
+            VintageMessageBox.information(
                 self,
                 "Documentation",
                 "The custom driver guide (docs/CUSTOM_DRIVER.md) was not "
@@ -414,22 +416,11 @@ class PinConfigDialog(QtWidgets.QDialog):
             return
 
         text = doc_path.read_text(encoding="utf-8")
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Custom Driver Guide")
-        dlg.resize(700, 550)
-        layout = QtWidgets.QVBoxLayout(dlg)
-        viewer = QtWidgets.QPlainTextEdit()
-        viewer.setReadOnly(True)
-        viewer.setFont(QtGui.QFont("Courier", 11))
-        viewer.setPlainText(text)
-        layout.addWidget(viewer)
-        close_btn = QtWidgets.QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch()
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-        dlg.exec()
+        VintageTextDialog.show_read_only(
+            self,
+            title="Custom Driver Guide",
+            text=text,
+        )
 
     def _save(self) -> None:
         self._accepted = True
@@ -445,31 +436,36 @@ class PinConfigJsonDialog(QtWidgets.QDialog):
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Edit pin_config.json")
-        self.resize(500, 400)
         self._result_config: Optional[Dict[str, Any]] = None
 
-        layout = QtWidgets.QVBoxLayout(self)
+        layout, footer = begin_sync_modal_dialog(
+            self,
+            title="Edit pin_config.json",
+            subtitle="Advanced — edit raw JSON directly.",
+            min_width=520,
+        )
 
         self._editor = QtWidgets.QPlainTextEdit()
         self._editor.setFont(QtGui.QFont("Courier", 11))
         self._editor.setPlainText(json.dumps(config, indent=2))
-        layout.addWidget(self._editor)
+        self._editor.setMinimumHeight(280)
+        editor_scroll = wrap_with_mockup_scrollbar(self._editor, variant="track")
+        layout.addWidget(editor_scroll)
 
         self._error_label = QtWidgets.QLabel()
-        self._error_label.setStyleSheet("color: red;")
+        self._error_label.setStyleSheet("color: red; background: transparent;")
         self._error_label.setVisible(False)
         layout.addWidget(self._error_label)
 
-        btn_layout = QtWidgets.QHBoxLayout()
-        btn_layout.addStretch()
-        save_btn = QtWidgets.QPushButton("Save")
-        save_btn.clicked.connect(self._save)
-        btn_layout.addWidget(save_btn)
-        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn = ModalButton("Cancel", variant="secondary")
         cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
+        footer.add_button(cancel_btn)
+
+        save_btn = ModalButton("Save", variant="primary")
+        save_btn.clicked.connect(self._save)
+        footer.add_button(save_btn)
+
+        self.resize(500, 420)
 
     def _save(self) -> None:
         try:

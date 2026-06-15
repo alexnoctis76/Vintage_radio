@@ -160,3 +160,49 @@ def test_best_release_newer_than_for_platform_respects_manifest_not_tag():
         ):
             rel2 = updater._best_release_newer_than_for_platform(items, "v0.2.3-beta")
     assert rel2 is None
+
+
+def test_run_update_check_up_to_date_when_current_ahead_of_github():
+    items = [
+        {
+            "tag_name": "v0.2.5-beta",
+            "draft": False,
+            "html_url": "https://github.com/a/b/releases/tag/v0.2.5-beta",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/z.zip",
+                }
+            ],
+        }
+    ]
+    with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+            result = updater.run_update_check(current_version="v1.0.0")
+    assert result.status == "up_to_date"
+    assert result.latest_published == "v0.2.5-beta"
+    assert result.release is not None
+
+
+def test_run_update_check_update_available():
+    items = [
+        {
+            "tag_name": "v1.1.0",
+            "draft": False,
+            "html_url": "https://github.com/a/b/releases/tag/v1.1.0",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/z.zip",
+                }
+            ],
+        }
+    ]
+    with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+            result = updater.run_update_check(current_version="v1.0.0")
+    assert result.status == "update_available"
+    assert result.release is not None
+    assert result.release.tag_name == "v1.1.0"

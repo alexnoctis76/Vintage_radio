@@ -14,6 +14,10 @@ from PyQt6.QtCore import QUrl
 from PyQt6.QtGui import QDesktopServices
 
 from . import updater
+from gui.widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from gui.widgets.common.vintage_progress import VintageProgressBar
+from gui.widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
+from gui.widgets.dialogs.vintage_message import VintageMessageBox
 
 
 class _DownloadSignals(QtCore.QObject):
@@ -44,44 +48,40 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self._signals.finished.connect(self._on_download_finished)
         self._signals.failed.connect(self._on_download_failed)
 
-        self.setWindowTitle("Update Available")
-        self.setModal(True)
-        self.resize(680, 500)
-
-        title = QtWidgets.QLabel(
-            f"A new version is available: {self.release_info.advertised_version()}\n"
-            f"Current version: {self.current_version}"
+        body_lay, footer = begin_sync_modal_dialog(
+            self,
+            title="Update Available",
+            subtitle=(
+                f"New: {self.release_info.advertised_version()}  ·  "
+                f"Current: {self.current_version}"
+            ),
+            min_width=560,
         )
-        title.setWordWrap(True)
 
         notes = self.release_info.body or "No release notes provided."
         self.notes_view = QtWidgets.QPlainTextEdit(notes)
         self.notes_view.setReadOnly(True)
+        self.notes_view.setMinimumHeight(240)
+        notes_scroll = wrap_with_mockup_scrollbar(self.notes_view, variant="track")
+        body_lay.addWidget(QtWidgets.QLabel("Release notes:"))
+        body_lay.addWidget(notes_scroll, 1)
 
-        self.progress = QtWidgets.QProgressBar()
+        self.progress = VintageProgressBar()
         self.progress.setMinimum(0)
         self.progress.setMaximum(100)
         self.progress.setValue(0)
         self.progress.setVisible(False)
+        body_lay.addWidget(self.progress)
 
-        self.download_btn = QtWidgets.QPushButton(
-            "Download & Install" if self._download_url else "Open Download Page"
+        self.download_btn = ModalButton(
+            "Download & Install" if self._download_url else "Open Download Page",
+            variant="primary",
         )
-        self.later_btn = QtWidgets.QPushButton("Later")
+        self.later_btn = ModalButton("Later", variant="secondary")
         self.download_btn.clicked.connect(self._on_download_clicked)
         self.later_btn.clicked.connect(self.reject)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.download_btn)
-        btn_row.addWidget(self.later_btn)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(title)
-        layout.addWidget(QtWidgets.QLabel("Release notes:"))
-        layout.addWidget(self.notes_view, 1)
-        layout.addWidget(self.progress)
-        layout.addLayout(btn_row)
+        footer.add_button(self.later_btn)
+        footer.add_button(self.download_btn)
 
     def _on_download_clicked(self) -> None:
         if not self._download_url:
@@ -120,7 +120,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             self.progress.setRange(0, 100)
             self.progress.setValue(max(0, min(100, pct)))
         else:
-            self.progress.setRange(0, 0)  # indeterminate
+            self.progress.setRange(0, 0)
 
     def _on_download_finished(self, path: str) -> None:
         try:
@@ -138,7 +138,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
             )
         elif sys.platform == "win32":
             msg += "\n\nThe updater will restart Vintage Radio when this window closes."
-        QtWidgets.QMessageBox.information(self, "Updater", msg)
+        VintageMessageBox.information(self, "Updater", msg)
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.quit()
@@ -148,4 +148,4 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         self.download_btn.setEnabled(True)
         self.later_btn.setEnabled(True)
         self.progress.setVisible(False)
-        QtWidgets.QMessageBox.critical(self, "Updater", f"Update failed:\n{error}")
+        VintageMessageBox.critical(self, "Updater", f"Update failed:\n{error}")

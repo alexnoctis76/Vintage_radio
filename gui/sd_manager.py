@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import platform
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +25,12 @@ try:
 except ImportError:
     PYDUB_AVAILABLE = False
 
-from .audio_metadata import compute_file_hash, extract_metadata, file_matches_metadata
+from .audio_metadata import (
+    compute_file_hash,
+    extract_metadata,
+    file_matches_metadata,
+    mp3_matches_conversion_profile,
+)
 from .database import DatabaseManager
 from .resource_paths import resource_path, resolve_ffmpeg_executable
 
@@ -1461,6 +1467,78 @@ class SDManager:
         except OSError as e:
             return False, str(e)
 
+    def prefetch_basic_conversion_cache(
+        self,
+        *,
+        song_ids: Optional[List[int]] = None,
+        conversion_profile: str = "dfplayer_safe",
+        dfplayer_eq: str = "normal",
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> int:
+        """Convert tracks into the host MP3 cache while idle (returns newly converted count).
+
+        Skips tracks already cached, source MP3s matching the profile, and missing files.
+        """
+        _ = dfplayer_eq  # reserved for future EQ-aware cache keys
+        convert_mode = self._resolve_basic_convert_mode()
+        force_ffmpeg_only = os.environ.get("VINTAGE_RADIO_FORCE_FFMPEG", "").strip() == "1"
+        vlc_available = (not force_ffmpeg_only) and self._check_vlc()
+        ffmpeg_available = self._check_ffmpeg()
+        if convert_mode == "pydub":
+            can_convert = vlc_available or (ffmpeg_available and PYDUB_AVAILABLE)
+        else:
+            can_convert = vlc_available or ffmpeg_available
+        if not can_convert:
+            return 0
+
+        cache_root = self._basic_sync_mp3_cache_dir(conversion_profile, convert_mode)
+        songs: List[Any] = []
+        if song_ids is not None:
+            rows = self.db.get_songs_by_ids(song_ids)
+            songs.extend(rows)
+        else:
+            seen: set[int] = set()
+            for station in self.db.list_basic_stations():
+                for song in self.db.list_basic_station_songs(station["id"]):
+                    sid = int(song["id"])
+                    if sid not in seen:
+                        seen.add(sid)
+                        songs.append(song)
+
+        converted = 0
+        for song in songs:
+            if should_stop and should_stop():
+                break
+            fp_raw = (song["file_path"] or "").strip()
+            if not fp_raw:
+                continue
+            file_path = Path(fp_raw)
+            if not file_path.is_file():
+                continue
+            source_ext = file_path.suffix.lower()
+            if source_ext == ".mp3" and mp3_matches_conversion_profile(
+                file_path, conversion_profile
+            ):
+                continue
+            cache_key = self._cache_key_for_song(song, file_path)
+            if cache_key is None:
+                continue
+            cache_mp3 = cache_root / f"{cache_key[0]}_{cache_key[1]}.mp3"
+            if cache_mp3.is_file():
+                try:
+                    if file_path.stat().st_mtime <= cache_mp3.stat().st_mtime:
+                        continue
+                except OSError:
+                    continue
+            if self._convert_to_mp3(
+                file_path,
+                cache_mp3,
+                mode=convert_mode,
+                conversion_profile=conversion_profile,
+            ):
+                converted += 1
+        return converted
+
     def _resolve_basic_sd_copy_workers(self, total_jobs: int) -> int:
         """Parallel copy workers for Phase 2 (USB/SD is often slower than conversion)."""
         env_raw = (os.environ.get("VINTAGE_RADIO_SD_COPY_WORKERS", "") or "").strip()
@@ -1557,6 +1635,7 @@ class SDManager:
         dfplayer_eq: str = "normal",
         copy_destination_label: str = "SD card",
         sync_log_prefix: str = "Basic SD",
+        use_conversion_cache: bool = True,
     ) -> Dict[str, object]:
         """Sync basic-mode stations to SD card.
 
@@ -1626,21 +1705,70 @@ class SDManager:
             can_convert = vlc_available or (ffmpeg_available and PYDUB_AVAILABLE)
         else:
             can_convert = vlc_available or ffmpeg_available
-        # Persistent per-library cache: reuse converted MP3s across full syncs (same profile/mode).
-        conversion_cache_root = self._basic_sync_mp3_cache_dir(
-            conversion_profile, convert_mode
-        )
-        print(f"Basic sync MP3 cache directory: {conversion_cache_root}")
-        print(
-            "Basic sync conversion backend: "
-            f"ffmpeg={'yes' if ffmpeg_available else 'no'}"
-            f"{f' ({self._ffmpeg_exe})' if self._ffmpeg_exe else ''}, "
-            f"vlc={'yes' if vlc_available else 'no'}, "
-            f"force_ffmpeg_only={'yes' if force_ffmpeg_only else 'no'}, "
-            f"mode={convert_mode}, profile={conversion_profile}"
-        )
 
-        # Count total tracks for progress
+        ephemeral_cache_root: Optional[Path] = None
+        try:
+            if use_conversion_cache:
+                conversion_cache_root = self._basic_sync_mp3_cache_dir(
+                    conversion_profile, convert_mode
+                )
+                print(f"Basic sync MP3 cache directory: {conversion_cache_root}")
+            else:
+                ephemeral_cache_root = Path(
+                    tempfile.mkdtemp(prefix="vr_sync_ephemeral_")
+                )
+                conversion_cache_root = ephemeral_cache_root
+                print(
+                    "Basic sync MP3 cache: disabled — using ephemeral temp conversions only"
+                )
+            print(
+                "Basic sync conversion backend: "
+                f"ffmpeg={'yes' if ffmpeg_available else 'no'}"
+                f"{f' ({self._ffmpeg_exe})' if self._ffmpeg_exe else ''}, "
+                f"vlc={'yes' if vlc_available else 'no'}, "
+                f"force_ffmpeg_only={'yes' if force_ffmpeg_only else 'no'}, "
+                f"mode={convert_mode}, profile={conversion_profile}"
+            )
+
+            return self._sync_library_basic_impl(
+                sd_root=sd_root,
+                force_clean=force_clean,
+                progress_callback=progress_callback,
+                should_cancel=should_cancel,
+                conversion_profile=conversion_profile,
+                dfplayer_eq=dfplayer_eq,
+                copy_destination_label=copy_destination_label,
+                sync_log_prefix=sync_log_prefix,
+                use_conversion_cache=use_conversion_cache,
+                conversion_cache_root=conversion_cache_root,
+                can_convert=can_convert,
+                convert_mode=convert_mode,
+                preserved_volume_label=preserved_volume_label,
+                stations=stations,
+            )
+        finally:
+            if ephemeral_cache_root is not None:
+                shutil.rmtree(ephemeral_cache_root, ignore_errors=True)
+
+    def _sync_library_basic_impl(
+        self,
+        *,
+        sd_root: Path,
+        force_clean: bool,
+        progress_callback: Optional[callable],
+        should_cancel: Optional[Callable[[], bool]],
+        conversion_profile: str,
+        dfplayer_eq: str,
+        copy_destination_label: str,
+        sync_log_prefix: str,
+        use_conversion_cache: bool,
+        conversion_cache_root: Path,
+        can_convert: bool,
+        convert_mode: str,
+        preserved_volume_label: str,
+        stations: List[Any],
+    ) -> Dict[str, object]:
+        """Inner basic sync implementation (see ``sync_library_basic``)."""
         station_tracks: List[Tuple[int, List]] = []
         total_tracks = 0
         for station in stations:
@@ -1660,8 +1788,13 @@ class SDManager:
         last_progress_emit = 0.0
 
         manifest_stations: Dict[str, dict] = {}
-        old_manifest = self._read_sync_manifest(sd_root) if not force_clean else None
-        old_manifest_stations = (old_manifest or {}).get("stations", {})
+        old_manifest_stations, manifest_trusted, stored_profile, stored_eq, manifest_synced_at = (
+            self._load_basic_sync_baseline(sd_root, force_clean=force_clean)
+        )
+        settings_match = (
+            (stored_profile is None or stored_profile == conversion_profile)
+            and (stored_eq is None or stored_eq == dfplayer_eq)
+        )
         conversion_cache: Dict[Tuple[str, int], Path] = {}
         deferred_cache_copy_jobs: List[Tuple[Path, Path]] = []
 
@@ -1679,7 +1812,9 @@ class SDManager:
             if not progress_callback:
                 return
             now = time.monotonic()
-            if (processed_tracks % 25) != 0 and (now - last_progress_emit) < 0.25:
+            prep_step = 1 if total_tracks <= 500 else 10
+            prep_interval = 0.0 if total_tracks <= 500 else 0.12
+            if (processed_tracks % prep_step) != 0 and (now - last_progress_emit) < prep_interval:
                 return
             progress_callback(
                 processed_tracks,
@@ -1733,60 +1868,31 @@ class SDManager:
                 target_path = folder_path / f"{track_order:03d}.mp3"
                 source_ext = file_path.suffix.lower()
                 cache_key = self._cache_key_for_song(song, file_path)
-                src_sz = int(song["file_size"]) if song["file_size"] else file_path.stat().st_size
-                src_hash = str(song["file_hash"] or "").strip()
-
+                descriptor = self._library_track_descriptor(song, file_path)
                 manifest_tracks[f"{track_order:03d}"] = {
-                    "source_name": file_path.name,
-                    "source_size": src_sz,
-                    "source_hash": src_hash or None,
+                    "source_name": descriptor["source_name"],
+                    "source_size": descriptor["source_size"],
+                    "source_hash": descriptor.get("source_hash"),
                 }
 
-                if not force_clean and target_path.exists():
-                    try:
-                        target_size = target_path.stat().st_size
-                        old_folder = old_manifest_stations.get(folder_key, {})
-                        old_entry = (old_folder.get("tracks") or {}).get(
-                            f"{track_order:03d}"
-                        )
-                        if old_entry and target_size > 0:
-                            old_hash = str(old_entry.get("source_hash") or "").strip()
-                            # Strong comparison when hash is available.
-                            if src_hash:
-                                if old_hash and old_hash == src_hash:
-                                    skipped += 1
-                                    processed_tracks += 1
-                                    continue
-                                # If this is a legacy manifest entry with no hash,
-                                # force one rewrite so the manifest upgrades.
-                            else:
-                                # Backward-compatible fallback for old manifests.
-                                if (
-                                    old_entry.get("source_name") == file_path.name
-                                    and old_entry.get("source_size") == src_sz
-                                ):
-                                    skipped += 1
-                                    processed_tracks += 1
-                                    continue
-                        if source_ext == ".mp3":
-                            if target_size == src_sz and src_sz > 0:
-                                if compute_file_hash(file_path) == compute_file_hash(
-                                    target_path
-                                ):
-                                    skipped += 1
-                                    processed_tracks += 1
-                                    continue
-                        else:
-                            if target_size > 0 and not old_entry:
-                                try:
-                                    if file_path.stat().st_mtime <= target_path.stat().st_mtime:
-                                        skipped += 1
-                                        processed_tracks += 1
-                                        continue
-                                except OSError:
-                                    pass
-                    except OSError:
-                        pass
+                old_folder = old_manifest_stations.get(folder_key, {})
+                old_entry = (old_folder.get("tracks") or {}).get(f"{track_order:03d}")
+                if self._basic_track_can_skip(
+                    force_clean=force_clean,
+                    manifest_trusted=manifest_trusted,
+                    settings_match=settings_match,
+                    old_entry=old_entry,
+                    descriptor=descriptor,
+                    target_path=target_path,
+                    source_path=file_path,
+                    source_ext=source_ext,
+                    conversion_profile=conversion_profile,
+                    source_duration=song["duration"],
+                    manifest_synced_at=manifest_synced_at,
+                ):
+                    skipped += 1
+                    processed_tracks += 1
+                    continue
 
                 try:
                     cached_src = conversion_cache.get(cache_key) if cache_key else None
@@ -1799,7 +1905,9 @@ class SDManager:
                             # writing the shared cache file (avoid Phase 2 racing on missing path).
                             deferred_cache_copy_jobs.append((cached_src, target_path))
                             station_to_copy += 1
-                    elif source_ext == ".mp3":
+                    elif source_ext == ".mp3" and mp3_matches_conversion_profile(
+                        file_path, conversion_profile
+                    ):
                         copy_jobs.append((file_path, target_path, "direct_mp3"))
                         self._remember_cache_entry(conversion_cache, cache_key, file_path)
                         station_to_copy += 1
@@ -1807,7 +1915,11 @@ class SDManager:
                         cache_mp3: Optional[Path] = None
                         if cache_key is not None:
                             cache_mp3 = conversion_cache_root / f"{cache_key[0]}_{cache_key[1]}.mp3"
-                        if cache_mp3 is not None and cache_mp3.exists():
+                        if (
+                            use_conversion_cache
+                            and cache_mp3 is not None
+                            and cache_mp3.exists()
+                        ):
                             copy_jobs.append((cache_mp3, target_path, "cache"))
                             station_to_copy += 1
                             self._remember_cache_entry(conversion_cache, cache_key, cache_mp3)
@@ -1821,6 +1933,14 @@ class SDManager:
                             convert_jobs.append((file_path, cache_mp3, target_path, cache_key))
                             station_to_copy += 1
                             station_queued_convert += 1
+                    elif source_ext == ".mp3":
+                        print(
+                            f"Warning: cannot re-encode {file_path.name} for profile "
+                            f"{conversion_profile}; copying as-is"
+                        )
+                        copy_jobs.append((file_path, target_path, "direct_mp3"))
+                        self._remember_cache_entry(conversion_cache, cache_key, file_path)
+                        station_to_copy += 1
                     else:
                         print(f"Cannot convert {file_path.name} (no converter)")
                         skipped += 1
@@ -1930,6 +2050,7 @@ class SDManager:
                     if progress_callback and (
                         done_convert % _conv_step == 0
                         or done_convert == len(convert_jobs)
+                        or len(convert_jobs) <= 50
                     ):
                         elapsed = time.monotonic() - convert_start
                         rate = done_convert / max(0.001, elapsed)
@@ -1970,8 +2091,9 @@ class SDManager:
             _raise_if_cancelled()
             if progress_callback:
                 progress_callback(
-                    0, total_copies,
-                    f"Copying {total_copies} tracks to {copy_destination_label} (multi-threaded)...",
+                    0,
+                    total_copies,
+                    f"Copying to {copy_destination_label} (0/{total_copies})...",
                 )
 
             num_workers = self._resolve_basic_sd_copy_workers(total_copies)
@@ -2008,19 +2130,18 @@ class SDManager:
                             skipped += 1
                         print(f"Copy error: {job_src.name} -> {job_dst}: {e}")
 
-                    _copy_step = _basic_sync_progress_step_interval(total_copies, large_step=100)
-                    if progress_callback and (
-                        copies_done % _copy_step == 0 or copies_done == total_copies
-                    ):
+                    if progress_callback:
                         elapsed = time.monotonic() - copy_phase_start
                         rate = copies_done / max(0.001, elapsed)
                         remaining = total_copies - copies_done
-                        eta = int(remaining / rate) if rate > 0 else 0
+                        eta = int(remaining / rate) if rate > 0 and remaining > 0 else 0
                         progress_callback(
                             copies_done,
                             total_copies,
                             f"Copying to {copy_destination_label} ({copies_done}/{total_copies}, "
-                            f"{rate:.0f} files/s, ETA ~{eta}s)",
+                            f"{job_src.name}, {rate:.1f} files/s"
+                            + (f", ETA ~{eta}s" if eta > 0 else "")
+                            + ")",
                         )
 
             copy_elapsed = time.monotonic() - copy_phase_start
@@ -2030,20 +2151,14 @@ class SDManager:
                 f"{num_workers} threads)"
             )
 
-        # ── Phase 3: Cleanup (keep progress scale on file count so a follow-on job
-        # like SD disk imaging does not inherit a bogus 2/2 bar).
-        _tb = max(1, total_copies)
+        # ── Phase 3: Cleanup stale station folders on SD ──
+        self._remove_stale_numeric_sd_folders(
+            sd_root,
+            used_folders,
+            progress_callback=progress_callback,
+        )
         if progress_callback:
-            progress_callback(0, _tb, "Cleaning up stale folders...")
-        for item in sd_root.iterdir():
-            if item.is_dir() and item.name.isdigit():
-                folder_num = int(item.name)
-                if folder_num not in used_folders:
-                    print(f"Removing stale folder: {item}")
-                    shutil.rmtree(item, ignore_errors=True)
-
-        if progress_callback:
-            progress_callback(_tb, _tb, "Copying AM radio sound...")
+            progress_callback(0, 0, "Copying AM radio sound...")
         self._copy_am_wav_to_dfplayer_sd(sd_root)
         self._write_advanced_runtime_sd_config(
             sd_root,
@@ -2052,11 +2167,7 @@ class SDManager:
         )
 
         if progress_callback:
-            progress_callback(
-                _tb,
-                _tb,
-                f"{sync_log_prefix} sync complete.",
-            )
+            progress_callback(1, 1, f"{sync_log_prefix} sync complete.")
         self._remove_legacy_vintage_radio_folder_on_dfplayer_sd(sd_root)
         n = self.remove_hidden_junk_from_sd(sd_root)
         if n:
@@ -2065,7 +2176,12 @@ class SDManager:
                 "(macOS ._*, .DS_Store, __MACOSX, etc.)"
             )
 
-        self._write_sync_manifest(sd_root, manifest_stations)
+        self._write_sync_manifest(
+            sd_root,
+            manifest_stations,
+            conversion_profile=conversion_profile,
+            dfplayer_eq=dfplayer_eq,
+        )
 
         total_elapsed = time.monotonic() - sync_start
         rate = (total_copies / total_elapsed) if total_elapsed > 0 else 0.0
@@ -2086,7 +2202,221 @@ class SDManager:
             out_end["preserved_volume_label"] = preserved_volume_label
         return out_end
 
+    @staticmethod
+    def _remove_stale_numeric_sd_folders(
+        sd_root: Path,
+        used_folders: set,
+        *,
+        progress_callback=None,
+        progress_total: int | None = None,
+    ) -> int:
+        """Delete numbered station folders on SD that are no longer in the library."""
+        stale = sorted(
+            (
+                item
+                for item in sd_root.iterdir()
+                if item.is_dir() and item.name.isdigit() and int(item.name) not in used_folders
+            ),
+            key=lambda p: p.name,
+        )
+        n = len(stale)
+        if not stale:
+            if progress_callback:
+                progress_callback(0, 0, "No stale folders to remove.")
+            return 0
+        removed = 0
+        for i, item in enumerate(stale):
+            if progress_callback:
+                progress_callback(
+                    i,
+                    n,
+                    f"Removing stale folder {item.name} ({i + 1}/{n})...",
+                )
+            print(f"Removing stale folder: {item}")
+            shutil.rmtree(item, ignore_errors=True)
+            removed += 1
+        if progress_callback:
+            progress_callback(n, n, f"Removed {removed} stale folder(s).")
+        return removed
+
     # -- Sync manifest helpers ------------------------------------------------
+
+    @staticmethod
+    def _read_sd_runtime_config(sd_root: Path) -> Tuple[Optional[str], Optional[str]]:
+        """Read ``advanced_runtime.json`` from *sd_root* if present."""
+        cfg_path = sd_root / "advanced_runtime.json"
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            return None, None
+        if not isinstance(data, dict):
+            return None, None
+        profile = str(data.get("conversion_profile") or "").strip() or None
+        eq = str(data.get("dfplayer_eq") or "").strip() or None
+        return profile, eq
+
+    def _load_basic_sync_baseline(
+        self,
+        sd_root: Path,
+        *,
+        force_clean: bool,
+    ) -> Tuple[Dict[str, dict], bool, Optional[str], Optional[str], Optional[float]]:
+        """Return ``(old_stations, manifest_trusted, stored_profile, stored_eq, synced_at_epoch)``."""
+        if force_clean:
+            return {}, False, None, None, None
+        old_manifest = self._read_sync_manifest(sd_root)
+        stations_raw = (old_manifest or {}).get("stations") if old_manifest else None
+        runtime_profile, runtime_eq = self._read_sd_runtime_config(sd_root)
+        synced_at_epoch = self._parse_manifest_synced_at(old_manifest)
+        if not isinstance(stations_raw, dict) or not stations_raw:
+            return {}, False, runtime_profile, runtime_eq, synced_at_epoch
+        manifest_trusted = isinstance(old_manifest, dict) and old_manifest.get("version") == 1
+        stored_profile = str(old_manifest.get("conversion_profile") or "").strip() or None
+        stored_eq = str(old_manifest.get("dfplayer_eq") or "").strip() or None
+        if stored_profile is None:
+            stored_profile = runtime_profile
+        if stored_eq is None:
+            stored_eq = runtime_eq
+        return stations_raw, manifest_trusted, stored_profile, stored_eq, synced_at_epoch
+
+    @staticmethod
+    def _parse_manifest_synced_at(manifest: Optional[dict]) -> Optional[float]:
+        if not isinstance(manifest, dict):
+            return None
+        raw = manifest.get("synced_at")
+        if not raw:
+            return None
+        try:
+            import datetime
+
+            dt = datetime.datetime.fromisoformat(str(raw))
+            if dt.tzinfo is None:
+                return dt.timestamp()
+            return dt.timestamp()
+        except (TypeError, ValueError, OSError):
+            return None
+
+    @staticmethod
+    def _library_track_descriptor(song: Any, file_path: Path) -> Dict[str, Any]:
+        """Fingerprint a library track for manifest compare / skip decisions."""
+        try:
+            src_sz = int(song["file_size"]) if song["file_size"] else int(file_path.stat().st_size)
+        except (OSError, TypeError, ValueError):
+            try:
+                src_sz = int(file_path.stat().st_size)
+            except OSError:
+                src_sz = 0
+        src_hash = str(song["file_hash"] or "").strip() or None
+        return {
+            "source_name": file_path.name,
+            "source_size": src_sz,
+            "source_hash": src_hash,
+        }
+
+    @staticmethod
+    def _manifest_entry_matches_library(
+        m_entry: dict,
+        descriptor: Dict[str, Any],
+        *,
+        source_hash: str = "",
+    ) -> bool:
+        """True when a saved manifest slot describes the same library source."""
+        if str(m_entry.get("source_name") or "") != descriptor["source_name"]:
+            return False
+        expected_size = m_entry.get("source_size")
+        if expected_size is not None:
+            try:
+                if int(expected_size) != int(descriptor["source_size"]):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        expected_hash = str(m_entry.get("source_hash") or "").strip()
+        actual_hash = (source_hash or str(descriptor.get("source_hash") or "")).strip()
+        if expected_hash and actual_hash:
+            return expected_hash == actual_hash
+        if expected_hash and not actual_hash:
+            return False
+        # Legacy manifest entry without hash: name + size match is enough; manifest
+        # will be upgraded on the next successful copy pass.
+        return True
+
+    def _resolve_source_hash(self, source_path: Path, descriptor: Dict[str, Any]) -> str:
+        return self._resolve_source_hash_static(source_path, descriptor)
+
+    @staticmethod
+    def _resolve_source_hash_static(source_path: Path, descriptor: Dict[str, Any]) -> str:
+        h = str(descriptor.get("source_hash") or "").strip()
+        if h:
+            return h
+        try:
+            return compute_file_hash(source_path)
+        except OSError:
+            return ""
+
+    def _basic_track_can_skip(
+        self,
+        *,
+        force_clean: bool,
+        manifest_trusted: bool,
+        settings_match: bool,
+        old_entry: Optional[dict],
+        descriptor: Dict[str, Any],
+        target_path: Path,
+        source_path: Path,
+        source_ext: str,
+        conversion_profile: str,
+        source_duration: Optional[float] = None,
+        manifest_synced_at: Optional[float] = None,
+    ) -> bool:
+        """Return True when the SD slot already matches the library and can be left in place.
+
+        Sync Changes compares the library to ``.sync_manifest.json`` on the SD card
+        (fast, no per-file hashing). Full file verification runs only when the
+        manifest is missing or the slot entry does not match the library.
+        """
+        _ = source_duration  # reserved for fallback paths if extended later
+        if force_clean or not settings_match:
+            return False
+        try:
+            target_size = target_path.stat().st_size
+        except OSError:
+            return False
+        if target_size <= 0:
+            return False
+
+        # ── Fast path: manifest slot matches library (metadata-only) ──
+        if manifest_trusted and old_entry:
+            source_hash = str(descriptor.get("source_hash") or "").strip()
+            if not source_hash:
+                source_hash = self._resolve_source_hash(source_path, descriptor)
+            if self._manifest_entry_matches_library(
+                old_entry, descriptor, source_hash=source_hash
+            ):
+                if manifest_synced_at is not None:
+                    try:
+                        if source_path.stat().st_mtime > manifest_synced_at + 2.0:
+                            return False
+                    except OSError:
+                        pass
+                return True
+
+        # ── Fallback: no manifest proof — verify SD file content ──
+        if source_ext == ".mp3":
+            try:
+                if int(source_path.stat().st_size) != int(target_size):
+                    return False
+            except OSError:
+                return False
+            if not mp3_matches_conversion_profile(source_path, conversion_profile):
+                return False
+            if not mp3_matches_conversion_profile(target_path, conversion_profile):
+                return False
+            try:
+                return compute_file_hash(source_path) == compute_file_hash(target_path)
+            except OSError:
+                return False
+
+        return False
 
     @staticmethod
     def _local_manifest_path(sd_root: Path) -> Optional[Path]:
@@ -2107,7 +2437,13 @@ class SDManager:
             return None
 
     @staticmethod
-    def _write_sync_manifest(sd_root: Path, stations: Dict[str, dict]) -> None:
+    def _write_sync_manifest(
+        sd_root: Path,
+        stations: Dict[str, dict],
+        *,
+        conversion_profile: str = "dfplayer_safe",
+        dfplayer_eq: str = "normal",
+    ) -> None:
         """Persist a lightweight manifest after a basic-mode sync.
 
         Tries the SD card root first (works on macOS/Linux and most Windows
@@ -2118,6 +2454,8 @@ class SDManager:
         manifest = {
             "version": 1,
             "synced_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "conversion_profile": str(conversion_profile or "dfplayer_safe"),
+            "dfplayer_eq": str(dfplayer_eq or "normal"),
             "stations": stations,
         }
         sd_path = sd_root / _SYNC_MANIFEST_NAME
@@ -2352,17 +2690,18 @@ class SDManager:
                     continue
                 fp = Path(fp_raw)
                 expected_name = str(m_entry.get("source_name") or "")
-                expected_size = m_entry.get("source_size")
-                expected_hash = str(m_entry.get("source_hash") or "").strip()
-                actual_size: Optional[int] = None
-                actual_hash = str(song["file_hash"] or "").strip()
+                descriptor = {
+                    "source_name": fp.name,
+                    "source_size": None,
+                    "source_hash": str(song["file_hash"] or "").strip() or None,
+                }
                 try:
                     if song["file_size"] is not None:
-                        actual_size = int(song["file_size"])
+                        descriptor["source_size"] = int(song["file_size"])
                     elif fp.exists():
-                        actual_size = int(fp.stat().st_size)
+                        descriptor["source_size"] = int(fp.stat().st_size)
                 except Exception:
-                    actual_size = None
+                    descriptor["source_size"] = None
 
                 if fp.name != expected_name:
                     t = song["title"] or song["original_filename"] or f"track {order}"
@@ -2372,21 +2711,21 @@ class SDManager:
                     )
                     continue
 
-                if expected_hash and actual_hash and expected_hash != actual_hash:
+                source_hash = ""
+                if fp.exists():
+                    try:
+                        source_hash = SDManager._resolve_source_hash_static(fp, descriptor)
+                    except Exception:
+                        source_hash = str(descriptor.get("source_hash") or "")
+                if not SDManager._manifest_entry_matches_library(
+                    m_entry, descriptor, source_hash=source_hash
+                ):
                     t = song["title"] or song["original_filename"] or f"track {order}"
                     msgs.append(
                         f'Station "{name}": slot {track_key} changed for "{t}" '
-                        "(source hash differs from last sync)."
+                        "(source differs from last sync)."
                     )
                     continue
-
-                if expected_size is not None and actual_size is not None:
-                    if int(expected_size) != int(actual_size):
-                        t = song["title"] or song["original_filename"] or f"track {order}"
-                        msgs.append(
-                            f'Station "{name}": slot {track_key} changed for "{t}" '
-                            "(source size differs from last sync)."
-                        )
 
         for mk in manifest_stations:
             if len(msgs) >= cap:
@@ -2398,6 +2737,21 @@ class SDManager:
                 )
 
         return msgs
+
+    def basic_library_manifest_diff(
+        self,
+        manifest_stations: Dict[str, dict],
+        *,
+        reserved_folder: Optional[int] = 99,
+    ) -> List[str]:
+        """Compare the current library to a saved sync manifest (empty list = unchanged)."""
+        try:
+            stations = self.db.list_basic_stations()
+        except Exception:
+            return ["Could not read stations from the database."]
+        return self._validate_basic_sd_manifest_fast(
+            stations, manifest_stations, reserved_folder,
+        )
 
     def sync_library(
         self,
@@ -2642,16 +2996,20 @@ class SDManager:
                 progress_callback(0, total_work, "All files already up to date")
 
         # ── Clean up stale folders (folders with no assigned songs) ──
-        work_done += 1
-        if progress_callback:
-            progress_callback(work_done, total_work, "Cleaning up stale files...")
         used_folders = {f for f, _ in song_slot.values()}
-        for item in sd_root.iterdir():
-            if item.is_dir() and item.name.isdigit():
-                folder_num = int(item.name)
-                if folder_num not in used_folders:
-                    print(f"Removing stale folder: {item}")
-                    shutil.rmtree(item, ignore_errors=True)
+        work_done += 1
+        cleanup_step = work_done
+
+        def _cleanup_progress(_current: int, _total: int, msg: str) -> None:
+            if progress_callback:
+                progress_callback(cleanup_step, total_work, msg)
+
+        self._remove_stale_numeric_sd_folders(
+            sd_root,
+            used_folders,
+            progress_callback=_cleanup_progress if progress_callback else None,
+            progress_total=1,
+        )
 
         # Also remove stale files within used folders (track numbers no longer needed)
         folder_tracks: Dict[int, set] = {}

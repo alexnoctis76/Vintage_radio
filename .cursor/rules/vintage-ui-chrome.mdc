@@ -1,0 +1,54 @@
+---
+description: Vintage Radio GUI — modals and scrollbars must use themed chrome
+globs:
+  - gui/**/*.py
+alwaysApply: true
+---
+
+# Vintage UI chrome — modals & scrollbars
+
+## Modals (dialogs, alerts, wizards)
+
+**Do not** ship new user-facing modals with the native OS title bar (`QDialog` default chrome, plain `QMessageBox`).
+
+Use the **Sync modal shell** from `gui/widgets/dialogs/sync/primitives.py`:
+
+- `apply_frameless_modal()` + `SyncModalShell` + `ModalHeader` + `ModalFooter`
+- `ModalButton` for actions (`primary` / `secondary` / `danger`) — same sizes as Sync to SD
+- `apply_modal_rounded_mask()` on show; `refresh_modal_rounded_mask()` after theme reload
+
+**Prefer these helpers:**
+
+| Use case | Module |
+|----------|--------|
+| Info / warning / yes-no | `VintageMessageBox` — `gui/widgets/dialogs/vintage_message.py` |
+| Read-only or editable text | `VintageTextDialog` — `gui/widgets/dialogs/vintage_text_dialog.py` |
+| Sync choice / confirm / progress | Existing sync dialogs + `TaskProgressDialog` |
+| Main-thread blocking progress | `IndeterminateProgressDialog` — `gui/widgets/dialogs/task_progress.py` |
+| Custom body + footer buttons | `begin_sync_modal_dialog()` — `gui/widgets/dialogs/sync/primitives.py` |
+| Text / choice / multiline prompt | `get_text`, `get_item`, `get_multiline_text` — `gui/widgets/dialogs/vintage_input.py` |
+| Dropdowns in modals / settings | `VintageComboBox` — `gui/widgets/common/styled_combo.py` |
+| Numeric steppers in settings | `VintageSpinBox` — `gui/widgets/common/styled_spin.py` |
+| Checkboxes in settings / modals | `VintageCheckBox` — `gui/widgets/common/styled_checkbox.py` |
+
+`QMessageBox` and unstyled `QDialog` are legacy — migrate when touching a file.
+
+## Scrollbars
+
+**Do not** leave default Qt scrollbars on themed surfaces.
+
+Use `wrap_with_mockup_scrollbar()` from `gui/widgets/common/mockup_scrollbar.py`:
+
+| Background | `variant=` |
+|------------|------------|
+| Dark (station list, debugger console, session logs on dark panel) | `"station"` or `"dark"` |
+| Light (track table, settings, notes, cream panels) | `"track"` or `"light"` |
+
+Applies to `QScrollArea`, `QListWidget`, `QTableWidget`, `QPlainTextEdit`, `QTextEdit`.
+
+Hide native bars (`ScrollBarAlwaysOff` on the widget) before wrapping.
+
+## Theme tokens
+
+Modal sizes/colours → `SYNC_MDL_*` in `gui/theme.py`.  
+Scrollbar colours → `SB_STA_*` (dark) / `SB_TRK_*` (light).
