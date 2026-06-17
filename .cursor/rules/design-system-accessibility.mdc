@@ -1,0 +1,84 @@
+---
+description: High-contrast and accessible UI design — WCAG contrast, foreground/background pairs, theme tokens
+globs: "**/*.{css,scss,sass,less,tsx,jsx,vue,html,qss,py}"
+alwaysApply: false
+---
+
+# Accessible design system (global)
+
+Apply when adding colours, themes, components, or styles. High-contrast mode is for **low vision and readability**, not merely a dark palette ([PROS Ascend](https://pros.com/ascend/the-importance-of-high-contrast-mode-in-a-design-system/), [Material color contrast](https://m3.material.io/foundations/designing/color-contrast)).
+
+## Core rule: every surface has an explicit text colour
+
+Never assign a background without deciding what text/icons sit on it.
+
+1. Define **pairs**: `(foreground_token, background_token)` — not isolated hex values.
+2. Prefer **near-black on light** (`#000`–`#1E1610` on `#FFF`–`#FDF6ED`) and **near-white on dark** (`#FFF`–`#FDF6ED` on `#121`–`#1E1610`).
+3. **Do not** reuse an accent hue (orange, blue) for small text on the same-hue background (orange-on-orange = invisible).
+4. Gradients: test **worst stop** (usually mid or bottom) against the foreground.
+
+## WCAG 2.x minimum contrast ([WCAG 2.1](https://www.w3.org/TR/WCAG21/))
+
+| Content | Ratio |
+|---------|-------|
+| Normal text (< 18pt / 14pt bold) | **4.5:1** |
+| Large text | **3:1** |
+| UI components, icons, focus rings | **3:1** |
+| **Monochromatic SVG/glyph icons** | **4.5:1** (treated as text — see below) |
+
+Target **7:1** for body text in dedicated high-contrast themes when practical.
+
+## Monochromatic icons — treat as text
+
+Any icon rendered as a single tint colour (SVG filled with one colour, Unicode glyph, Qt-painted shape) must satisfy the **text** contrast threshold of **4.5:1** against its actual background — not just the 3:1 UI-component floor.
+
+Rationale: a monochromatic glyph conveys meaning through shape and fill the same way a letter does. At small sizes (< 24 px) it is perceptually indistinguishable from a text character.
+
+**Applies to:**
+- SVG files recoloured via `CompositionMode_SourceIn` (sidebar nav, SD card, USB, chip glyphs)
+- Scrollbar arrow/chevron shapes painted in code
+- Row-level glyphs: drag-handle `≡`, edit pencil `✎`, station/track count text
+- Badge or pill icons painted as filled shapes with a single foreground colour
+
+**Per-occurrence rule:** evaluate every distinct `(icon_color, background)` pair independently — the same icon may appear on multiple surfaces (unselected row, selected row, button). Each surface must pass separately.
+
+**Gradient backgrounds:** test the icon against the **worst stop** (the stop that gives the lowest contrast). If the icon is centred, test both the top and bottom stops.
+
+## High-contrast theme ≠ dark mode
+
+- **Dark mode**: low light, aesthetic; muted grays are OK.
+- **High contrast**: maximum separation; bold borders, light text on dark chrome, dark text on light content, accent only on large controls with contrasting label.
+
+Avoid `rgba()` washes for text-bearing areas when a solid pair passes contrast.
+
+## Token checklist (name fg + bg explicitly)
+
+- Page body: `TEXT_PRI` / `TEXT_SEC` on `C_BG`, `TRACK_BG`
+- Sidebar: `S_TEXT` on `S_BG`; active nav fg on active nav bg
+- Headers: `PANEL_HDR_TEXT` on `PANEL_HDR`
+- Buttons: label fg on `*_GRAD_TOP` (primary) or light btn top
+- Selected rows: icon/count fg on `*_SEL_GRAD_MID` — usually **white on saturated fill** or **black on light fill**
+- Status pills: `IF_STATUS_PILL_FG` on both ON and OFF tops
+- Disabled: still **≥ 4.5:1** for labels (do not fade to mud)
+
+## Implementation habits
+
+- Store palettes as complete token maps (see `gui/themes/*.py`).
+- Add semantic pairs to contrast tests (`gui/themes/contrast_utils.py`).
+- Borders: visible in HC (≥ 3:1 vs adjacent surface); do not rely on shadow alone.
+- Links/accents: blue `#005A9C` on white passes; orange `#C84B00` is for **large** controls with **white** labels only.
+- Test with real strings in situ, not only automated ratio checks.
+
+## Scope: all themes, not just high-contrast
+
+WCAG 2.1 and Material Design 3 contrast requirements apply to **every shipped theme** — default, high-contrast, colorblind, dark, etc. "This is just the aesthetic theme" is not an exemption. Add every theme to the automated contrast test matrix (`pytest tests/gui/test_theme_contrast.py`).
+
+## Anti-patterns
+
+- Testing contrast only on the high-contrast theme and ignoring vintage/colorblind/dark themes
+- Same accent hue for fill **and** icon/glyph on that fill (e.g. orange SD card icon on orange button, orange scrollbar arrow on same-hue rail → invisible)
+- Cream secondary text on cream panel; light text on mid-tone surface
+- Single scrollbar thumb token when station and track rails have different luminances — add per-context tokens (`SB_STA_THUMB_GRAD_TOP` vs `SB_THUMB_GRAD_TOP`) rather than forcing one colour to work on both
+- Status pill foreground that fails on both the ON and OFF pill backgrounds simultaneously — decide whether fg is light or dark and adjust the pill background accordingly
+- Hardcoding icon colours as module constants instead of reading from the theme palette — the icon will never respond to theme switches or high-contrast overrides
+- Changing a colour in one palette without running the full contrast test suite across all palettes

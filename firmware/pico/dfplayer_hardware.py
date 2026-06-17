@@ -9,6 +9,7 @@ This allows the firmware to run the exact same logic as the GUI emulator.
 
 from machine import Pin, PWM, Timer, UART
 import neopixel
+import math
 import time
 import os
 try:
@@ -83,6 +84,13 @@ BUSY_IDLE_WAIT_MS = 700
 BUSY_IGNORE_MS_AFTER_PLAY_OK = 800
 # Longer suppress after UART errors / failed play — BUSY can lie for a while.
 BUSY_IGNORE_MS_LONG = 4000
+# Onboard NeoPixel playback indicator (#7954f2)
+PLAYBACK_LED_R = 0x79
+PLAYBACK_LED_G = 0x54
+PLAYBACK_LED_B = 0xF2
+PLAYBACK_LED_CYCLE_MS = 5000
+PLAYBACK_LED_UPDATE_MS = 40
+IDLE_NEOPIX = (4, 4, 4)
 ALBUM_PROBE_MS  = 650
 
 # DFPlayer response (command) codes (from DFPlayer TX -> Pico RX)
@@ -189,6 +197,7 @@ class DFPlayerHardware(HardwareInterface):
         
         # Flag to prevent duplicate playback when AM overlay is playing
         self._am_overlay_active = False
+        self._playback_led_last_ms = 0
         
         # When True, play_track() no-ops so firmware can play AM overlay first (mode switch / power-on)
         self._delay_playback = False
@@ -935,6 +944,34 @@ class DFPlayerHardware(HardwareInterface):
         # Map 0-100 to 0-DFPLAYER_VOL for DFPlayer (capped at 28)
         self._df_volume = int((self._volume / 100.0) * DFPLAYER_VOL)
         self._df_set_vol(self._df_volume)
+
+    def update_playback_led(self, *, is_playing=False):
+        """Breathing onboard NeoPixel (#7954f2): fully off -> full -> off over 2 s."""
+        if self._am_overlay_active:
+            return
+        now = time.ticks_ms()
+        if time.ticks_diff(now, self._playback_led_last_ms) < PLAYBACK_LED_UPDATE_MS:
+            return
+        self._playback_led_last_ms = now
+        playing = bool(is_playing) or self.pin_busy.value() == 0
+        if not playing:
+            self.np[0] = IDLE_NEOPIX
+            self.np.write()
+            return
+        phase = now % PLAYBACK_LED_CYCLE_MS
+        # One full breath per cycle: 0% at t=0, 100% at t=1s, 0% at t=2s.
+        scale = (1.0 + math.sin((2.0 * math.pi * phase / PLAYBACK_LED_CYCLE_MS) - (math.pi / 2.0))) * 50.0
+        if scale < 0.0:
+            scale = 0.0
+        elif scale > 100.0:
+            scale = 100.0
+        s = int(scale)
+        self.np[0] = (
+            (PLAYBACK_LED_R * s) // 100,
+            (PLAYBACK_LED_G * s) // 100,
+            (PLAYBACK_LED_B * s) // 100,
+        )
+        self.np.write()
     
     def play_am_overlay(self):
         """Play AM radio sound with DFPlayer volume fade-in."""
@@ -962,7 +999,7 @@ class DFPlayerHardware(HardwareInterface):
                 confirmed = self._play_music_only_fade_after_stop(folder, track)
 
             try:
-                self.np[0] = (0, 0, 0)
+                self.np[0] = IDLE_NEOPIX
                 self.np.write()
             except Exception:
                 pass

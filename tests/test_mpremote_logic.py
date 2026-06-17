@@ -235,15 +235,27 @@ class TestRunMpremoteSubprocess:
         assert call_args[1]["cwd"] is None
 
 
-# ---------------------------------------------------------------------------
-# _install_to_pico_worker tests
-# ---------------------------------------------------------------------------
+_OK_MPREMOTE_PROBE = mock.Mock(returncode=0, stdout="VR_INSTALL_PROBE ['main.py']", stderr="")
+
+
+def _args_joined(args) -> str:
+    return " ".join(args) if isinstance(args, list) else ""
+
+
+def _is_cp_call(args) -> bool:
+    return isinstance(args, list) and "cp" in args
+
 
 class TestInstallToPicoWorker:
     """Test the _install_to_pico_worker static method.
 
     We mock _run_mpremote so no real hardware/subprocess calls are made.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_real_serial_port(self):
+        with mock.patch("gui.radio_manager._find_rp2040_serial_port", return_value=None):
+            yield
 
     @pytest.fixture
     def project_root(self, tmp_path):
@@ -304,7 +316,7 @@ class TestInstallToPicoWorker:
     @mock.patch("gui.radio_manager._run_mpremote")
     def test_copies_all_firmware_files(self, mock_mpremote, project_root, mock_sd_manager):
         worker = self._get_worker()
-        mock_mpremote.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
         progress = []
 
         result = worker(
@@ -318,7 +330,7 @@ class TestInstallToPicoWorker:
         assert len(progress) >= 3
 
         all_args = [call[0][1] for call in mock_mpremote.call_args_list]
-        cp_calls = [a for a in all_args if isinstance(a, list) and a and a[0] == "cp"]
+        cp_calls = [a for a in all_args if _is_cp_call(a)]
         assert len(cp_calls) >= 3
 
     @mock.patch("gui.radio_manager._run_mpremote")
@@ -329,9 +341,11 @@ class TestInstallToPicoWorker:
         def side_effect(cmd, args, **kwargs):
             nonlocal call_count
             call_count += 1
-            if isinstance(args, list) and args and args[0] == "cp":
+            if _is_cp_call(args):
                 return mock.Mock(returncode=1, stdout="", stderr="copy failed")
-            return mock.Mock(returncode=0, stdout="", stderr="")
+            if "VR_INSTALL_PROBE" in _args_joined(args):
+                return _OK_MPREMOTE_PROBE
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
 
         mock_mpremote.side_effect = side_effect
 
@@ -346,7 +360,7 @@ class TestInstallToPicoWorker:
     @mock.patch("gui.radio_manager._run_mpremote")
     def test_copies_am_wav(self, mock_mpremote, project_root, mock_sd_manager):
         worker = self._get_worker()
-        mock_mpremote.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
 
         worker(
             mpremote_cmd=["/usr/bin/mpremote"],
@@ -365,7 +379,7 @@ class TestInstallToPicoWorker:
     @mock.patch("gui.radio_manager._run_mpremote")
     def test_writes_and_copies_metadata(self, mock_mpremote, project_root, mock_sd_manager):
         worker = self._get_worker()
-        mock_mpremote.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
 
         worker(
             mpremote_cmd=["/usr/bin/mpremote"],
@@ -384,7 +398,7 @@ class TestInstallToPicoWorker:
     @mock.patch("gui.radio_manager._run_mpremote")
     def test_creates_directories(self, mock_mpremote, project_root, mock_sd_manager):
         worker = self._get_worker()
-        mock_mpremote.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
 
         worker(
             mpremote_cmd=["/usr/bin/mpremote"],
@@ -400,7 +414,7 @@ class TestInstallToPicoWorker:
     @mock.patch("gui.radio_manager._run_mpremote")
     def test_reboots_pico(self, mock_mpremote, project_root, mock_sd_manager):
         worker = self._get_worker()
-        mock_mpremote.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
 
         worker(
             mpremote_cmd=["/usr/bin/mpremote"],
@@ -418,7 +432,7 @@ class TestInstallToPicoWorker:
     @mock.patch("gui.radio_manager._run_mpremote")
     def test_progress_callback_reports_all_steps(self, mock_mpremote, project_root, mock_sd_manager):
         worker = self._get_worker()
-        mock_mpremote.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
         progress = []
 
         worker(
@@ -435,7 +449,7 @@ class TestInstallToPicoWorker:
     def test_worker_thread_fallback_for_inprocess(self, mock_mpremote, project_root, mock_sd_manager):
         """In a worker thread, __INPROCESS__ should fall back to system mpremote."""
         worker = self._get_worker()
-        mock_mpremote.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
         import threading
 
         error_raised = []
@@ -492,10 +506,12 @@ class TestRunMpremoteWithRetry:
         def side_effect(cmd, args, **kwargs):
             nonlocal call_count
             call_count += 1
-            if isinstance(args, list) and "exec" in args and "mkdir" in " ".join(args):
-                if call_count <= 1:
-                    return mock.Mock(returncode=1, stdout="", stderr="no device found")
-            return mock.Mock(returncode=0, stdout="", stderr="")
+            joined = _args_joined(args)
+            if "VR_INSTALL_PROBE" in joined:
+                return _OK_MPREMOTE_PROBE
+            if "os.mkdir" in joined and call_count <= 1:
+                return mock.Mock(returncode=1, stdout="", stderr="no device found")
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
 
         mock_mpremote.side_effect = side_effect
 

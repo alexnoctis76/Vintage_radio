@@ -56,3 +56,16 @@ class TestInitSessionLogging:
             sys.stdout = saved_stdout
             sys.stderr = saved_stderr
             session_log._session_log_path = None
+
+
+class TestWriteSessionLine:
+    def test_mirrors_to_console(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        console = mock.Mock()
+        monkeypatch.setattr(session_log, "_original_stdout", console)
+        session_log.init_session_logging(app_version="test")
+        session_log.write_session_line("hello install", prefix="INSTALL")
+        written = "".join(call.args[0] for call in console.write.call_args_list)
+        assert "[INSTALL] hello install" in written
+        assert "hello install" in session_log.get_session_log_path().read_text()
+        session_log._session_log_path = None

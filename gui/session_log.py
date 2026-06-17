@@ -57,10 +57,20 @@ def get_session_log_path() -> Optional[Path]:
 
 def log_gui_error(title: str, message: str) -> None:
     """Log a GUI-visible failure (task dialog, message box) to the session log file."""
-    if not _session_log_path:
-        return
     ts = format_session_timestamp()
     block = f"{title}\n{message}"
+    try:
+        for line in block.splitlines() or [block]:
+            console_line = f"{ts} [GUI-ERROR] {line}"
+            try:
+                _original_stdout.write(console_line + "\n")
+                _original_stdout.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not _session_log_path:
+        return
     try:
         with open(_session_log_path, "a", encoding="utf-8", newline="\n") as f:
             for line in block.splitlines() or [block]:
@@ -115,17 +125,23 @@ def install_messagebox_session_logging() -> None:
 
 
 def write_session_line(message: str, *, prefix: str = "SETUP") -> None:
-    """Append one line directly to the session log file and flush + fsync.
+    """Append one line to the session log file and mirror to the console when available.
 
     Use this for crash-prone paths (e.g. Setup Device / mpremote). Unlike ``print()``,
     this does not depend on ``sys.stdout`` (PyInstaller windowed builds, torn TeeWriter).
     Survives until the OS buffers are lost (hard kill / native crash may still omit lines).
     """
+    ts = format_session_timestamp()
+    console_line = f"{ts} [{prefix}] {message}"
+    try:
+        _original_stdout.write(console_line + "\n")
+        _original_stdout.flush()
+    except Exception:
+        pass
     if not _session_log_path:
         return
     try:
-        ts = format_session_timestamp()
-        line = f"{ts} [{prefix}] {message}\n"
+        line = f"{console_line}\n"
         with open(_session_log_path, "a", encoding="utf-8", newline="\n") as f:
             f.write(line)
             f.flush()

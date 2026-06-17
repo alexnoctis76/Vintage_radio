@@ -68,9 +68,9 @@ class InstallActionBar(QtWidgets.QWidget):
         self._install_btn.setFixedSize(u.px(t.IF_INSTALL_BTN_W), u.px(t.LM_SYNC_BTN_H))
         self._install_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self._install_btn.setToolTip(
-            "Install the selected software. Official firmware installs MicroPython if "
-            "needed, then copies the Vintage Radio basic bundle. .uf2 files copy "
-            "directly in BOOTSEL mode without a MicroPython step."
+            "Install the selected software. Official Vintage Radio uses a bundled full-flash "
+            ".uf2 when available; otherwise copies firmware over USB (MicroPython is installed "
+            "automatically when possible). Community .uf2 files install in BOOTSEL mode."
         )
         self._install_btn.setStyleSheet(f"""
             QPushButton {{

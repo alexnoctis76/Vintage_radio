@@ -158,6 +158,7 @@ PALETTE: dict[str, str | bool | int] = {
     "SB_STA_BG": "#625642",
     "SB_STA_BORDER_L": "rgba(28,18,10,0.58)",
     "SB_STA_BORDER_R": "rgba(255,240,210,0.14)",
+    "SB_STA_THUMB_GRAD_TOP": "#eba04d",
     "SB_THUMB_BORDER": "#9f4c12",
     "SB_THUMB_GRAD_BOT": "#c46617",
     "SB_THUMB_GRAD_MID": "#db852e",

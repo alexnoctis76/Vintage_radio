@@ -101,76 +101,54 @@ def _device_btn_style(*, primary: bool = False) -> str:
 
 
 
-def _paint_device_chip_icon(size: int) -> QtGui.QPixmap:
-
-    """Chip + download glyph from scratch.html device-icon SVG."""
-
+def _paint_device_chip_glyph(size: int) -> QtGui.QPixmap:
+    """Chip + download glyph (transparent background)."""
     pix = QtGui.QPixmap(size, size)
-
     pix.fill(QtCore.Qt.GlobalColor.transparent)
-
     p = QtGui.QPainter(pix)
-
     p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
 
-
-
-    r = size * 0.25
-
-    bg = QtGui.QLinearGradient(0, 0, 0, size)
-
-    bg.setColorAt(0, QtGui.QColor(t.IF_DEVICE_ICON_TOP))
-
-    bg.setColorAt(1, QtGui.QColor(t.IF_DEVICE_ICON_BOT))
-
-    p.setBrush(bg)
-
-    p.setPen(QtCore.Qt.PenStyle.NoPen)
-
-    p.drawRoundedRect(QtCore.QRectF(size * 0.06, size * 0.06, size * 0.88, size * 0.88), r, r)
-
-
-
     pen = QtGui.QPen(QtGui.QColor("#fff4e6"))
-
     pen.setWidthF(max(1.8, size * 0.045))
-
     pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-
     pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-
     p.setPen(pen)
-
     p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
 
-
-
     s = size / 64.0
-
     p.drawRoundedRect(QtCore.QRectF(18 * s, 14 * s, 28 * s, 36 * s), 4 * s, 4 * s)
-
     for px in (24, 32, 40):
-
         p.drawLine(QtCore.QPointF(px * s, 7 * s), QtCore.QPointF(px * s, 14 * s))
-
         p.drawLine(QtCore.QPointF(px * s, 50 * s), QtCore.QPointF(px * s, 57 * s))
-
     for py in (24, 32, 40):
-
         p.drawLine(QtCore.QPointF(10 * s, py * s), QtCore.QPointF(18 * s, py * s))
-
         p.drawLine(QtCore.QPointF(46 * s, py * s), QtCore.QPointF(54 * s, py * s))
-
     cx = 32 * s
-
     p.drawLine(QtCore.QPointF(cx, 20 * s), QtCore.QPointF(cx, 39 * s))
-
     p.drawLine(QtCore.QPointF(24 * s, 31 * s), QtCore.QPointF(cx, 39 * s))
-
     p.drawLine(QtCore.QPointF(40 * s, 31 * s), QtCore.QPointF(cx, 39 * s))
-
     p.end()
+    return pix
 
+
+def _paint_device_chip_icon(size: int) -> QtGui.QPixmap:
+    """Chip + download glyph from scratch.html device-icon SVG (legacy flat pixmap)."""
+    pix = QtGui.QPixmap(size, size)
+    pix.fill(QtCore.Qt.GlobalColor.transparent)
+    p = QtGui.QPainter(pix)
+    p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+
+    r = size * 0.25
+    bg = QtGui.QLinearGradient(0, 0, 0, size)
+    bg.setColorAt(0, QtGui.QColor(t.IF_DEVICE_ICON_TOP))
+    bg.setColorAt(1, QtGui.QColor(t.IF_DEVICE_ICON_BOT))
+    p.setBrush(bg)
+    p.setPen(QtCore.Qt.PenStyle.NoPen)
+    p.drawRoundedRect(QtCore.QRectF(size * 0.06, size * 0.06, size * 0.88, size * 0.88), r, r)
+
+    glyph = _paint_device_chip_glyph(int(size * 0.88))
+    p.drawPixmap(int(size * 0.06), int(size * 0.06), glyph)
+    p.end()
     return pix
 
 
@@ -233,17 +211,23 @@ class DeviceSection(QtWidgets.QFrame):
 
 
 
-    def set_detected(self, detected: bool) -> None:
+    def set_detected(
+        self,
+        detected: bool,
+        *,
+        status_text: str | None = None,
+        status_on: bool = True,
+    ) -> None:
 
         if detected:
 
-            self._status_pill.setText("Connected")
+            self._status_pill.setText(status_text or "Connected")
 
-            self._status_pill.apply_variant("status_on")
+            self._status_pill.apply_variant("status_on" if status_on else "status_off")
 
         else:
 
-            self._status_pill.setText("Not connected")
+            self._status_pill.setText(status_text or "Not connected")
 
             self._status_pill.apply_variant("status_off")
 
@@ -323,26 +307,19 @@ class DeviceSection(QtWidgets.QFrame):
 
 
         self._icon_wrap = QtWidgets.QLabel()
-
+        self._icon_wrap.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         icon_sz = u.px(t.IF_DEVICE_ICON)
         self._icon_wrap.setFixedSize(icon_sz, icon_sz)
         self._icon_wrap.setPixmap(_paint_device_chip_icon(icon_sz))
-
         self._icon_wrap.setStyleSheet(f"""
-
             background: qlineargradient(
-
                 x1:0, y1:0, x2:0, y2:1,
-
                 stop:0 {t.IF_DEVICE_ICON_TOP}, stop:1 {t.IF_DEVICE_ICON_BOT}
-
             );
-
             border-radius: {u.px(t.IF_DEVICE_ICON_RADIUS)}px;
-
         """)
 
-        lay.addWidget(self._icon_wrap)
+        lay.addWidget(self._icon_wrap, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
 
 
 

@@ -111,7 +111,7 @@ def test_high_contrast_vintage_palette_spec() -> None:
     assert hc["TEXT_PRI"] == "#1E1610"
     assert hc["ORANGE_BTN"] == "#C84B00"
     assert hc["IF_STATUS_PILL_ON_TOP"] == "#005A9C"
-    assert hc["IF_INSTALL_BTN_FG"] == "#FDF6ED"
+    assert hc["IF_INSTALL_BTN_FG"] == "#FFFFFF"
 
 
 def test_high_contrast_dark_palette_spec() -> None:
