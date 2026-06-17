@@ -123,7 +123,7 @@ class MetaPill(QtWidgets.QFrame):
         self._apply_style()
 
         lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(8, 3, 8, 3)
+        lay.setContentsMargins(u.px(8), u.px(3), u.px(8), u.px(3))
         lay.setSpacing(0)
 
         self._label = QtWidgets.QLabel(label.upper())
@@ -132,7 +132,7 @@ class MetaPill(QtWidgets.QFrame):
 
         value_row = QtWidgets.QHBoxLayout()
         value_row.setContentsMargins(0, 0, 0, 0)
-        value_row.setSpacing(4)
+        value_row.setSpacing(u.px(4))
         value_row.addStretch(1)
 
         self._icon = QtWidgets.QLabel()
@@ -146,6 +146,7 @@ class MetaPill(QtWidgets.QFrame):
         self._value = QtWidgets.QLabel("")
         self._value.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self._value.setStyleSheet(self._value_style())
+        self._full_value = ""
         value_row.addWidget(self._value)
         value_row.addStretch(1)
 
@@ -154,12 +155,33 @@ class MetaPill(QtWidgets.QFrame):
 
     def _label_style(self) -> str:
         return (
-            f"color:{t.IF_META_LABEL_FG}; font-size:{u.px(t.IF_META_LABEL_PX)}px; font-weight:900;"
+            f"color:{t.IF_META_LABEL_FG}; font-size:{u.px(t.IF_META_LABEL_PX)}px; "
+            f"font-weight:{u.qss_weight(900)};"
         )
 
     def _value_style(self) -> str:
         return (
-            f"color:{t.IF_META_VALUE_FG}; font-size:{u.px(t.IF_META_VALUE_PX)}px; font-weight:800;"
+            f"color:{t.IF_META_VALUE_FG}; font-size:{u.px(t.IF_META_VALUE_PX)}px; "
+            f"font-weight:{u.qss_weight(800)};"
+        )
+
+    def _value_text_width(self) -> int:
+        margins = u.px(16)
+        icon = (u.px(t.IF_META_ICON) + u.px(4)) if self._icon.isVisible() else 0
+        return max(u.px(20), self.width() - margins - icon)
+
+    def _apply_value_text(self, text: str) -> None:
+        self._full_value = str(text or "")
+        available = self._value_text_width()
+        fm = QtGui.QFontMetrics(self._value.font())
+        shown = fm.elidedText(
+            self._full_value,
+            QtCore.Qt.TextElideMode.ElideRight,
+            available,
+        )
+        self._value.setText(shown)
+        self._value.setToolTip(
+            self._full_value if shown != self._full_value else ""
         )
 
     def _apply_style(self) -> None:
@@ -181,8 +203,13 @@ class MetaPill(QtWidgets.QFrame):
         p.drawPath(path)
         super().paintEvent(a0)
 
+    def resizeEvent(self, a0: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(a0)
+        if self._full_value:
+            self._apply_value_text(self._full_value)
+
     def set_value(self, text: str) -> None:
-        self._value.setText(text)
+        self._apply_value_text(text)
 
     def reload_theme(self) -> None:
         self.setFixedSize(u.px(self._pill_width), u.px(t.IF_META_PILL_H))
@@ -193,6 +220,8 @@ class MetaPill(QtWidgets.QFrame):
             icon_sz = u.px(t.IF_META_ICON)
             self._icon.setFixedSize(icon_sz, icon_sz)
             self._icon.setPixmap(_icon_pixmap(self._icon_kind, icon_sz))
+        if self._full_value:
+            self._apply_value_text(self._full_value)
 
 
 class AuthorMetaPill(MetaPill):

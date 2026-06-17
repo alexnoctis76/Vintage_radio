@@ -49,7 +49,7 @@ def _small_btn_style() -> str:
             min-height: {t.IF_SMALL_BTN_H}px;
             padding: 0 18px;
             font-size: {u.px(t.IF_SMALL_BTN_FONT)}px;
-            font-weight: 900;
+            font-weight: {u.qss_weight(900)};
         }}
         QPushButton:hover {{ background: {t.LIGHT_BTN_HOVER}; }}
     """
@@ -67,7 +67,7 @@ def _install_btn_style() -> str:
             border: 2px solid {t.IF_INSTALL_BTN_BORDER};
             border-radius: 7px;
             font-size: {u.px(t.IF_INSTALL_BTN_FONT)}px;
-            font-weight: 900;
+            font-weight: {u.qss_weight(900)};
         }}
         QPushButton:hover {{
             background: {t.IF_INSTALL_BTN_MID};
@@ -150,7 +150,8 @@ class _NotesCard(QtWidgets.QFrame):
         hdr.setObjectName("notesCardTitle")
         self._title_label = hdr
         hdr.setStyleSheet(
-            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_NOTES_TITLE_PX)}px; font-weight:800;"
+            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_NOTES_TITLE_PX)}px; "
+            f"font-weight:{u.qss_weight(800)};"
         )
         title_row.addWidget(hdr)
         title_row.addStretch(1)
@@ -180,7 +181,8 @@ class _NotesCard(QtWidgets.QFrame):
     def reload_theme(self) -> None:
         self.setStyleSheet(_inner_card_style())
         self._title_label.setStyleSheet(
-            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_NOTES_TITLE_PX)}px; font-weight:800;"
+            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_NOTES_TITLE_PX)}px; "
+            f"font-weight:{u.qss_weight(800)};"
         )
         self._preview.apply_theme()
         self._action_btn.setStyleSheet(_small_btn_style())
@@ -253,6 +255,7 @@ class FirmwareDetailPanel(QtWidgets.QWidget):
         )
         self._sw_badge.apply_variant(badge_variant)  # type: ignore[arg-type]
         self._sw_desc.setText(str(entry.get("description") or ""))
+        self._sync_sw_desc_height()
         self._meta_version.set_value(
             str(entry.get("version") or ("Custom" if custom else "v1.1")),
         )
@@ -365,9 +368,7 @@ class FirmwareDetailPanel(QtWidgets.QWidget):
 
         title_row = QtWidgets.QHBoxLayout()
         self._sw_title = QtWidgets.QLabel("Vintage Radio Basic")
-        self._sw_title.setStyleSheet(
-            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_SW_TITLE_PX)}px; font-weight:800;"
-        )
+        self._apply_sw_title_style()
         title_row.addWidget(self._sw_title, 1)
         self._sw_badge = PillLabel("Official", variant="badge_official")
         title_row.addWidget(self._sw_badge, 0, QtCore.Qt.AlignmentFlag.AlignRight)
@@ -375,17 +376,22 @@ class FirmwareDetailPanel(QtWidgets.QWidget):
 
         self._sw_desc = QtWidgets.QLabel("")
         self._sw_desc.setWordWrap(True)
-        self._sw_desc.setMaximumHeight(32)
-        self._sw_desc.setStyleSheet(
-            f"color:{t.TEXT_SEC}; font-size:{u.px(t.IF_SW_DESC_PX)}px;"
+        self._sw_desc.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
         )
+        self._apply_sw_desc_style()
         lay.addWidget(self._sw_desc)
 
         meta_row = QtWidgets.QHBoxLayout()
         meta_row.setSpacing(8)
         meta_row.addStretch(1)
         self._meta_version = MetaPill("Version", icon="tag")
-        self._meta_device = MetaPill("Device", icon="chip")
+        self._meta_device = MetaPill(
+            "Device",
+            icon="chip",
+            width=t.IF_META_DEVICE_PILL_W,
+        )
         self._meta_author = AuthorMetaPill()
         meta_row.addWidget(self._meta_version)
         meta_row.addWidget(self._meta_device)
@@ -498,7 +504,8 @@ class FirmwareDetailPanel(QtWidgets.QWidget):
         title = QtWidgets.QLabel("No custom firmware yet")
         title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
-            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_NOTES_TITLE_PX)}px; font-weight:800;"
+            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_NOTES_TITLE_PX)}px; "
+            f"font-weight:{u.qss_weight(800)};"
         )
         inner.addWidget(title)
 
@@ -537,8 +544,41 @@ class FirmwareDetailPanel(QtWidgets.QWidget):
             }}
         """)
 
+    def resizeEvent(self, a0: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(a0)
+        self._sync_sw_desc_height()
+
+    def _apply_sw_title_style(self) -> None:
+        self._sw_title.setStyleSheet(
+            f"color:{t.TEXT_PRI}; font-size:{u.px(t.IF_SW_TITLE_PX)}px; "
+            f"font-weight:{u.qss_weight(800)};"
+        )
+
+    def _apply_sw_desc_style(self) -> None:
+        self._sw_desc.setStyleSheet(
+            f"color:{t.TEXT_SEC}; font-size:{u.px(t.IF_SW_DESC_PX)}px;"
+        )
+
+    def _sync_sw_desc_height(self) -> None:
+        """Size description to wrapped content — macOS line metrics exceed the old 32px cap."""
+        if not hasattr(self, "_sw_desc"):
+            return
+        width = self._sw_desc.width()
+        if width <= 1:
+            QtCore.QTimer.singleShot(0, self._sync_sw_desc_height)
+            return
+        height = self._sw_desc.heightForWidth(width)
+        if height <= 0:
+            fm = QtGui.QFontMetrics(self._sw_desc.font())
+            height = fm.lineSpacing() * 3
+        self._sw_desc.setMinimumHeight(height)
+        self._sw_desc.setMaximumHeight(height)
+
     def reload_theme(self) -> None:
         self._apply_pane_style()
+        self._apply_sw_title_style()
+        self._apply_sw_desc_style()
+        self._sync_sw_desc_height()
         self._sw_badge.apply_variant(
             "badge_soft"
             if self._sw_badge.text() != "Official"

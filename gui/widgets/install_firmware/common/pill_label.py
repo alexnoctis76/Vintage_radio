@@ -43,53 +43,61 @@ def pill_stylesheet(variant: PillVariant, *, height_px: int) -> str:
     radius = t.if_pill_radius(height_px)
     if variant == "badge_official":
         return (
-            f"color:{t.IF_SW_BADGE_FG}; font-size:{_fs(t.IF_SW_BADGE_FONT)}; font-weight:900;"
+            f"color:{t.IF_SW_BADGE_FG}; font-size:{_fs(t.IF_SW_BADGE_FONT)}; "
+            f"font-weight:{u.qss_weight(900)};"
             f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {t.IF_SW_BADGE_TOP}, stop:1 {t.IF_SW_BADGE_BOT});"
             f"border-radius:{radius}px; padding:{u.px(t.IF_SW_BADGE_PAD_V)}px {u.px(t.IF_SW_BADGE_PAD_H)}px;"
         )
     if variant == "badge_soft":
         return (
-            f"color:{t.IF_SW_BADGE_FG}; font-size:{_fs(t.IF_SW_BADGE_FONT)}; font-weight:900;"
+            f"color:{t.IF_SW_BADGE_FG}; font-size:{_fs(t.IF_SW_BADGE_FONT)}; "
+            f"font-weight:{u.qss_weight(900)};"
             f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {t.IF_SW_BADGE_SOFT_TOP}, stop:1 {t.IF_SW_BADGE_SOFT_BOT});"
             f"border-radius:{radius}px; padding:{u.px(t.IF_SW_BADGE_PAD_V)}px {u.px(t.IF_SW_BADGE_PAD_H)}px;"
         )
     if variant == "notes_editable":
         return (
-            f"color:{t.IF_NOTES_PILL_FG}; font-size:{_fs(t.IF_NOTES_PILL_FONT)}; font-weight:900;"
+            f"color:{t.IF_NOTES_PILL_FG}; font-size:{_fs(t.IF_NOTES_PILL_FONT)}; "
+            f"font-weight:{u.qss_weight(900)};"
             f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {t.IF_NOTES_PILL_EDIT_TOP}, stop:1 {t.IF_NOTES_PILL_EDIT_BOT});"
             f"border-radius:{radius}px; padding:{u.px(t.IF_NOTES_PILL_PAD_V)}px {u.px(t.IF_NOTES_PILL_PAD_H)}px;"
         )
     if variant == "notes_readonly":
         return (
-            f"color:{t.IF_NOTES_PILL_FG}; font-size:{_fs(t.IF_NOTES_PILL_FONT)}; font-weight:900;"
+            f"color:{t.IF_NOTES_PILL_FG}; font-size:{_fs(t.IF_NOTES_PILL_FONT)}; "
+            f"font-weight:{u.qss_weight(900)};"
             f"background:{t.IF_NOTES_PILL_BG}; border-radius:{radius}px;"
             f"padding:{u.px(t.IF_NOTES_PILL_PAD_V)}px {u.px(t.IF_NOTES_PILL_PAD_H)}px;"
         )
     if variant == "status_on":
         return (
-            f"color:{t.IF_STATUS_PILL_FG}; font-size:{_fs(t.IF_STATUS_PILL_FONT)}; font-weight:900;"
+            f"color:{t.IF_STATUS_PILL_FG}; font-size:{_fs(t.IF_STATUS_PILL_FONT)}; "
+            f"font-weight:{u.qss_weight(900)};"
             f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {t.IF_STATUS_PILL_ON_TOP}, stop:1 {t.IF_STATUS_PILL_ON_BOT});"
             f"border-radius:{radius}px; padding:{u.px(t.IF_STATUS_PILL_PAD_V)}px {u.px(t.IF_STATUS_PILL_PAD_H)}px;"
         )
     if variant == "status_off":
         return (
-            f"color:{t.IF_STATUS_PILL_FG}; font-size:{_fs(t.IF_STATUS_PILL_FONT)}; font-weight:900;"
+            f"color:{t.IF_STATUS_PILL_FG}; font-size:{_fs(t.IF_STATUS_PILL_FONT)}; "
+            f"font-weight:{u.qss_weight(900)};"
             f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {t.IF_STATUS_PILL_OFF_TOP}, stop:1 {t.IF_STATUS_PILL_OFF_BOT});"
             f"border-radius:{radius}px; padding:{u.px(t.IF_STATUS_PILL_PAD_V)}px {u.px(t.IF_STATUS_PILL_PAD_H)}px;"
         )
     if variant == "card_tag_selected":
         return (
-            f"color:{t.IF_CARD_TAG_FG_SEL}; font-size:{_fs(t.IF_CARD_TAG_PX)}; font-weight:800;"
+            f"color:{t.IF_CARD_TAG_FG_SEL}; font-size:{_fs(t.IF_CARD_TAG_PX)}; "
+            f"font-weight:{u.qss_weight(800)};"
             f"background:{t.IF_CARD_TAG_BG_SEL}; border-radius:{radius}px;"
             f"padding:0;"
         )
     return (
-        f"color:{t.IF_CARD_TAG_FG_IDLE}; font-size:{_fs(t.IF_CARD_TAG_PX)}; font-weight:800;"
+        f"color:{t.IF_CARD_TAG_FG_IDLE}; font-size:{_fs(t.IF_CARD_TAG_PX)}; "
+        f"font-weight:{u.qss_weight(800)};"
         f"background:{t.IF_CARD_TAG_BG_IDLE}; border-radius:{radius}px;"
         f"padding:0;"
     )
