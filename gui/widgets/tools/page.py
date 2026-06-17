@@ -8,6 +8,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
 from gui.widgets.tools.debugger_panel.debugger_panel import DebuggerPanel
+from gui.widgets.tools.micropython_panel.micropython_panel import MicroPythonPanel
 from gui.widgets.tools.mode_tabs.mode_tabs import ToolsModeTabs
 from gui.widgets.tools.session_logs_panel.session_logs_panel import SessionLogsPanel
 
@@ -28,6 +29,14 @@ class ToolsPage(QtWidgets.QWidget):
     @property
     def session_logs_panel(self) -> SessionLogsPanel:
         return self._logs
+
+    @property
+    def micropython_panel(self) -> MicroPythonPanel:
+        return self._micropython
+
+    def set_on_micropython_install(self, callback) -> None:
+        if callback is not None:
+            self._micropython.install_clicked.connect(callback)
 
     def set_mode(self, mode: str) -> None:
         self._tabs.set_mode(mode)
@@ -58,8 +67,10 @@ class ToolsPage(QtWidgets.QWidget):
         self._stack = QtWidgets.QStackedWidget()
         self._debugger = DebuggerPanel()
         self._logs = SessionLogsPanel()
+        self._micropython = MicroPythonPanel()
         self._stack.addWidget(self._debugger)
         self._stack.addWidget(self._logs)
+        self._stack.addWidget(self._micropython)
         shell_lay.addWidget(self._stack, 1)
 
         shadow = QtWidgets.QGraphicsDropShadowEffect(shell)
@@ -75,7 +86,12 @@ class ToolsPage(QtWidgets.QWidget):
 
     def _show_mode(self, mode: str) -> None:
         norm = str(mode).lower().replace(" ", "_")
-        self._stack.setCurrentIndex(1 if norm == "session_logs" else 0)
+        if norm == "session_logs":
+            self._stack.setCurrentIndex(1)
+        elif norm in ("micropython", "mp", "board_setup"):
+            self._stack.setCurrentIndex(2)
+        else:
+            self._stack.setCurrentIndex(0)
 
     def apply_ui_zoom(self) -> None:
         self.reload_theme()
@@ -85,3 +101,4 @@ class ToolsPage(QtWidgets.QWidget):
         self._tabs.reload_theme()
         self._debugger.reload_theme()
         self._logs.reload_theme()
+        self._micropython.reload_theme()

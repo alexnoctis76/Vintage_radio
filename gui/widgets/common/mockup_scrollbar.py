@@ -15,6 +15,7 @@ from typing import Callable, Literal, Optional
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
+from gui import ui_scale as u
 from gui.widgets.common.delegates import track_title_text
 
 Variant = Literal["station", "track", "dark", "light"]
@@ -122,7 +123,8 @@ class MockupScrollBar(QtWidgets.QWidget):
             grad = QtGui.QLinearGradient(0, tr.top(), 0, tr.bottom())
         else:
             grad = QtGui.QLinearGradient(tr.left(), 0, tr.right(), 0)
-        grad.setColorAt(0.0, QtGui.QColor(t.SB_THUMB_GRAD_TOP))
+        thumb_top = t.SB_THUMB_GRAD_TOP if self._variant in ("track", "light") else t.SB_STA_THUMB_GRAD_TOP
+        grad.setColorAt(0.0, QtGui.QColor(thumb_top))
         grad.setColorAt(0.42, QtGui.QColor(t.SB_THUMB_GRAD_MID))
         grad.setColorAt(1.0, QtGui.QColor(t.SB_THUMB_GRAD_BOT))
         p.fillPath(path, QtGui.QBrush(grad))

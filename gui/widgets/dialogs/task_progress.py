@@ -52,8 +52,11 @@ class _BackgroundWorker(QtCore.QObject):
         self.progress.emit(current, total, message)
 
     def _safe_progress(self, current: int, total: int, message: str) -> None:
-        # sync_library_basic reports from ThreadPoolExecutor workers; marshal to this
-        # QObject's thread before emitting so GUI slots always run on the main thread.
+        # When called from this worker's QThread, emit directly (install firmware path).
+        # sync_library_basic reports from ThreadPoolExecutor workers — marshal via invokeMethod.
+        if QtCore.QThread.currentThread() == self.thread():
+            self.progress.emit(current, total, message)
+            return
         QtCore.QMetaObject.invokeMethod(
             self,
             "_relay_progress",
@@ -91,6 +94,8 @@ class TaskProgressDialog(QtWidgets.QDialog):
         cancelable: bool = False,
         cancel_callback_kwarg: str | None = None,
         show_byte_detail: bool = False,
+        initial_message: str = "Starting...",
+        on_before_start: Optional[Callable[[], None]] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -125,8 +130,12 @@ class TaskProgressDialog(QtWidgets.QDialog):
         self._image_scan_label.hide()
         body_lay.addWidget(self._image_scan_label)
 
-        self._status_label = QtWidgets.QLabel("Starting...")
+        self._status_label = QtWidgets.QLabel(initial_message)
         self._status_label.setWordWrap(True)
+        self._status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding,
+        )
         body_lay.addWidget(self._status_label)
 
         self._progress_bar = VintageProgressBar()
@@ -162,6 +171,7 @@ class TaskProgressDialog(QtWidgets.QDialog):
 
         self.on_success: Optional[Callable[[Any], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
+        self._on_before_start = on_before_start
         self._cancel_event = threading.Event()
         # Set to True once the worker signals it has entered a non-cancellable
         # cleanup phase (current == total > 0).  Cancel is disabled at that point.
@@ -188,10 +198,44 @@ class TaskProgressDialog(QtWidgets.QDialog):
         # Legacy kwarg — byte detail removed from UI; kept for call-site compatibility.
         _ = show_byte_detail
         self._cancelable = cancelable
+        self._resize_status_label(initial_message)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._resize_status_label()
+        self.adjustSize()
+
+    def set_status_message(self, message: str) -> None:
+        """Update status text from the main thread (e.g. before the worker starts)."""
+        self._status_label.setText(message)
+        self._resize_status_label(message)
+        self.adjustSize()
+
+    def _status_content_width(self) -> int:
+        inner = self._status_label.width()
+        if inner > 40:
+            return inner
+        return max(200, t.SYNC_MDL_PROGRESS_W - 2 * t.SYNC_MDL_BODY_PAD - 8)
+
+    def _resize_status_label(self, message: Optional[str] = None) -> None:
+        fm = QtGui.QFontMetrics(self._status_label.font())
+        text = message if message is not None else self._status_label.text()
+        if not (text or "").strip():
+            self._status_label.setMinimumHeight(max(fm.height() + 16, 40))
+            return
+        rect = fm.boundingRect(
+            0,
+            0,
+            self._status_content_width(),
+            10000,
+            int(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.TextFlag.TextWordWrap),
+            text,
+        )
+        self._status_label.setMinimumHeight(max(rect.height() + 16, 40))
 
     def _status_label_min_height(self) -> int:
-        fm = QtGui.QFontMetrics(self._status_label.font())
-        return max(fm.height() + 8, 24)
+        self._resize_status_label()
+        return self._status_label.minimumHeight()
 
     def _apply_body_styles(self) -> None:
         self._status_label.setStyleSheet(
@@ -387,7 +431,8 @@ class TaskProgressDialog(QtWidgets.QDialog):
             self._progress_last_total = None
             self._progress_monotonic_start = None
         self._status_label.setText(message)
-        self._status_label.setMinimumHeight(self._status_label_min_height())
+        self._resize_status_label(message)
+        self.adjustSize()
         if phase == "disk_write" and image_scan_message:
             self._image_scan_label.setText(image_scan_message)
             self._image_scan_label.show()
@@ -468,7 +513,9 @@ class TaskProgressDialog(QtWidgets.QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        QtCore.QTimer.singleShot(100, self._thread.start)
+        if self._on_before_start is not None:
+            self._on_before_start()
+        QtCore.QTimer.singleShot(0, self._thread.start)
 
     def closeEvent(self, event):
         if self._thread.isRunning() and not self._in_cleanup:
@@ -535,6 +582,10 @@ class IndeterminateProgressDialog(QtWidgets.QDialog):
 
         self._status_label = QtWidgets.QLabel(message)
         self._status_label.setWordWrap(True)
+        self._status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding,
+        )
         self._status_label.setStyleSheet(
             f"color: {t.SYNC_MDL_PROGRESS_STATUS_CLR};"
             f"font-size: {u.px(t.SYNC_MDL_PROGRESS_STATUS_SIZE)}px;"
@@ -556,9 +607,39 @@ class IndeterminateProgressDialog(QtWidgets.QDialog):
         shell.setGraphicsEffect(shadow)
 
         apply_modal_rounded_mask(self)
+        self._resize_indeterminate_status(message)
+
+    def _indeterminate_content_width(self) -> int:
+        inner = self._status_label.width()
+        if inner > 40:
+            return inner
+        return max(200, t.SYNC_MDL_PROGRESS_W - 2 * t.SYNC_MDL_BODY_PAD - 8)
+
+    def _resize_indeterminate_status(self, message: Optional[str] = None) -> None:
+        fm = QtGui.QFontMetrics(self._status_label.font())
+        text = message if message is not None else self._status_label.text()
+        if not (text or "").strip():
+            self._status_label.setMinimumHeight(max(fm.height() + 16, 40))
+            return
+        rect = fm.boundingRect(
+            0,
+            0,
+            self._indeterminate_content_width(),
+            10000,
+            int(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.TextFlag.TextWordWrap),
+            text,
+        )
+        self._status_label.setMinimumHeight(max(rect.height() + 16, 40))
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._resize_indeterminate_status()
+        self.adjustSize()
 
     def set_message(self, message: str) -> None:
         self._status_label.setText(message)
+        self._resize_indeterminate_status(message)
+        self.adjustSize()
         QtWidgets.QApplication.processEvents()
 
     def set_progress(self, current: int, total: int, message: str = "") -> None:
@@ -569,6 +650,8 @@ class IndeterminateProgressDialog(QtWidgets.QDialog):
             self._progress_bar.setRange(0, 0)
         if message:
             self._status_label.setText(message)
+            self._resize_indeterminate_status(message)
+            self.adjustSize()
         QtWidgets.QApplication.processEvents()
 
     def show_and_raise(self) -> None:

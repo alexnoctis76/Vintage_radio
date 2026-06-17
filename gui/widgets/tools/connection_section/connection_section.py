@@ -17,6 +17,20 @@ _USB_SVG = resource_path("USB.svg")
 _USB_GLYPH_COLOR = "#fff4e6"
 
 
+def _paint_usb_glyph(size: int) -> QtGui.QPixmap:
+    """USB symbol only (transparent background)."""
+    glyph = QtGui.QPixmap(size, size)
+    glyph.fill(QtCore.Qt.GlobalColor.transparent)
+    renderer = QtSvg.QSvgRenderer(str(_USB_SVG))
+    gp = QtGui.QPainter(glyph)
+    gp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    renderer.render(gp, QtCore.QRectF(glyph.rect()))
+    gp.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceIn)
+    gp.fillRect(glyph.rect(), QtGui.QColor(_USB_GLYPH_COLOR))
+    gp.end()
+    return glyph
+
+
 def _paint_usb_connection_icon(size: int) -> QtGui.QPixmap:
     """Orange badge with the USB.svg resource (cream-tinted)."""
     pix = QtGui.QPixmap(size, size)
@@ -33,24 +47,14 @@ def _paint_usb_connection_icon(size: int) -> QtGui.QPixmap:
     p.drawRoundedRect(QtCore.QRectF(size * 0.06, size * 0.06, size * 0.88, size * 0.88), r, r)
     p.end()
 
-    inset = size * 0.16
+    inset = int(size * 0.16)
     glyph_size = int(size - 2 * inset)
-    glyph = QtGui.QPixmap(glyph_size, glyph_size)
-    glyph.fill(QtCore.Qt.GlobalColor.transparent)
-    renderer = QtSvg.QSvgRenderer(str(_USB_SVG))
-    gp = QtGui.QPainter(glyph)
-    gp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-    renderer.render(gp, QtCore.QRectF(glyph.rect()))
-    gp.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceIn)
-    gp.fillRect(glyph.rect(), QtGui.QColor(_USB_GLYPH_COLOR))
-    gp.end()
-
     out = QtGui.QPixmap(size, size)
     out.fill(QtCore.Qt.GlobalColor.transparent)
     op = QtGui.QPainter(out)
     op.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
     op.drawPixmap(0, 0, pix)
-    op.drawPixmap(int(inset), int(inset), glyph)
+    op.drawPixmap(inset, inset, _paint_usb_glyph(glyph_size))
     op.end()
     return out
 
@@ -208,7 +212,7 @@ class ConnectionSection(QtWidgets.QFrame):
             );
             border-radius: {u.px(t.IF_DEVICE_ICON_RADIUS)}px;
         """)
-        row.addWidget(self._icon_wrap)
+        row.addWidget(self._icon_wrap, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
 
         self._title = QtWidgets.QLabel("Device Connection")
         self._title.setStyleSheet(

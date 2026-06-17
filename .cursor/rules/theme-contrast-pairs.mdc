@@ -1,0 +1,24 @@
+---
+description: Vintage Radio theme tokens — always pair foreground with background; run contrast tests
+globs: gui/theme*.py,gui/themes/**,gui/**/theme*.py
+alwaysApply: false
+---
+
+# Theme contrast (Vintage Radio)
+
+When editing `gui/theme.py`, `gui/themes/*.py`, or widget QSS that hardcodes colours:
+
+1. **Pair rule**: every `*_BG`, `*_GRAD_*`, or panel surface needs a documented text/icon token tested on it.
+2. **All three palettes** (`vintage`, `high_contrast`, `colorblind`) must pass `pytest tests/gui/test_theme_contrast.py` — not just high_contrast. Add any new theme to `_ALL_THEMES` in the test.
+3. Use `gui/themes/contrast_utils.contrast_ratio(fg, bg)` when unsure.
+4. After palette changes, always run:
+   ```bash
+   pytest tests/gui/test_theme_contrast.py tests/gui/test_ui_scale_and_themes.py -q
+   ```
+5. Monochromatic icons must pass **4.5:1** (text threshold). Test every distinct `(icon_color, surface)` pair individually — the same icon on a selected row vs an unselected row are different pairs.
+6. If station and track scrollbar rails have different luminances, use `SB_STA_THUMB_GRAD_TOP` (dark rail) separately from `SB_THUMB_GRAD_TOP` (light rail).
+7. Project copy: `.cursor/rules/design-system-accessibility.mdc` (openable in this repo).
+
+**Vintage accent buttons**: icon/text use dark `#1E1610` on bright-orange surfaces (≥ 4.5:1). Button gradient must be dark enough for the chosen foreground. Do NOT use cream/white fg on a mid-light orange top stop.
+**Colorblind accent buttons**: icon/text use `#121212` on orange surfaces (8:1+).
+**High-contrast accent buttons**: icon/text are `#FFFFFF` on the dark-blue gradient.

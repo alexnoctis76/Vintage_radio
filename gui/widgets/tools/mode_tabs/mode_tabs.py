@@ -1,4 +1,4 @@
-"""Debugger / Session Logs folder tabs for the Tools page."""
+"""Debugger / Session Logs / MicroPython tabs for the Tools page."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from PyQt6.QtCore import pyqtSignal
 import gui.theme as t
 from gui import ui_scale as u
 
-ToolsMode = Literal["debugger", "session_logs"]
+ToolsMode = Literal["debugger", "session_logs", "micropython"]
 
 
 class ToolsModeTabs(QtWidgets.QWidget):
@@ -26,12 +26,19 @@ class ToolsModeTabs(QtWidgets.QWidget):
         return self._mode
 
     def set_mode(self, mode: str) -> None:
-        norm: ToolsMode = "session_logs" if str(mode).lower().replace(" ", "_") == "session_logs" else "debugger"
-        if norm == self._mode:
+        norm = str(mode).lower().replace(" ", "_")
+        if norm == "session_logs":
+            target: ToolsMode = "session_logs"
+        elif norm in ("micropython", "mp", "board_setup"):
+            target = "micropython"
+        else:
+            target = "debugger"
+        if target == self._mode:
             return
-        self._mode = norm
-        self._debugger_btn.setChecked(norm == "debugger")
-        self._logs_btn.setChecked(norm == "session_logs")
+        self._mode = target
+        self._debugger_btn.setChecked(target == "debugger")
+        self._logs_btn.setChecked(target == "session_logs")
+        self._mp_btn.setChecked(target == "micropython")
         self._apply_tab_styles()
 
     def _build(self) -> None:
@@ -45,7 +52,8 @@ class ToolsModeTabs(QtWidgets.QWidget):
 
         self._debugger_btn = QtWidgets.QPushButton("Debugger")
         self._logs_btn = QtWidgets.QPushButton("Session Logs")
-        for btn in (self._debugger_btn, self._logs_btn):
+        self._mp_btn = QtWidgets.QPushButton("MicroPython")
+        for btn in (self._debugger_btn, self._logs_btn, self._mp_btn):
             btn.setCheckable(True)
             btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
             lay.addWidget(btn, 1)
@@ -53,6 +61,7 @@ class ToolsModeTabs(QtWidgets.QWidget):
         self._debugger_btn.setChecked(True)
         self._debugger_btn.clicked.connect(lambda: self._on_tab("debugger"))
         self._logs_btn.clicked.connect(lambda: self._on_tab("session_logs"))
+        self._mp_btn.clicked.connect(lambda: self._on_tab("micropython"))
         self._apply_container_style()
         self._apply_tab_styles()
 
@@ -62,15 +71,21 @@ class ToolsModeTabs(QtWidgets.QWidget):
         self._mode = mode
         self._debugger_btn.setChecked(mode == "debugger")
         self._logs_btn.setChecked(mode == "session_logs")
+        self._mp_btn.setChecked(mode == "micropython")
         self._apply_tab_styles()
         self.mode_changed.emit(mode)
 
-    def _tab_style(self, *, active: bool, first: bool, top_clip: int) -> str:
+    def _tab_style(self, *, active: bool, position: str, top_clip: int) -> str:
         r = t.IF_TAB_CORNER_RADIUS
         overlap = t.IF_TAB_ACTIVE_OVERLAP
 
         if active:
-            corners = f"border-top-left-radius: {r}px;" if first else f"border-top-right-radius: {r}px;"
+            if position == "first":
+                corners = f"border-top-left-radius: {r}px;"
+            elif position == "last":
+                corners = f"border-top-right-radius: {r}px;"
+            else:
+                corners = ""
             bg = (
                 f"qlineargradient(x1:0,y1:0,x2:0,y2:1,"
                 f"stop:0 {t.IF_TAB_ACTIVE_TOP}, stop:1 {t.IF_TAB_ACTIVE_BOT})"
@@ -87,7 +102,11 @@ class ToolsModeTabs(QtWidgets.QWidget):
                 f"stop:0 {t.IF_TAB_INACTIVE_TOP}, stop:1 {t.IF_TAB_INACTIVE_BOT})"
             )
             fg = t.IF_TAB_INACTIVE_FG
-            side = f"border-right: 1px solid {t.IF_TAB_DIVIDER};" if first else ""
+            side = ""
+            if position == "first":
+                side = f"border-right: 1px solid {t.IF_TAB_DIVIDER};"
+            elif position == "middle":
+                side = f"border-right: 1px solid {t.IF_TAB_DIVIDER};"
             border = (
                 f"border: 1px solid {t.IF_TAB_INACTIVE_BORDER}; border-top: none; "
                 f"border-bottom: none; margin-top: {top_clip}px; {side} {corners}"
@@ -112,17 +131,21 @@ class ToolsModeTabs(QtWidgets.QWidget):
 
     def _apply_tab_styles(self) -> None:
         clip = t.IF_TAB_INACTIVE_TOP_CLIP
-        for btn, first in ((self._debugger_btn, True), (self._logs_btn, False)):
+        for btn, position in (
+            (self._debugger_btn, "first"),
+            (self._logs_btn, "middle"),
+            (self._mp_btn, "last"),
+        ):
             active = btn.isChecked()
             top_clip = 0 if active else clip
             btn.setFixedHeight(u.px(t.TOOLS_TAB_H) - u.px(top_clip))
             btn.setStyleSheet(
-                self._tab_style(active=active, first=first, top_clip=top_clip)
+                self._tab_style(active=active, position=position, top_clip=top_clip)
             )
-        if self._debugger_btn.isChecked():
-            self._debugger_btn.raise_()
-        else:
-            self._logs_btn.raise_()
+        for btn in (self._debugger_btn, self._logs_btn, self._mp_btn):
+            if btn.isChecked():
+                btn.raise_()
+                break
 
     def reload_theme(self) -> None:
         self.setFixedHeight(u.px(t.TOOLS_TAB_H))

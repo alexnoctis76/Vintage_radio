@@ -45,7 +45,14 @@ class TestSDDetection:
     def test_no_partitions_returns_empty(self):
         from gui.sd_manager import SDManager
         with mock.patch("psutil.disk_partitions", return_value=[]):
-            roots = SDManager.detect_sd_roots()
+            if sys.platform == "win32":
+                with mock.patch(
+                    "gui.sd_manager._windows_get_removable_drive_roots",
+                    return_value=[],
+                ):
+                    roots = SDManager.detect_sd_roots()
+            else:
+                roots = SDManager.detect_sd_roots()
         assert roots == []
 
     def test_internal_drive_not_included(self):

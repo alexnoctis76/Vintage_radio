@@ -159,7 +159,7 @@ class SDManager:
         self,
         sd_root: Path,
         progress_callback: Optional[callable] = None,
-        volume_label: str = SYNC_TARGET_VOLUME_LABEL,
+        volume_label: str = "",
     ) -> Path:
         """Wipe app-managed content for a clean install.
 
@@ -169,7 +169,7 @@ class SDManager:
         3. Parallel folder deletion fallback (works everywhere, slower)
         """
         root = Path(sd_root)
-        fmt_label = _sanitize_fat_volume_label(volume_label) or SYNC_TARGET_VOLUME_LABEL
+        fmt_label = _sanitize_fat_volume_label(volume_label)
 
         # ── Attempt quick format ──
         system = platform.system()
@@ -238,7 +238,7 @@ class SDManager:
         self,
         sd_root: Path,
         progress_callback: Optional[callable] = None,
-        volume_label: str = SYNC_TARGET_VOLUME_LABEL,
+        volume_label: str = "",
     ) -> Path:
         """Quick-format an SD card via PowerShell ``Format-Volume``.
 
@@ -253,11 +253,16 @@ class SDManager:
         if progress_callback:
             progress_callback(0, 1, "Quick-formatting SD card (FAT32)...")
 
-        safe_label = (volume_label or SYNC_TARGET_VOLUME_LABEL).replace("'", "''")
+        safe_label = _sanitize_fat_volume_label(volume_label)
+        if safe_label:
+            ps_label = safe_label.replace("'", "''")
+            label_clause = f"-NewFileSystemLabel '{ps_label}' "
+        else:
+            label_clause = ""
         ps_cmd = (
             f"Format-Volume -DriveLetter {drive_letter} "
             f"-FileSystem FAT32 "
-            f"-NewFileSystemLabel '{safe_label}' "
+            f"{label_clause}"
             f"-Force -Confirm:$false"
         )
         result = subprocess.run(
@@ -347,18 +352,32 @@ class SDManager:
         final.parent.mkdir(parents=True, exist_ok=True)
         os.replace(part, final)
 
+    def capture_volume_label_before_sync(self, sd_root: Path) -> str:
+        """Remember the current FAT volume name before format/sync (for restore after)."""
+        hint = (
+            (self.db.get_setting("sd_volume_label") or "").strip()
+            or (self.db.get_setting("sd_label") or "").strip()
+        )
+        raw = _resolve_mount_volume_name(Path(sd_root), hint)
+        return _sanitize_fat_volume_label(raw) or _sanitize_fat_volume_label(hint) or ""
+
     @staticmethod
     def set_sync_target_volume_label(sd_root: Path, label: Optional[str] = None) -> bool:
         """
-        Try to set the volume label of the given path so we can detect "our" SD card
-        when multiple are present.
+        Restore or keep the volume label on *sd_root*.
 
-        If *label* is None, uses :data:`SYNC_TARGET_VOLUME_LABEL` (default app label).
-        Returns True if we believe the label was set (or already matched).
+        When *label* is given, set it only if it differs from the current name.
+        When *label* is omitted, leave the drive name unchanged.
+        Returns True when the mount has a usable label (unchanged or successfully set).
         """
-        target = _sanitize_fat_volume_label(label) if label else SYNC_TARGET_VOLUME_LABEL
+        current = (_get_volume_label(sd_root) or "").strip()
+        if label is None or not str(label).strip():
+            return bool(current)
+        target = _sanitize_fat_volume_label(label)
         if not target:
-            target = SYNC_TARGET_VOLUME_LABEL
+            return bool(current)
+        if current.upper() == target.upper():
+            return True
         try:
             system = platform.system()
             if system == "Windows":
@@ -1645,19 +1664,9 @@ class SDManager:
         hidden ``.sync_manifest.json`` at the SD root (for host-side mismatch checks),
         which the DFPlayer ignores.
         """
-        preserved_volume_label = ""
+        root_in = Path(sd_root)
+        preserved_volume_label = self.capture_volume_label_before_sync(root_in)
         if force_clean:
-            root_in = Path(sd_root)
-            hint = (
-                (self.db.get_setting("sd_volume_label") or "").strip()
-                or (self.db.get_setting("sd_label") or "").strip()
-            )
-            raw = _resolve_mount_volume_name(root_in, hint)
-            preserved_volume_label = (
-                _sanitize_fat_volume_label(raw)
-                or _sanitize_fat_volume_label(hint)
-                or SYNC_TARGET_VOLUME_LABEL
-            )
             sd_root = self._clean_install_purge(
                 root_in,
                 progress_callback=progress_callback,
@@ -3937,13 +3946,24 @@ def _resolve_mount_volume_name(sd_root: Path, db_hint: str = "") -> str:
 
 
 def _get_volume_label(path: Path) -> str:
+    label, _serial = _win_volume_info(path)
+    return label
+
+
+def _get_volume_serial(path: Path) -> str:
+    """Windows volume serial as 8-digit hex (empty on other OS / failure)."""
+    _label, serial = _win_volume_info(path)
+    return serial
+
+
+def _win_volume_info(path: Path) -> tuple[str, str]:
     if os.name != "nt":
-        return ""
+        return "", ""
     try:
         import ctypes
         from ctypes import wintypes
     except ImportError:
-        return ""
+        return "", ""
     volume_name = ctypes.create_unicode_buffer(261)
     file_system_name = ctypes.create_unicode_buffer(261)
     serial_number = wintypes.DWORD()
@@ -3963,6 +3983,7 @@ def _get_volume_label(path: Path) -> str:
         len(file_system_name),
     )
     if result:
-        return volume_name.value or ""
-    return ""
+        serial = f"{int(serial_number.value):08X}"
+        return volume_name.value or "", serial
+    return "", ""
 

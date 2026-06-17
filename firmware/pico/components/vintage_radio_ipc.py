@@ -155,6 +155,25 @@ def _cmd_combo_tap_then_long(fw, n_taps: int) -> None:
     _resolve_pending_input(fw)
 
 
+def _cmd_mem_free() -> dict:
+    import gc
+
+    return {"mem_free": int(gc.mem_free())}
+
+
+def _cmd_gc_collect() -> dict:
+    import gc
+
+    before = int(gc.mem_free())
+    gc.collect()
+    after = int(gc.mem_free())
+    return {
+        "mem_free_before": before,
+        "mem_free_after": after,
+        "recovered": after - before,
+    }
+
+
 def _cmd_get_state(fw) -> dict:
     c = fw.core
     playing = None
@@ -191,6 +210,18 @@ def _handle_line(fw, arg: str) -> None:
         return
     if cmd == "get_state":
         _emit({"ok": True, "cmd": "get_state", "state": _cmd_get_state(fw)})
+        return
+    if cmd == "mem_free":
+        stats = _cmd_mem_free()
+        payload = {"ok": True, "cmd": "mem_free"}
+        payload.update(stats)
+        _emit(payload)
+        return
+    if cmd in ("gc_collect", "collect"):
+        stats = _cmd_gc_collect()
+        payload = {"ok": True, "cmd": "gc_collect"}
+        payload.update(stats)
+        _emit(payload)
         return
     if cmd == "single_tap":
         _cmd_single_tap(fw)

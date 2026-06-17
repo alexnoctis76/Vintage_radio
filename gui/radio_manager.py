@@ -32,7 +32,7 @@ from .pin_config_editor import BoardSelectorWidget, PinConfigDialog
 from .profile_manager import ProfileSelectorBar
 from .resource_paths import app_data_dir, project_root, resource_path
 from .release_config import ZBVR_FIRMWARE_ENTRY_ID, is_official_firmware_visible
-from .sd_manager import SDManager, SYNC_TARGET_VOLUME_LABEL
+from .sd_manager import SDManager, _get_volume_serial
 from .conversion_prefetch import ConversionPrefetchController
 from .experimental_sd_image import (
     pyfatfs_dependency_message,
@@ -462,7 +462,7 @@ class MetadataDialog(QtWidgets.QDialog):
 def _show_install_error(parent: QtWidgets.QWidget, msg: str, after_firmware: bool) -> None:
     text = f"Error:\n\n{msg}"
     if after_firmware:
-        text += "\n\nClick Setup Pico again to install the app once the Pico is connected."
+        text += "\n\nClick Install Firmware again once the Pico shows up on USB serial."
     VintageMessageBox.warning(parent, "Install to Pico", text)
 
 
@@ -480,6 +480,7 @@ def _run_install_main_thread(
     basic_mode: bool = False,
     install_mode: str = "basic",
     dfplayer_eq: str = "normal",
+    preferred_serial_port: Optional[str] = None,
 ) -> None:
     """Run install on main thread with progress dialog. Status bar updates via processEvents()."""
     title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
@@ -503,6 +504,7 @@ def _run_install_main_thread(
             install_mode=install_mode,
             dfplayer_eq=dfplayer_eq,
             after_firmware=after_firmware,
+            preferred_serial_port=preferred_serial_port,
         )
         dlg.close()
         on_success(result)
@@ -641,11 +643,395 @@ def _mpremote_failure_is_transient_no_device(result: Any) -> bool:
     return "no device found" in err or "could not open" in err
 
 
+def _mpremote_failure_is_transient_serial(result: Any) -> bool:
+    """True when a retry may help (USB glitch, port contention, REPL not ready yet)."""
+    if getattr(result, "returncode", 1) == 0:
+        return False
+    err = ((getattr(result, "stderr", None) or "") + (getattr(result, "stdout", None) or "")).lower()
+    return (
+        "no device found" in err
+        or "could not open" in err
+        or "clearcommerror" in err
+        or "permissionerror" in err
+        or "does not recognize the command" in err
+        or "winerror 22" in err
+        or "could not enter raw repl" in err
+        or "device reports readiness to read but returned no data" in err
+    )
+
+
+def _list_rp2040_serial_ports() -> List[str]:
+    """All connected RP2040/Pico CDC ports, sorted (COM number varies by machine)."""
+    try:
+        import serial.tools.list_ports as list_ports
+
+        from gui.device_debug import DeviceDebugWidget
+
+        ports: List[str] = []
+        for port_info in list_ports.comports():
+            if DeviceDebugWidget._is_rp2040_port(port_info):
+                dev = getattr(port_info, "device", None) or str(port_info)
+                ports.append(dev)
+        return sorted(set(ports))
+    except Exception:
+        return []
+
+
+def _find_rp2040_serial_port(*, preferred: Optional[str] = None) -> Optional[str]:
+    """Best-effort RP2040 CDC port, identified by USB vendor id — not a fixed COM number."""
+    ports = _list_rp2040_serial_ports()
+    if not ports:
+        return None
+    if len(ports) == 1:
+        return ports[0]
+    if preferred:
+        pref = preferred.strip()
+        for dev in ports:
+            if dev == pref or dev.upper() == pref.upper():
+                return dev
+    return ports[0]
+
+
+def _read_preferred_serial_port_from_ui(radio_manager: Any) -> Optional[str]:
+    """Device-tab COM selection when it points at an RP2040 port."""
+    for attr in ("_device_debug_widget", "_basic_debug_widget"):
+        widget = getattr(radio_manager, attr, None)
+        if widget is None:
+            continue
+        try:
+            port = widget.port_combo.currentData()
+            if port:
+                return str(port)
+        except Exception:
+            pass
+    return None
+
+
+def _mpremote_args_with_connect(args: List[str], port: Optional[str]) -> List[str]:
+    if not port or (args and args[0] == "connect"):
+        return args
+    return ["connect", port] + args
+
+
+def _format_install_mpremote_error(err: str) -> str:
+    """Turn mpremote stderr/stdout into actionable install guidance."""
+    combined = (err or "").strip()
+    lower = combined.lower()
+    if _serial_output_indicates_blocking_firmware(combined):
+        return (
+            "The Pico is running firmware that blocks file transfer "
+            "(mpremote cannot use raw REPL).\n\n"
+            "Flash stock MicroPython first:\n"
+            "  Install Firmware will guide you through BOOTSEL, or use "
+            "Tools → MicroPython → Install MicroPython on Pico…\n"
+            "Then run Install Firmware again.\n\n"
+            f"Technical detail:\n{combined[:1400]}"
+        )
+    if "clearcommerror" in lower or "does not recognize the command" in lower:
+        return (
+            "Windows lost access to the COM port during install.\n\n"
+            "Try:\n"
+            "  1. Disconnect Tools → Debugger if it is connected\n"
+            "  2. Close Thonny, serial monitors, or other apps using COM ports\n"
+            "  3. Unplug the Pico USB cable, wait 3 seconds, replug\n"
+            "  4. Run Install Firmware again (leave Debugger disconnected)\n\n"
+            f"Technical detail:\n{combined[:1400]}"
+        )
+    if "could not enter raw repl" in lower:
+        return (
+            "mpremote could not enter MicroPython raw REPL (required to copy files).\n\n"
+            "Common causes:\n"
+            "  • Community / custom UF2 firmware instead of stock MicroPython\n"
+            "  • Another program still using the COM port\n"
+            "  • Pico in BOOTSEL mode (RPI-RP2 drive) instead of serial mode\n\n"
+            "Fix: Tools → MicroPython to flash official MicroPython, then retry Install Firmware.\n\n"
+            f"Technical detail:\n{combined[:1400]}"
+        )
+    return (
+        "Failed to copy firmware files.\n\n"
+        "Ensure the Pico is connected via USB and running stock MicroPython.\n\n"
+        f"{combined}"
+    )
+
+
 # REPL snippet for mpremote ``exec``: must print ``micropython`` so we do not treat a bare
 # USB CDC session (or CircuitPython, etc.) as Vintage Radio–compatible MicroPython.
 _MPREMOTE_MICROPYTHON_PROBE = (
     "import sys;n=getattr(sys.implementation,'name',None);print(n if n else '')"
 )
+_MPREMOTE_PROBE_TIMEOUT_S = 22
+
+
+def _serial_output_indicates_blocking_firmware(text: str) -> Optional[str]:
+    """Return a short firmware label when serial output is not stock MicroPython REPL."""
+    lower = (text or "").lower()
+    if "could not enter raw repl" in lower:
+        return "custom firmware (raw REPL blocked)"
+    if (
+        "retro radio baseline" in lower
+        or "booting retro radio" in lower
+        or "zbvr" in lower
+        or "initiailzing modules" in lower
+        or "initializing modules" in lower
+    ):
+        return "third-party firmware"
+    if lower.count("loading module:") >= 2:
+        return "third-party firmware"
+    idle_markers = (
+        "now playing:",
+        "dfplayer online",
+        "waiting for dfplayer",
+        "loading audio data:",
+        "discovering playlist",
+        "pwm audio:",
+        "equalizer setting:",
+        "filesystem has ",
+        " files in ",
+        " folders",
+    )
+    if sum(1 for marker in idle_markers if marker in lower) >= 2:
+        return "third-party firmware"
+    return None
+
+
+def _sniff_rp2040_serial_text(
+    port: str,
+    *,
+    duration_s: float = 3.0,
+    interrupt_uart: bool = False,
+) -> str:
+    """Read recent UART text without mpremote (fast firmware identification)."""
+    try:
+        import serial
+    except ImportError:
+        return ""
+    try:
+        ser = serial.Serial(port, 115200, timeout=0.15)
+    except Exception:
+        return ""
+    try:
+        import time
+
+        time.sleep(0.15)
+        # Do not reset_input_buffer — keep recent boot banner already in the UART buffer.
+        if interrupt_uart:
+            try:
+                ser.write(b"\x03\x03")
+                time.sleep(0.35)
+            except Exception:
+                pass
+        deadline = time.time() + duration_s
+        parts: List[str] = []
+        while time.time() < deadline:
+            try:
+                chunk = ser.read(4096)
+            except Exception:
+                break
+            if chunk:
+                parts.append(chunk.decode("utf-8", errors="replace"))
+        return "".join(parts)
+    finally:
+        try:
+            if ser.is_open:
+                ser.close()
+        except Exception:
+            pass
+
+
+def _run_mpremote_probe(
+    mpremote_cmd: List[str],
+    port: str,
+    cwd: str,
+    *,
+    timeout_sec: int = _MPREMOTE_PROBE_TIMEOUT_S,
+) -> Any:
+    """Run MicroPython probe on *port* ('auto' allowed); never raise TimeoutExpired to callers."""
+    if port == "auto":
+        args = ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE]
+    else:
+        args = ["connect", port, "exec", _MPREMOTE_MICROPYTHON_PROBE]
+    try:
+        return _run_mpremote(
+            mpremote_cmd,
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = ""
+        if exc.stdout:
+            partial = exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode("utf-8", errors="replace")
+        if exc.stderr:
+            err = exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode("utf-8", errors="replace")
+            partial += err
+        return type(
+            "Result",
+            (),
+            {"returncode": 124, "stdout": partial, "stderr": "mpremote probe timed out"},
+        )()
+
+
+def _setup_device_failure_message(
+    *,
+    probe_outputs: List[str],
+    timed_out: bool,
+) -> str:
+    combined = "\n".join(probe_outputs)
+    blocking = _serial_output_indicates_blocking_firmware(combined)
+    if blocking:
+        return (
+            f"The Pico on USB serial is running {blocking}, not stock MicroPython.\n\n"
+            "That firmware is built on MicroPython but blocks the file-transfer mode "
+            "Vintage Radio uses to install (mpremote raw REPL). Having “MicroPython” "
+            "on the board is not enough — it must be the official MicroPython UF2.\n\n"
+            "To install Vintage Radio:\n"
+            "1. Hold BOOTSEL and plug in USB (RPI-RP2 drive appears).\n"
+            "2. Tools → MicroPython → flash the official MicroPython .uf2 "
+            "(this replaces the current firmware).\n"
+            "3. After reboot, run Install Firmware again.\n\n"
+            "Close Tools → Debugger and other serial apps before step 3."
+        )
+    if timed_out:
+        return (
+            "The Pico answered on USB serial but did not reach MicroPython raw REPL in time.\n\n"
+            "Common causes:\n"
+            "  • Community or custom UF2 firmware that blocks mpremote\n"
+            "  • Another program holding the COM port\n"
+            "  • Long boot / playback keeping the port busy\n\n"
+            "Try: disconnect Debugger, flash stock MicroPython (Tools → MicroPython), "
+            "then Install Firmware again."
+        )
+    return (
+        "A Raspberry Pi Pico USB serial port was found, but stock MicroPython did not respond.\n\n"
+        "On a new or erased board you must install MicroPython before Vintage Radio can "
+        "copy firmware.\n\n"
+        "1. Hold BOOTSEL and plug the Pico into USB (RPI-RP2 drive).\n"
+        "2. Tools → MicroPython → copy the official .uf2 file.\n"
+        "3. When the Pico reboots, run Install Firmware again.\n\n"
+        "If MicroPython is already installed, close other apps using the serial port and retry."
+    )
+
+
+def _pico_install_assessment(
+    mpremote_cmd: Optional[List[Any]],
+    root: Path,
+    *,
+    preferred_port: Optional[str] = None,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    """Classify Pico USB state for Vintage Radio mpremote install."""
+    def _progress(msg: str) -> None:
+        if progress_callback:
+            progress_callback(0, 0, msg)
+
+    if not mpremote_cmd:
+        return {"status": "no_mpremote"}
+
+    port = _find_rp2040_serial_port(preferred=preferred_port)
+    if not port:
+        _progress("No Pico serial port found — checking for BOOTSEL (RPI-RP2)…")
+        try:
+            from gui.sd_manager import SDManager
+
+            for path, label in SDManager.detect_sd_roots():
+                if label and label.strip().upper() == "RPI-RP2":
+                    return {"status": "bootsel", "port": None, "bootsel_path": str(path)}
+        except Exception:
+            pass
+        return {"status": "no_pico", "port": None}
+
+    _progress(f"Reading firmware output on {port}…")
+    sniff = _sniff_rp2040_serial_text(port)
+    blocking = _serial_output_indicates_blocking_firmware(sniff)
+    if not blocking and len(sniff.strip()) < 80:
+        sniff = sniff + _sniff_rp2040_serial_text(
+            port, duration_s=2.5, interrupt_uart=True,
+        )
+        blocking = _serial_output_indicates_blocking_firmware(sniff)
+    if blocking:
+        _progress(f"Detected {blocking} on {port} — MicroPython flash required.")
+        return {
+            "status": "needs_reflash",
+            "port": port,
+            "blocking_label": blocking,
+            "sniff": sniff,
+        }
+
+    if _sniff_suggests_stock_micropython_repl(sniff):
+        _progress(
+            f"Testing MicroPython file transfer on {port} "
+            f"(up to {_MPREMOTE_PROBE_TIMEOUT_S}s)…"
+        )
+    elif _sniff_suggests_app_firmware(sniff):
+        label = _serial_output_indicates_blocking_firmware(sniff) or "third-party firmware"
+        _progress(f"Detected {label} on {port} — MicroPython flash required.")
+        return {
+            "status": "needs_reflash",
+            "port": port,
+            "blocking_label": label,
+            "sniff": sniff,
+        }
+    else:
+        _progress(
+            f"Testing MicroPython file transfer on {port} "
+            f"(up to {_MPREMOTE_PROBE_TIMEOUT_S}s)…"
+        )
+
+    probe = _run_mpremote_probe(mpremote_cmd, port, str(root))
+    probe_out = ((probe.stdout or "") + (probe.stderr or "")).strip()
+    if _mpremote_result_indicates_micropython(probe):
+        repl = _run_mpremote(
+            mpremote_cmd,
+            _mpremote_args_with_connect(
+                ["exec", "import os; print('VR_INSTALL_PROBE', len(os.listdir()))"],
+                port,
+            ),
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=_MPREMOTE_PROBE_TIMEOUT_S,
+        )
+        repl_out = (repl.stdout or "") + (repl.stderr or "")
+        if repl.returncode == 0 and "VR_INSTALL_PROBE" in repl_out:
+            return {"status": "ready", "port": port}
+
+    if _serial_output_indicates_blocking_firmware(probe_out):
+        return {
+            "status": "needs_reflash",
+            "port": port,
+            "blocking_label": _serial_output_indicates_blocking_firmware(probe_out),
+            "sniff": probe_out,
+        }
+    return {
+        "status": "needs_reflash",
+        "port": port,
+        "blocking_label": None,
+        "sniff": probe_out or sniff,
+    }
+
+
+def _sniff_suggests_stock_micropython_repl(text: str) -> bool:
+    """True when UART text looks like an idle official MicroPython REPL."""
+    lower = (text or "").lower()
+    if "micropython v1" in lower:
+        return True
+    if "\n>>> " in lower or lower.rstrip().endswith(">>>"):
+        return True
+    return False
+
+
+def _sniff_suggests_app_firmware(text: str) -> bool:
+    """True when UART shows a running app, not an idle MicroPython REPL."""
+    if not text or len(text.strip()) < 20:
+        return False
+    if _sniff_suggests_stock_micropython_repl(text):
+        return False
+    if _serial_output_indicates_blocking_firmware(text):
+        return True
+    lower = text.lower()
+    return ">>>" not in lower and "micropython v1" not in lower
 
 
 def _mpremote_result_indicates_micropython(result: Any) -> bool:
@@ -656,6 +1042,356 @@ def _mpremote_result_indicates_micropython(result: Any) -> bool:
     return "micropython" in combined
 
 
+def _post_flash_serial_timeout_message(port: Optional[str] = None) -> str:
+    """Actionable error when MicroPython does not answer after a UF2 flash."""
+    base = (
+        "Timed out waiting for the Pico on USB serial after installing MicroPython.\n\n"
+        "The board often disconnects and reappears as a new COM port; on some PCs that "
+        "takes 15–30 seconds."
+    )
+    if port:
+        sniff = _sniff_rp2040_serial_text(port, duration_s=2.0)
+        blocking = _serial_output_indicates_blocking_firmware(sniff)
+        if blocking:
+            return (
+                f"{base}\n\n"
+                f"Serial output on {port} still looks like {blocking}, not stock MicroPython. "
+                "The MicroPython .uf2 may not have flashed correctly.\n\n"
+                "Put the Pico in BOOTSEL mode (RPI-RP2 drive) and run Install Firmware again."
+            )
+        if sniff.strip():
+            write_session_line(
+                f"Post-flash timeout serial ({port}): {sniff[:400]!r}",
+                prefix="INSTALL",
+            )
+    return (
+        f"{base}\n\n"
+        "Try unplugging the Pico USB cable, wait 3 seconds, replug, then run Install Firmware again. "
+        "Close Tools → Debugger and other apps that might use the COM port."
+    )
+
+
+def _is_authentic_rp2040_bootsel_volume(path: Path) -> Tuple[bool, str]:
+    """True when *path* looks like the ROM UF2 bootloader (not an emulated MSC share)."""
+    info = path / "INFO_UF2.TXT"
+    if info.is_file():
+        try:
+            text = info.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError as exc:
+            return False, f"Could not read INFO_UF2.TXT on {path}: {exc}"
+        if "raspberry pi" in text or "rp2" in text or "uf2 bootloader" in text:
+            return True, ""
+        return False, (
+            f"{path} has INFO_UF2.TXT but it does not look like a Pico BOOTSEL volume."
+        )
+    index = path / "INDEX.HTM"
+    if index.is_file():
+        return True, ""
+    return False, (
+        f"{path} is missing INFO_UF2.TXT — it may not be a Pico in BOOTSEL mode.\n"
+        "Hold BOOTSEL while plugging in USB (or hold BOOTSEL and tap RESET)."
+    )
+
+
+def _bootsel_serial_blocking_message(port: str) -> str:
+    return (
+        f"The Pico still appears on USB serial ({port}) while RPI-RP2 is visible.\n\n"
+        "In true BOOTSEL mode the COM port must disappear — only the RPI-RP2 drive "
+        "should show. Some third-party firmware emulates an RPI-RP2 drive while still "
+        "running on serial; copying a .uf2 there does not replace flash.\n\n"
+        "Unplug USB, hold BOOTSEL, plug USB back in while still holding BOOTSEL, "
+        "then release BOOTSEL once RPI-RP2 appears."
+    )
+
+
+def _wait_for_serial_port_gone(
+    *,
+    preferred_port: Optional[str] = None,
+    timeout_s: float = 8.0,
+    poll_s: float = 0.35,
+) -> bool:
+    """Wait until no RP2040 CDC port is listed (required before UF2 copy)."""
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _find_rp2040_serial_port(preferred=preferred_port) is None:
+            return True
+        time.sleep(poll_s)
+    return _find_rp2040_serial_port(preferred=preferred_port) is None
+
+
+def _wait_for_bootsel_polling(
+    progress_callback: Optional[Callable[..., Any]],
+    *,
+    intro: str,
+    timeout_s: float = 180.0,
+    is_present: Callable[[], bool],
+    preferred_serial_port: Optional[str] = None,
+) -> bool:
+    """Poll until RPI-RP2 appears and USB serial is gone (safe from a worker thread)."""
+    import time
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        remaining = max(0, int(deadline - time.time()))
+        bootsel = is_present()
+        port = _find_rp2040_serial_port(preferred=preferred_serial_port)
+        if progress_callback:
+            if bootsel and port:
+                progress_callback(
+                    0,
+                    0,
+                    f"{intro}\n\n"
+                    f"RPI-RP2 is visible but USB serial ({port}) is still active.\n\n"
+                    "The COM port must disappear before flash can proceed.\n\n"
+                    f"Unplug USB, hold BOOTSEL, plug back in while holding BOOTSEL… "
+                    f"({remaining}s remaining)",
+                )
+            elif bootsel:
+                progress_callback(
+                    0,
+                    0,
+                    f"{intro}\n\n"
+                    f"RPI-RP2 detected and USB serial is off — ready to flash. "
+                    f"({remaining}s remaining)",
+                )
+            else:
+                progress_callback(
+                    0,
+                    0,
+                    f"{intro}\n\nWaiting for RPI-RP2 drive… ({remaining}s remaining)\n\n"
+                    "Unplug USB, hold BOOTSEL, plug back in while holding BOOTSEL, "
+                    "or hold BOOTSEL and tap RESET.",
+                )
+        if bootsel and port is None:
+            if _wait_for_serial_port_gone(
+                preferred_port=preferred_serial_port,
+                timeout_s=2.0,
+            ):
+                return True
+        time.sleep(0.4)
+    return False
+
+
+def _wait_for_bootsel_volume_gone(
+    *,
+    timeout_s: float = 45.0,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> bool:
+    """After a UF2 copy the RPI-RP2 volume should disappear as the Pico reboots."""
+    import time
+
+    from gui.sd_manager import SDManager
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        if not SDManager.is_rp2040_bootsel_present():
+            return True
+        if progress_callback:
+            progress_callback(0, 0, "Waiting for Pico to reboot after UF2 flash…")
+        time.sleep(0.5)
+    return False
+
+
+def _copy_uf2_to_rpi_rp2(
+    uf2_path: Path,
+    dest_dir: Path,
+    *,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> Tuple[bool, str]:
+    """Copy a .uf2 to RPI-RP2 (same mechanism as drag-and-drop in Explorer)."""
+    authentic, auth_detail = _is_authentic_rp2040_bootsel_volume(dest_dir)
+    if not authentic:
+        return False, auth_detail
+
+    dest_file = dest_dir / uf2_path.name
+    src_size = uf2_path.stat().st_size
+    write_session_line(
+        f"Copying UF2 {uf2_path.name} ({src_size} bytes) → {dest_file} (RPI-RP2 at {dest_dir})",
+        prefix="INSTALL",
+    )
+    if progress_callback:
+        progress_callback(0, 0, f"Copying {uf2_path.name} to RPI-RP2 ({dest_dir})…")
+    try:
+        with uf2_path.open("rb") as src_f:
+            with dest_file.open("wb") as dest_f:
+                shutil.copyfileobj(src_f, dest_f, length=1024 * 1024)
+                dest_f.flush()
+                os.fsync(dest_f.fileno())
+    except OSError as exc:
+        return False, f"Could not copy .uf2 to {dest_dir}: {exc}"
+    try:
+        copied_size = dest_file.stat().st_size
+    except OSError as exc:
+        return False, f"Could not verify .uf2 on {dest_dir}: {exc}"
+    if copied_size != src_size:
+        return False, (
+            f"UF2 copy size mismatch on {dest_dir}: expected {src_size} bytes, "
+            f"got {copied_size}."
+        )
+    try:
+        with dest_file.open("rb") as verify_f:
+            header = verify_f.read(32)
+        if len(header) >= 8 and header[0:4] not in (b"UF2\n", b"\x00UF2"):
+            write_session_line(
+                f"UF2 header warning on {dest_file}: {header[:8]!r}",
+                prefix="INSTALL",
+            )
+    except OSError:
+        pass
+    if not _wait_for_bootsel_volume_gone(progress_callback=progress_callback):
+        return False, (
+            "The RPI-RP2 drive is still present after copying the .uf2 — the Pico may "
+            "not have accepted the flash.\n\n"
+            "Ensure the COM port disappeared before copying. Unplug USB, hold BOOTSEL, "
+            "plug back in while holding BOOTSEL, then try drag-and-drop in File Explorer."
+        )
+    write_session_line("RPI-RP2 drive disappeared after UF2 copy (Pico rebooted)", prefix="INSTALL")
+    return True, ""
+
+
+def _find_picotool_executable() -> Optional[Path]:
+    """Locate picotool (bundled workshop copy or PATH)."""
+    for candidate in (
+        project_root() / "agent_workshop" / "tools" / "picotool" / "picotool.exe",
+        project_root() / "agent_workshop" / "tools" / "picotool.exe",
+        Path(shutil.which("picotool") or ""),
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _run_picotool(args: List[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    exe = _find_picotool_executable()
+    if exe is None:
+        raise RuntimeError("picotool not found")
+    cmd = [str(exe)] + list(args)
+    write_session_line(f"picotool: {' '.join(cmd)}", prefix="INSTALL")
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+
+def _flash_uf2_file(
+    uf2_path: Path,
+    dest_dir: Path,
+    *,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> Tuple[bool, str]:
+    """Flash a UF2 via picotool load when available, else RPI-RP2 drag-and-drop copy."""
+    if _find_picotool_executable() is not None:
+        if progress_callback:
+            progress_callback(0, 0, f"Flashing {uf2_path.name} via picotool…")
+        try:
+            result = _run_picotool(["load", "-f", str(uf2_path)])
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            write_session_line(f"picotool load failed: {exc}", prefix="INSTALL")
+        else:
+            if result.returncode == 0:
+                write_session_line(f"picotool load OK: {uf2_path.name}", prefix="INSTALL")
+                return True, ""
+            write_session_line(
+                f"picotool load rc={result.returncode}: "
+                f"{(result.stderr or result.stdout or '').strip()[:400]}",
+                prefix="INSTALL",
+            )
+    return _copy_uf2_to_rpi_rp2(uf2_path, dest_dir, progress_callback=progress_callback)
+
+
+def _factory_erase_rp2040_flash(
+    dest_dir: Path,
+    *,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> Tuple[bool, str, str]:
+    """Erase all RP2040 flash. Returns (ok, error, method) where method is picotool|nuke|."""
+    if _find_picotool_executable() is not None:
+        if progress_callback:
+            progress_callback(0, 0, "Factory reset: erasing all flash (picotool)…")
+        try:
+            result = _run_picotool(["erase", "-a", "-f"])
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            write_session_line(f"picotool erase failed: {exc}", prefix="INSTALL")
+        else:
+            if result.returncode == 0:
+                write_session_line("picotool erase -a succeeded", prefix="INSTALL")
+                return True, "", "picotool"
+            write_session_line(
+                f"picotool erase rc={result.returncode}: "
+                f"{(result.stderr or result.stdout or '').strip()[:400]}",
+                prefix="INSTALL",
+            )
+
+    from gui.services.firmware_bundle import fetch_flash_nuke_uf2
+
+    if progress_callback:
+        progress_callback(0, 0, "Factory reset: downloading flash_nuke.uf2…")
+    try:
+        nuke_path = fetch_flash_nuke_uf2()
+    except Exception as exc:
+        return False, f"Could not download flash_nuke.uf2: {exc}", ""
+    if progress_callback:
+        progress_callback(0, 0, "Factory reset: erasing all flash (flash_nuke.uf2)…")
+    write_session_line(f"Factory erase via flash_nuke: {nuke_path.name}", prefix="INSTALL")
+    ok, err = _copy_uf2_to_rpi_rp2(nuke_path, dest_dir, progress_callback=progress_callback)
+    return ok, err, "nuke" if ok else ""
+
+
+def _verify_stock_micropython_serial(
+    preferred_port: Optional[str] = None,
+    *,
+    timeout_s: float = 50.0,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> Optional[str]:
+    """Wait for stock MicroPython on USB serial. Returns None on success, else error text."""
+    import time
+
+    if progress_callback:
+        progress_callback(0, 0, "Verifying MicroPython booted on USB serial…")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        port = _find_rp2040_serial_port(preferred=preferred_port)
+        if port:
+            sniff = _sniff_rp2040_serial_text(port, duration_s=2.0)
+            if _sniff_suggests_stock_micropython_repl(sniff):
+                write_session_line(f"Verified stock MicroPython on {port}", prefix="INSTALL")
+                return None
+            blocking = _serial_output_indicates_blocking_firmware(sniff)
+            if blocking:
+                write_session_line(
+                    f"Verify: {port} still shows {blocking}: {sniff[:200]!r}",
+                    prefix="INSTALL",
+                )
+                return f"still running {blocking}"
+            if _sniff_suggests_app_firmware(sniff):
+                write_session_line(
+                    f"Verify: {port} still shows app firmware: {sniff[:200]!r}",
+                    prefix="INSTALL",
+                )
+                return "still running third-party firmware"
+        if progress_callback:
+            progress_callback(
+                0,
+                0,
+                "Waiting for MicroPython on USB serial after flash…",
+            )
+        time.sleep(2.0)
+    return "timed out waiting for stock MicroPython on USB serial"
+
+
+_FACTORY_RESET_BOOTSEL_INTRO = (
+    "The first MicroPython flash did not replace the previous firmware.\n\n"
+    "Factory reset will erase all flash. Unplug all power from the device, "
+    "hold BOOTSEL, plug USB while still holding BOOTSEL, then release once "
+    "only RPI-RP2 appears and the COM port is gone."
+)
+
+
 def _wait_mpremote_serial_ready(
     mpremote_cmd: List[str],
     cwd: Optional[str],
@@ -664,37 +1400,120 @@ def _wait_mpremote_serial_ready(
     total_steps: int,
     creationflags: int = 0,
     env: Optional[dict] = None,
-    deadline_s: float = 78.0,
+    deadline_s: Optional[float] = None,
     poll_s: float = 2.0,
-) -> bool:
-    """Poll until MicroPython answers on USB serial (Pico back after UF2 / reboot)."""
+    after_uf2_flash: bool = False,
+    preferred_port: Optional[str] = None,
+) -> Optional[str]:
+    """Poll until MicroPython answers on USB serial.
+
+    Returns None on success, or an error message string on failure.
+    """
     import time
 
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < deadline_s:
-        elapsed = int(time.monotonic() - t0)
+    if deadline_s is None:
+        deadline_s = 120.0 if after_uf2_flash else 78.0
+    if after_uf2_flash:
+        poll_s = max(poll_s, 2.5)
         if progress_callback:
             progress_callback(
                 0,
                 max(1, total_steps),
-                "Waiting for MicroPython on USB serial "
-                f"(elapsed {elapsed}s, timeout {int(deadline_s)}s). "
-                "After a fresh install the port can take several seconds.",
+                "Waiting for Pico to reboot after MicroPython flash…",
             )
-        r = _run_mpremote(
-            mpremote_cmd,
-            ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=14,
-            creationflags=creationflags,
-            env=env,
-        )
-        if _mpremote_result_indicates_micropython(r):
-            return True
+        time.sleep(8.0)
+
+    t0 = time.monotonic()
+    last_port: Optional[str] = None
+    last_blocking_label: Optional[str] = None
+
+    while time.monotonic() - t0 < deadline_s:
+        elapsed = int(time.monotonic() - t0)
+        port = _find_rp2040_serial_port(preferred=preferred_port)
+        if progress_callback:
+            port_hint = port or "waiting for COM port…"
+            progress_callback(
+                0,
+                max(1, total_steps),
+                f"Waiting for MicroPython on {port_hint} "
+                f"(elapsed {elapsed}s, timeout {int(deadline_s)}s). "
+                "The Pico may disconnect briefly after flashing.",
+            )
+
+        if port != last_port and port:
+            write_session_line(f"RP2040 serial port: {port}", prefix="INSTALL")
+            last_port = port
+
+        if port and after_uf2_flash and elapsed >= 6:
+            sniff = _sniff_rp2040_serial_text(port, duration_s=1.2)
+            blocking = _serial_output_indicates_blocking_firmware(sniff)
+            if blocking:
+                last_blocking_label = blocking
+                write_session_line(
+                    f"Post-flash serial still shows {blocking} on {port}",
+                    prefix="INSTALL",
+                )
+
+        if port:
+            probe_timeout = 20 if after_uf2_flash else 14
+            r = _run_mpremote(
+                mpremote_cmd,
+                _mpremote_args_with_connect(
+                    ["exec", _MPREMOTE_MICROPYTHON_PROBE],
+                    port,
+                ),
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=probe_timeout,
+                creationflags=creationflags,
+                env=env,
+            )
+            probe_out = ((r.stdout or "") + (r.stderr or "")).strip()
+            if _mpremote_result_indicates_micropython(r):
+                write_session_line(f"MicroPython ready on {port}", prefix="INSTALL")
+                return None
+            blocking = _serial_output_indicates_blocking_firmware(probe_out)
+            if blocking:
+                last_blocking_label = blocking
+                write_session_line(
+                    f"mpremote probe on {port} rc={r.returncode}: still {blocking}",
+                    prefix="INSTALL",
+                )
+                if after_uf2_flash:
+                    return (
+                        f"After installing MicroPython, the Pico on {port} is still running "
+                        f"{blocking}.\n\n"
+                        "The .uf2 flash did not replace the previous firmware. This usually "
+                        "means the Pico was not in true BOOTSEL mode (ROM bootloader).\n\n"
+                        "Unplug USB completely. Hold BOOTSEL, plug USB back in while still "
+                        "holding BOOTSEL, then release once only the RPI-RP2 drive appears "
+                        "and the COM port is gone. Run Install Firmware again, or drag the "
+                        "MicroPython .uf2 into RPI-RP2 manually in File Explorer."
+                    )
+            elif probe_out and (elapsed % 12 < poll_s + 0.5):
+                write_session_line(
+                    f"mpremote probe on {port} rc={r.returncode}: {probe_out[:240]}",
+                    prefix="INSTALL",
+                )
+            elif after_uf2_flash and last_blocking_label and elapsed >= 20:
+                return (
+                    f"After installing MicroPython, the Pico on {port} is still running "
+                    f"{last_blocking_label}.\n\n"
+                    "The .uf2 flash did not replace the previous firmware. Use BOOTSEL (RPI-RP2) "
+                    "and copy the MicroPython .uf2 manually, then run Install Firmware again."
+                )
+
         time.sleep(poll_s)
-    return False
+
+    if last_blocking_label:
+        port_hint = last_port or "USB serial"
+        return (
+            f"Timed out: {port_hint} still shows {last_blocking_label} after MicroPython flash.\n\n"
+            "The UF2 did not replace the previous firmware. Use BOOTSEL (RPI-RP2 drive) and "
+            "copy the MicroPython .uf2 manually, then run Install Firmware again."
+        )
+    return _post_flash_serial_timeout_message(last_port)
 
 
 def _run_mpremote_connect_auto_with_retry(
@@ -732,8 +1551,8 @@ def _run_mpremote_connect_auto_with_retry(
     return last
 
 
-# After copying a .uf2, Windows/macOS often need a few seconds before the new CDC port appears.
-_POST_MICROPYTHON_INSTALL_DELAY_MS = 3500
+# After copying a .uf2, Windows/macOS often need several seconds before the new CDC port appears.
+_POST_MICROPYTHON_INSTALL_DELAY_MS = 8000
 
 
 _TABLE_REORDER_MIME = "application/x-vintage-radio-table-reorder"
@@ -1294,9 +2113,9 @@ class _StationItemDelegate(QtWidgets.QStyledItemDelegate):
         selected = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
 
         # ── 1. Row background ────────────────────────────────────────────────
-        # selected → _STA_ACTIVE (Primary Accent Orange)
-        # normal   → _PANEL_DARK (Stations Pane Mocha Taupe)
-        painter.fillRect(rect, QColor(_STA_ACTIVE if selected else _PANEL_DARK))
+        # selected → theme STA_SEL_GRAD_MID (guarantees themed contrast in HC/CB)
+        # normal   → theme STA_PANE_GRAD_TOP
+        painter.fillRect(rect, QColor(_theme.STA_SEL_GRAD_MID if selected else _theme.STA_PANE_GRAD_TOP))
 
         # ── 2. Left accent bar (selected rows only) ──────────────────────────
         # Coloured strip at the very left edge; width = ACCENT_W px.
@@ -4825,6 +5644,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_tools_page(self) -> QtWidgets.QWidget:
         page = _ToolsPage()
         page.embed_debug_widget(self._ensure_device_debug_widget())
+        page.set_on_micropython_install(self._show_install_micropython_dialog)
         self._tools_page = page
         return page
 
@@ -4969,19 +5789,69 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         return bool(has_usb)
 
+    def _basic_install_device_banner(self) -> Tuple[bool, str, str, str, bool]:
+        """Return (detected, title, status_pill, meta_line, status_pill_on)."""
+        bootsel = SDManager.is_rp2040_bootsel_present()
+        rp_ports = _list_rp2040_serial_ports()
+        preferred = _read_preferred_serial_port_from_ui(self)
+        if preferred and preferred not in rp_ports:
+            preferred = None
+        serial_port = preferred or (rp_ports[0] if rp_ports else "")
+
+        if bootsel and rp_ports:
+            port_hint = serial_port or rp_ports[0]
+            return (
+                True,
+                "Pico — BOOTSEL conflict",
+                "Not ready",
+                (
+                    f"RPI-RP2 and {port_hint} are both visible. "
+                    "Unplug USB, hold BOOTSEL, plug in while holding BOOTSEL until "
+                    "only RPI-RP2 appears and the COM port disappears."
+                ),
+                False,
+            )
+        if bootsel:
+            return (
+                True,
+                "Pico in BOOTSEL mode",
+                "Ready to flash",
+                "RPI-RP2 · BOOTSEL · USB serial off",
+                True,
+            )
+        if serial_port:
+            return (
+                True,
+                "Raspberry Pi Pico detected",
+                "Connected",
+                f"{serial_port} · RP2040 · USB serial · DFPlayer",
+                True,
+            )
+        return (
+            False,
+            "Waiting for device...",
+            "Not connected",
+            "Plug in USB to detect your Pico.",
+            False,
+        )
+
     def _set_basic_device_presence_indicator(self, detected: bool) -> None:
         """Update device banner, install button, and Choose Device visibility."""
+        banner = self._basic_install_device_banner()
+        detected, title_text, status_text, meta_text, status_on = banner
+
         page = getattr(self, "_install_firmware_page", None)
         if _qt_widget_alive(page):
-            page.device_section.set_detected(detected)
-            page.device_section.set_meta_text(self._basic_detected_device_meta_line(detected))
+            page.device_section.set_detected(
+                detected, status_text=status_text, status_on=status_on,
+            )
+            page.device_section.set_meta_text(meta_text)
+            if hasattr(page.device_section, "_title"):
+                page.device_section._title.setText(title_text)
 
         title = getattr(self, "_basic_device_title_label", None)
         if _qt_widget_alive(title):
-            if detected:
-                title.setText("Raspberry Pi Pico detected")
-            else:
-                title.setText("Waiting for device...")
+            title.setText(title_text)
 
         install_btn = getattr(self, "_basic_install_firmware_btn", None)
         if _qt_widget_alive(install_btn):
@@ -5031,7 +5901,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             parts.append("RP2040")
             if port_label:
-                parts.append("MicroPython")
+                parts.append("USB serial")
         parts.append("DFPlayer")
         return " · ".join(parts)
 
@@ -5067,16 +5937,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _open_advanced_tools_dialog(self) -> None:
         """Open the Tools tab with the Debugger folder selected."""
+        self._open_tools_tab("debugger")
+
+    def _open_tools_tab(self, mode: str = "debugger", *, open_micropython_dialog: bool = False) -> None:
         sidebar = getattr(self, "_sidebar", None)
         if _qt_widget_alive(sidebar):
             sidebar.set_active(self._PAGE_TOOLS)
         self._on_sidebar_nav(self._PAGE_TOOLS)
         page = getattr(self, "_tools_page", None)
         if _qt_widget_alive(page):
-            page.set_mode("debugger")
+            page.set_mode(mode)
+            if mode == "session_logs":
+                page.session_logs_panel._refresh_full()
         w = getattr(self, "_basic_debug_widget", None)
         if _qt_widget_alive(w) and hasattr(w, "reload_vintage_theme"):
             w.reload_vintage_theme()
+        if open_micropython_dialog:
+            self._show_install_micropython_dialog()
 
     # ── Choose Device picker ──────────────────────────────
 
@@ -5158,7 +6035,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "id": "v1.1_stable",
                 "name": "Vintage Radio Basic Firmware",
                 "listName": "Default RP2040",
-                "listSubtitle": "Official Vintage Radio Music Manager firmware",
+                "listSubtitle": "One-step UF2 when bundled, else auto mpremote",
                 "description": (
                     "Official firmware made with this app in mind - an improved version of Zion's original firmware with station browsing, playback control, "
                     "AM tuning overlay, shuffle modes, and the full gesture set for DFPlayer + RP2040 hardware."
@@ -5172,6 +6049,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
                 "notes": (
                     "Vintage Radio basic-mode firmware (main_basic.py + radio_core).\n\n"
+                    "Install: flashes a bundled full-flash .uf2 in BOOTSEL mode when available; "
+                    "otherwise installs MicroPython automatically (if needed) and copies firmware via USB.\n\n"
+                    "Stock MicroPython only (no Vintage Radio app) is under Tools → MicroPython.\n\n"
                     "Includes DFPlayer playback, AM tuning overlay, and the full gesture set.\n\n"
                     "Button presses:\n"
                     "  Single tap       — Next track\n"
@@ -5186,6 +6066,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
                 "recommended": True,
                 "available": True,
+                "kind": "vintage_radio",
                 "custom": False,
             },
             {
@@ -5680,12 +6561,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         entry_id = str(entry.get("id", ""))
-        if entry_id == "v1.1_stable":
-            self._setup_basic_device(
-                install_callback=lambda: self.install_to_pico(basic_mode=True),
-                install_label="Vintage Radio Basic",
-                require_builtin_firmware=True,
-            )
+        if entry_id == "v1.1_stable" or str(entry.get("kind") or "").lower() == "vintage_radio":
+            self._install_vintage_radio_official_firmware()
             return
         kind = str(entry.get("kind") or "micropython").lower()
         if kind == "remote_uf2":
@@ -5770,10 +6647,35 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         write_session_line(f"Remote UF2 ready: {uf2_path}", prefix="SETUP")
-        self._install_custom_uf2_to_pico(Path(uf2_path))
+        self._flash_uf2_to_bootsel(uf2_path)
 
-    def _install_custom_uf2_to_pico(self, uf2_path: Path) -> None:
-        """Copy a .uf2 directly to a Pico in BOOTSEL mode (no MicroPython prompt)."""
+    def _resolve_bootsel_drive(self) -> Optional[Path]:
+        try:
+            for path, label in SDManager.detect_sd_roots():
+                if label and label.strip().upper() == "RPI-RP2":
+                    return Path(path)
+        except Exception:
+            pass
+        if platform.system() == "Darwin":
+            vols = Path("/Volumes")
+            if vols.is_dir():
+                for item in vols.iterdir():
+                    try:
+                        if item.is_dir() and item.name.upper().startswith("RPI-RP2"):
+                            return item
+                    except OSError:
+                        continue
+        return None
+
+    def _flash_uf2_to_bootsel(self, uf2_path: Path, *, success_title: str = "Install firmware") -> bool:
+        """Copy a .uf2 to the Pico BOOTSEL drive. Returns True on success."""
+        if not uf2_path.is_file():
+            VintageMessageBox.warning(
+                self,
+                success_title,
+                f"Firmware file not found:\n{uf2_path}",
+            )
+            return False
         if not self._is_rpi_rp2_present():
             reply = VintageMessageBox.question(
                 self,
@@ -5785,54 +6687,637 @@ class MainWindow(QtWidgets.QMainWindow):
                 VintageMessageBox.StandardButton.Ok,
             )
             if reply != VintageMessageBox.StandardButton.Ok:
-                return
+                return False
             if not self._is_rpi_rp2_present():
                 VintageMessageBox.warning(
                     self,
                     "BOOTSEL required",
                     "Still no RPI-RP2 drive detected. Aborting install.",
                 )
-                return
-        dest_dir: Optional[Path] = None
-        try:
-            for path, label in SDManager.detect_sd_roots():
-                if label and label.strip().upper() == "RPI-RP2":
-                    dest_dir = Path(path)
-                    break
-        except Exception:
-            dest_dir = None
-        if dest_dir is None and platform.system() == "Darwin":
-            vols = Path("/Volumes")
-            if vols.is_dir():
-                for item in vols.iterdir():
-                    try:
-                        if item.is_dir() and item.name.upper().startswith("RPI-RP2"):
-                            dest_dir = item
-                            break
-                    except OSError:
-                        continue
+                return False
+        dest_dir = self._resolve_bootsel_drive()
         if dest_dir is None:
             VintageMessageBox.warning(
                 self,
-                "Install firmware",
+                success_title,
                 "Could not locate the RPI-RP2 drive. Replug the Pico (BOOTSEL held) and retry.",
             )
-            return
+            return False
         dest_file = dest_dir / uf2_path.name
         try:
             shutil.copy2(uf2_path, dest_file)
         except OSError as e:
             VintageMessageBox.warning(
                 self,
-                "Install firmware",
-                f"Could not copy .uf2 to {dest_dir}: {e}",
+                success_title,
+                f"Could not copy .uf2 to {dest_dir}:\n{e}",
             )
-            return
+            return False
         VintageMessageBox.information(
             self,
-            "Install firmware",
+            success_title,
             f"Copied {uf2_path.name} to {dest_dir}.\n\nThe Pico should reboot automatically.",
         )
+        return True
+
+    def _install_custom_uf2_to_pico(self, uf2_path: Path) -> None:
+        """Copy a .uf2 directly to a Pico in BOOTSEL mode (no MicroPython prompt)."""
+        self._flash_uf2_to_bootsel(uf2_path)
+
+    def _wait_for_bootsel_with_progress(
+        self,
+        *,
+        title: str,
+        intro: str,
+        timeout_s: float = 180.0,
+    ) -> bool:
+        """Poll until RPI-RP2 appears or *timeout_s* elapses (main thread + modal)."""
+        dlg = IndeterminateProgressDialog(self, title, intro)
+        dlg.show_and_raise()
+
+        def _report(_cur: int, _total: int, message: str) -> None:
+            dlg.set_message(message)
+
+        found = _wait_for_bootsel_polling(
+            _report,
+            intro=intro,
+            timeout_s=timeout_s,
+            is_present=self._is_rpi_rp2_present,
+            preferred_serial_port=_read_preferred_serial_port_from_ui(self),
+        )
+        dlg.close()
+        return found
+
+    def _copy_uf2_to_bootsel_quiet(
+        self,
+        uf2_path: Path,
+        *,
+        preferred_serial_port: Optional[str] = None,
+    ) -> bool:
+        """Copy a .uf2 to BOOTSEL without extra dialogs (automated install path)."""
+        ok, _detail = self._bootsel_preflight_for_uf2_flash(preferred_serial_port)
+        if not ok:
+            write_session_line(f"BOOTSEL preflight failed: {_detail}", prefix="INSTALL")
+            return False
+        dest_dir = self._resolve_bootsel_drive()
+        if dest_dir is None:
+            return False
+        copied, err = _copy_uf2_to_rpi_rp2(uf2_path, dest_dir)
+        if not copied:
+            write_session_line(f"BOOTSEL copy failed: {err}", prefix="INSTALL")
+        else:
+            write_session_line(f"Flashed UF2: {uf2_path}", prefix="INSTALL")
+        return copied
+
+    def _flash_micropython_then_install_vintage_radio(
+        self,
+        *,
+        blocking_label: Optional[str] = None,
+    ) -> None:
+        """Replace non-stock firmware via BOOTSEL MicroPython flash, then mpremote install."""
+        if blocking_label:
+            intro = (
+                f"Detected {blocking_label} on the Pico.\n\n"
+                "Vintage Radio will flash official MicroPython (replacing that firmware), "
+                "then copy the Vintage Radio app automatically.\n\n"
+                "No hardware reset is required — put the Pico in BOOTSEL mode when prompted."
+            )
+        else:
+            intro = (
+                "The Pico needs official MicroPython before Vintage Radio can be copied.\n\n"
+                "Put the Pico in BOOTSEL mode when prompted; the app will flash MicroPython "
+                "and install Vintage Radio automatically."
+            )
+
+        if not self._is_rpi_rp2_present():
+            if not self._wait_for_bootsel_with_progress(
+                title="Install Vintage Radio",
+                intro=intro,
+            ):
+                VintageMessageBox.information(
+                    self,
+                    "Install Vintage Radio",
+                    "Timed out waiting for BOOTSEL (RPI-RP2 drive).\n\n"
+                    "Hold BOOTSEL while plugging in USB, then click Install Firmware again.",
+                )
+                return
+
+        if not self._auto_flash_micropython_to_bootsel():
+            VintageMessageBox.warning(
+                self,
+                "Install Vintage Radio",
+                "Could not copy MicroPython to the Pico.\n\n"
+                "Ensure RPI-RP2 is visible and try again.",
+            )
+            return
+
+        self.statusBar().showMessage(
+            "MicroPython flashed. Installing Vintage Radio when the Pico reboots…", 12000
+        )
+        QtCore.QTimer.singleShot(
+            _POST_MICROPYTHON_INSTALL_DELAY_MS,
+            lambda: self.install_to_pico(basic_mode=True, after_firmware=True),
+        )
+
+    def _bootsel_preflight_for_uf2_flash(
+        self,
+        preferred_serial_port: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Ensure RPI-RP2 is present, authentic, and USB serial is off."""
+        if not self._is_rpi_rp2_present():
+            return False, "No RPI-RP2 drive detected. Hold BOOTSEL while plugging in USB."
+        dest_dir = self._resolve_bootsel_drive()
+        if dest_dir is None:
+            return False, "Could not locate the RPI-RP2 drive path."
+        authentic, auth_detail = _is_authentic_rp2040_bootsel_volume(dest_dir)
+        if not authentic:
+            return False, auth_detail
+        port = _find_rp2040_serial_port(preferred=preferred_serial_port)
+        if port:
+            return False, _bootsel_serial_blocking_message(port)
+        if not _wait_for_serial_port_gone(
+            preferred_port=preferred_serial_port,
+            timeout_s=3.0,
+        ):
+            port = _find_rp2040_serial_port(preferred=preferred_serial_port)
+            if port:
+                return False, _bootsel_serial_blocking_message(port)
+        write_session_line(
+            f"BOOTSEL preflight OK: RPI-RP2 at {dest_dir} (USB serial off)",
+            prefix="INSTALL",
+        )
+        return True, str(dest_dir)
+
+    def _flash_micropython_uf2_to_bootsel_core(
+        self,
+        progress_callback: Optional[Callable[..., Any]] = None,
+        preferred_serial_port: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Download/cache stock MicroPython and flash to BOOTSEL (no Qt dialogs)."""
+        from gui.services.firmware_bundle import fetch_micropython_uf2
+
+        ok, detail = self._bootsel_preflight_for_uf2_flash(preferred_serial_port)
+        if not ok:
+            return False, detail
+
+        dest_dir = Path(detail)
+
+        if progress_callback:
+            progress_callback(0, 0, "Downloading MicroPython for Pico…")
+        try:
+            uf2_path = fetch_micropython_uf2()
+        except Exception as exc:
+            write_session_line(f"MicroPython download failed: {exc}", prefix="SETUP")
+            return False, f"MicroPython download failed: {exc}"
+        if uf2_path is None:
+            return False, "MicroPython download returned no file."
+
+        return _flash_uf2_file(
+            Path(uf2_path),
+            dest_dir,
+            progress_callback=progress_callback,
+        )
+
+    def _factory_reset_reflash_micropython(
+        self,
+        progress_callback: Optional[Callable[..., Any]] = None,
+        preferred_serial_port: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Erase all flash then flash stock MicroPython (after first flash did not stick)."""
+        write_session_line("Starting factory reset (full flash erase)", prefix="INSTALL")
+
+        def _progress(msg: str) -> None:
+            if progress_callback:
+                progress_callback(0, 0, msg)
+
+        if not self._is_rpi_rp2_present():
+            _progress(_FACTORY_RESET_BOOTSEL_INTRO)
+            if not _wait_for_bootsel_polling(
+                progress_callback,
+                intro=_FACTORY_RESET_BOOTSEL_INTRO,
+                timeout_s=180.0,
+                is_present=self._is_rpi_rp2_present,
+                preferred_serial_port=preferred_serial_port,
+            ):
+                return False, (
+                    "Timed out waiting for BOOTSEL to run factory reset.\n\n"
+                    "Unplug all power, hold BOOTSEL, plug USB while holding BOOTSEL."
+                )
+
+        ok, detail = self._bootsel_preflight_for_uf2_flash(preferred_serial_port)
+        if not ok:
+            return False, detail
+        dest_dir = Path(detail)
+
+        ok, err, erase_method = _factory_erase_rp2040_flash(
+            dest_dir, progress_callback=progress_callback,
+        )
+        if not ok:
+            return False, err or "Factory erase failed."
+
+        if erase_method == "nuke":
+            import time
+
+            _progress("Waiting for Pico to re-enter BOOTSEL after flash erase…")
+            time.sleep(2.0)
+            if not self._is_rpi_rp2_present():
+                if not _wait_for_bootsel_polling(
+                    progress_callback,
+                    intro="Put the Pico back in BOOTSEL mode to flash MicroPython.",
+                    timeout_s=90.0,
+                    is_present=self._is_rpi_rp2_present,
+                    preferred_serial_port=preferred_serial_port,
+                ):
+                    return False, (
+                        "After flash_nuke the Pico did not reappear as RPI-RP2.\n\n"
+                        "Hold BOOTSEL and plug in USB, then run Install Firmware again."
+                    )
+            ok, detail = self._bootsel_preflight_for_uf2_flash(preferred_serial_port)
+            if not ok:
+                return False, detail
+            dest_dir = Path(detail)
+
+        from gui.services.firmware_bundle import fetch_micropython_uf2
+
+        _progress("Factory reset complete — flashing MicroPython…")
+        try:
+            uf2_path = fetch_micropython_uf2()
+        except Exception as exc:
+            return False, f"MicroPython download failed: {exc}"
+
+        ok, err = _flash_uf2_file(
+            Path(uf2_path),
+            dest_dir,
+            progress_callback=progress_callback,
+        )
+        if not ok:
+            return False, err
+
+        verify_err = _verify_stock_micropython_serial(
+            preferred_serial_port,
+            progress_callback=progress_callback,
+        )
+        if verify_err:
+            return False, (
+                f"Factory reset completed but MicroPython still did not boot ({verify_err}).\n\n"
+                "The Pico may not be entering true ROM BOOTSEL, or the board may need "
+                "a full power cycle (not just USB). Try USB directly into the PC, not "
+                "through a hub."
+            )
+        return True, ""
+
+    def _flash_micropython_for_install(
+        self,
+        progress_callback: Optional[Callable[..., Any]] = None,
+        preferred_serial_port: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Flash MicroPython, verify boot, factory-reset and retry once if needed."""
+        flashed, flash_err = self._flash_micropython_uf2_to_bootsel_core(
+            progress_callback,
+            preferred_serial_port=preferred_serial_port,
+        )
+        if not flashed:
+            return False, flash_err or "Could not flash MicroPython."
+
+        verify_err = _verify_stock_micropython_serial(
+            preferred_serial_port,
+            progress_callback=progress_callback,
+        )
+        if verify_err is None:
+            return True, ""
+
+        write_session_line(
+            f"First MicroPython flash did not stick ({verify_err}); running factory reset",
+            prefix="INSTALL",
+        )
+        if progress_callback:
+            progress_callback(
+                0,
+                0,
+                "MicroPython did not replace the old firmware.\n\n"
+                "Running factory reset (full flash erase)…",
+            )
+        return self._factory_reset_reflash_micropython(
+            progress_callback,
+            preferred_serial_port=preferred_serial_port,
+        )
+
+    def _smart_install_vintage_radio_worker(
+        self,
+        progress_callback: Optional[Callable[..., Any]] = None,
+        preferred_serial_port: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Background worker: detect Pico state and flash MicroPython when needed."""
+        write_session_line("Smart install Vintage Radio basic", prefix="INSTALL")
+
+        def _progress(msg: str) -> None:
+            if progress_callback:
+                progress_callback(0, 0, msg)
+
+        _progress("Preparing firmware install…")
+
+        from gui.services.firmware_bundle import bundled_vintage_radio_full_uf2
+
+        full_uf2 = bundled_vintage_radio_full_uf2()
+        if full_uf2 is not None:
+            write_session_line(f"Bundled full-flash UF2: {full_uf2}", prefix="INSTALL")
+            if not self._is_rpi_rp2_present():
+                intro = (
+                    "A one-file Vintage Radio firmware image is available.\n\n"
+                    "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
+                )
+                if not _wait_for_bootsel_polling(
+                    progress_callback,
+                    intro=intro,
+                    is_present=self._is_rpi_rp2_present,
+                    preferred_serial_port=preferred_serial_port,
+                ):
+                    return {
+                        "action": "message",
+                        "level": "info",
+                        "title": "Install Vintage Radio",
+                        "message": (
+                            "Timed out waiting for BOOTSEL. Hold BOOTSEL and try "
+                            "Install Firmware again."
+                        ),
+                    }
+            _progress(f"Flashing {full_uf2.name}…")
+            if self._copy_uf2_to_bootsel_quiet(
+                full_uf2, preferred_serial_port=preferred_serial_port,
+            ):
+                return {
+                    "action": "message",
+                    "level": "info",
+                    "title": "Install Vintage Radio",
+                    "message": (
+                        f"Flashed {full_uf2.name}.\n\n"
+                        "The Pico should reboot with Vintage Radio ready."
+                    ),
+                    "status_message": "Vintage Radio firmware flashed.",
+                }
+            return {
+                "action": "message",
+                "level": "warning",
+                "title": "Install Vintage Radio",
+                "message": "Could not copy the firmware .uf2 to RPI-RP2.",
+            }
+
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        if not mpremote_cmd:
+            return {
+                "action": "message",
+                "level": "info",
+                "title": "Install Vintage Radio",
+                "message": (
+                    "mpremote is not available. Install it with: pip install mpremote"
+                ),
+            }
+
+        _progress("Checking Pico connection…")
+        assessment = _pico_install_assessment(
+            mpremote_cmd,
+            self._project_root(),
+            preferred_port=preferred_serial_port,
+            progress_callback=progress_callback,
+        )
+        status = assessment.get("status")
+        write_session_line(f"Pico install assessment: {assessment}", prefix="INSTALL")
+
+        if status == "ready":
+            write_session_line("Pico ready for mpremote install", prefix="INSTALL")
+            return {"action": "install_to_pico", "after_firmware": False}
+
+        if status == "bootsel":
+            _progress("Flashing MicroPython…")
+            flashed, flash_err = self._flash_micropython_for_install(
+                progress_callback,
+                preferred_serial_port=preferred_serial_port,
+            )
+            if flashed:
+                return {"action": "install_to_pico", "after_firmware": True}
+            return {
+                "action": "message",
+                "level": "warning",
+                "title": "Install Vintage Radio",
+                "message": flash_err or (
+                    "Could not copy MicroPython to the Pico.\n\n"
+                    "Ensure RPI-RP2 is visible and try again."
+                ),
+            }
+
+        blocking_label = assessment.get("blocking_label")
+        if status == "needs_reflash":
+            if blocking_label:
+                intro = (
+                    f"Detected {blocking_label}.\n\n"
+                    "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears "
+                    "in File Explorer and the COM port disappears.\n\n"
+                    "Vintage Radio will flash official MicroPython, then install the app."
+                )
+            else:
+                intro = (
+                    "The Pico needs official MicroPython before Vintage Radio can be copied.\n\n"
+                    "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears."
+                )
+        else:
+            intro = (
+                "No Pico detected on USB serial.\n\n"
+                "Connect the Pico and put it in BOOTSEL mode (RPI-RP2 drive) "
+                "to flash MicroPython, then Vintage Radio will install automatically."
+            )
+
+        if status in ("needs_reflash", "no_pico"):
+            if not self._is_rpi_rp2_present():
+                write_session_line(
+                    "Waiting for BOOTSEL (RPI-RP2 drive) — hold BOOTSEL and tap RESET",
+                    prefix="INSTALL",
+                )
+                _progress(intro)
+                if not _wait_for_bootsel_polling(
+                    progress_callback,
+                    intro=intro,
+                    is_present=self._is_rpi_rp2_present,
+                    preferred_serial_port=preferred_serial_port,
+                ):
+                    if status == "no_pico":
+                        return {
+                            "action": "message",
+                            "level": "info",
+                            "title": "Install Vintage Radio",
+                            "message": (
+                                "No Pico detected. Connect via USB and try Install Firmware again."
+                            ),
+                        }
+                    return {
+                        "action": "message",
+                        "level": "info",
+                        "title": "Install Vintage Radio",
+                        "message": (
+                            "Timed out waiting for BOOTSEL (RPI-RP2 drive).\n\n"
+                            "Hold BOOTSEL while plugging in USB, then click Install Firmware again."
+                        ),
+                    }
+            _progress("Flashing MicroPython…")
+            flashed, flash_err = self._flash_micropython_for_install(
+                progress_callback,
+                preferred_serial_port=preferred_serial_port,
+            )
+            if flashed:
+                return {"action": "install_to_pico", "after_firmware": True}
+            return {
+                "action": "message",
+                "level": "warning",
+                "title": "Install Vintage Radio",
+                "message": flash_err or (
+                    "Could not copy MicroPython to the Pico.\n\n"
+                    "Ensure RPI-RP2 is visible and try again."
+                ),
+            }
+
+        return {
+            "action": "message",
+            "level": "warning",
+            "title": "Install Vintage Radio",
+            "message": (
+                "Could not determine Pico state. Connect the Pico via USB and try again."
+            ),
+        }
+
+    def _apply_smart_install_result(self, result: Dict[str, Any]) -> None:
+        """Main-thread follow-up after the smart-install worker finishes."""
+        action = result.get("action")
+        if action == "install_to_pico":
+            after = bool(result.get("after_firmware"))
+            if after:
+                self.statusBar().showMessage(
+                    "MicroPython flashed. Installing Vintage Radio when the Pico reboots…",
+                    12000,
+                )
+                QtCore.QTimer.singleShot(
+                    _POST_MICROPYTHON_INSTALL_DELAY_MS,
+                    lambda: self.install_to_pico(basic_mode=True, after_firmware=True),
+                )
+            else:
+                self.install_to_pico(basic_mode=True)
+            return
+
+        status_msg = result.get("status_message")
+        if status_msg:
+            self.statusBar().showMessage(str(status_msg), 10000)
+
+        message = str(result.get("message") or "")
+        if not message:
+            return
+        title = str(result.get("title") or "Install Firmware")
+        level = str(result.get("level") or "info").lower()
+        if level == "warning":
+            VintageMessageBox.warning(self, title, message)
+        else:
+            VintageMessageBox.information(self, title, message)
+
+    def _prepare_install_serial_for_worker(self, dlg: TaskProgressDialog) -> None:
+        """Main-thread setup before the install worker thread starts."""
+        port = _read_preferred_serial_port_from_ui(self) or _find_rp2040_serial_port()
+        dlg.set_status_message("Releasing USB serial port for install…")
+        QtWidgets.QApplication.processEvents()
+        if self._release_serial_if_connected_for_mpremote(log_prefix="INSTALL"):
+            self.statusBar().showMessage(
+                "Serial console disconnected so Install Firmware can use the USB port. "
+                "Click Connect on the Device tab when finished.",
+                12000,
+            )
+        if port:
+            dlg.set_status_message(
+                f"Checking firmware on {port} (device already connected via USB)…"
+            )
+        else:
+            dlg.set_status_message("Looking for Pico on USB…")
+        QtWidgets.QApplication.processEvents()
+
+    def _run_smart_install_with_progress(self) -> None:
+        """Run smart install on a worker thread with a modal progress dialog."""
+        if getattr(self, "_smart_install_active", False):
+            return
+
+        root = self._project_root()
+        if not (root / "firmware" / "pico" / "main.py").exists() or not (
+            root / "firmware" / "radio_core.py"
+        ).exists():
+            VintageMessageBox.warning(self, "Install Firmware", "Project files not found.")
+            return
+        if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
+            VintageMessageBox.warning(
+                self,
+                "Install Firmware",
+                "firmware/pico/dfplayer_hardware.py not found.",
+            )
+            return
+
+        preferred = _read_preferred_serial_port_from_ui(self)
+
+        dlg = TaskProgressDialog(
+            parent=self,
+            title="Install Firmware",
+            func=self._smart_install_vintage_radio_worker,
+            kwargs={"preferred_serial_port": preferred},
+            initial_message="Preparing firmware install…",
+            on_before_start=lambda: self._prepare_install_serial_for_worker(dlg),
+        )
+
+        def _on_success(result: Any) -> None:
+            self._smart_install_active = False
+            if isinstance(result, dict):
+                self._apply_smart_install_result(result)
+
+        def _on_error(msg: str) -> None:
+            self._smart_install_active = False
+            VintageMessageBox.warning(self, "Install Firmware", f"Error:\n\n{msg}")
+
+        dlg.on_success = _on_success
+        dlg.on_error = _on_error
+        self._smart_install_active = True
+        dlg.exec()
+        self._smart_install_active = False
+
+    def _smart_install_vintage_radio_basic(self) -> None:
+        """Detect Pico state and install using the correct path (one button)."""
+        self._run_smart_install_with_progress()
+
+    def _install_vintage_radio_official_firmware(self) -> None:
+        """Install official Vintage Radio basic firmware (smart detect + one-button flow)."""
+        self._run_smart_install_with_progress()
+
+    def _auto_flash_micropython_to_bootsel(self) -> bool:
+        """Download/cache stock MicroPython and copy to BOOTSEL without opening a dialog."""
+        progress = IndeterminateProgressDialog(
+            self, "Setup Device", "Downloading MicroPython for Pico…",
+        )
+        progress.show_and_raise()
+
+        def _report(_cur: int, _total: int, message: str) -> None:
+            progress.set_message(message)
+
+        ok, _err = self._flash_micropython_for_install(_report)
+        progress.close()
+        return ok
+
+    def _prompt_install_micropython_via_tools(self, *, install_label: str) -> None:
+        msg = VintageMessageBox(self)
+        msg.setIcon(VintageMessageBox.Icon.Information)
+        msg.setWindowTitle("MicroPython required")
+        msg.setText(
+            "MicroPython must be installed on the Pico before Vintage Radio firmware can be copied.\n\n"
+            "Use Tools → MicroPython to flash the official MicroPython .uf2 in BOOTSEL mode, "
+            "then run Install Firmware again.\n\n"
+            f"After MicroPython is running, the app will install {install_label} automatically."
+        )
+        open_btn = msg.addButton(
+            "Open Tools → MicroPython", VintageMessageBox.ButtonRole.ActionRole
+        )
+        msg.addButton("Close", VintageMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        if msg.clickedButton() == open_btn:
+            self._open_tools_tab("micropython", open_micropython_dialog=True)
 
     def _current_max_tracks_per_station(self) -> int:
         if not self._is_advanced_mode():
@@ -5882,9 +7367,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if not trusted:
             return False
         cur = self._basic_sd_path_volume_tag(new_root).strip()
-        if not cur:
-            return False
-        return _volume_name_key(cur) != _volume_name_key(trusted)
+        if cur and _volume_name_key(cur) != _volume_name_key(trusted):
+            return True
+        trusted_serial = (self.db.get_setting("basic_trusted_sd_serial") or "").strip().upper()
+        if trusted_serial:
+            try:
+                cur_serial = _get_volume_serial(Path(new_root).expanduser()).strip().upper()
+            except OSError:
+                cur_serial = ""
+            if cur_serial and cur_serial != trusted_serial:
+                return True
+        return False
 
     def _basic_confirm_first_sd_sync_target(self, sd_path_str: str) -> bool:
         """One-time check before the first successful basic sync (no trusted volume yet)."""
@@ -5969,8 +7462,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         trusted = (self.db.get_setting("basic_trusted_sd_volume") or "").strip()
         cur = self._basic_sd_path_volume_tag(new_root).strip()
-        if not trusted or not cur:
+        if not trusted:
             return None
+        if not cur or _volume_name_key(cur) == _volume_name_key(trusted):
+            cur = f"{cur or trusted} (different physical card)"
         return trusted, cur
 
     def _basic_confirm_different_card(self, new_root: str, *, for_sync: bool) -> bool:
@@ -6005,10 +7500,6 @@ class MainWindow(QtWidgets.QMainWindow):
             k = _volume_name_key(raw)
             if k:
                 names.add(k)
-        if (self.db.get_setting("sd_volume_label") or "").strip():
-            k = _volume_name_key(SYNC_TARGET_VOLUME_LABEL)
-            if k:
-                names.add(k)
         return names
 
     def _basic_sd_identity_match_set(self) -> set:
@@ -6029,7 +7520,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         Omits :attr:`sd_label` and ``sd_root`` so after **Select** switches to another
         volume, **Detect** can still resolve the original sync-target card from
-        ``basic_trusted_sd_volume`` / ``sd_volume_label`` / ``VINTAGERADIO``.
+        ``basic_trusted_sd_volume`` / ``sd_volume_label``.
         """
         names: set = set()
         for raw in (
@@ -6039,11 +7530,43 @@ class MainWindow(QtWidgets.QMainWindow):
             k = _volume_name_key(raw)
             if k:
                 names.add(k)
-        if (self.db.get_setting("sd_volume_label") or "").strip():
-            k = _volume_name_key(SYNC_TARGET_VOLUME_LABEL)
-            if k:
-                names.add(k)
         return names
+
+    def _refresh_basic_sd_after_sync(self) -> None:
+        """Re-detect SD mount and refresh status after sync (format, rename, or label change)."""
+        if not self._is_basic_like_mode():
+            self._update_sd_root_label()
+            self._check_basic_sd_sync()
+            return
+        self._try_rebind_basic_sd_mount()
+        candidates = self.sd_manager.detect_sd_roots()
+        sync_id = self._basic_sync_target_identity_match_set()
+        if sync_id and candidates:
+            sync_matched = [
+                (path, label)
+                for path, label in candidates
+                if self._basic_candidate_matches_identity(path, label, sync_id)
+            ]
+            if len(sync_matched) == 1:
+                path, lab = sync_matched[0]
+                new_label = (lab or "").strip() or (self._get_volume_label(path) or "")
+                self.sd_root = str(path)
+                self.sd_label = new_label
+                self.db.set_setting("sd_root", self.sd_root)
+                self.db.set_setting("sd_label", self.sd_label)
+        elif self.sd_root:
+            try:
+                path = Path(self.sd_root)
+                if path.is_dir():
+                    lab = self._get_volume_label(path) or self.sd_label
+                    if lab:
+                        self.sd_label = lab
+                        self.db.set_setting("sd_label", self.sd_label)
+            except OSError:
+                pass
+        self._update_sd_root_label()
+        self._refresh_basic_sd_capacity()
+        self._check_basic_sd_sync()
 
     @staticmethod
     def _basic_candidate_matches_identity(path: Path, label: str, identity: set) -> bool:
@@ -6332,7 +7855,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if released:
             import time
 
-            time.sleep(0.35)
+            time.sleep(1.25 if sys.platform == "win32" else 0.35)
             write_session_line(
                 "Released app-held serial port(s) so mpremote can access the device",
                 prefix=log_prefix,
@@ -6378,6 +7901,7 @@ class MainWindow(QtWidgets.QMainWindow):
         install_callback: Optional[Callable[[], None]] = None,
         install_label: str = "basic firmware",
         require_builtin_firmware: bool = True,
+        auto_flash_micropython: bool = False,
     ) -> None:
         """One-click: install MicroPython if needed, then install application firmware."""
         try:
@@ -6416,6 +7940,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Prefer explicit RP2040 ports first to avoid grabbing unrelated serial devices (e.g. Bluetooth COM).
             rp_ports: List[Any] = []
+            probe_outputs: List[str] = []
+            probe_timed_out = False
             try:
                 import serial.tools.list_ports as list_ports
 
@@ -6439,25 +7965,39 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 write_session_line(f"RP2040 candidate ports: {len(rp_ports)}", prefix="SETUP")
                 print(f"[Setup Basic Device] RP2040 candidate ports: {len(rp_ports)}")
+                probe_outputs: List[str] = []
+                probe_timed_out = False
                 for port_info in rp_ports:
                     port_dev = getattr(port_info, "device", None) or str(port_info)
+                    sniff = _sniff_rp2040_serial_text(port_dev)
+                    if sniff.strip():
+                        probe_outputs.append(sniff)
+                        write_session_line(
+                            f"serial sniff ({port_dev}): {sniff[:400]!r}",
+                            prefix="SETUP",
+                        )
+                        blocking = _serial_output_indicates_blocking_firmware(sniff)
+                        if blocking:
+                            write_session_line(
+                                f"Detected non-installable firmware on {port_dev}: {blocking}",
+                                prefix="SETUP",
+                            )
+                            print(f"[Setup Basic Device] Detected {blocking} on {port_dev}")
+                            break
+
                     write_session_line(f"Trying mpremote explicit connect: {port_dev}", prefix="SETUP")
                     print(f"[Setup Basic Device] Trying mpremote explicit connect: {port_dev}")
-                    r = _run_mpremote(
-                        mpremote_cmd,
-                        ["connect", port_dev, "exec", _MPREMOTE_MICROPYTHON_PROBE],
-                        cwd=str(root),
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
+                    r = _run_mpremote_probe(mpremote_cmd, port_dev, str(root))
                     out = ((r.stdout or "") + (r.stderr or "")).strip()
                     if out:
+                        probe_outputs.append(out)
                         write_session_line(
                             f"explicit connect output ({port_dev}): {out[:800]}",
                             prefix="SETUP",
                         )
                         print(f"[Setup Basic Device] explicit connect output ({port_dev}): {out[:600]}")
+                    if getattr(r, "returncode", 1) == 124:
+                        probe_timed_out = True
                     write_session_line(
                         f"explicit connect rc ({port_dev}) = {r.returncode} micropython="
                         f"{_mpremote_result_indicates_micropython(r)}",
@@ -6475,6 +8015,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         print(f"[Setup Basic Device] explicit connect succeeded on {port_dev}, installing firmware")
                         install_now()
                         return
+                    if _serial_output_indicates_blocking_firmware(out):
+                        break
             except Exception:
                 write_session_line(
                     f"RP2040 explicit scan/connect exception:\n{traceback.format_exc()}",
@@ -6482,20 +8024,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 print("[Setup Basic Device] RP2040 explicit scan/connect exception:")
                 print(traceback.format_exc())
+                probe_timed_out = True
 
             # Fallback: can we reach a running MicroPython via auto-detected port?
             write_session_line("Trying mpremote auto connect fallback", prefix="SETUP")
             print("[Setup Basic Device] Trying mpremote auto connect fallback")
             try:
-                r = _run_mpremote(
-                    mpremote_cmd,
-                    ["connect", "auto", "exec", _MPREMOTE_MICROPYTHON_PROBE],
-                    cwd=str(root), capture_output=True, text=True, timeout=10,
-                )
+                r = _run_mpremote_probe(mpremote_cmd, "auto", str(root))
                 out = ((r.stdout or "") + (r.stderr or "")).strip()
                 if out:
+                    probe_outputs.append(out)
                     write_session_line(f"auto connect output: {out[:800]}", prefix="SETUP")
                     print(f"[Setup Basic Device] auto connect output: {out[:600]}")
+                if getattr(r, "returncode", 1) == 124:
+                    probe_timed_out = True
                 write_session_line(
                     f"auto connect rc = {r.returncode} micropython={_mpremote_result_indicates_micropython(r)}",
                     prefix="SETUP",
@@ -6522,21 +8064,15 @@ class MainWindow(QtWidgets.QMainWindow):
             write_session_line(f"BOOTSEL (RPI-RP2) present: {bootsel_present}", prefix="SETUP")
             print(f"[Setup Basic Device] BOOTSEL (RPI-RP2) present: {bootsel_present}")
             if bootsel_present:
-                write_session_line("Opening InstallMicroPythonDialog", prefix="SETUP")
-                print("[Setup Basic Device] Opening InstallMicroPythonDialog")
-                dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
-                result = dlg.exec()
-                if result == QtWidgets.QDialog.DialogCode.Accepted:
-                    # User completed MicroPython installation — proceed after the Pico reboots.
+                if auto_flash_micropython and self._auto_flash_micropython_to_bootsel():
                     self.statusBar().showMessage(
                         f"MicroPython installed. Installing {install_label}...", 8000
                     )
                     QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
-                else:
-                    self.statusBar().showMessage(
-                        "Install MicroPython first, then click Install firmware on device again.",
-                        8000,
-                    )
+                    return
+                write_session_line("BOOTSEL present — prompt Tools → MicroPython", prefix="SETUP")
+                print("[Setup Basic Device] BOOTSEL present — directing user to Tools → MicroPython")
+                self._prompt_install_micropython_via_tools(install_label=install_label)
                 return
 
             if rp_ports:
@@ -6547,35 +8083,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 print("[Setup Basic Device] RP2040 port(s) present without verified MicroPython")
                 msg = VintageMessageBox(self)
                 msg.setIcon(VintageMessageBox.Icon.Information)
-                msg.setWindowTitle("Setup Device — MicroPython required")
+                msg.setWindowTitle("Setup Device — stock MicroPython required")
                 msg.setText(
-                    "A Raspberry Pi Pico USB serial port was found, but MicroPython did not respond.\n\n"
-                    "On a new or erased board you must install MicroPython before Vintage Radio can "
-                    "copy firmware.\n\n"
-                    "1. Hold BOOTSEL and plug the Pico into USB (it should show up as RPI-RP2 "
-                    "like a thumb drive).\n"
-                    "2. Click Install MicroPython… and copy the .uf2 file to that drive.\n"
-                    "3. When the Pico reboots, run Setup Device again.\n\n"
-                    "If MicroPython is already installed, close other apps using the serial port and retry."
+                    _setup_device_failure_message(
+                        probe_outputs=probe_outputs,
+                        timed_out=probe_timed_out,
+                    )
                 )
-                install_btn = msg.addButton(
-                    "Install MicroPython…", VintageMessageBox.ButtonRole.ActionRole
+                open_btn = msg.addButton(
+                    "Open Tools → MicroPython", VintageMessageBox.ButtonRole.ActionRole
                 )
                 msg.addButton("Close", VintageMessageBox.ButtonRole.RejectRole)
                 msg.exec()
-                if msg.clickedButton() == install_btn:
-                    dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
-                    result = dlg.exec()
-                    if result == QtWidgets.QDialog.DialogCode.Accepted:
-                        self.statusBar().showMessage(
-                            f"MicroPython installed. Installing {install_label}...", 8000
-                        )
-                        QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, install_now)
-                    else:
-                        self.statusBar().showMessage(
-                            "Install MicroPython first, then click Install firmware on device again.",
-                            8000,
-                        )
+                if msg.clickedButton() == open_btn:
+                    self._open_tools_tab("micropython", open_micropython_dialog=True)
                 return
 
             write_session_line("No compatible Pico detected (user message)", prefix="SETUP")
@@ -7635,6 +9156,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._basic_confirm_first_sd_sync_target(str(sd_root)):
             return
 
+        if not self._basic_confirm_different_card(str(sd_root), for_sync=True):
+            return
+
         sd_display = self._basic_sd_display_text()
         library_name = self._lib_registry.active_library_name() or "this library"
 
@@ -7767,29 +9291,33 @@ class MainWindow(QtWidgets.QMainWindow):
                         preserved = str(
                             result.get("preserved_volume_label") or ""
                         ).strip()
-                    rename_label = preserved if preserved else None
-                    if self.sd_manager.set_sync_target_volume_label(
-                        Path(self.sd_root), label=rename_label
+                    if not preserved and self.sd_root:
+                        preserved = self.sd_manager.capture_volume_label_before_sync(
+                            Path(self.sd_root)
+                        )
+                    if preserved and self.sd_manager.set_sync_target_volume_label(
+                        Path(self.sd_root), label=preserved
                     ):
-                        effective = preserved if preserved else SYNC_TARGET_VOLUME_LABEL
-                        self.db.set_setting("sd_volume_label", effective)
-                        if preserved:
-                            self.sd_label = preserved
-                            self.db.set_setting("sd_label", preserved)
-                        # macOS diskutil rename changes the mount path
+                        self.db.set_setting("sd_volume_label", preserved)
+                        self.sd_label = preserved
+                        self.db.set_setting("sd_label", preserved)
                         if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
-                            new_path = Path("/Volumes") / effective
+                            new_path = Path("/Volumes") / preserved
                             if new_path.is_dir():
                                 self.sd_root = str(new_path)
                                 self.db.set_setting("sd_root", self.sd_root)
                     tag = self._basic_sd_path_volume_tag(self.sd_root)
                     if tag:
                         self.db.set_setting("basic_trusted_sd_volume", tag)
+                    try:
+                        serial = _get_volume_serial(Path(self.sd_root)).strip()
+                        if serial:
+                            self.db.set_setting("basic_trusted_sd_serial", serial)
+                    except OSError:
+                        pass
                 except Exception:
                     pass
-            self._update_sd_root_label()
-            self._refresh_basic_sd_capacity()
-            self._check_basic_sd_sync()
+            self._refresh_basic_sd_after_sync()
             if self.db.get_setting("auto_eject_after_sync", "0") == "1" and self.sd_root:
                 QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
 
@@ -7826,6 +9354,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 "No stations",
                 "Create at least one station with tracks before installing to an SD card.",
             )
+            return
+
+        if not self._basic_confirm_first_sd_sync_target(str(sd_root)):
+            return
+        if not self._basic_confirm_different_card(str(sd_root), for_sync=True):
             return
 
         missing_pyfatfs = pyfatfs_dependency_message()
@@ -8626,12 +10159,13 @@ class MainWindow(QtWidgets.QMainWindow):
         install_pico_btn = QtWidgets.QPushButton("Install to Pico")
         install_pico_btn.setToolTip("Copy the application files directly to a connected Pico via USB. Requires mpremote (pip install mpremote) and MicroPython already installed on the Pico.")
         install_pico_btn.clicked.connect(self.install_to_pico)
-        install_mp_btn = QtWidgets.QPushButton("Install MicroPython on Pico...")
-        install_mp_btn.setToolTip("One-time setup: put the Pico in BOOTSEL mode, then copy the MicroPython .uf2 to it. After this you can use Install to Pico.")
-        install_mp_btn.clicked.connect(self._show_install_micropython_dialog)
+        mp_tools_hint = QtWidgets.QLabel(
+            "MicroPython only: Tools → MicroPython tab"
+        )
+        mp_tools_hint.setStyleSheet("color: #666; font-style: italic;")
         rp2040_layout.addWidget(export_rp2040_btn)
         rp2040_layout.addWidget(install_pico_btn)
-        rp2040_layout.addWidget(install_mp_btn)
+        rp2040_layout.addWidget(mp_tools_hint)
         rp2040_layout.addStretch()
         layout.addWidget(rp2040_group)
 
@@ -10006,6 +11540,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if reply == VintageMessageBox.StandardButton.No:
             force_clean = True
+
+        preserved_volume_label = self.sd_manager.capture_volume_label_before_sync(sd_root)
         
         effective_audio_target = "dfplayer_rp2040" if self._is_basic_like_mode() else self.audio_target
         dlg = TaskProgressDialog(
@@ -10034,13 +11570,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(
                     f"SD sync complete. Copied: {copied}, Skipped: {skipped}", 5000
                 )
-                # Mark this SD as our sync target (set volume label so we recognize it when multiple cards are present)
+                # Remember sync target by its existing volume name (no forced rename).
                 if self.sd_root:
                     try:
-                        if self.sd_manager.set_sync_target_volume_label(Path(self.sd_root)):
-                            self.db.set_setting("sd_volume_label", SYNC_TARGET_VOLUME_LABEL)
+                        label = preserved_volume_label or self.sd_manager.capture_volume_label_before_sync(
+                            Path(self.sd_root)
+                        )
+                        if label:
+                            if self.sd_manager.set_sync_target_volume_label(
+                                Path(self.sd_root), label=label
+                            ):
+                                self.db.set_setting("sd_volume_label", label)
+                                self.sd_label = label
+                                self.db.set_setting("sd_label", label)
                             if sys.platform == "darwin" and not Path(self.sd_root).is_dir():
-                                new_path = Path("/Volumes") / SYNC_TARGET_VOLUME_LABEL
+                                new_path = Path("/Volumes") / label
                                 if new_path.is_dir():
                                     self.sd_root = str(new_path)
                                     self.db.set_setting("sd_root", self.sd_root)
@@ -10482,7 +12026,11 @@ class MainWindow(QtWidgets.QMainWindow):
             VintageMessageBox.warning(self, "Install Firmware", "firmware/pico/dfplayer_hardware.py not found.")
             return
 
-        # Quick test: can we connect to Pico (MicroPython already installed)?
+        if is_pico:
+            self._smart_install_vintage_radio_basic()
+            return
+
+        # Non-Pico MicroPython boards: probe serial and install when reachable.
         conn_err = ""
         try:
             r = _run_mpremote(
@@ -10581,32 +12129,17 @@ class MainWindow(QtWidgets.QMainWindow):
         except (subprocess.TimeoutExpired, Exception) as e:
             conn_err = str(e)
 
-        # No connection: check for Pico in BOOTSEL (RPI-RP2 drive) -- Pico-only
         print(f"[Setup Device] All connection attempts failed. Output:\n{conn_err}")
-        if is_pico and self._is_rpi_rp2_present():
-            dlg = InstallMicroPythonDialog(self, preselect_rpi_rp2=True)
-            result = dlg.exec()
-            if result == QtWidgets.QDialog.DialogCode.Accepted:
-                self.statusBar().showMessage("MicroPython installed. Installing app...", 8000)
-                QtCore.QTimer.singleShot(_POST_MICROPYTHON_INSTALL_DELAY_MS, self._install_to_pico_after_firmware)
-            else:
-                self.statusBar().showMessage(
-                    "Install MicroPython first, then click Install firmware on device again.",
-                    8000,
-                )
-        else:
-            board_name = bp.name if bp else "device"
-            msg = (
-                f"No {board_name} detected. Connect the device via USB.\n\n"
-                "Ensure MicroPython is installed on the device."
-            )
-            if is_pico:
-                msg += "\nIf it's new, hold BOOTSEL while plugging in to install MicroPython first."
-            if conn_err and len(conn_err) < 500:
-                msg += f"\n\nConnection attempt output:\n{conn_err.strip()}"
-            elif conn_err:
-                msg += f"\n\nConnection attempt output:\n{conn_err[:500].strip()}..."
-            VintageMessageBox.information(self, "Install Firmware", msg)
+        board_name = bp.name if bp else "device"
+        msg = (
+            f"No {board_name} detected. Connect the device via USB.\n\n"
+            "Ensure MicroPython is installed on the device."
+        )
+        if conn_err and len(conn_err) < 500:
+            msg += f"\n\nConnection attempt output:\n{conn_err.strip()}"
+        elif conn_err:
+            msg += f"\n\nConnection attempt output:\n{conn_err[:500].strip()}..."
+        VintageMessageBox.information(self, "Install Firmware", msg)
 
     def _is_rpi_rp2_present(self) -> bool:
         """True if a drive with label RPI-RP2 (Pico in BOOTSEL) is present."""
@@ -10713,6 +12246,7 @@ class MainWindow(QtWidgets.QMainWindow):
         install_mode: str = "basic",
         dfplayer_eq: str = "normal",
         after_firmware: bool = False,
+        preferred_serial_port: Optional[str] = None,
     ) -> str:
         """Background worker: copy firmware files to Pico via mpremote CLI.
 
@@ -10774,6 +12308,13 @@ class MainWindow(QtWidgets.QMainWindow):
         total = 7
         step = 0
 
+        if progress_callback:
+            progress_callback(
+                0,
+                total,
+                "Preparing to copy Vintage Radio firmware to the Pico…",
+            )
+
         def _report(msg: str):
             nonlocal step
             if progress_callback:
@@ -10803,48 +12344,67 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def run_mpremote(args: List[str], timeout_sec: int = 30):
             return _run_mpremote(
-                mpremote_cmd, args, cwd=_mpremote_cwd, capture_output=True, text=True,
+                mpremote_cmd, _mpremote_args_with_connect(args, rp_port), cwd=_mpremote_cwd, capture_output=True, text=True,
                 timeout=timeout_sec, creationflags=creation_flags, env=env,
             )
 
         def run_mpremote_with_retry(args: List[str], timeout_sec: int = 30):
-            """Run mpremote; retry on 'no device found' while USB serial is still enumerating after flash/reboot."""
+            """Run mpremote; retry transient USB / REPL / port errors."""
             import time
 
             r = run_mpremote(args, timeout_sec=timeout_sec)
-            for attempt in range(5):
+            for attempt in range(6):
                 if r.returncode == 0:
                     return r
                 err = (r.stderr or "") + (r.stdout or "")
-                if "no device found" not in err.lower():
+                if not (
+                    _mpremote_failure_is_transient_no_device(r)
+                    or _mpremote_failure_is_transient_serial(r)
+                ):
                     return r
-                time.sleep(min(8.0, 2.0 + attempt * 2.0))
+                time.sleep(min(10.0, 1.5 + attempt * 1.5))
                 r = run_mpremote(args, timeout_sec=timeout_sec)
             return r
 
+        rp_port = _find_rp2040_serial_port(preferred=preferred_serial_port)
+
         if after_firmware:
-            if not _wait_mpremote_serial_ready(
+            wait_err = _wait_mpremote_serial_ready(
                 mpremote_cmd,
                 _mpremote_cwd,
                 progress_callback=progress_callback,
                 total_steps=total,
                 creationflags=creation_flags,
                 env=env,
-            ):
-                raise RuntimeError(
-                    "Timed out waiting for the Pico on USB serial after installing MicroPython.\n\n"
-                    "When the new COM port appears, run Setup Device again."
-                )
+                after_uf2_flash=True,
+                preferred_port=preferred_serial_port,
+            )
+            if wait_err is not None:
+                raise RuntimeError(wait_err)
+            rp_port = _find_rp2040_serial_port(preferred=preferred_serial_port)
+
+        if rp_port:
+            write_session_line(f"Pico install using explicit port {rp_port}", prefix="INSTALL")
 
         # ── Create directories (batched: one mpremote call) ──
         _report("Creating directories on Pico...")
         try:
             run_mpremote_with_retry(
-                ["exec", "import os; os.mkdir('components'); os.mkdir('VintageRadio')"],
+                ["exec", "import os\nfor d in ('components','VintageRadio'):\n try: os.mkdir(d)\n except OSError: pass"],
                 timeout_sec=15,
             )
         except Exception:
             pass  # directories may already exist
+
+        # Preflight: raw REPL + filesystem access (fails fast on blocking firmware / port contention).
+        _report("Checking MicroPython file transfer…")
+        probe = run_mpremote_with_retry(
+            ["exec", "import os; print('VR_INSTALL_PROBE', os.listdir())"],
+            timeout_sec=20,
+        )
+        probe_out = (probe.stdout or "") + (probe.stderr or "")
+        if probe.returncode != 0 or "VR_INSTALL_PROBE" not in probe_out:
+            raise RuntimeError(_format_install_mpremote_error(probe_out or "mpremote probe failed"))
 
         # ── Copy firmware files (one mpremote cp per file; batched cp requires dest to be a dir) ──
         _report("Copying main, radio_core, components (dfplayer + vintage_radio_ipc), …")
@@ -10861,11 +12421,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
             if r.returncode != 0:
-                raise RuntimeError(
-                    "Failed to copy firmware files.\n\n"
-                    "Ensure the Pico is connected via USB and running MicroPython.\n\n"
-                    f"{r.stderr or r.stdout or ''}"
-                )
+                detail = (r.stderr or "") + (r.stdout or "")
+                raise RuntimeError(_format_install_mpremote_error(detail))
 
         # ── Write pin_config.json from active profile ──
         _report("Writing pin configuration...")
@@ -11110,6 +12667,7 @@ class MainWindow(QtWidgets.QMainWindow):
         profile_params["install_mode"] = install_mode
         profile_params["dfplayer_eq"] = dfplayer_eq
         profile_params["after_firmware"] = after_firmware
+        profile_params["preferred_serial_port"] = _read_preferred_serial_port_from_ui(self)
         use_inprocess = mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__"
 
         title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
@@ -11129,6 +12687,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 args=(mpremote_cmd, root, self.sd_root, self.sd_manager),
                 kwargs=profile_params,
                 show_byte_detail=False,
+                initial_message=(
+                    "Waiting for MicroPython on USB serial after flash…"
+                    if after_firmware
+                    else "Preparing to copy Vintage Radio firmware to the Pico…"
+                ),
             )
 
             def on_success(msg):
@@ -11202,21 +12765,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if "python" in exe or (exe.startswith("/usr") and "mpremote" not in exe):
                 _mpremote_cwd = os.path.expanduser("~")
 
-        if not _wait_mpremote_serial_ready(
+        wait_err = _wait_mpremote_serial_ready(
             mpremote_cmd,
             _mpremote_cwd,
             progress_callback=progress_callback,
             total_steps=total,
             creationflags=creationflags,
             env=env,
-        ):
-            raise RuntimeError(
-                "Timed out waiting for the Pico on USB serial (mpremote could not open a session).\n\n"
-                "After installing MicroPython the board disconnects and comes back as a COM port; "
-                "that can take 10–30 seconds on some PCs.\n\n"
-                "Unplug/replug the Pico if nothing happens, close other apps using the COM port, "
-                "then try Setup Device again."
-            )
+            after_uf2_flash=True,
+        )
+        if wait_err is not None:
+            raise RuntimeError(wait_err)
 
         _report("Preparing Pico directories...")
         _run_mpremote_connect_auto_with_retry(
@@ -11620,8 +13179,6 @@ class MainWindow(QtWidgets.QMainWindow):
             bt = (self.db.get_setting("basic_trusted_sd_volume") or "").strip().upper()
             if bt:
                 label_matches.add(bt)
-            if sv:
-                label_matches.add(SYNC_TARGET_VOLUME_LABEL.strip().upper())
             if label_matches:
                 matched = [
                     path
@@ -12039,13 +13596,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _view_session_log(self) -> None:
         """Show the session log on the Tools tab (basic) or open in the system editor."""
         if self.devices_view_mode in ("basic", "advanced"):
-            sidebar = getattr(self, "_sidebar", None)
-            if _qt_widget_alive(sidebar):
-                sidebar.set_active(self._PAGE_TOOLS)
-            self._on_sidebar_nav(self._PAGE_TOOLS)
+            self._open_tools_tab("session_logs")
             page = getattr(self, "_tools_page", None)
             if _qt_widget_alive(page):
-                page.set_mode("session_logs")
                 page.session_logs_panel._refresh_full()
                 return
         from .session_log import get_session_log_path

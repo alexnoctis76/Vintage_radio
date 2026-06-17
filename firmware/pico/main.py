@@ -563,6 +563,10 @@ class VintageRadioFirmware:
                 # Poll volume potentiometer ADC (self-throttled to ~50ms intervals)
                 if getattr(self.hw, 'poll_volume_adc', None):
                     self.hw.poll_volume_adc()
+
+                update_led = getattr(self.hw, "update_playback_led", None)
+                if update_led is not None:
+                    update_led(is_playing=getattr(self.core, "is_playing", False))
             except OSError as e:
                 print("Main loop recoverable error:", e)
             

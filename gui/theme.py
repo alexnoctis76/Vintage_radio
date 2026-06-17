@@ -276,9 +276,12 @@ SB_TRK_BORDER_R     = "rgba(83,52,24,0.22)"
 SB_TRK_ARROW_COLOR  = "#543a23"   # chevron colour on light bg
 
 # Shared thumb gradient (same for both panes)
-SB_THUMB_GRAD_TOP   = "#eba04d"
-SB_THUMB_GRAD_MID   = "#db852e"
-SB_THUMB_GRAD_BOT   = "#c46617"
+SB_THUMB_GRAD_TOP     = "#eba04d"
+SB_THUMB_GRAD_MID     = "#db852e"
+SB_THUMB_GRAD_BOT     = "#c46617"
+# Station-specific thumb top (dark rail variant).  Defaults to SB_THUMB_GRAD_TOP;
+# override in palettes where the station and track rails have different luminances.
+SB_STA_THUMB_GRAD_TOP = SB_THUMB_GRAD_TOP
 SB_THUMB_BORDER     = "#9f4c12"
 SB_THUMB_W_MARGIN   = 8   # px margin each side → effective thumb width = SCROLLBAR_W - 2×8 = 14px
 

@@ -20,6 +20,55 @@ except ImportError:
     SERIAL_AVAILABLE = False
 
 
+def live_vrtest_arg_for_command(command: str) -> Optional[str]:
+    """Map Send Command text to a VRTEST arg when it can run without Ctrl+C (REPL).
+
+    Returns None when the command must use the REPL path (interrupts main.py).
+    """
+    text = (command or "").strip()
+    if not text:
+        return None
+    # Single-line only; multiline REPL snippets stay on the interrupt path.
+    if "\n" in text:
+        return None
+    normalized = text.rstrip(";").strip()
+    lowered = normalized.lower()
+    live_map = {
+        "gc.mem_free()": "mem_free",
+        "import gc; gc.mem_free()": "mem_free",
+        "mem_free": "mem_free",
+        "gc.collect()": "gc_collect",
+        "import gc; gc.collect()": "gc_collect",
+        "gc_collect": "gc_collect",
+        "collect": "gc_collect",
+    }
+    if lowered in live_map:
+        return live_map[lowered]
+    return None
+
+
+def format_live_vrtest_result(device: dict) -> str:
+    """Human-readable stdout for a VRTEST_RESULT object from the device."""
+    if not device.get("ok"):
+        err = device.get("error", "unknown")
+        detail = device.get("detail", "")
+        return f"VRTEST error: {err}" + (f" ({detail})" if detail else "")
+    cmd = device.get("cmd", "")
+    if cmd == "mem_free":
+        return "mem_free: {} bytes".format(device.get("mem_free", "?"))
+    if cmd == "gc_collect":
+        before = device.get("mem_free_before", "?")
+        after = device.get("mem_free_after", "?")
+        recovered = device.get("recovered", "?")
+        return (
+            "gc.collect() complete — mem_free before: {} bytes, after: {} bytes "
+            "(recovered {} bytes)".format(before, after, recovered)
+        )
+    if cmd == "get_state" and isinstance(device.get("state"), dict):
+        return json.dumps(device["state"], indent=2, sort_keys=True)
+    return json.dumps(device, indent=2, sort_keys=True)
+
+
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
@@ -298,13 +347,20 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         # Command input
         cmd_group = QtWidgets.QGroupBox("Send Command")
+        cmd_group.setToolTip(
+            "gc.mem_free() and gc.collect() run live via VRTEST (playback continues). "
+            "Other commands use the REPL (Ctrl+C stops main.py until Restart Firmware)."
+        )
         cmd_layout = QtWidgets.QVBoxLayout(cmd_group)
         cmd_layout.setSpacing(6)
         
         cmd_input_layout = QtWidgets.QHBoxLayout()
         cmd_input_layout.setSpacing(t.TOOLS_DEBUG_ROW_GAP)
         self.cmd_input = QtWidgets.QLineEdit()
-        self.cmd_input.setPlaceholderText("Enter Python command (e.g., print('Hello')) or 'help' for examples")
+        self.cmd_input.setPlaceholderText(
+            "Python command — gc.mem_free() / gc.collect() keep playback running; "
+            "type help for more"
+        )
         self.cmd_input.returnPressed.connect(self._send_command)
         cmd_input_layout.addWidget(self.cmd_input, 1)
         
@@ -766,32 +822,24 @@ class DeviceDebugWidget(QtWidgets.QWidget):
     def _is_rp2040_port(port_info: Any) -> bool:
         """Best-effort: Raspberry Pi Pico / RP2040 USB CDC.
 
-        Prefer ``ListPortInfo.vid`` (reliable on Windows) when present. Some drivers
-        omit VID in ``hwid`` or use generic descriptions, so we also match common
-        vendor/product strings.
+        Requires Raspberry Pi USB vendor id 0x2E8A when the OS reports VID/PID.
+        Bluetooth and other virtual COM ports are excluded explicitly.
         """
+        hwid = (getattr(port_info, "hwid", "") or "").upper()
+        if "BTHENUM" in hwid or "BLUETOOTH" in hwid:
+            return False
+        desc = (getattr(port_info, "description", "") or "").upper()
+        if "BLUETOOTH" in desc:
+            return False
         try:
             vid = getattr(port_info, "vid", None)
-            if vid is not None and int(vid) == 0x2E8A:
-                return True
+            if vid is not None:
+                return int(vid) == 0x2E8A
         except (TypeError, ValueError):
             pass
-        hwid = (getattr(port_info, "hwid", "") or "").upper()
         if "2E8A" in hwid:
             return True
-        desc = (getattr(port_info, "description", "") or "").upper()
-        manufacturer = (getattr(port_info, "manufacturer", "") or "").upper()
-        product = (getattr(port_info, "product", "") or "").upper()
-        interface = (getattr(port_info, "interface", "") or "").upper()
-        combined = f"{desc} {manufacturer} {product} {interface}"
-        needles = (
-            "RASPBERRY PI",
-            "RP2040",
-            "PICO",
-            "PI PICO",
-            "RPI-RP2",
-        )
-        return any(n in combined for n in needles)
+        return False
 
     def _list_rp2040_devices(self) -> Tuple[str, ...]:
         """Sorted tuple of RP2040 serial ports only."""
@@ -1335,12 +1383,15 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self._debug_log("Command already executing, ignoring", "warning")
             return
         
+        live_vrtest = live_vrtest_arg_for_command(command)
+        
         self._active_operations.add(op_id)
-        self._log(f">>> {command}", "command")
+        route = "VRTEST (live)" if live_vrtest else "REPL (Ctrl+C)"
+        self._log(f">>> {command}  [{route}]", "command")
         self.cmd_input.clear()
         
         port = self.port_combo.currentData()
-        self._debug_log(f"Sending command to {port}: {command[:100]}", "info")
+        self._debug_log(f"Sending command to {port}: {command[:100]} via {route}", "info")
         
         def run_command():
             try:
@@ -1354,6 +1405,37 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                         QtCore.Q_ARG(str, ""),
                         QtCore.Q_ARG(str, "pyserial not available."),
                         QtCore.Q_ARG(int, 0)
+                    )
+                    return
+                
+                if live_vrtest:
+                    result = self.run_vrtest_command(live_vrtest, timeout=10)
+                    self._active_operations.discard(op_id)
+                    if not result.get("ok"):
+                        err = result.get("error", "vrtest_failed")
+                        detail = result.get("detail") or result.get("hint") or ""
+                        stderr = "{}: {}".format(err, detail).strip(": ")
+                        QtCore.QMetaObject.invokeMethod(
+                            self,
+                            "_display_command_result",
+                            QtCore.Qt.ConnectionType.QueuedConnection,
+                            QtCore.Q_ARG(int, 1),
+                            QtCore.Q_ARG(str, ""),
+                            QtCore.Q_ARG(str, stderr),
+                            QtCore.Q_ARG(int, 0),
+                        )
+                        return
+                    device = result.get("device") or {}
+                    stdout = format_live_vrtest_result(device)
+                    rc = 0 if device.get("ok") else 1
+                    QtCore.QMetaObject.invokeMethod(
+                        self,
+                        "_display_command_result",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                        QtCore.Q_ARG(int, rc),
+                        QtCore.Q_ARG(str, stdout),
+                        QtCore.Q_ARG(str, ""),
+                        QtCore.Q_ARG(int, 0),
                     )
                     return
                 
@@ -2533,11 +2615,13 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         """Show help with example commands."""
         help_text = """
 Example Commands (sent to device):
-  print('Hello from Pico!')
+  gc.mem_free()  — live (playback continues)
+  gc.collect()   — live (runs gc.collect() on device)
+  import gc; gc.mem_free()
+  print('Hello from Pico!')  — REPL (Ctrl+C stops firmware; use Restart Firmware after)
   import machine; machine.Pin(2).value()
   from components.dfplayer_hardware import DFPlayerHardware; hw = DFPlayerHardware()
   import os; os.listdir()
-  import gc; gc.mem_free()
 
 GUI Commands (not sent to device):
   check_amplifier - Run amplifier diagnostic

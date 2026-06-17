@@ -1,4 +1,4 @@
-"""Tests for DeviceDebugWidget serial stream parsing and protocol logic.
+﻿"""Tests for DeviceDebugWidget serial stream parsing and protocol logic.
 
 These tests validate the parsing logic without requiring real hardware.
 We test _parse_stream_for_now_playing, command output parsing, and
@@ -192,6 +192,56 @@ class TestStreamParsing:
         state = self._fresh_state()
         _parse_stream_line("[MODE] album -> playlist, album_idx=3", state)
         assert state["album_idx"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Live VRTEST command routing (Send Command without Ctrl+C)
+# ---------------------------------------------------------------------------
+
+class TestLiveVrtestCommandRouting:
+    def test_mem_free_variants(self):
+        from gui.device_debug import live_vrtest_arg_for_command
+
+        assert live_vrtest_arg_for_command("gc.mem_free()") == "mem_free"
+        assert live_vrtest_arg_for_command("import gc; gc.mem_free()") == "mem_free"
+        assert live_vrtest_arg_for_command("mem_free") == "mem_free"
+        assert live_vrtest_arg_for_command("gc.mem_free();") == "mem_free"
+
+    def test_gc_collect_variants(self):
+        from gui.device_debug import live_vrtest_arg_for_command
+
+        assert live_vrtest_arg_for_command("gc.collect()") == "gc_collect"
+        assert live_vrtest_arg_for_command("import gc; gc.collect()") == "gc_collect"
+        assert live_vrtest_arg_for_command("gc_collect") == "gc_collect"
+
+    def test_repl_only_commands_return_none(self):
+        from gui.device_debug import live_vrtest_arg_for_command
+
+        assert live_vrtest_arg_for_command("print('hi')") is None
+        assert live_vrtest_arg_for_command("import os\nos.listdir()") is None
+
+    def test_format_mem_free(self):
+        from gui.device_debug import format_live_vrtest_result
+
+        out = format_live_vrtest_result({"ok": True, "cmd": "mem_free", "mem_free": 123456})
+        assert "123456" in out
+        assert "mem_free" in out
+
+    def test_format_gc_collect(self):
+        from gui.device_debug import format_live_vrtest_result
+
+        out = format_live_vrtest_result(
+            {
+                "ok": True,
+                "cmd": "gc_collect",
+                "mem_free_before": 100000,
+                "mem_free_after": 120000,
+                "recovered": 20000,
+            }
+        )
+        assert "100000" in out
+        assert "120000" in out
+        assert "20000" in out
 
 
 # ---------------------------------------------------------------------------
