@@ -117,7 +117,8 @@ def test_sniff_suggests_app_firmware():
     assert not _sniff_suggests_app_firmware("MicroPython v1.23.0 on 2024-01-01; Raspberry Pi Pico\n>>> ")
 
 
-def test_pico_assessment_skips_mpremote_for_idle_app(monkeypatch):
+def test_pico_assessment_tries_mpremote_before_reflash(monkeypatch):
+    """UART sniff alone must not skip mpremote (avoids false 'third-party' on Vintage Radio)."""
     sniff = (
         "Now Playing: Album 01 Track 001\n"
         "DFPlayer online, ready to proceed\n"
@@ -126,13 +127,45 @@ def test_pico_assessment_skips_mpremote_for_idle_app(monkeypatch):
     monkeypatch.setattr(rm, "_find_rp2040_serial_port", lambda preferred=None: "COM6")
     monkeypatch.setattr(rm, "_sniff_rp2040_serial_text", lambda *a, **k: sniff)
 
-    def fail_mpremote(*_a, **_k):
-        raise AssertionError("mpremote should not run for idle app firmware")
+    probe_calls: list[str] = []
 
-    monkeypatch.setattr(rm, "_run_mpremote_probe", fail_mpremote)
+    def fake_probe(_cmd, port, cwd, **kw):
+        probe_calls.append(port)
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "could not enter raw repl"})()
+
+    monkeypatch.setattr(rm, "_run_mpremote_probe", fake_probe)
+    monkeypatch.setattr(
+        rm,
+        "_run_mpremote",
+        lambda *_a, **_k: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})(),
+    )
+    result = rm._pico_install_assessment(["mpremote"], rm.Path("."))
+    assert probe_calls == ["COM6"]
+    assert result["status"] == "needs_reflash"
+    assert result["blocking_label"] in (
+        "third-party firmware",
+        "custom firmware (raw REPL blocked)",
+    )
+
+
+def test_pico_assessment_vintage_radio_mpremote_fail_suggests_retry(monkeypatch):
+    sniff = "[12:00:01.000] DF: Playing folder=01 track=001\n"
+    monkeypatch.setattr(rm, "_find_rp2040_serial_port", lambda preferred=None: "COM6")
+    monkeypatch.setattr(rm, "_sniff_rp2040_serial_text", lambda *a, **k: sniff)
+
+    def fake_probe(_cmd, port, cwd, **kw):
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "could not enter raw repl"})()
+
+    monkeypatch.setattr(rm, "_run_mpremote_probe", fake_probe)
+    monkeypatch.setattr(
+        rm,
+        "_run_mpremote",
+        lambda *_a, **_k: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})(),
+    )
     result = rm._pico_install_assessment(["mpremote"], rm.Path("."))
     assert result["status"] == "needs_reflash"
-    assert result["blocking_label"] == "third-party firmware"
+    assert result.get("vintage_radio_detected") is True
+    assert "Vintage Radio" in (result.get("blocking_label") or "")
 
 
 def test_bootsel_preflight_rejects_active_serial(tmp_path, monkeypatch):

@@ -772,14 +772,33 @@ def _serial_output_indicates_vintage_radio_firmware(text: str) -> bool:
         "basic: discovering stations",
         "basic: seeded",
         "--- dfplayer comms check (basic mode) ---",
+        "boot sequence starting",
+        "track finished",
+        "auto-advanced:",
         "#vrdbg",
+        "vrtest ipc",
+        "vrtest_result",
     )
     if any(marker in lower for marker in vintage_markers):
         return True
-    # Runtime dfplayer_hardware.py lines (basic mode) — distinct from Retro Radio banners.
-    if "df: playing" in lower and "retro radio" not in lower:
-        return True
+    # Timestamped dfplayer_hardware.py lines (``[HH:MM:SS.mmm] DF: …``).
+    if " df: " in lower or lower.lstrip().startswith("df:"):
+        if "retro radio" not in lower:
+            return True
     return False
+
+
+def _pico_install_reflash_label(sniff: str, probe_out: str) -> Optional[str]:
+    """Human label when mpremote install path failed (after probe, not from sniff alone)."""
+    combined = f"{sniff}\n{probe_out}".strip()
+    if _serial_output_indicates_vintage_radio_firmware(combined):
+        return "Vintage Radio firmware (file transfer unavailable)"
+    label = _serial_output_indicates_blocking_firmware(combined)
+    if label:
+        return label
+    if _sniff_suggests_app_firmware(sniff):
+        return "third-party firmware"
+    return None
 
 
 def _serial_output_indicates_blocking_firmware(text: str) -> Optional[str]:
@@ -966,20 +985,10 @@ def _pico_install_assessment(
 
     _progress(f"Reading firmware output on {port}…")
     sniff = _sniff_rp2040_serial_text(port)
-    blocking = _serial_output_indicates_blocking_firmware(sniff)
-    if not blocking and len(sniff.strip()) < 80:
+    if len(sniff.strip()) < 80:
         sniff = sniff + _sniff_rp2040_serial_text(
             port, duration_s=2.5, interrupt_uart=True,
         )
-        blocking = _serial_output_indicates_blocking_firmware(sniff)
-    if blocking:
-        _progress(f"Detected {blocking} on {port} — MicroPython flash required.")
-        return {
-            "status": "needs_reflash",
-            "port": port,
-            "blocking_label": blocking,
-            "sniff": sniff,
-        }
 
     if _serial_output_indicates_vintage_radio_firmware(sniff):
         _progress(
@@ -990,15 +999,6 @@ def _pico_install_assessment(
             f"Testing MicroPython file transfer on {port} "
             f"(up to {_MPREMOTE_PROBE_TIMEOUT_S}s)…"
         )
-    elif _sniff_suggests_app_firmware(sniff):
-        label = _serial_output_indicates_blocking_firmware(sniff) or "third-party firmware"
-        _progress(f"Detected {label} on {port} — MicroPython flash required.")
-        return {
-            "status": "needs_reflash",
-            "port": port,
-            "blocking_label": label,
-            "sniff": sniff,
-        }
     else:
         _progress(
             f"Testing MicroPython file transfer on {port} "
@@ -1023,18 +1023,15 @@ def _pico_install_assessment(
         if repl.returncode == 0 and "VR_INSTALL_PROBE" in repl_out:
             return {"status": "ready", "port": port}
 
-    if _serial_output_indicates_blocking_firmware(probe_out):
-        return {
-            "status": "needs_reflash",
-            "port": port,
-            "blocking_label": _serial_output_indicates_blocking_firmware(probe_out),
-            "sniff": probe_out,
-        }
+    reflash_label = _pico_install_reflash_label(sniff, probe_out)
     return {
         "status": "needs_reflash",
         "port": port,
-        "blocking_label": None,
+        "blocking_label": reflash_label,
         "sniff": probe_out or sniff,
+        "vintage_radio_detected": _serial_output_indicates_vintage_radio_firmware(
+            f"{sniff}\n{probe_out}"
+        ),
     }
 
 
@@ -7134,7 +7131,25 @@ class MainWindow(QtWidgets.QMainWindow):
             }
 
         blocking_label = assessment.get("blocking_label")
+        vintage_detected = bool(assessment.get("vintage_radio_detected"))
         if status == "needs_reflash":
+            if vintage_detected:
+                return {
+                    "action": "message",
+                    "level": "warning",
+                    "title": "Install Vintage Radio",
+                    "message": (
+                        "Vintage Radio is already running on the Pico, but the installer "
+                        "could not copy updated files over USB serial.\n\n"
+                        "Try:\n"
+                        "  1. Disconnect Tools → Debugger (and close any other app using "
+                        "the serial port)\n"
+                        "  2. Click Install Firmware again\n\n"
+                        "Do not enter BOOTSEL unless you intend to replace MicroPython "
+                        "and erase the current firmware entirely."
+                    ),
+                    "status_message": "Install blocked — release the serial port and retry.",
+                }
             if blocking_label:
                 intro = (
                     f"Detected {blocking_label}.\n\n"
