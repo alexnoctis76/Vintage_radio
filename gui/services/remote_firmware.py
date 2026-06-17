@@ -10,13 +10,15 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from gui.resource_paths import app_data_dir, project_root
+
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent
+    return project_root()
 
 
 def firmware_cache_dir() -> Path:
-    cache = _project_root() / "data" / "firmware_cache"
+    cache = app_data_dir() / "firmware_cache"
     cache.mkdir(parents=True, exist_ok=True)
     return cache
 

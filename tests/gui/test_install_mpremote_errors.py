@@ -53,6 +53,61 @@ def test_detect_blocking_serial_idle_now_playing():
     assert _serial_output_indicates_blocking_firmware(sniff) == "third-party firmware"
 
 
+def test_vintage_radio_firmware_not_blocking():
+    from gui.radio_manager import (
+        _serial_output_indicates_vintage_radio_firmware,
+        _sniff_suggests_app_firmware,
+    )
+
+    boot = "Booting Vintage Radio (BASIC MODE)\n--- DFPlayer comms check (basic mode) ---"
+    assert _serial_output_indicates_vintage_radio_firmware(boot)
+    assert _serial_output_indicates_blocking_firmware(boot) is None
+
+    idle = "BASIC MODE active. Button patterns:\nDF: Playing folder=01 track=001"
+    assert _serial_output_indicates_vintage_radio_firmware(idle)
+    assert _serial_output_indicates_blocking_firmware(idle) is None
+    assert not _sniff_suggests_app_firmware(idle)
+
+
+def test_pico_assessment_vintage_radio_runs_mpremote(monkeypatch):
+    sniff = (
+        "Booting Vintage Radio (BASIC MODE)\n"
+        "BASIC MODE active. Button patterns:\n"
+    )
+    monkeypatch.setattr(rm, "_find_rp2040_serial_port", lambda preferred=None: "COM6")
+    monkeypatch.setattr(rm, "_sniff_rp2040_serial_text", lambda *a, **k: sniff)
+
+    probe_calls: list[str] = []
+
+    def fake_probe(_cmd, port, cwd, **kw):
+        probe_calls.append(port)
+        return type("R", (), {"returncode": 0, "stdout": "micropython", "stderr": ""})()
+
+    def fake_run(_cmd, args, **_kw):
+        return type(
+            "R",
+            (),
+            {"returncode": 0, "stdout": "VR_INSTALL_PROBE 8", "stderr": ""},
+        )()
+
+    monkeypatch.setattr(rm, "_run_mpremote_probe", fake_probe)
+    monkeypatch.setattr(rm, "_run_mpremote", fake_run)
+    result = rm._pico_install_assessment(["mpremote"], rm.Path("."))
+    assert result["status"] == "ready"
+    assert probe_calls == ["COM6"]
+
+
+def test_micropython_cache_uses_app_data_dir(tmp_path, monkeypatch):
+    from gui.services import firmware_bundle as fb
+
+    data = tmp_path / "appdata"
+    data.mkdir()
+    monkeypatch.setattr(fb, "app_data_dir", lambda: data)
+    cache = fb._micropython_cache_dir()
+    assert cache == data / "firmware_cache" / "micropython"
+    assert cache.is_dir()
+
+
 def test_sniff_suggests_app_firmware():
     from gui.radio_manager import _sniff_suggests_app_firmware, _sniff_suggests_stock_micropython_repl
 

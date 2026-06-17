@@ -762,8 +762,30 @@ _MPREMOTE_MICROPYTHON_PROBE = (
 _MPREMOTE_PROBE_TIMEOUT_S = 22
 
 
+def _serial_output_indicates_vintage_radio_firmware(text: str) -> bool:
+    """True when UART output is from our main_basic / Vintage Radio stack (not ZBVR/Retro Radio)."""
+    lower = (text or "").lower()
+    vintage_markers = (
+        "booting vintage radio",
+        "vintage radio main() [basic mode]",
+        "basic mode active",
+        "basic: discovering stations",
+        "basic: seeded",
+        "--- dfplayer comms check (basic mode) ---",
+        "#vrdbg",
+    )
+    if any(marker in lower for marker in vintage_markers):
+        return True
+    # Runtime dfplayer_hardware.py lines (basic mode) — distinct from Retro Radio banners.
+    if "df: playing" in lower and "retro radio" not in lower:
+        return True
+    return False
+
+
 def _serial_output_indicates_blocking_firmware(text: str) -> Optional[str]:
     """Return a short firmware label when serial output is not stock MicroPython REPL."""
+    if _serial_output_indicates_vintage_radio_firmware(text):
+        return None
     lower = (text or "").lower()
     if "could not enter raw repl" in lower:
         return "custom firmware (raw REPL blocked)"
@@ -959,7 +981,11 @@ def _pico_install_assessment(
             "sniff": sniff,
         }
 
-    if _sniff_suggests_stock_micropython_repl(sniff):
+    if _serial_output_indicates_vintage_radio_firmware(sniff):
+        _progress(
+            f"Vintage Radio firmware detected on {port} — preparing file update…"
+        )
+    elif _sniff_suggests_stock_micropython_repl(sniff):
         _progress(
             f"Testing MicroPython file transfer on {port} "
             f"(up to {_MPREMOTE_PROBE_TIMEOUT_S}s)…"
@@ -1025,6 +1051,8 @@ def _sniff_suggests_stock_micropython_repl(text: str) -> bool:
 def _sniff_suggests_app_firmware(text: str) -> bool:
     """True when UART shows a running app, not an idle MicroPython REPL."""
     if not text or len(text.strip()) < 20:
+        return False
+    if _serial_output_indicates_vintage_radio_firmware(text):
         return False
     if _sniff_suggests_stock_micropython_repl(text):
         return False

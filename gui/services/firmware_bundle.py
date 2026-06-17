@@ -7,17 +7,22 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from gui.resource_paths import project_root
+from gui.resource_paths import app_data_dir, project_root
 
 _UF2_PATTERN = re.compile(r'href="(/resources/firmware/RPI_PICO[^"]*\.uf2)"')
 MICROPYTHON_PICO_URL = "https://micropython.org/download/RPI_PICO/"
 FLASH_NUKE_URL = "https://datasheets.raspberrypi.com/soft/flash_nuke.uf2"
 
 
-def _flash_nuke_cache_dir() -> Path:
-    cache = project_root() / "data" / "firmware_cache" / "flash_nuke"
+def _writable_firmware_cache_dir(*parts: str) -> Path:
+    """User-writable cache (never inside a frozen .app bundle / _MEIPASS)."""
+    cache = app_data_dir().joinpath("firmware_cache", *parts)
     cache.mkdir(parents=True, exist_ok=True)
     return cache
+
+
+def _flash_nuke_cache_dir() -> Path:
+    return _writable_firmware_cache_dir("flash_nuke")
 
 
 def fetch_flash_nuke_uf2(*, force: bool = False) -> Path:
@@ -36,9 +41,7 @@ def fetch_flash_nuke_uf2(*, force: bool = False) -> Path:
 
 
 def _micropython_cache_dir() -> Path:
-    cache = project_root() / "data" / "firmware_cache" / "micropython"
-    cache.mkdir(parents=True, exist_ok=True)
-    return cache
+    return _writable_firmware_cache_dir("micropython")
 
 
 def bundled_vintage_radio_full_uf2() -> Optional[Path]:
