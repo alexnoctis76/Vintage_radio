@@ -1,0 +1,87 @@
+---
+description: Minimum physical device test requirements before and after any firmware or radio-logic change.
+alwaysApply: true
+---
+
+# Physical Device Testing — Minimum Requirements
+
+> **BASIC MODE ONLY.** The Pico runs `main_basic.py` (flashed as `main.py`). Legacy/full mode
+> (`main.py` with `radio_metadata.json`) is **never** tested here. Do not add legacy-mode test
+> steps. See `legacy-mode-freeze.md` for the freeze policy.
+
+Run **`run_full_acceptance`** via the `vintage_radio_debug_request` MCP tool (method `run_full_acceptance`, target `device`) before declaring any firmware or radio-logic change correct. The suite must **PASS** with no failed steps.
+
+## Cursor agent — physical device is mandatory
+
+- **Always run the full physical-device acceptance** (`run_full_acceptance` / `python agent_workshop/run_full_acceptance.py`) when you change anything that affects the Pico, DFPlayer path, `radio_core`, acceptance harness (`mcp_device_acceptance.py`), or device/MCP wiring — **in the same session**, before you tell the user the work is done.
+- **MCP is mandatory for edge cases, not optional:** after any such change, drive the **Vintage Radio MCP debug server** (TCP `127.0.0.1:8765`) in the same session — at minimum `ping` → `get_connection_state` → `device_connect` (if needed) → **`run_full_acceptance`** (or `run_acceptance_suite` with a profile that covers the touched behavior when you are iterating, then **`run_full_acceptance`** before sign-off). Exercise gestures and modes the diff affects (e.g. station shuffle end-of-station, long_press station advance, revert paths), not only the happy path. **Host `pytest` supplements MCP; it does not replace it.**
+- **Host `pytest` alone is never sufficient** for those changes; it only supplements. If Vintage Radio is not running, MCP is down, or COM is unavailable, **state that explicitly** and treat the task as **blocked** until the suite can run — do not imply verification without it.
+- If the suite **FAIL**s, capture the failed step names and artifacts under `agent_workshop/reports/` (or `full_acceptance_report.json`) in your reply.
+
+## What the full suite validates (non-negotiable)
+
+All checks run against **basic mode** (DFPlayer folder-based station discovery, no `radio_metadata.json`).
+
+1. **Station discovery** — `total_playlists >= 1` at boot with no boot errors (field name is legacy; value = **station count**).
+2. **Ordered station playback — 5 consecutive tracks** (firmware reports IPC `mode=playlist`; this is **not** a host “music playlist”, only sequential tracks on the current station)
+   - Each track must start (busy_pin=0) within **8 seconds** of the tap gesture.
+   - Each track must still be playing **4 seconds** after it started (**suite intentionally waits** this long to verify sustained play — long log gaps are often harness time, not the radio stalling between tracks).
+   - **Phase 1a — natural auto-advance (no taps):** serial timing **≤ ~1.55 s** host-measured from `Track finished, auto-advancing` → next `DF: BUSY went LOW -> playback started`, **2 samples**; busy_pin fallback **≤ 1 s** if serial path cannot complete.
+   - **Phase 1b — gestures:** `double_tap` (previous track) must change track or station index; `triple_tap` must land on **track 1**; serial should show double/triple tap handling. (Firmware also exposes `four_tap` / `five_tap` for previous station and first station; the default full suite does not require them unless a change targets that behavior.)
+   - Audio output on line-in must be audible (`rms_dbfs > -55 dB`; host capture device is auto-selected, prefer **Vintage Radio Line In** if renamed in Windows).
+   - **DFPlayer must be actively playing** during line-in capture; the suite ensures `busy_pin=0` before recording (or issues `single_tap` first).
+   - No `Traceback`, `MemoryError`, or `FATAL:` lines in serial after the phase.
+3. **Station advance — 3 stations via long_press**
+   - Each station must change `current_album_index` (station index) and settle into playback.
+4. **Shuffle-station mode (double_tap_long_press)** — **Phase 3a natural auto-advance** (same **2-sample** serial **≤ ~1.55 s** / busy rules), then **5 tracks** via `single_tap` (same timing/audio/error rules as #2).
+5. **triple_tap_long_press** — **Phase 4** verifies **station 1** track shuffle (`shuffle_source_type=station`, `current_album_index=0`). Full-library shuffle is **removed**; double+hold still reshuffles the **current** station.
+6. **Revert (tap_long_press)** — IPC mode must return to `playlist` (ordered station) and 2 tracks must play.
+7. **Final serial error scan** — no hard errors in the full tail after all phases.
+
+## How to run
+
+**Preferred (live logs in the app):** With Vintage Radio open, Developer → **Run full device acceptance (physical)…**. Progress streams to the **MCP / session log** (same file as `[MCP]` lines). After each major phase the suite pastes a **Pico serial** block (last N lines from the device stream ring) so firmware `print` output appears next to test steps — not only the separate serial text view. Full run is typically **18–40+ minutes**; each line-in capture blocks for several seconds with no new lines (normal). The suite runs on a **worker thread** so the UI stays responsive.
+
+**From Cursor / automation** (same engine as above — app must be running):
+
+```python
+# call_mcp_tool → project-0-Vintage_radio-vintage-radio-debug
+{
+  "method": "run_full_acceptance",
+  "params": {"target": "device"}
+}
+```
+
+**Automation:** `python agent_workshop/run_full_acceptance.py` prints timestamps in a terminal; it drives the **same** in-app TCP server as the GUI. JSON summary: `agent_workshop/full_acceptance_report.json`. **Device tab must be connected** to COM (and streaming) before the script runs, or Phase 0 fails with `not_connected`.
+
+MCP method `run_full_acceptance` requires a **current** Vintage Radio build that exposes it on the debug server; if the MCP bridge returns `unknown_method`, use `run_full_acceptance.py` instead (same suite).
+
+The `vintage_radio_debug_request` tool must be reachable (MCP TCP on **127.0.0.1:8765**, device connected + streaming as needed).
+
+## IPC gestures available (vintage_radio_ipc.py on Pico)
+
+| Gesture | Behavior (basic mode) |
+|---|---|
+| `ping` | IPC health check |
+| `get_state` | Returns mode, track, `current_album_index` (station idx), `playing_folder`, busy_pin, is_playing, shuffle_source_type |
+| `single_tap` | Next track |
+| `double_tap` | Previous track |
+| `triple_tap` | Restart station at track 1 |
+| `four_tap` | Previous station (or previous source in station shuffle) |
+| `five_tap` | First station (exits track shuffle); advanced: first album/playlist |
+| `long_press` | Next station |
+| `tap_long_press` | Exit shuffle → playlist mode |
+| `double_tap_long_press` | Shuffle current station |
+| `triple_tap_long_press` | First station + track shuffle (stays in shuffle) |
+
+## After firmware changes
+
+1. Flash changed files to Pico (`mpremote connect COM6 cp <file> :<dest>`).
+2. `invoke_action` → `restart_firmware`, wait 8 s, reconnect + start streaming.
+3. Run `run_full_acceptance` and confirm **PASS**.
+
+## Failure threshold
+
+- Any `FAIL` step in phases 1–7 above **blocks** the change from being considered done.
+- `SKIP` steps (e.g. line-in device not found) are acceptable only when hardware is genuinely absent — document the gap explicitly.
+- Warn-level patterns (`fallback to`, `BUSY=1`, `compact load retry`) in error scans must be investigated and explained before sign-off.

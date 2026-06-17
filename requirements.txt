@@ -1,9 +1,22 @@
-PyQt6>=6.6.0
+PyQt6>=6.8.0
 mutagen>=1.47.0
-pygame>=2.5.2
+# Drop-in for pygame (same `import pygame`). Upstream pygame often has no wheel for
+# brand-new Python (e.g. 3.14) and then fails to compile on Apple Silicon; pygame-ce does.
+pygame-ce>=2.5.2
 psutil>=5.9.0
 pydub>=0.25.1
+imageio-ffmpeg
 python-vlc>=3.0.20123
 mpremote>=1.0.0
 pyserial>=3.5
-
+certifi>=2023.7.22
+pytest>=8.0.0
+# Stdio MCP bridge for Cursor: scripts/vintage_radio_debug_mcp_bridge.py
+mcp>=1.2.0
+# Line-in capture for MCP line_in_analyze (DFPlayer bench testing)
+numpy>=1.26.0
+sounddevice>=0.4.6
+# Experimental: FAT32 disk image export from synced SD folder (gui/experimental_sd_image.py)
+pyfatfs>=1.0.0
+# pyfatfs -> fs still imports pkg_resources. Setuptools 82+ removed that module; pin below 82.
+setuptools>=65.0.0,<82.0.0

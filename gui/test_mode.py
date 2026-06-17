@@ -27,7 +27,7 @@ from .resource_paths import app_data_dir, resource_path
 from .sd_manager import SDManager
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "firmware"))
 from radio_core import (
     RadioCore, HardwareInterface,
     DF_BOOT_MS, LONG_PRESS_MS, TAP_WINDOW_MS,
@@ -310,7 +310,14 @@ class TestModeWidget(QtWidgets.QWidget):
             log_callback=self._log,
             am_wav_path=am_wav if am_wav.exists() else None,
         )
-        
+
+        # Audio (VLC/pygame) is initialized lazily on first play so the main window can appear
+        # immediately; vlc.Instance() can block for tens of seconds on some macOS systems.
+
+        # Reflect emulator audio state in the widget
+        self.audio_ready = getattr(self.hw_emulator, '_audio_ready', False)
+        self.am_sound = getattr(self.hw_emulator, '_am_sound', None)
+
         # Initialize RadioCore - THE SAME LOGIC AS FIRMWARE
         self.core = RadioCore(self.hw_emulator)
         self.resume_position_ms: Optional[int] = None
@@ -319,7 +326,6 @@ class TestModeWidget(QtWidgets.QWidget):
         self.resume_track: Optional[int] = None
         self.audio_ready = False
         self.am_sound = None
-        self.am_channel = None
         self.target_volume = 1.0
         self._playback_timer = QtCore.QTimer(self)
         self._playback_timer.setInterval(200)
@@ -335,6 +341,9 @@ class TestModeWidget(QtWidgets.QWidget):
         self._tap_thread_timer: Optional[threading.Timer] = None
         self.tap_count = 0
         self._last_tap_time: Optional[float] = None  # time.monotonic() of last tap
+        self._last_tune_value: Optional[int] = None
+        self._last_tuned_station: Optional[int] = None
+        self.am_channel = None
         self.rail2_on = True
         self._press_timer = QtCore.QElapsedTimer()
         self._long_press_fired = False
@@ -358,10 +367,10 @@ class TestModeWidget(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel()
         self.status_label.setWordWrap(True)
         
-        # SD card sync warning label (red text if out of sync)
+        # SD card sync warning label (shown when library and SD card differ)
         self.sd_sync_warning = QtWidgets.QLabel()
         self.sd_sync_warning.setWordWrap(True)
-        self.sd_sync_warning.setStyleSheet("color: red; font-weight: bold;")
+        self.sd_sync_warning.setStyleSheet("color: #b07800; font-weight: bold;")
         self.sd_sync_warning.setVisible(False)
         
         self.log = QtWidgets.QTextEdit()
@@ -399,8 +408,9 @@ class TestModeWidget(QtWidgets.QWidget):
         self.mode_shuffle_btn.clicked.connect(lambda: self._switch_mode("shuffle"))
         self.mode_radio_btn.clicked.connect(lambda: self._switch_mode("radio"))
         self.mode_hint_label = QtWidgets.QLabel(
-            "Tap: Next | Double-tap: Prev | Triple-tap: Restart | "
-            "Hold: Next album | Tap+Hold: Switch mode | 2 taps+Hold: Shuffle current | 3 taps+Hold: Shuffle all"
+            "Tap: Next | Double: Prev track | Triple: Restart track 1 | Four: Prev station | "
+            "Five: First station (ordered) | Hold: Next station | 1 tap+Hold: Exit shuffle / mode | "
+            "2 taps+Hold: Shuffle station | 3 taps+Hold: First station + shuffle"
         )
         self.mode_hint_label.setWordWrap(True)
         self.radio_dial = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -426,14 +436,20 @@ class TestModeWidget(QtWidgets.QWidget):
         single_btn = QtWidgets.QPushButton("Tap (Next)")
         double_btn = QtWidgets.QPushButton("Double-Tap (Prev)")
         triple_btn = QtWidgets.QPushButton("Triple-Tap (Restart)")
+        four_btn = QtWidgets.QPushButton("Four-Tap (Prev station)")
+        five_btn = QtWidgets.QPushButton("Five-Tap (First station)")
         long_btn = QtWidgets.QPushButton("Hold (Next Source)")
         single_btn.clicked.connect(self.single_tap)
         double_btn.clicked.connect(self.double_tap)
         triple_btn.clicked.connect(self.triple_tap)
+        four_btn.clicked.connect(self.four_tap)
+        five_btn.clicked.connect(self.five_tap)
         long_btn.clicked.connect(self.long_press)
         tap_layout.addWidget(single_btn)
         tap_layout.addWidget(double_btn)
         tap_layout.addWidget(triple_btn)
+        tap_layout.addWidget(four_btn)
+        tap_layout.addWidget(five_btn)
         tap_layout.addWidget(long_btn)
         
         # Set pointing hand cursor for all clickable buttons
@@ -441,7 +457,14 @@ class TestModeWidget(QtWidgets.QWidget):
         for btn in [
             self.refresh_btn, self.radio_button, self.mode_album_btn,
             self.mode_playlist_btn, self.mode_shuffle_btn, self.mode_radio_btn,
-            self.play_btn, self.finish_btn, single_btn, double_btn, triple_btn, long_btn
+            self.play_btn,
+            self.finish_btn,
+            single_btn,
+            double_btn,
+            triple_btn,
+            four_btn,
+            five_btn,
+            long_btn,
         ]:
             btn.setCursor(pointer_cursor)
 
@@ -491,9 +514,8 @@ class TestModeWidget(QtWidgets.QWidget):
         self.radio_face.set_power(self.rail2_on)
         
         self.refresh_from_db()
-        # Check SD card sync status on initialization
-        # Use QTimer to ensure widget is visible before checking
-        QtCore.QTimer.singleShot(100, self._check_sd_sync)
+        # SD sync check is scheduled from refresh_from_db (singleShot) so /Volumes scan
+        # cannot block widget construction.
         self._init_log_file()
         # Auto-start playback on boot only if power was on last time
         if self.rail2_on:
@@ -573,18 +595,25 @@ class TestModeWidget(QtWidgets.QWidget):
         self._check_sd_sync()
     
     def _check_sd_sync(self) -> None:
-        """Check if library is in sync with SD card and show warning if not."""
+        """Check if library is in sync with SD card and show warning if not.
+        Only show when our sync-target SD card is present (card unplugged = no warning).
+        """
+        sd_root = self.db.get_setting("sd_root")
+        stored_label = self.db.get_setting("sd_volume_label")
+        if not self.sd_manager.is_sync_target_sd_present(sd_root, stored_label):
+            self.sd_sync_warning.setVisible(False)
+            return
         results = self.sd_manager.validate_sd()
         
         # Filter out size mismatches that are due to format conversion
-        # (These are expected when files are converted to MP3)
         actual_size_mismatches = [
             item for item in results.get("size_mismatch", [])
             if item.get("reason") == "size_mismatch"
         ]
+        source_missing = results.get("source_file_missing", [])
         
-        # Count total issues (excluding format conversion size differences)
         total_issues = (
+            len(source_missing) +
             len(results.get("missing_sd_path", [])) +
             len(results.get("missing_file", [])) +
             len(actual_size_mismatches) +
@@ -592,26 +621,25 @@ class TestModeWidget(QtWidgets.QWidget):
         )
         
         if total_issues > 0:
-            # Show red warning
-            missing_sd = len(results.get("missing_sd_path", []))
-            missing_files = len(results.get("missing_file", []))
-            hash_mismatch = len(results.get("hash_mismatch", []))
-            
             warning_parts = []
-            if missing_sd > 0:
-                warning_parts.append(f"{missing_sd} missing SD paths")
-            if missing_files > 0:
-                warning_parts.append(f"{missing_files} missing files")
-            if len(actual_size_mismatches) > 0:
-                warning_parts.append(f"{len(actual_size_mismatches)} size mismatches")
-            if hash_mismatch > 0:
-                warning_parts.append(f"{hash_mismatch} hash mismatches")
-            
-            warning_text = f"⚠️ Library out of sync with SD card: {', '.join(warning_parts)}. Sync to SD card to test with actual hardware files."
+            if source_missing:
+                warning_parts.append(
+                    f"{len(source_missing)} track(s) have broken file paths — "
+                    "update or remove them in the Library before syncing"
+                )
+            if results.get("missing_sd_path"):
+                warning_parts.append(f"{len(results['missing_sd_path'])} tracks not yet on the SD card")
+            if results.get("missing_file"):
+                warning_parts.append(f"{len(results['missing_file'])} files missing from SD card")
+            if actual_size_mismatches:
+                warning_parts.append(f"{len(actual_size_mismatches)} files differ in size")
+            if results.get("hash_mismatch"):
+                warning_parts.append(f"{len(results['hash_mismatch'])} files changed since last sync")
+
+            warning_text = "Your SD card differs from your library: " + ". ".join(warning_parts)
             self.sd_sync_warning.setText(warning_text)
             self.sd_sync_warning.setVisible(True)
         else:
-            # All in sync
             self.sd_sync_warning.setVisible(False)
     
     def refresh_from_db(self) -> None:
@@ -675,8 +703,9 @@ class TestModeWidget(QtWidgets.QWidget):
             self.radio_mode_start_time = None
         
             self._update_status("Loaded albums for emulator.")
-        # Check SD card sync status
-        self._check_sd_sync()
+        # Defer SD sync check: detect_sd_roots() scans /Volumes; a stale SMB/network
+        # mount can block for minutes and would prevent the main window from appearing.
+        QtCore.QTimer.singleShot(0, self._check_sd_sync)
 
     def current_album(self) -> AlbumState:
         return self.albums[self.current_album_index]
@@ -733,6 +762,22 @@ class TestModeWidget(QtWidgets.QWidget):
         self.core._triple_tap()
         self._sync_from_core()
         self._update_status("Restarted album/playlist.")
+
+    def four_tap(self) -> None:
+        """Helper: previous station / source (same as four quick taps on device)."""
+        if not self.rail2_on:
+            return
+        self.core._prev_album()
+        self._sync_from_core()
+        self._update_status("Previous station / source.")
+
+    def five_tap(self) -> None:
+        """Helper: first station / first source (same as five quick taps on device)."""
+        if not self.rail2_on:
+            return
+        self.core._five_tap_first_station()
+        self._sync_from_core()
+        self._update_status("First station / source.")
     
     def _go_previous(self) -> None:
         """Go to previous track, handling all modes correctly."""
@@ -803,8 +848,16 @@ class TestModeWidget(QtWidgets.QWidget):
         """Helper button: simulate long press - uses RadioCore."""
         if not self.rail2_on:
             return
-        # Use RadioCore's long press handling
-        self.core._handle_long_press()
+        # Use RadioCore's long press handling; pass current tap count so core can
+        # interpret combinations (e.g. 1 tap+hold = toggle mode)
+        try:
+            self.core._handle_long_press_with_taps(self.core.tap_count)
+        except Exception:
+            # Fallback: if internals change, call the generic handler without args
+            try:
+                self.core._handle_long_press_with_taps(0)
+            except Exception:
+                pass
         self._sync_from_core()
         self._update_status("Long press action.")
     
@@ -878,19 +931,6 @@ class TestModeWidget(QtWidgets.QWidget):
         self._log(f"Shuffle mode: {source_name} ({len(self.shuffle_tracks)} tracks)")
         self.mode_label.setText(f"Mode: Shuffle ({source_name})")
         self._update_status(f"Shuffle: {source_name}")
-        if self.rail2_on:
-            self._start_playback_for_current()
-    
-    def _switch_to_library_shuffle(self) -> None:
-        """Shuffle the entire library."""
-        self.shuffle_tracks = [dict(track) for track in self.db.list_songs()]
-        random.shuffle(self.shuffle_tracks)
-        self.shuffle_index = 0
-        self.current_track = 1
-        self.mode = "shuffle"
-        self._log(f"Shuffle mode: Full Library ({len(self.shuffle_tracks)} tracks)")
-        self.mode_label.setText("Mode: Shuffle (Library)")
-        self._update_status("Shuffle: Full Library")
         if self.rail2_on:
             self._start_playback_for_current()
 
@@ -1099,11 +1139,14 @@ class TestModeWidget(QtWidgets.QWidget):
         
         if not hasattr(self, '_core_initialized'):
             self._core_initialized = True
-            self.core.init()  # First boot: load state + start playback (will be delayed)
+            self.core.init()  # First boot: load state (playback requested below so it can be delayed)
         else:
-            self.core.power_on_handler()  # Resume from power off (will be delayed)
+            self.core.power_on_handler()  # Resume from power off (playback requested below so it can be delayed)
         
         self._sync_from_core()
+        
+        # Request first-track playback so it is queued in _pending_playback (delay_playback is True)
+        self.core.start_playback_for_current()
         
         # Play AM overlay first, then schedule track playback after it finishes
         if not self.audio_ready:
@@ -1599,7 +1642,7 @@ class TestModeWidget(QtWidgets.QWidget):
 
     def _current_track_count(self) -> int:
         if self.mode == "radio":
-            if self.radio_stations and self.radio_station_index < len(self.radio_stations):
+            if self.radio_stations and self.radio_station_index < self.radio_stations:
                 return max(len(self.radio_stations[self.radio_station_index].tracks), 1)
             return 1
         if self.mode == "shuffle":
@@ -1622,12 +1665,7 @@ class TestModeWidget(QtWidgets.QWidget):
         if mode == "shuffle":
             if self.mode == "shuffle":
                 # Already in shuffle - reshuffle the current source
-                if self.core._shuffle_source_type:
-                    # Reshuffle current album/playlist
-                    self.core._init_current_shuffle()
-                else:
-                    # Reshuffle library
-                    self.core._init_library_shuffle()
+                self.core._init_current_shuffle()
                 # Reshuffling doesn't change mode, so no AM overlay needed
                 self._sync_from_core()
                 return
@@ -1636,7 +1674,7 @@ class TestModeWidget(QtWidgets.QWidget):
                 self.core._init_current_shuffle()
                 # Mode will change to shuffle, so continue with AM overlay
             else:
-                # Other mode - switch to library shuffle
+                # Other mode (e.g. radio): let RadioCore build shuffle from current context
                 self.core.switch_mode(mode)
         else:
             self.core.switch_mode(mode)

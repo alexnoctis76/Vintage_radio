@@ -1,0 +1,2219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Vintage Radio Music Manager</title>
+
+<style>
+  :root {
+    --title-dark: #1a1208;
+    --title-dark-2: #2b1e14;
+    --workspace: #faf1e4;
+    --floating: #f1dfc8;
+    --left-panel: #5c4d38;
+    --left-panel-2: #4d402f;
+    --accent: #d46f1a;
+    --selected-top: #ffc978;
+    --selected-bottom: #b65a12;
+    --border: #9b6a36;
+    --text: #2c1f14;
+    --soft-text: #5e4b38;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    overflow: auto;
+    font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(circle at top, #4b2d13 0, #1b1108 42%, #0d0804 100%);
+  }
+
+  button,
+  select,
+  textarea {
+    font-family: inherit;
+  }
+
+  .scale-shell {
+    transform-origin: center center;
+    transition: transform 160ms ease;
+  }
+
+  .app {
+    width: 1448px;
+    height: 1086px;
+    position: relative;
+    overflow: hidden;
+    border-radius: 9px;
+    background: var(--workspace);
+    box-shadow:
+      0 24px 65px rgba(0, 0, 0, 0.48),
+      0 0 0 1px rgba(255, 255, 255, 0.22) inset;
+  }
+
+  .title-bar {
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 58px;
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    color: white;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.05), rgba(0,0,0,0.16)),
+      repeating-linear-gradient(
+        90deg,
+        rgba(255,255,255,0.018) 0,
+        rgba(255,255,255,0.018) 1px,
+        transparent 1px,
+        transparent 8px
+      ),
+      linear-gradient(90deg, var(--title-dark), var(--title-dark-2), var(--title-dark));
+  }
+
+  .app-title {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    font-size: 22px;
+    font-weight: 700;
+  }
+
+  .radio-icon {
+    width: 36px;
+    height: 36px;
+    flex: 0 0 auto;
+  }
+
+  .window-controls {
+    margin-left: auto;
+    display: flex;
+    gap: 30px;
+    align-items: center;
+    color: #fffaf0;
+    font-size: 31px;
+    line-height: 1;
+  }
+
+  .win-control {
+    width: 23px;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .win-control.min {
+    transform: translateY(-3px);
+  }
+
+  .win-control.max {
+    font-size: 26px;
+  }
+
+  .win-control.close {
+    font-size: 35px;
+    transform: translateY(-1px);
+  }
+
+  .sidebar {
+    position: absolute;
+    left: 0;
+    top: 58px;
+    bottom: 58px;
+    width: 164px;
+    color: #fff4e3;
+    background:
+      radial-gradient(circle at 55% 20%, rgba(255,255,255,0.06), transparent 27%),
+      repeating-linear-gradient(
+        90deg,
+        rgba(255,255,255,0.018) 0,
+        rgba(255,255,255,0.018) 1px,
+        transparent 1px,
+        transparent 7px
+      ),
+      linear-gradient(180deg, #130902, #21150c 45%, #110904);
+    box-shadow:
+      inset -1px 0 0 rgba(255,255,255,0.08),
+      inset -5px 0 16px rgba(0,0,0,0.24);
+  }
+
+  .nav {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 13px;
+  }
+
+  .nav-item {
+    min-height: 135px;
+    border-radius: 8px;
+    margin-bottom: 7px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-size: 23px;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .nav-item:hover {
+    background: rgba(255, 255, 255, 0.055);
+  }
+
+  .nav-item svg {
+    width: 70px;
+    height: 70px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 3.3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .nav-item.active {
+    background:
+      radial-gradient(circle at 45% 24%, rgba(255,255,255,0.22), transparent 35%),
+      linear-gradient(180deg, #c86917, #8c3f08);
+    box-shadow:
+      0 0 0 2px #e07918,
+      0 0 20px rgba(232,110,11,0.36),
+      inset 0 1px 0 rgba(255,255,255,0.22);
+  }
+
+  .nav-divider {
+    height: 1px;
+    margin: 14px 0 25px;
+    background: rgba(255,255,255,0.13);
+    box-shadow: 0 1px 0 rgba(0,0,0,0.4);
+  }
+
+  .spacer {
+    flex: 1;
+  }
+
+  .small-nav {
+    min-height: 110px;
+  }
+
+  .main {
+    position: absolute;
+    left: 164px;
+    right: 0;
+    top: 58px;
+    bottom: 58px;
+    background:
+      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.82), transparent 40%),
+      linear-gradient(180deg, #fff8ee 0, var(--workspace) 34%, #fbf2e6 100%);
+    border-left: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .bottom-bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 58px;
+    display: flex;
+    align-items: center;
+    padding: 0 30px;
+    color: #35271a;
+    font-size: 20px;
+    background: #f5eadc;
+    border-top: 1px solid #d8c6ad;
+  }
+
+  .zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .zoom-btn {
+    width: 42px;
+    height: 36px;
+    border-radius: 11px;
+    border: 1px solid #d3b995;
+    background: linear-gradient(180deg, #fff8ef, #eadcc9);
+    display: grid;
+    place-items: center;
+    font-weight: 800;
+    cursor: pointer;
+    user-select: none;
+    box-shadow:
+      0 2px 4px rgba(81,45,13,0.15),
+      inset 0 1px 0 rgba(255,255,255,0.9);
+  }
+
+  .version {
+    margin-left: auto;
+    font-size: 19px;
+  }
+
+  .page {
+    position: absolute;
+    inset: 0;
+    display: none;
+  }
+
+  .page.active {
+    display: block;
+  }
+
+  .library-bar {
+    position: absolute;
+    left: 26px;
+    right: 17px;
+    top: 13px;
+    height: 78px;
+    border: 1px solid #d6bd99;
+    border-radius: 9px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0.15)),
+      linear-gradient(180deg, var(--floating), #f1dfc6);
+    box-shadow:
+      0 6px 18px rgba(78, 39, 8, 0.12),
+      inset 0 1px 0 rgba(255,255,255,0.82);
+    display: grid;
+    grid-template-columns: 105px 1fr 119px 119px 119px;
+    align-items: center;
+    gap: 16px;
+    padding: 0 32px 0 39px;
+    z-index: 4;
+  }
+
+  .library-label {
+    font-size: 22px;
+    font-weight: 800;
+    text-align: right;
+  }
+
+  .library-select {
+    height: 52px;
+    border-radius: 8px;
+    border: 1px solid #c6a77e;
+    background: linear-gradient(180deg, #fff9f1, #f2e5d2);
+    padding: 0 24px;
+    font-size: 21px;
+    color: #2b2117;
+    box-shadow:
+      0 2px 4px rgba(76,45,18,0.1),
+      inset 0 1px 0 rgba(255,255,255,0.92);
+  }
+
+  .top-button,
+  .device-button,
+  .small-button {
+    height: 52px;
+    border-radius: 8px;
+    border: 2px solid var(--border);
+    background: linear-gradient(180deg, #fff8ef, #ead6bd);
+    color: #302316;
+    font-size: 21px;
+    box-shadow:
+      0 3px 6px rgba(71, 35, 8, 0.16),
+      inset 0 1px 0 rgba(255,255,255,0.9);
+    cursor: pointer;
+  }
+
+  .top-button:hover,
+  .device-button:hover,
+  .small-button:hover,
+  .firmware-tab:hover,
+  .firmware-card:hover,
+  .filter-button:hover,
+  .filter-chip:hover {
+    filter: brightness(1.035);
+  }
+
+  .firmware-page-content {
+    position: absolute;
+    left: 26px;
+    right: 24px;
+    top: 112px;
+    bottom: 34px;
+    display: grid;
+    grid-template-rows: 124px 48px 1fr;
+    gap: 14px;
+  }
+
+  .device-panel {
+    border: 1px solid #d6bd99;
+    border-radius: 12px;
+    background:
+      radial-gradient(circle at 20% 0%, rgba(255,255,255,0.86), transparent 45%),
+      linear-gradient(180deg, #fff7eb, #f0ddc4);
+    box-shadow:
+      0 7px 18px rgba(75,43,18,0.13),
+      inset 0 1px 0 rgba(255,255,255,0.8);
+    display: grid;
+    grid-template-columns: 82px 1fr 156px 156px;
+    align-items: center;
+    gap: 18px;
+    padding: 18px 24px;
+  }
+
+  .device-icon {
+    width: 72px;
+    height: 72px;
+    border-radius: 18px;
+    display: grid;
+    place-items: center;
+    color: #fff4e6;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.14), rgba(0,0,0,0.18)),
+      linear-gradient(180deg, #d67923, #9c4610);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.24),
+      0 7px 14px rgba(91,42,5,0.25);
+  }
+
+  .device-icon svg {
+    width: 48px;
+    height: 48px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .device-title {
+    margin: 0 0 7px;
+    font-size: 27px;
+    color: #2b1d11;
+  }
+
+  .device-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: #5c4732;
+    font-size: 18px;
+  }
+
+  .device-status {
+    border-radius: 999px;
+    padding: 5px 11px 6px;
+    color: #fff8ed;
+    background: linear-gradient(180deg, #48a964, #267b43);
+    font-size: 13px;
+    font-weight: 900;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.28);
+  }
+
+  .device-button {
+    font-size: 19px;
+    font-weight: 800;
+  }
+
+  .device-button.primary {
+    border-color: #813c09;
+    color: #fff7eb;
+    background: linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
+  }
+
+  .firmware-tabs-wide {
+    height: 48px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border: 2px solid #5a3b1f;
+    border-radius: 7px 7px 0 0;
+    overflow: hidden;
+    background: #f5ead9;
+  }
+
+  .firmware-tab {
+    border: 0;
+    color: #2f2115;
+    background: linear-gradient(180deg, #fff8ed, #ead9c2);
+    font-size: 24px;
+    font-weight: 900;
+    cursor: pointer;
+  }
+
+  .firmware-tab:first-child {
+    border-right: 1px solid #7a5128;
+  }
+
+  .firmware-tab.active {
+    color: #fff8ed;
+    background:
+      radial-gradient(circle at 45% 24%, rgba(255,255,255,0.18), transparent 35%),
+      linear-gradient(180deg, #bd6617, #955016);
+  }
+
+  .firmware-main {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 398px 1fr;
+    gap: 0;
+  }
+
+  .firmware-selector-panel {
+    position: relative;
+    min-height: 0;
+    border: 2px solid #5a3b1f;
+    border-top: 0;
+    border-radius: 0 0 7px 7px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.06), transparent 36%),
+      linear-gradient(180deg, var(--left-panel), var(--left-panel-2));
+    overflow: hidden;
+  }
+
+  .firmware-filter-strip {
+    position: absolute;
+    left: 0;
+    right: 26px;
+    top: 0;
+    height: 60px;
+    display: flex;
+    align-items: center;
+    padding-left: 18px;
+    background: rgba(44, 34, 22, 0.17);
+    z-index: 4;
+  }
+
+  .filter-button {
+    width: 50px;
+    height: 42px;
+    border-radius: 8px;
+    border: 1px solid #d9b47f;
+    background: linear-gradient(180deg, #fff7ec, #ead8bf);
+    color: #2c1f14;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    box-shadow:
+      0 3px 7px rgba(0,0,0,0.16),
+      inset 0 1px 0 rgba(255,255,255,0.84);
+  }
+
+  .filter-button svg {
+    width: 27px;
+    height: 27px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 3.2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .filter-menu {
+    display: none;
+    position: absolute;
+    left: 18px;
+    right: 44px;
+    top: 52px;
+    border-radius: 12px;
+    border: 1px solid #d2a06a;
+    background:
+      radial-gradient(circle at 22% 0%, rgba(255,255,255,0.8), transparent 45%),
+      linear-gradient(180deg, #fff7eb, #ead7bd);
+    box-shadow: 0 16px 30px rgba(31, 16, 5, 0.32);
+    padding: 16px;
+    z-index: 50;
+  }
+
+  .filter-menu.show {
+    display: block;
+  }
+
+  .filter-section {
+    margin-bottom: 14px;
+  }
+
+  .filter-section:last-child {
+    margin-bottom: 0;
+  }
+
+  .filter-section-title {
+    margin: 0 0 9px;
+    font-size: 13px;
+    font-weight: 900;
+    color: #6b4c2f;
+    letter-spacing: 0.35px;
+    text-transform: uppercase;
+  }
+
+  .filter-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .filter-chip {
+    height: 33px;
+    border-radius: 999px;
+    border: 1px solid #b7884e;
+    background: linear-gradient(180deg, #fff9ef, #ead8c1);
+    color: #3c2a19;
+    padding: 0 12px;
+    font-size: 14px;
+    font-weight: 850;
+    cursor: pointer;
+  }
+
+  .filter-chip.active {
+    color: #fff7ed;
+    border-color: #813c09;
+    background: linear-gradient(180deg, #e27d25, #a94f10);
+  }
+
+  .firmware-list {
+    position: absolute;
+    left: 0;
+    right: 26px;
+    top: 60px;
+    bottom: 0;
+    padding: 18px 14px 22px 20px;
+    display: grid;
+    align-content: start;
+    gap: 16px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .firmware-list::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+
+  .firmware-card {
+    min-height: 138px;
+    border-radius: 11px;
+    border: 1px solid rgba(255, 229, 190, 0.24);
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)),
+      rgba(77, 60, 42, 0.72);
+    color: #fff4df;
+    padding: 18px;
+    cursor: pointer;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.10),
+      0 2px 5px rgba(0,0,0,0.16);
+  }
+
+  .firmware-card.selected {
+    border: 1px solid #eea54c;
+    background:
+      radial-gradient(circle at 22% 0%, rgba(255,255,255,0.22), transparent 40%),
+      linear-gradient(180deg, var(--selected-top), #cf761f 55%, var(--selected-bottom));
+    color: #fff;
+    box-shadow:
+      0 2px 8px rgba(69,32,5,0.28),
+      inset 0 1px 0 rgba(255,255,255,0.42);
+  }
+
+  .firmware-card-title {
+    font-size: 24px;
+    font-weight: 900;
+    line-height: 1.1;
+  }
+
+  .firmware-card-subtitle {
+    margin-top: 8px;
+    font-size: 16px;
+    line-height: 1.35;
+    color: rgba(255, 246, 229, 0.92);
+  }
+
+  .firmware-card-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 13px;
+  }
+
+  .firmware-card-tag {
+    border-radius: 999px;
+    padding: 4px 9px;
+    background: rgba(255,255,255,0.16);
+    color: rgba(255,255,255,0.96);
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  .firmware-details-panel {
+    min-height: 0;
+    border: 2px solid #5a3b1f;
+    border-top: 0;
+    border-left: 0;
+    border-radius: 0 0 7px 0;
+    background:
+      radial-gradient(circle at 50% 12%, rgba(255,255,255,0.72), transparent 40%),
+      linear-gradient(180deg, #fff3e2, #fbf2e6 72%, #f4e4cd);
+    box-shadow:
+      0 9px 18px rgba(75,43,18,0.12),
+      inset 0 1px 0 rgba(255,255,255,0.42);
+    padding: 20px 22px 20px;
+    display: grid;
+    grid-template-rows: auto minmax(274px, 1fr) 72px;
+    gap: 16px;
+  }
+
+  .software-card,
+  .notes-card,
+  .custom-picker-card {
+    border-radius: 12px;
+    border: 1px solid #d0a875;
+    background:
+      radial-gradient(circle at 25% 0%, rgba(255,255,255,0.82), transparent 44%),
+      linear-gradient(180deg, #fff7eb, #ead7bd);
+    box-shadow:
+      0 7px 16px rgba(75,43,18,0.11),
+      inset 0 1px 0 rgba(255,255,255,0.82);
+  }
+
+  .software-card {
+    padding: 20px;
+  }
+
+  .software-title-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+
+  .software-title {
+    margin: 0;
+    font-size: 30px;
+    color: #2b1d11;
+  }
+
+  .firmware-badge {
+    border-radius: 999px;
+    padding: 5px 11px 6px;
+    font-size: 13px;
+    font-weight: 900;
+    color: #fff6ea;
+    background: linear-gradient(180deg, #df852f, #a94f10);
+  }
+
+  .firmware-badge.soft {
+    background: linear-gradient(180deg, #8b6240, #4a321e);
+  }
+
+  .software-description {
+    font-size: 18px;
+    line-height: 1.38;
+    color: #4f3d2b;
+    margin: 0;
+  }
+
+  .software-meta-grid {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: 160px 230px 1fr;
+    gap: 10px;
+  }
+
+  .software-meta {
+    border-radius: 10px;
+    border: 1px solid #d6bd99;
+    background: rgba(255, 250, 241, 0.62);
+    padding: 10px 12px;
+    min-width: 0;
+  }
+
+  .software-meta-label {
+    font-size: 12px;
+    color: #76604a;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .software-meta-value {
+    margin-top: 5px;
+    font-size: 16px;
+    color: #2d1f13;
+    font-weight: 800;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .repo-author {
+    color: #7b3c0d;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
+  .firmware-detail-middle {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .notes-card,
+  .custom-picker-card {
+    padding: 18px;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .card-title-line {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .detail-card-title {
+    margin: 0;
+    font-size: 23px;
+    color: #2b1d11;
+  }
+
+  .notes-pill {
+    border-radius: 999px;
+    padding: 4px 10px 5px;
+    background: #6e553b;
+    color: #fff4e6;
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  .notes-preview {
+    flex: 1;
+    min-height: 150px;
+    border-radius: 10px;
+    border: 1px solid #d5b287;
+    background: rgba(255, 250, 241, 0.72);
+    padding: 13px 15px;
+    font-size: 15px;
+    line-height: 1.35;
+    color: #4d3927;
+    overflow: auto;
+  }
+
+  .notes-preview ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+
+  .notes-preview li {
+    margin-bottom: 6px;
+  }
+
+  .notes-preview::-webkit-scrollbar {
+    width: 13px;
+  }
+
+  .notes-preview::-webkit-scrollbar-track {
+    background: #f4ead7;
+    border-left: 1px solid rgba(97, 66, 34, 0.28);
+  }
+
+  .notes-preview::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: linear-gradient(180deg, #f0ad5a, #bf5c16);
+    border: 3px solid #f4ead7;
+  }
+
+  .notes-card .small-button,
+  .custom-picker-card .small-button {
+    margin-top: 12px;
+    height: 46px;
+    font-size: 17px;
+    font-weight: 900;
+  }
+
+  .custom-side-stack {
+    display: none;
+    min-height: 0;
+  }
+
+  .custom-side-stack.show {
+    display: block;
+  }
+
+  .custom-picker-card {
+    height: 100%;
+  }
+
+  .custom-picker-copy {
+    margin: 0;
+    font-size: 16px;
+    line-height: 1.38;
+    color: #594431;
+  }
+
+  .choose-firmware-button {
+    width: 100%;
+    margin-top: 18px;
+  }
+
+  .selected-custom-file {
+    margin-top: 14px;
+    border-radius: 10px;
+    border: 1px solid #d2ae7e;
+    background: rgba(255, 250, 241, 0.72);
+    padding: 12px 13px;
+    font-size: 16px;
+    color: #3f2e1e;
+  }
+
+  .firmware-detail-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .firmware-install-status {
+    margin-right: auto;
+    font-size: 18px;
+    color: #5d4732;
+  }
+
+  .firmware-progress {
+    width: 260px;
+    height: 18px;
+    border-radius: 999px;
+    border: 1px solid #a8703d;
+    background: linear-gradient(180deg, #f9efe0, #f0dfca);
+    overflow: hidden;
+    box-shadow: inset 0 2px 4px rgba(73,43,17,0.2);
+    display: none;
+  }
+
+  .firmware-progress.show {
+    display: block;
+  }
+
+  .firmware-progress-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #e8994d, #cc6c1f 58%, #a74d12);
+    transition: width 180ms ease;
+  }
+
+  .firmware-install-button {
+    height: 62px;
+    width: 248px;
+    border-radius: 7px;
+    border: 2px solid #813c09;
+    background: linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
+    color: white;
+    font-size: 21px;
+    font-weight: 900;
+    box-shadow:
+      0 4px 8px rgba(86,41,5,0.28),
+      inset 0 1px 0 rgba(255,255,255,0.32);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 13px;
+    cursor: pointer;
+  }
+
+  .install-firmware-svg {
+    width: 28px;
+    height: 28px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 2.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .custom-scrollbar {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 26px;
+    display: grid;
+    grid-template-rows: 36px 1fr 36px;
+    z-index: 12;
+    user-select: none;
+    background: #f4ead7;
+    border-left: 1px solid rgba(97, 66, 34, 0.35);
+    border-right: 1px solid rgba(255,255,255,0.55);
+  }
+
+  .scroll-arrow {
+    border: 0;
+    background: transparent;
+    position: relative;
+    cursor: pointer;
+    padding: 0;
+    color: #2d1f13;
+  }
+
+  .scroll-arrow::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    border-top: 2px solid currentColor;
+    border-left: 2px solid currentColor;
+    transform-origin: center;
+  }
+
+  .scroll-up::before {
+    transform: translate(-50%, -18%) rotate(45deg);
+  }
+
+  .scroll-down::before {
+    transform: translate(-50%, -82%) rotate(225deg);
+  }
+
+  .scroll-track {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+
+  .scroll-thumb {
+    position: absolute;
+    left: 8px;
+    top: 0;
+    width: 10px;
+    min-height: 88px;
+    border-radius: 999px;
+    background:
+      linear-gradient(180deg, #f0ad5a 0%, #db852e 45%, #bf5c16 100%);
+    border: 1px solid #a55112;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.42),
+      inset 0 -1px 0 rgba(67,32,9,0.28),
+      0 1px 2px rgba(0,0,0,0.22);
+    cursor: grab;
+  }
+
+  .scroll-thumb:active {
+    cursor: grabbing;
+  }
+
+  .placeholder-page {
+    position: absolute;
+    inset: 112px 42px 40px;
+    display: grid;
+    place-items: center;
+    border: 1px solid #d6bd99;
+    border-radius: 12px;
+    background: rgba(255, 248, 238, 0.72);
+    text-align: center;
+  }
+
+  .placeholder-card {
+    max-width: 620px;
+  }
+
+  .placeholder-card h1 {
+    font-size: 42px;
+    margin: 0 0 12px;
+  }
+
+  .placeholder-card p {
+    font-size: 21px;
+    color: var(--soft-text);
+    line-height: 1.45;
+  }
+
+  .toast {
+    position: absolute;
+    right: 32px;
+    bottom: 78px;
+    z-index: 80;
+    min-width: 300px;
+    max-width: 520px;
+    padding: 16px 20px;
+    border-radius: 10px;
+    border: 1px solid #b8874e;
+    background: linear-gradient(180deg, #fff8ee, #f0ddc2);
+    box-shadow: 0 10px 25px rgba(54, 27, 5, 0.22);
+    color: #2c1f14;
+    font-size: 18px;
+    opacity: 0;
+    transform: translateY(12px);
+    pointer-events: none;
+    transition: 180ms ease;
+  }
+
+  .toast.show {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .modal-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 70;
+    display: none;
+    place-items: center;
+    background:
+      radial-gradient(circle at 50% 28%, rgba(255, 244, 226, 0.16), transparent 42%),
+      rgba(25, 14, 6, 0.54);
+    backdrop-filter: blur(4px);
+  }
+
+  .modal-backdrop.show {
+    display: grid;
+  }
+
+  .modal-window {
+    width: 760px;
+    border-radius: 16px;
+    border: 1px solid #b98a55;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.18)),
+      linear-gradient(180deg, #fff8ed, #f1dfc6);
+    box-shadow:
+      0 24px 70px rgba(24, 12, 4, 0.44),
+      inset 0 1px 0 rgba(255,255,255,0.8);
+    overflow: hidden;
+  }
+
+  .modal-header {
+    height: 78px;
+    padding: 0 28px 0 32px;
+    display: flex;
+    align-items: center;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.07), rgba(0,0,0,0.14)),
+      linear-gradient(180deg, #4a341f, #2d1d10);
+    color: #fff5e6;
+  }
+
+  .modal-title {
+    margin: 0;
+    font-size: 28px;
+    line-height: 1.1;
+  }
+
+  .modal-subtitle {
+    margin: 6px 0 0;
+    font-size: 16px;
+    color: #ead9c1;
+  }
+
+  .modal-close {
+    margin-left: auto;
+    width: 38px;
+    height: 38px;
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 10px;
+    background: rgba(255,255,255,0.08);
+    color: #fff5e6;
+    font-size: 28px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .modal-body {
+    padding: 30px 32px 28px;
+  }
+
+  .notes-editor {
+    width: 100%;
+    min-height: 290px;
+    border-radius: 12px;
+    border: 1px solid #c7a06d;
+    background: rgba(255, 250, 241, 0.82);
+    padding: 18px 20px;
+    font-size: 18px;
+    line-height: 1.45;
+    color: #3d2b1c;
+    resize: none;
+    outline: none;
+  }
+
+  .notes-editor[readonly] {
+    color: #4d3927;
+    background: rgba(255, 250, 241, 0.58);
+  }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 14px;
+    padding: 0 32px 30px;
+  }
+
+  .modal-button {
+    height: 54px;
+    min-width: 160px;
+    border-radius: 9px;
+    border: 2px solid #813c09;
+    background: linear-gradient(180deg, #e27d25 0, #ce6817 58%, #a94f10 100%);
+    color: white;
+    font-size: 20px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+
+  .modal-button.secondary {
+    border-color: #9b6a36;
+    background: linear-gradient(180deg, #fff7ec, #ead8bf);
+    color: #352516;
+  }
+
+  .hidden-file {
+    display: none;
+  }
+
+  button:disabled {
+    opacity: 0.58;
+    cursor: not-allowed;
+  }
+</style>
+</head>
+
+<body>
+<div class="scale-shell" id="scaleShell">
+  <div class="app" id="app">
+
+    <header class="title-bar">
+      <div class="app-title">
+        <svg class="radio-icon" viewBox="0 0 64 64" aria-hidden="true">
+          <defs>
+            <linearGradient id="radioGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#ffb357"/>
+              <stop offset="1" stop-color="#c45b11"/>
+            </linearGradient>
+          </defs>
+          <rect x="7" y="19" width="48" height="34" rx="6" fill="url(#radioGrad)" stroke="#f6c07a" stroke-width="2"/>
+          <path d="M18 18 L39 8" stroke="#ffd18e" stroke-width="4" stroke-linecap="round"/>
+          <circle cx="44" cy="40" r="6" fill="#4a2e16"/>
+          <path d="M15 29h23M15 36h20M15 43h17" stroke="#4a2e16" stroke-width="3" stroke-linecap="round"/>
+          <rect x="12" y="23" width="11" height="7" rx="2" fill="#ffe0a8"/>
+        </svg>
+        <span>Vintage Radio Music Manager</span>
+      </div>
+
+      <div class="window-controls">
+        <div class="win-control min" id="minimizeBtn">−</div>
+        <div class="win-control max" id="maximizeBtn">□</div>
+        <div class="win-control close" id="closeBtn">×</div>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <nav class="nav">
+        <div class="nav-item" data-page="loadMusic">
+          <svg viewBox="0 0 80 80" aria-hidden="true">
+            <path d="M24 17v30" />
+            <path d="M24 17l22-6v30" />
+            <circle cx="18" cy="50" r="6" />
+            <circle cx="40" cy="44" r="6" />
+            <rect x="48" y="34" width="18" height="27" rx="3" />
+            <path d="M53 39h8M53 45h8M53 51h8" />
+            <path d="M56 15c9 5 15 13 16 23" />
+            <path d="M72 38l-6-5" />
+            <path d="M72 38l5-6" />
+          </svg>
+          <div>Load Music</div>
+        </div>
+
+        <div class="nav-item active" data-page="firmware">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="19" y="17" width="26" height="30" rx="3"/>
+            <path d="M24 9v8M32 9v8M40 9v8M24 47v8M32 47v8M40 47v8"/>
+            <path d="M11 23h8M11 32h8M11 41h8M45 23h8M45 32h8M45 41h8"/>
+            <path d="M32 22v17"/>
+            <path d="M24 32l8 8 8-8"/>
+          </svg>
+          <div>Install Firmware</div>
+        </div>
+
+        <div class="nav-divider"></div>
+
+        <div class="nav-item" data-page="tools">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <path d="M22 12l8 8-9 9-8-8z"/>
+            <path d="M20 30L8 42l14 14 12-12"/>
+            <path d="M45 9a11 11 0 0 0-9 16L13 48l6 6 23-23a11 11 0 0 0 16-12l-8 8-7-7 8-8a11 11 0 0 0-6-3z"/>
+          </svg>
+          <div>Tools</div>
+        </div>
+
+        <div class="spacer"></div>
+
+        <div class="nav-item small-nav" data-page="settings">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="32" r="8"/>
+            <path d="M32 6v8M32 50v8M6 32h8M50 32h8"/>
+            <path d="M13.6 13.6l5.7 5.7M44.7 44.7l5.7 5.7M50.4 13.6l-5.7 5.7M19.3 44.7l-5.7 5.7"/>
+          </svg>
+          <div>Settings</div>
+        </div>
+
+        <div class="nav-divider"></div>
+
+        <div class="nav-item small-nav" data-page="help">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="32" r="24"/>
+            <path d="M25 25a8 8 0 1 1 13 6c-4 3-6 5-6 10"/>
+            <path d="M32 50h.1"/>
+          </svg>
+          <div>Help</div>
+        </div>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <section class="library-bar">
+        <div class="library-label">Library:</div>
+        <select class="library-select" id="librarySelect"></select>
+        <button class="top-button" id="newLibraryBtn">New</button>
+        <button class="top-button" id="renameLibraryBtn">Rename</button>
+        <button class="top-button" id="deleteLibraryBtn">Delete</button>
+      </section>
+
+      <section class="page" id="loadMusicPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Load Music</h1>
+            <p>The music loading layout can stay wired here while we refine the firmware tab.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="page active" id="firmwarePage">
+        <div class="firmware-page-content">
+          <section class="device-panel">
+            <div class="device-icon">
+              <svg viewBox="0 0 64 64" aria-hidden="true">
+                <rect x="18" y="14" width="28" height="36" rx="4"/>
+                <path d="M24 7v7M32 7v7M40 7v7M24 50v7M32 50v7M40 50v7"/>
+                <path d="M10 24h8M10 32h8M10 40h8M46 24h8M46 32h8M46 40h8"/>
+                <path d="M32 20v19"/>
+                <path d="M24 31l8 8 8-8"/>
+              </svg>
+            </div>
+
+            <div>
+              <h2 class="device-title" id="deviceTitle">Raspberry Pi Pico detected</h2>
+              <div class="device-meta">
+                <span class="device-status" id="deviceStatus">Connected</span>
+                <span id="deviceMetaText">COM6 · RP2040 · DFPlayer · MicroPython detected</span>
+              </div>
+            </div>
+
+            <button class="device-button primary" id="detectDeviceBtn" type="button">Autodetect</button>
+            <button class="device-button" id="chooseDeviceBtn" type="button">Choose Device</button>
+          </section>
+
+          <section class="firmware-tabs-wide">
+            <button class="firmware-tab active" id="officialFirmwareTab" type="button">Official Firmware</button>
+            <button class="firmware-tab" id="customFirmwareTab" type="button">Custom Firmware</button>
+          </section>
+
+          <section class="firmware-main">
+            <aside class="firmware-selector-panel">
+              <div class="firmware-filter-strip">
+                <button class="filter-button" id="filterButton" type="button" aria-label="Filter firmware">
+                  <svg viewBox="0 0 64 64" aria-hidden="true">
+                    <path d="M13 16h38L37 33v15l-10 6V33z"/>
+                  </svg>
+                </button>
+
+                <div class="filter-menu" id="filterMenu">
+                  <div class="filter-section">
+                    <div class="filter-section-title">Microcontroller</div>
+                    <div class="filter-chip-row" id="microcontrollerChips"></div>
+                  </div>
+
+                  <div class="filter-section">
+                    <div class="filter-section-title">MP3 Controller</div>
+                    <div class="filter-chip-row" id="mp3ControllerChips"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="firmware-list" id="firmwareList"></div>
+
+              <div class="custom-scrollbar firmware-custom-scrollbar" data-target="firmwareList">
+                <button class="scroll-arrow scroll-up" type="button" aria-label="Scroll firmware up"></button>
+                <div class="scroll-track">
+                  <div class="scroll-thumb"></div>
+                </div>
+                <button class="scroll-arrow scroll-down" type="button" aria-label="Scroll firmware down"></button>
+              </div>
+            </aside>
+
+            <section class="firmware-details-panel">
+              <article class="software-card">
+                <div class="software-title-row">
+                  <h2 class="software-title" id="softwareTitle">Vintage Radio Basic Firmware</h2>
+                  <span class="firmware-badge" id="softwareBadge">Official</span>
+                </div>
+
+                <p class="software-description" id="softwareDescription">
+                  A clean starter firmware for the Vintage Radio player.
+                </p>
+
+                <div class="software-meta-grid">
+                  <div class="software-meta">
+                    <div class="software-meta-label">Version</div>
+                    <div class="software-meta-value" id="softwareVersion">v1.0</div>
+                  </div>
+
+                  <div class="software-meta">
+                    <div class="software-meta-label">Device</div>
+                    <div class="software-meta-value" id="softwareDevice">DFPlayer + RP2040</div>
+                  </div>
+
+                  <div class="software-meta">
+                    <div class="software-meta-label">Author</div>
+                    <div class="software-meta-value">
+                      <a class="repo-author" id="softwareAuthor" href="#" target="_blank" rel="noopener noreferrer">Vintage Radio Project</a>
+                    </div>
+                  </div>
+                </div>
+              </article>
+
+              <div class="firmware-detail-middle" id="firmwareDetailMiddle">
+                <article class="notes-card" id="firmwareNotesCard">
+                  <div class="card-title-line">
+                    <h3 class="detail-card-title">Firmware Notes</h3>
+                    <span class="notes-pill">Read-only</span>
+                  </div>
+
+                  <div class="notes-preview" id="firmwareNotesPreview"></div>
+                  <button class="small-button" id="viewFirmwareNotesBtn" type="button">View Details</button>
+                </article>
+
+                <article class="notes-card" id="userNotesCard">
+                  <div class="card-title-line">
+                    <h3 class="detail-card-title" id="userNotesTitle">User Notes</h3>
+                    <span class="notes-pill">Editable</span>
+                  </div>
+
+                  <div class="notes-preview" id="userNotesPreview"></div>
+                  <button class="small-button" id="editUserNotesBtn" type="button">Edit Notes</button>
+                </article>
+
+                <div class="custom-side-stack" id="customSideStack">
+                  <article class="custom-picker-card">
+                    <div class="card-title-line">
+                      <h3 class="detail-card-title">Choose custom firmware</h3>
+                    </div>
+
+                    <p class="custom-picker-copy">
+                      Select a firmware folder path or a UF2 file. UF2 files install directly; folders copy firmware files after MicroPython setup if needed.
+                    </p>
+
+                    <button class="small-button choose-firmware-button" id="chooseCustomFirmwareBtn" type="button">
+                      Choose Firmware
+                    </button>
+
+                    <div class="selected-custom-file" id="selectedCustomFile">No custom firmware selected yet.</div>
+                  </article>
+                </div>
+              </div>
+
+              <div class="firmware-detail-actions">
+                <div class="firmware-install-status" id="firmwareInstallStatus">Ready to install.</div>
+
+                <div class="firmware-progress" id="firmwareProgress">
+                  <div class="firmware-progress-fill" id="firmwareProgressFill"></div>
+                </div>
+
+                <button class="firmware-install-button" id="installFirmwareBtn" type="button">
+                  <svg class="install-firmware-svg" viewBox="0 0 64 64" aria-hidden="true">
+                    <rect x="14" y="12" width="36" height="40" rx="5"/>
+                    <path d="M24 7v5M32 7v5M40 7v5M24 52v5M32 52v5M40 52v5"/>
+                    <path d="M8 24h6M8 32h6M8 40h6M50 24h6M50 32h6M50 40h6"/>
+                    <path d="M32 20v18"/>
+                    <path d="M24 31l8 8 8-8"/>
+                  </svg>
+                  <span>Install Firmware</span>
+                </button>
+              </div>
+            </section>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="toolsPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Tools</h1>
+            <p>Future utilities, conversion tools, SD diagnostics, and repair actions can live here.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="settingsPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Settings</h1>
+            <p>Theme, conversion profile defaults, sync behavior, and device preferences can live here.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="helpPage">
+        <div class="placeholder-page">
+          <div class="placeholder-card">
+            <h1>Help</h1>
+            <p>Guides, button controls, firmware notes, and troubleshooting can live here.</p>
+          </div>
+        </div>
+      </section>
+
+      <div class="modal-backdrop" id="notesModal" aria-hidden="true">
+        <div class="modal-window notes-window" role="dialog" aria-modal="true" aria-labelledby="notesModalTitle">
+          <header class="modal-header">
+            <div>
+              <h2 class="modal-title" id="notesModalTitle">Notes</h2>
+              <p class="modal-subtitle" id="notesModalSubtitle">View or edit notes.</p>
+            </div>
+            <button class="modal-close" id="closeNotesBtn" type="button" aria-label="Close">×</button>
+          </header>
+
+          <div class="modal-body">
+            <textarea class="notes-editor" id="notesEditor"></textarea>
+          </div>
+
+          <footer class="modal-footer">
+            <button class="modal-button secondary" id="cancelNotesBtn" type="button">Close</button>
+            <button class="modal-button" id="saveNotesBtn" type="button">Save Notes</button>
+          </footer>
+        </div>
+      </div>
+
+      <div class="toast" id="toast"></div>
+
+      <input class="hidden-file" id="customFirmwareInput" type="file" accept=".uf2,.py,.mpy,.json,.txt" multiple />
+    </main>
+
+    <footer class="bottom-bar">
+      <div class="zoom-controls">
+        <span>Zoom</span>
+        <span class="zoom-btn" id="zoomOutBtn">−</span>
+        <span class="zoom-btn" id="zoomInBtn">＋</span>
+      </div>
+      <div class="version">v1.0</div>
+    </footer>
+  </div>
+</div>
+
+<script>
+  const state = {
+    zoom: 1,
+    selectedPage: "firmware",
+    libraries: ["My Jazz Collection", "Stress Test", "Road Trip Mix"],
+    selectedLibrary: "My Jazz Collection",
+
+    firmwareMode: "custom",
+    selectedFirmwareId: "default-rp2040-dfplayer",
+    selectedNoteType: "firmware",
+    installingFirmware: false,
+
+    filters: {
+      microcontroller: "all",
+      mp3Controller: "all"
+    },
+
+    filterOptions: {
+      microcontrollers: ["all", "RP2040", "ESP32"],
+      mp3Controllers: ["all", "DFPlayer", "VS1053"]
+    },
+
+    officialFirmware: [
+      {
+        id: "default-rp2040-dfplayer",
+        name: "Vintage Radio Basic Firmware",
+        listName: "Default RP2040",
+        version: "v1.0",
+        microcontroller: "RP2040",
+        mp3Controller: "DFPlayer",
+        device: "DFPlayer + RP2040",
+        author: "Vintage Radio Project",
+        repoUrl: "https://github.com/example/vintage-radio-basic",
+        description: "A clean starter firmware for the Vintage Radio player with basic button controls, SD card playback, and station selection.",
+        firmwareNotes: [
+          "Power: short press wakes or starts playback.",
+          "Station: short press cycles stations. Long press opens station select.",
+          "Track: short press skips to the next track. Long press returns to the previous track.",
+          "Volume knob: turn to adjust volume. Press to mute or unmute.",
+          "Designed for RP2040 boards using a DFPlayer Mini audio module."
+        ].join("\\n"),
+        userNotes: "Add personal setup notes here, like wiring changes, case revisions, or preferred button behavior."
+      },
+      {
+        id: "zbvr-rp2040-vs1053",
+        name: "Zbvr-Firmware RP2040",
+        listName: "Zbvr-Firmware RP2040",
+        version: "v1.0",
+        microcontroller: "RP2040",
+        mp3Controller: "VS1053",
+        device: "VS1053 + RP2040",
+        author: "Zbvr",
+        repoUrl: "https://github.com/example/zbvr-firmware-rp2040",
+        description: "An alternate official firmware build for RP2040 projects using the VS1053 audio controller.",
+        firmwareNotes: [
+          "Designed for RP2040 boards using a VS1053 audio module.",
+          "Button behavior follows the Vintage Radio layout unless changed in configuration.",
+          "Use this build when your audio board is VS1053 instead of DFPlayer.",
+          "Check wiring before installing, since VS1053 pin usage differs from DFPlayer."
+        ].join("\\n"),
+        userNotes: "Add personal notes for this firmware here."
+      },
+      {
+        id: "future-esp32-dfplayer",
+        name: "Vintage Radio ESP32 Firmware",
+        listName: "ESP32 DFPlayer",
+        version: "planned",
+        microcontroller: "ESP32",
+        mp3Controller: "DFPlayer",
+        device: "DFPlayer + ESP32",
+        author: "Vintage Radio Project",
+        repoUrl: "https://github.com/example/vintage-radio-esp32",
+        description: "Placeholder entry for a future ESP32 build.",
+        firmwareNotes: "Future firmware entry. Not ready to install yet.",
+        userNotes: "Add personal notes for the future ESP32 build here.",
+        disabled: true
+      }
+    ],
+
+    customFirmware: {
+      id: "custom-local",
+      name: "No custom firmware selected",
+      listName: "Local Custom Firmware",
+      version: "Custom",
+      microcontroller: "RP2040",
+      mp3Controller: "DFPlayer",
+      device: "DFPlayer + RP2040",
+      author: "User added",
+      repoUrl: "",
+      description: "Choose a custom firmware folder path or UF2 file to preview install details.",
+      notes: "Add notes for your custom firmware here. You can document button mappings, setup steps, wiring notes, or known issues.",
+      selected: false,
+      type: "None"
+    }
+  };
+
+  const els = {
+    scaleShell: document.getElementById("scaleShell"),
+    app: document.getElementById("app"),
+    toast: document.getElementById("toast"),
+
+    librarySelect: document.getElementById("librarySelect"),
+
+    officialFirmwareTab: document.getElementById("officialFirmwareTab"),
+    customFirmwareTab: document.getElementById("customFirmwareTab"),
+    filterButton: document.getElementById("filterButton"),
+    filterMenu: document.getElementById("filterMenu"),
+    microcontrollerChips: document.getElementById("microcontrollerChips"),
+    mp3ControllerChips: document.getElementById("mp3ControllerChips"),
+    firmwareList: document.getElementById("firmwareList"),
+
+    softwareTitle: document.getElementById("softwareTitle"),
+    softwareBadge: document.getElementById("softwareBadge"),
+    softwareDescription: document.getElementById("softwareDescription"),
+    softwareVersion: document.getElementById("softwareVersion"),
+    softwareDevice: document.getElementById("softwareDevice"),
+    softwareAuthor: document.getElementById("softwareAuthor"),
+
+    firmwareNotesCard: document.getElementById("firmwareNotesCard"),
+    firmwareNotesPreview: document.getElementById("firmwareNotesPreview"),
+    viewFirmwareNotesBtn: document.getElementById("viewFirmwareNotesBtn"),
+
+    userNotesTitle: document.getElementById("userNotesTitle"),
+    userNotesPreview: document.getElementById("userNotesPreview"),
+    editUserNotesBtn: document.getElementById("editUserNotesBtn"),
+
+    customSideStack: document.getElementById("customSideStack"),
+    chooseCustomFirmwareBtn: document.getElementById("chooseCustomFirmwareBtn"),
+    selectedCustomFile: document.getElementById("selectedCustomFile"),
+    customFirmwareInput: document.getElementById("customFirmwareInput"),
+
+    firmwareInstallStatus: document.getElementById("firmwareInstallStatus"),
+    firmwareProgress: document.getElementById("firmwareProgress"),
+    firmwareProgressFill: document.getElementById("firmwareProgressFill"),
+    installFirmwareBtn: document.getElementById("installFirmwareBtn"),
+
+    notesModal: document.getElementById("notesModal"),
+    notesModalTitle: document.getElementById("notesModalTitle"),
+    notesModalSubtitle: document.getElementById("notesModalSubtitle"),
+    notesEditor: document.getElementById("notesEditor"),
+    closeNotesBtn: document.getElementById("closeNotesBtn"),
+    cancelNotesBtn: document.getElementById("cancelNotesBtn"),
+    saveNotesBtn: document.getElementById("saveNotesBtn"),
+
+    zoomInBtn: document.getElementById("zoomInBtn"),
+    zoomOutBtn: document.getElementById("zoomOutBtn"),
+
+    closeBtn: document.getElementById("closeBtn"),
+    maximizeBtn: document.getElementById("maximizeBtn"),
+    minimizeBtn: document.getElementById("minimizeBtn")
+  };
+
+  const customScrollbarRefreshers = [];
+
+  function showToast(message) {
+    els.toast.textContent = message;
+    els.toast.classList.add("show");
+
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => {
+      els.toast.classList.remove("show");
+    }, 2400);
+  }
+
+  function renderLibraries() {
+    els.librarySelect.innerHTML = "";
+
+    state.libraries.forEach(name => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      option.selected = name === state.selectedLibrary;
+      els.librarySelect.appendChild(option);
+    });
+  }
+
+  function getFilteredOfficialFirmware() {
+    return state.officialFirmware.filter(firmware => {
+      const microMatches =
+        state.filters.microcontroller === "all" ||
+        firmware.microcontroller === state.filters.microcontroller;
+
+      const mp3Matches =
+        state.filters.mp3Controller === "all" ||
+        firmware.mp3Controller === state.filters.mp3Controller;
+
+      return microMatches && mp3Matches;
+    });
+  }
+
+  function getCurrentFirmware() {
+    if (state.firmwareMode === "custom") {
+      return state.customFirmware;
+    }
+
+    return (
+      state.officialFirmware.find(firmware => firmware.id === state.selectedFirmwareId) ||
+      getFilteredOfficialFirmware()[0] ||
+      state.officialFirmware[0]
+    );
+  }
+
+  function renderFilterChips() {
+    els.microcontrollerChips.innerHTML = "";
+    els.mp3ControllerChips.innerHTML = "";
+
+    state.filterOptions.microcontrollers.forEach(option => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "filter-chip";
+      button.textContent = option === "all" ? "All" : option;
+      button.classList.toggle("active", state.filters.microcontroller === option);
+
+      button.addEventListener("click", () => {
+        state.filters.microcontroller = option;
+        renderFirmware();
+      });
+
+      els.microcontrollerChips.appendChild(button);
+    });
+
+    state.filterOptions.mp3Controllers.forEach(option => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "filter-chip";
+      button.textContent = option === "all" ? "All" : option;
+      button.classList.toggle("active", state.filters.mp3Controller === option);
+
+      button.addEventListener("click", () => {
+        state.filters.mp3Controller = option;
+        renderFirmware();
+      });
+
+      els.mp3ControllerChips.appendChild(button);
+    });
+  }
+
+  function renderFirmwareTabs() {
+    els.officialFirmwareTab.classList.toggle("active", state.firmwareMode === "official");
+    els.customFirmwareTab.classList.toggle("active", state.firmwareMode === "custom");
+  }
+
+  function renderFirmwareList() {
+    els.firmwareList.innerHTML = "";
+
+    if (state.firmwareMode === "custom") {
+      const custom = state.customFirmware;
+      const card = document.createElement("article");
+      card.className = "firmware-card selected";
+      card.innerHTML = `
+        <div class="firmware-card-title">${escapeHtml(custom.listName)}</div>
+        <div class="firmware-card-subtitle">${escapeHtml(custom.name)}</div>
+        <div class="firmware-card-tags">
+          <span class="firmware-card-tag">${escapeHtml(custom.version)}</span>
+          <span class="firmware-card-tag">${escapeHtml(custom.device)}</span>
+          <span class="firmware-card-tag">${escapeHtml(custom.type)}</span>
+        </div>
+      `;
+      els.firmwareList.appendChild(card);
+      refreshCustomScrollbars();
+      return;
+    }
+
+    const firmwareList = getFilteredOfficialFirmware();
+
+    if (firmwareList.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-firmware-list";
+      empty.textContent = "No official firmware matches these filters yet.";
+      els.firmwareList.appendChild(empty);
+      refreshCustomScrollbars();
+      return;
+    }
+
+    if (!firmwareList.some(firmware => firmware.id === state.selectedFirmwareId)) {
+      state.selectedFirmwareId = firmwareList[0].id;
+    }
+
+    firmwareList.forEach(firmware => {
+      const card = document.createElement("article");
+      card.className = "firmware-card";
+
+      if (firmware.id === state.selectedFirmwareId) {
+        card.classList.add("selected");
+      }
+
+      card.innerHTML = `
+        <div class="firmware-card-title">${escapeHtml(firmware.listName)}</div>
+        <div class="firmware-card-subtitle">${escapeHtml(firmware.name)}</div>
+        <div class="firmware-card-tags">
+          <span class="firmware-card-tag">${escapeHtml(firmware.version)}</span>
+          <span class="firmware-card-tag">${escapeHtml(firmware.device)}</span>
+        </div>
+      `;
+
+      card.addEventListener("click", () => {
+        if (firmware.disabled) {
+          showToast("This firmware option is not available yet.");
+          return;
+        }
+
+        state.selectedFirmwareId = firmware.id;
+        renderFirmware();
+      });
+
+      els.firmwareList.appendChild(card);
+    });
+
+    refreshCustomScrollbars();
+  }
+
+  function renderFirmwareDetails() {
+    const firmware = getCurrentFirmware();
+    const isCustom = state.firmwareMode === "custom";
+
+    els.softwareTitle.textContent = firmware.name;
+    els.softwareBadge.textContent = isCustom ? "Custom" : "Official";
+    els.softwareBadge.classList.toggle("soft", isCustom);
+    els.softwareDescription.textContent = firmware.description;
+    els.softwareVersion.textContent = firmware.version;
+    els.softwareDevice.textContent = firmware.device;
+    els.softwareAuthor.textContent = firmware.author;
+    els.softwareAuthor.href = firmware.repoUrl || "#";
+
+    els.firmwareNotesCard.style.display = isCustom ? "none" : "flex";
+    els.customSideStack.classList.toggle("show", isCustom);
+    els.userNotesTitle.textContent = isCustom ? "Custom Notes" : "User Notes";
+
+    if (isCustom) {
+      renderNotesPreview(els.userNotesPreview, firmware.notes);
+      els.selectedCustomFile.textContent = firmware.selected
+        ? `${firmware.type}: ${firmware.name}`
+        : "No custom firmware selected yet.";
+      els.installFirmwareBtn.disabled = state.installingFirmware || !firmware.selected;
+    } else {
+      renderNotesPreview(els.firmwareNotesPreview, firmware.firmwareNotes);
+      renderNotesPreview(els.userNotesPreview, firmware.userNotes);
+      els.installFirmwareBtn.disabled = state.installingFirmware || !!firmware.disabled;
+    }
+  }
+
+  function renderNotesPreview(target, text) {
+    const lines = String(text || "No notes yet.").split("\\n").filter(Boolean);
+
+    if (lines.length === 0) {
+      target.textContent = "No notes yet.";
+      return;
+    }
+
+    target.innerHTML = `<ul>${lines.map(line => `<li>${escapeHtml(line)}</li>`).join("")}</ul>`;
+  }
+
+  function renderFirmware() {
+    renderFirmwareTabs();
+    renderFilterChips();
+    renderFirmwareList();
+    renderFirmwareDetails();
+  }
+
+  function openNotesModal(noteType) {
+    const firmware = getCurrentFirmware();
+    const isCustom = state.firmwareMode === "custom";
+    state.selectedNoteType = noteType;
+
+    if (isCustom) {
+      els.notesModalTitle.textContent = "Custom Firmware Notes";
+      els.notesModalSubtitle.textContent = "Add or edit notes for this custom firmware.";
+      els.notesEditor.value = firmware.notes;
+      els.notesEditor.readOnly = false;
+      els.saveNotesBtn.style.display = "block";
+      openModal(els.notesModal);
+      return;
+    }
+
+    if (noteType === "firmware") {
+      els.notesModalTitle.textContent = "Firmware Notes";
+      els.notesModalSubtitle.textContent = "Official firmware notes are read-only.";
+      els.notesEditor.value = firmware.firmwareNotes;
+      els.notesEditor.readOnly = true;
+      els.saveNotesBtn.style.display = "none";
+    } else {
+      els.notesModalTitle.textContent = "User Notes";
+      els.notesModalSubtitle.textContent = "Add or edit your personal notes for this firmware.";
+      els.notesEditor.value = firmware.userNotes;
+      els.notesEditor.readOnly = false;
+      els.saveNotesBtn.style.display = "block";
+    }
+
+    openModal(els.notesModal);
+  }
+
+  function saveNotes() {
+    const firmware = getCurrentFirmware();
+    const nextNotes = els.notesEditor.value.trim() || "No notes yet.";
+
+    if (state.firmwareMode === "custom") {
+      state.customFirmware.notes = nextNotes;
+      showToast("Custom firmware notes saved.");
+    } else if (state.selectedNoteType === "user") {
+      firmware.userNotes = nextNotes;
+      showToast("User notes saved.");
+    }
+
+    closeModal(els.notesModal);
+    renderFirmware();
+  }
+
+  function chooseCustomFirmware() {
+    els.customFirmwareInput.click();
+  }
+
+  function updateCustomFirmwareFromFiles(files) {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+
+    const first = list[0];
+    const isUf2 = first.name.toLowerCase().endsWith(".uf2");
+    const label = list.length === 1 ? first.name : `${list.length} firmware files selected`;
+
+    state.customFirmware.selected = true;
+    state.customFirmware.name = label;
+    state.customFirmware.listName = "Local Custom Firmware";
+    state.customFirmware.type = isUf2 ? "UF2 file" : "Path / files";
+    state.customFirmware.description = isUf2
+      ? "A custom UF2 firmware file selected from your computer. UF2 files install directly."
+      : "A custom firmware path or file set selected from your computer.";
+    
+    renderFirmware();
+    showToast(`Custom firmware selected: ${label}.`);
+    els.customFirmwareInput.value = "";
+  }
+
+  function installFirmware() {
+    if (state.installingFirmware) return;
+
+    const firmware = getCurrentFirmware();
+
+    if (state.firmwareMode === "custom" && !state.customFirmware.selected) {
+      showToast("Choose custom firmware first.");
+      return;
+    }
+
+    if (firmware.disabled) {
+      showToast("This firmware option is not available yet.");
+      return;
+    }
+
+    state.installingFirmware = true;
+    let progress = 0;
+
+    els.installFirmwareBtn.disabled = true;
+    els.firmwareProgress.classList.add("show");
+    els.firmwareProgressFill.style.width = "0%";
+    els.firmwareInstallStatus.textContent = "Installing firmware...";
+
+    const timer = setInterval(() => {
+      progress += Math.floor(Math.random() * 10) + 7;
+      progress = Math.min(progress, 100);
+      els.firmwareProgressFill.style.width = `${progress}%`;
+
+      if (progress >= 100) {
+        clearInterval(timer);
+        state.installingFirmware = false;
+        els.firmwareInstallStatus.textContent = "Firmware install complete.";
+        showToast("Firmware installed.");
+
+        setTimeout(() => {
+          els.firmwareProgress.classList.remove("show");
+          els.firmwareProgressFill.style.width = "0%";
+          els.firmwareInstallStatus.textContent = "Ready to install.";
+          renderFirmware();
+        }, 1400);
+      }
+    }, 260);
+  }
+
+  function openModal(modal) {
+    modal.classList.add("show");
+    modal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeModal(modal) {
+    modal.classList.remove("show");
+    modal.setAttribute("aria-hidden", "true");
+  }
+
+  function setupCustomScrollbars() {
+    document.querySelectorAll(".custom-scrollbar").forEach(scrollbar => {
+      const scroller = document.getElementById(scrollbar.dataset.target);
+      const track = scrollbar.querySelector(".scroll-track");
+      const thumb = scrollbar.querySelector(".scroll-thumb");
+      const upButton = scrollbar.querySelector(".scroll-up");
+      const downButton = scrollbar.querySelector(".scroll-down");
+
+      let isDragging = false;
+      let dragStartY = 0;
+      let dragStartTop = 0;
+
+      function getMaxScrollTop() {
+        return Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+      }
+
+      function getMaxThumbTop() {
+        return Math.max(1, track.clientHeight - thumb.offsetHeight);
+      }
+
+      function updateThumb() {
+        const trackHeight = track.clientHeight;
+        const visibleRatio = scroller.clientHeight / Math.max(scroller.scrollHeight, 1);
+        const thumbHeight = Math.max(88, Math.min(trackHeight, trackHeight * visibleRatio));
+
+        thumb.style.height = `${thumbHeight}px`;
+
+        const maxTop = Math.max(0, trackHeight - thumbHeight);
+        const scrollRatio = scroller.scrollTop / getMaxScrollTop();
+        const nextTop = maxTop * scrollRatio;
+
+        thumb.style.transform = `translateY(${nextTop}px)`;
+        thumb.dataset.top = String(nextTop);
+      }
+
+      function scrollByAmount(amount) {
+        scroller.scrollBy({
+          top: amount,
+          behavior: "smooth"
+        });
+      }
+
+      scroller.addEventListener("scroll", updateThumb);
+      upButton.addEventListener("click", () => scrollByAmount(-140));
+      downButton.addEventListener("click", () => scrollByAmount(140));
+
+      track.addEventListener("click", event => {
+        if (event.target !== track) return;
+
+        const rect = track.getBoundingClientRect();
+        const clickY = event.clientY - rect.top;
+        const thumbTop = Number(thumb.dataset.top || 0);
+
+        if (clickY < thumbTop) {
+          scrollByAmount(-scroller.clientHeight * 0.75);
+        } else {
+          scrollByAmount(scroller.clientHeight * 0.75);
+        }
+      });
+
+      thumb.addEventListener("mousedown", event => {
+        isDragging = true;
+        dragStartY = event.clientY;
+        dragStartTop = Number(thumb.dataset.top || 0);
+        document.body.style.userSelect = "none";
+        event.preventDefault();
+      });
+
+      window.addEventListener("mousemove", event => {
+        if (!isDragging) return;
+
+        const deltaY = event.clientY - dragStartY;
+        const nextTop = Math.max(0, Math.min(getMaxThumbTop(), dragStartTop + deltaY));
+        const scrollRatio = nextTop / getMaxThumbTop();
+
+        scroller.scrollTop = scrollRatio * getMaxScrollTop();
+        updateThumb();
+      });
+
+      window.addEventListener("mouseup", () => {
+        if (!isDragging) return;
+        isDragging = false;
+        document.body.style.userSelect = "";
+      });
+
+      const resizeObserver = new ResizeObserver(updateThumb);
+      resizeObserver.observe(scroller);
+      resizeObserver.observe(track);
+
+      customScrollbarRefreshers.push(updateThumb);
+      updateThumb();
+    });
+  }
+
+  function refreshCustomScrollbars() {
+    requestAnimationFrame(() => {
+      customScrollbarRefreshers.forEach(refresh => refresh());
+    });
+  }
+
+  function setZoom(nextZoom) {
+    state.zoom = Math.max(0.7, Math.min(1.15, nextZoom));
+    els.scaleShell.style.transform = `scale(${state.zoom})`;
+    refreshCustomScrollbars();
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function initEvents() {
+    document.querySelectorAll(".nav-item").forEach(item => {
+      item.addEventListener("click", () => {
+        state.selectedPage = item.dataset.page;
+
+        document.querySelectorAll(".nav-item").forEach(nav => {
+          nav.classList.toggle("active", nav.dataset.page === state.selectedPage);
+        });
+
+        document.querySelectorAll(".page").forEach(page => page.classList.remove("active"));
+
+        const pageMap = {
+          loadMusic: "loadMusicPage",
+          firmware: "firmwarePage",
+          tools: "toolsPage",
+          settings: "settingsPage",
+          help: "helpPage"
+        };
+
+        document.getElementById(pageMap[state.selectedPage]).classList.add("active");
+        refreshCustomScrollbars();
+      });
+    });
+
+    els.librarySelect.addEventListener("change", () => {
+      state.selectedLibrary = els.librarySelect.value;
+      showToast(`Library changed to ${state.selectedLibrary}.`);
+    });
+
+    els.officialFirmwareTab.addEventListener("click", () => {
+      state.firmwareMode = "official";
+      renderFirmware();
+    });
+
+    els.customFirmwareTab.addEventListener("click", () => {
+      state.firmwareMode = "custom";
+      renderFirmware();
+    });
+
+    els.filterButton.addEventListener("click", event => {
+      event.stopPropagation();
+      els.filterMenu.classList.toggle("show");
+    });
+
+    document.addEventListener("click", event => {
+      if (!els.filterMenu.contains(event.target) && event.target !== els.filterButton) {
+        els.filterMenu.classList.remove("show");
+      }
+    });
+
+    els.viewFirmwareNotesBtn.addEventListener("click", () => openNotesModal("firmware"));
+    els.editUserNotesBtn.addEventListener("click", () => openNotesModal("user"));
+
+    els.closeNotesBtn.addEventListener("click", () => closeModal(els.notesModal));
+    els.cancelNotesBtn.addEventListener("click", () => closeModal(els.notesModal));
+    els.saveNotesBtn.addEventListener("click", saveNotes);
+
+    els.chooseCustomFirmwareBtn.addEventListener("click", chooseCustomFirmware);
+    els.customFirmwareInput.addEventListener("change", () => {
+      updateCustomFirmwareFromFiles(els.customFirmwareInput.files);
+    });
+
+    els.installFirmwareBtn.addEventListener("click", installFirmware);
+
+    els.zoomInBtn.addEventListener("click", () => setZoom(state.zoom + 0.05));
+    els.zoomOutBtn.addEventListener("click", () => setZoom(state.zoom - 0.05));
+
+    els.closeBtn.addEventListener("click", () => {
+      els.app.style.display = "none";
+    });
+
+    els.maximizeBtn.addEventListener("click", () => {
+      setZoom(state.zoom === 1 ? 0.85 : 1);
+      showToast("Browser demo zoom toggled.");
+    });
+
+    els.minimizeBtn.addEventListener("click", () => {
+      showToast("Minimize would be handled by the desktop app.");
+    });
+
+    window.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        closeModal(els.notesModal);
+        els.filterMenu.classList.remove("show");
+      }
+    });
+  }
+
+  function init() {
+    renderLibraries();
+    renderFirmware();
+    initEvents();
+    setupCustomScrollbars();
+    refreshCustomScrollbars();
+  }
+
+  init();
+</script>
+</body>
+</html>

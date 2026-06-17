@@ -44,7 +44,7 @@ pip install -r requirements.txt
 **Core Dependencies:**
 - `PyQt6>=6.6.0` - GUI framework
 - `mutagen>=1.47.0` - Audio metadata extraction
-- `pygame>=2.5.2` - Audio playback (emulator)
+- `pygame-ce>=2.5.2` - Audio playback (emulator; same API as pygame, `import pygame`)
 - `psutil>=5.9.0` - System utilities (SD card detection)
 - `pydub>=0.25.1` - Audio processing
 - `python-vlc>=3.0.20123` - Advanced audio playback (optional, for better seeking support)
@@ -53,7 +53,7 @@ pip install -r requirements.txt
 To convert non-MP3 files (FLAC, WAV, OGG, etc.) to MP3 when syncing to SD card or exporting, **one of the following is required**:
 
 - **VLC Media Player** (recommended) – [Download from VideoLAN](https://www.videolan.org/vlc/). Install on your system; the app will use it for conversion and for better seeking in the Emulator.
-- **FFmpeg** – [Download from FFmpeg](https://ffmpeg.org/download.html) and add it to your system PATH. The app uses pydub with FFmpeg as a fallback when VLC is not installed.
+- **FFmpeg** – used by pydub for conversion fallback when VLC is unavailable. Packaged app builds bundle an FFmpeg binary; source/dev runs can also use a system FFmpeg from PATH.
 
 Without either VLC or FFmpeg, only MP3 files can be synced (other formats will be skipped).
 
@@ -140,76 +140,36 @@ python gui/radio_manager.py
 
 ## Building standalone executables (Windows / Mac)
 
-To build a standalone folder (no install; user runs the exe or .app directly):
+Packaging behavior differs across Windows and macOS. To avoid drift, use the canonical packaging guide:
 
-1. Install dependencies and PyInstaller:
-   ```bash
-   pip install -r requirements.txt
-   pip install pyinstaller
-   ```
+- [`docs/BUILD_AND_PACKAGE.md`](docs/BUILD_AND_PACKAGE.md)
 
-2. From the project root, run:
-   ```bash
-   pyinstaller vintage_radio.spec
-   ```
-   Close any running Vintage Radio app (or process using `dist/Vintage Radio`) before rebuilding, or PyInstaller may fail with "Access is denied". Use `--noconfirm` to skip the "Continue? (y/N)" prompt. SyntaxWarnings from the `pydub` dependency during build are harmless; to hide them use `$env:PYTHONWARNINGS='ignore::SyntaxWarning'` (PowerShell) before running PyInstaller.
+Quick commands:
 
-3. Output is in `dist/Vintage Radio/`. If the exe shows a generic icon in Explorer (especially in list view), try renaming the exe once so Windows refreshes its icon cache. Run the executable inside that folder. All Python dependencies and the radio icon are included. VLC is not bundled; users can install VLC system-wide for better conversion and seeking if desired.
-
-**Windows:** For a proper .exe icon, create an ICO from the PNG (requires Pillow):  
-`python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"`  
-Then rebuild. The spec will use `vintage_radio.ico` if present.
+- **Windows:** `build_windows.bat` (or `pyinstaller build/vintage_radio.spec`)
+- **macOS:** `bash build_macos.sh`
+- Output: `dist/Vintage Radio/`
 
 ## Project Structure
 
-```
-Vintage_radio/
-├── .github/
-│   └── workflows/
-│       └── build-release.yml   # CI: build Windows/macOS executables
-├── components/                 # Hardware interfaces
-│   ├── __init__.py
-│   ├── dfplayer_hardware.py   # DFPlayer (Pico/RP2040)
-│   └── pi_hardware.py         # Raspberry Pi (VLC)
-├── docs/
-│   ├── README_Pi.md           # Raspberry Pi setup
-│   └── README_RP2040.md       # RP2040 firmware notes
-├── gui/                        # GUI application code
-│   ├── __init__.py
-│   ├── radio_manager.py       # Main window
-│   ├── test_mode.py           # Emulator widget
-│   ├── database.py            # Database operations
-│   ├── sd_manager.py          # SD card sync
-│   ├── hardware_emulator.py   # Hardware emulation
-│   ├── audio_metadata.py      # Metadata extraction
-│   ├── resource_paths.py      # Paths for dev vs frozen exe
-│   ├── resources/             # Icons, images, sounds
-│   │   ├── vintage_radio.ico, .png, .svg
-│   │   ├── volDial.png, powerInd.png, AMradioSound.wav, etc.
-│   └── ...
-├── radio_core.py              # Shared core logic (GUI + firmware)
-├── main.py                    # Firmware entry (reference)
-├── main_pi.py                 # Raspberry Pi entry
-├── run_vintage_radio.py       # Launcher for GUI (used by PyInstaller)
-├── vintage_radio.spec         # PyInstaller spec for standalone build
-├── requirements.txt
-├── README.md
-└── RELEASE_NOTES.md           # Template for release notes
-```
+The canonical repository taxonomy and source-vs-generated policy lives in:
+
+- [`docs/REPO_STRUCTURE.md`](docs/REPO_STRUCTURE.md)
 
 ## Architecture
 
 ### Shared Core Logic
-The `radio_core.py` module contains the core state machine logic used by both:
-- The GUI emulator
-- The actual firmware (hardware)
+`firmware/radio_core.py` contains the core state machine logic used by both:
+- The GUI emulator (`gui/hardware_emulator.py`)
+- The actual firmware (`firmware/pico/main.py`, `firmware/pi/main_pi.py`)
 
 This ensures that the emulator accurately represents device behavior.
 
 ### Hardware Abstraction
 The system uses a `HardwareInterface` abstraction layer:
 - **GUI**: `PygameHardwareEmulator` - Uses pygame for audio playback
-- **Firmware**: `DFPlayerHardware` - Uses DFPlayer Mini via UART
+- **Pico Firmware**: `DFPlayerHardware` (`firmware/pico/dfplayer_hardware.py`) - Uses DFPlayer Mini via UART
+- **Pi Firmware**: `PiHardware` (`firmware/pi/pi_hardware.py`) - Uses VLC and GPIO
 
 ### Database Schema
 - `songs`: Music file metadata
@@ -230,7 +190,7 @@ The emulator provides a complete emulation of the device:
 - Detailed logging
 
 ### Firmware Integration
-The firmware uses `components/dfplayer_hardware.py` (and `components/pi_hardware.py` for Pi), implementing the same `HardwareInterface` as the GUI, ensuring compatibility.
+The firmware uses `firmware/pico/dfplayer_hardware.py` (and `firmware/pi/pi_hardware.py` for Pi), implementing the same `HardwareInterface` as the GUI, ensuring compatibility.
 
 ## Known Limitations
 
@@ -241,7 +201,7 @@ The firmware uses `components/dfplayer_hardware.py` (and `components/pi_hardware
 ## Troubleshooting
 
 ### Audio Playback Issues
-- Ensure pygame is properly installed: `pip install pygame`
+- Ensure pygame is available: `pip install -r requirements.txt` (uses **pygame-ce**, still `import pygame`)
 - For better format support, install VLC Media Player
 - Check that audio files are not corrupted
 

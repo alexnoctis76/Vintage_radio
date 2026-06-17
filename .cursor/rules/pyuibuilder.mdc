@@ -1,0 +1,280 @@
+---
+description: Rules for working with PyUIBuilder — generating .pyui files and fixing generated PySide6 code. Apply whenever editing .pyui files or .pyrunner/main.py.
+globs: ["**/*.pyui", "**/.pyrunner/**", "**/gen_pyui.py"]
+alwaysApply: false
+---
+
+# PyUIBuilder — Verified Rules
+
+> All rules below are sourced directly from the PyUIBuilder GitHub source code
+> (https://github.com/PaulleDemon/PyUIBuilder) and confirmed against real generated output.
+> Do NOT guess — only use what is listed here.
+
+---
+
+## 1. Confirmed `widgetClass` values
+
+These are the only widget types confirmed to exist in PyUIBuilder's source.
+The value is the `static widgetType` property from each JS class.
+
+| widgetClass      | Display name   | Qt equivalent     | Key extra attrs                          |
+|------------------|----------------|-------------------|------------------------------------------|
+| `main_window`    | Main Window    | QMainWindow       | `title`, `logo`, `menuData`, `menuHidden`, `resizable.x/y`, `maximized`, `initialPosition.*` |
+| `frame`          | Frame          | QFrame / QWidget  | (base attrs only)                        |
+| `label`          | Label          | QLabel            | `labelWidget` (text), `imageUpload`      |
+| `button`         | Button         | QPushButton       | `buttonLabel` (text)                     |
+| `entry`          | Entry          | QLineEdit         | `placeHolder`                            |
+| `Text`           | Text           | QTextEdit         | (no extra attrs — note capital T)        |
+| `option_menu`    | Option Menu    | QComboBox         | `defaultValue`, `widgetOptions: {inputs: [], selectedRadio: -1}` |
+| `check_button`   | Check Box      | QCheckBox         | `checkLabel`, `defaultChecked` (bool)    |
+| `radio_button`   | Radio Button   | QRadioButton      | `radios: {inputs: [], selectedRadio: -1}`|
+| `scale`          | Scale/Slider   | QSlider           | `scale.min/max/step/default`, `orientation` |
+| `spin_box`       | Spin Box       | QSpinBox          | `spinProps.min/max/step/default`         |
+| `progressBar`    | Progress Bar   | QProgressBar      | `orientation`, `mode`, `styling.chunkColor` |
+
+**NOT in the source (do not use):**
+`tabWidget`, `listWidget`, `tableWidget`, `groupBox`, `comboBox` — these do not exist.
+Use `frame` as a container placeholder for complex widgets.
+
+---
+
+## 2. Base attrs — every widget has these
+
+All widgets inherit these from `TkinterWidgetBase` / `TkinterBase`:
+
+```json
+{
+  "styling.backgroundColor": "#hexcolor",
+  "styling.foregroundColor": "#hexcolor",
+  "styling.hover.hoverBgEnabled": false,
+  "styling.hover.hoverBg": "#hexcolor",
+  "styling.borderWidth": 1,
+  "styling.borderColor": "#hexcolor",
+  "styling.borderRadius": 4,
+  "eventHandlers": [],
+  "cursor": "",
+  "layout": { "layout": "absolute" }
+}
+```
+
+---
+
+## 3. cursor attr — critical rule
+
+**ALWAYS set `"cursor": ""` (empty string) in every widget's attrs when
+targeting the PySide framework.**
+
+PyUIBuilder's PySide code generator takes the cursor string value and emits it
+verbatim as `qc.Qt.{value}` — it does NOT map any cursor name to a valid
+PySide6 enum. This means:
+
+| Value in attrs | Generated (broken) code     |
+|----------------|-----------------------------|
+| `"pointer"`    | `qc.Qt.pointer`  → crash    |
+| `"hand2"`      | `qc.Qt.hand2`    → crash    |
+| `"arrow"`      | `qc.Qt.arrow`    → crash    |
+| `""`           | (no cursor line generated)  |
+
+**Rule: always use `""`. Add cursor styling in hand-written Python after export.**
+
+To add a pointing-hand cursor in hand-written PySide6:
+```python
+widget.setCursor(qc.Qt.CursorShape.PointingHandCursor)
+```
+
+---
+
+## 4. Layout types (from layouts.js)
+
+```json
+{ "layout": "absolute" }   // absolute pixel positioning (use this always for .pyui files)
+{ "layout": "flex", "gap": 10, "direction": "row" }  // flex/pack layout
+{ "layout": "grid" }       // grid layout
+```
+
+In the `.pyui` format, use `"absolute"` layout for predictable drag-and-drop behavior.
+
+---
+
+## 5. .pyui file schema
+
+```json
+{
+  "framework": "PySide",
+  "projectName": "string",
+  "canvasData": [ /* widget tree — see §6 */ ],
+  "code": ""
+}
+```
+
+**`framework` values:** `"PySide"` | `"tkinter"` | `"CustomTkinter"`
+
+---
+
+## 6. Widget object schema
+
+Every entry in `canvasData` or in a `children` array:
+
+```json
+{
+  "id": "widgetClass_19charalphanumeric",
+  "children": [],
+  "parent": "parent_widget_id_or_empty_string",
+  "initialData": {
+    "zIndex": 0,
+    "selected": false,
+    "widgetName": "human readable name",
+    "pos": { "x": 0.0, "y": 0.0 },
+    "size": { "width": 100, "height": 40 },
+    "fitContent": { "width": false, "height": false },
+    "widgetContainer": "canvas",
+    "parentLayout": null,
+    "positionType": "absolute",
+    "attrs": { /* widget-specific attrs */ },
+    "draggable": true
+  },
+  "extraProps": {},
+  "widgetClass": "button"
+}
+```
+
+**`widgetContainer` rules:**
+- `"canvas"` — only for `main_window` (the top-level window on the canvas)
+- `"widget"` — for every other widget (children inside a window or frame)
+
+**`parentLayout` rules:**
+- `null` — only for `main_window`
+- `{ "layout": "absolute" }` — for all children when parent uses absolute layout
+
+**`positionType`** — always `"absolute"`
+
+**Position coordinates** are in pixels, relative to the parent widget's top-left corner (0,0).
+
+---
+
+## 7. main_window extras
+
+`main_window` has additional fields at the `initialData` level (NOT inside `attrs`):
+
+```json
+"initialData": {
+  ...
+  "draggable": true,
+  "menuData": [
+    {
+      "name": "File",
+      "items": [
+        { "name": "New", "items": [] }
+      ]
+    }
+  ]
+}
+```
+
+And these extra attrs:
+```json
+"attrs": {
+  "initialPosition.x": 0,
+  "initialPosition.y": 0,
+  "initialPosition.positionList": "",
+  "resizable.x": true,
+  "resizable.y": true,
+  "maximized": false,
+  "title": "Window Title",
+  "menuHidden": false,
+  "logo": ""
+}
+```
+
+---
+
+## 8. One main_window per canvasData — HARD RULE
+
+`canvasData` can only contain **one `main_window`** entry. PyUIBuilder will not
+load the file if there are multiple main windows. Use frames inside the single
+window to represent tabs or sections.
+
+---
+
+## 9. Known bugs in PyUIBuilder's PySide code generator
+
+When PyUIBuilder generates `main.py` from a `.pyui` file with `framework: "PySide"`,
+the generated code contains several errors that must be fixed manually:
+
+| Generated (wrong)                  | Correct PySide6                                    |
+|------------------------------------|----------------------------------------------------|
+| `qc.Qt.pointer`                    | `qc.Qt.CursorShape.PointingHandCursor`             |
+| `qc.Qt.hand2`                      | `qc.Qt.CursorShape.PointingHandCursor`             |
+| `qc.Qt.{any_cursor_name}`          | See §3 — best fix is to remove the setCursor line  |
+| `qc.Qt.AlignCenter`                | `qc.Qt.AlignmentFlag.AlignCenter`                  |
+| `qc.Qt.AlignLeft`                  | `qc.Qt.AlignmentFlag.AlignLeft`                    |
+| `qc.Qt.AlignRight`                 | `qc.Qt.AlignmentFlag.AlignRight`                   |
+| `qc.Qt.Horizontal`                 | `qc.Qt.Orientation.Horizontal`                     |
+| `qc.Qt.Vertical`                   | `qc.Qt.Orientation.Vertical`                       |
+| `frame_x = qw.QFrame(p)\n` ×2     | Remove the duplicate line (frames declared twice)  |
+
+**Fix script for generated main.py:**
+```python
+import re, pathlib
+p = pathlib.Path(".pyrunner/main.py")
+src = p.read_text(encoding="utf-8")
+# Cursor: any qc.Qt.<cursor_name> → remove the whole setCursor line
+src = re.sub(r'.*\.setCursor\(qc\.Qt\.\w+\)\n', '', src)
+src = src.replace("qc.Qt.AlignCenter", "qc.Qt.AlignmentFlag.AlignCenter")
+src = src.replace("qc.Qt.AlignLeft", "qc.Qt.AlignmentFlag.AlignLeft")
+src = src.replace("qc.Qt.AlignRight", "qc.Qt.AlignmentFlag.AlignRight")
+src = src.replace("qc.Qt.Horizontal", "qc.Qt.Orientation.Horizontal")
+src = src.replace("qc.Qt.Vertical", "qc.Qt.Orientation.Vertical")
+# remove duplicate frame declarations
+src = re.sub(r'(frame_\w+ = qw\.QFrame\([^)]+\))\n\1', r'\1', src)
+p.write_text(src, encoding="utf-8")
+```
+
+---
+
+## 10. ID format
+
+IDs follow the pattern `{widgetClass}_{19-char lowercase alphanumeric}`.
+Example: `button_mpmz53haajqwviffxb`
+
+Generate with Python:
+```python
+import random, string
+def uid(widget_class):
+    chars = string.ascii_lowercase + string.digits
+    return f"{widget_class}_{''.join(random.choices(chars, k=19))}"
+```
+
+---
+
+## 11. Preview runner venv setup
+
+PyUIBuilder's "Run Preview" feature spawns Python from:
+```
+<project_folder>\.pyrunner\venv\Scripts\python.exe
+```
+
+The folder name must be **`venv`** (no dot prefix). If preview gives an
+`ENOENT` error, the venv is missing. Fix:
+
+```powershell
+$target = "path\to\YourProject\.pyrunner"
+python -m venv "$target\venv"
+& "$target\venv\Scripts\pip.exe" install PySide6
+```
+
+The `requirements.txt` inside `.pyrunner` lists the packages needed (usually
+just `PySide6`). The outer `.pyrunner` at the workspace root level is separate
+from the inner project-level `.pyrunner` — PyUIBuilder uses the inner one.
+
+---
+
+## 12. What PyUIBuilder cannot represent
+
+These features require manual code after export:
+- Custom `paintEvent` / background image painting
+- QSS stylesheets beyond simple bg/fg/border
+- QSplitter, QTabWidget, QTableWidget, QListWidget (no widget types for these)
+- Signal/slot connections beyond stub `print()` handlers
+- Dynamic widget creation at runtime
+- Custom widgets (`RadioShellWidget`, etc.)

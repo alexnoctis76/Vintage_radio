@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.pytest_cache/
+# PyInstaller build output
 build/
 develop-eggs/
 dist/
@@ -39,9 +41,15 @@ env/
 *.db-wal
 *.db-journal
 
-# Backups
+# App data directory (DBs, libraries, backups when running from source)
+data/
+
+# Backups (legacy location at project root)
 backups/*.db
 !backups/.gitkeep
+backups/restore/*.patch
+backups/restore/*.bundle
+!backups/restore/RESTORE.md
 
 # Logs
 *.log
@@ -67,11 +75,12 @@ agent_workshop/
 agent_workshop/test_*.py
 !agent_workshop/backup_*.py
 
-# Project specific
+# Project specific (legacy DBs at project root; prefer data/ now)
 radio_manager.db
 radio_manager.db-shm
 radio_manager.db-wal
-
+libraries/
+*.db
 
 # Gradle
 .gradle/

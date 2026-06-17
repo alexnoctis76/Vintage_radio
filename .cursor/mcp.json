@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "vintage-radio-debug": {
+      "command": "python",
+      "args": ["-u", "c:/Users/alexn/Workspace/Vintage_radio/scripts/vintage_radio_debug_mcp_bridge.py"],
+      "cwd": "c:/Users/alexn/Workspace/Vintage_radio"
+    }
+  }
+}

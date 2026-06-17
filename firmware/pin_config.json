@@ -1,0 +1,31 @@
+{
+  "board": "raspberry_pi_pico",
+  "audio_module": "dfplayer",
+  "pins": {
+    "uart_tx": 0,
+    "uart_rx": 1,
+    "button": 2,
+    "audio_pwm": 3,
+    "power_sense": 14,
+    "busy": 15,
+    "neopixel": 16
+  },
+  "spi": {
+    "bus": 1,
+    "sck": 10,
+    "mosi": 11,
+    "miso": 12,
+    "cs": 13
+  },
+  "spi_alt": {
+    "bus": 0,
+    "sck": 18,
+    "mosi": 19,
+    "miso": 16,
+    "cs": 17
+  },
+  "dfplayer": {
+    "max_volume": 28,
+    "uart_baud": 9600
+  }
+}

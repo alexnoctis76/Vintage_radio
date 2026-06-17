@@ -5,26 +5,35 @@
 #
 # Release notes: The job uses permissions: contents: write. If "generate release notes" still fails with 403,
 # add a Personal Access Token (classic) with scope "repo" as a repo secret named RELEASE_TOKEN.
+#
+# ---------------------------------------------------------------------------
+# TEMPORARILY DISABLED (2026-03): CI-built Windows artifacts were missing
+# bundled mpremote (PyInstaller/spec vs runner env). Re-enable after fixing
+# the release build so mpremote is always collected. Restore the `on:` block
+# below and remove `if: false` from the `build` job.
+# ---------------------------------------------------------------------------
 
 name: Build release
 
 on:
-  push:
-    branches: [release]
-    tags: ["v*"]
-  release:
-    types: [published]
   workflow_dispatch:
+  # Re-enable when CI mpremote bundling is verified:
+  # push:
+  #   branches: [release]
+  #   tags: ["v*"]
+  # release:
+  #   types: [published]
 
 jobs:
   build:
+    if: false
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             artifact: Vintage-Radio-Windows
-          - os: macos-latest
+          - os: macos-15
             artifact: Vintage-Radio-macOS
 
     runs-on: ${{ matrix.os }}
@@ -37,6 +46,10 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Install macOS build dependencies (macOS only)
+        if: runner.os == 'macOS'
+        run: brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -44,19 +57,32 @@ jobs:
           pip install pyinstaller
 
       - name: Create Windows .ico from PNG (Windows only)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: |
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
-      - name: Build with PyInstaller
-        run: pyinstaller vintage_radio.spec
+      - name: Build Windows with PyInstaller
+        if: runner.os == 'Windows'
+        run: pyinstaller build/vintage_radio.spec --noconfirm
 
-      - name: Upload artifact
+      - name: "Build macOS app (same as local - build_macos.sh)"
+        if: runner.os == 'macOS'
+        run: bash build/build_macos.sh --no-dmg
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/Vintage Radio/
+
+      - name: Upload artifact (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/Vintage Radio.app
 
   # Create/update a GitHub Release and attach built binaries (on tag push or release published)
   upload-release:
@@ -80,8 +106,24 @@ jobs:
       - name: Zip macOS build
         run: |
           cd artifacts/Vintage-Radio-macOS
-          zip -r ../../Vintage-Radio-macOS.zip .
+          zip -r ../../Vintage-Radio-macOS.zip "Vintage Radio.app"
           cd ../..
+
+      # Per-OS semver the in-app updater compares against (may match tag_name; for manual
+      # releases you can edit before upload so Windows/Mac can differ from the tag).
+      - name: Write release-versions.json
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+
+          tag = os.environ["RELEASE_TAG"].strip()
+          with open("release-versions.json", "w", encoding="utf-8") as f:
+              json.dump({"windows": tag, "macos": tag}, f, indent=2)
+          PY
 
       - name: Create Release and upload binaries
         uses: softprops/action-gh-release@v2
@@ -92,5 +134,6 @@ jobs:
           files: |
             Vintage-Radio-Windows.zip
             Vintage-Radio-macOS.zip
+            release-versions.json
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

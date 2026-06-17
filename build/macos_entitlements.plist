@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Not a Mac App Store app: disable sandbox so serial/USB access works -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+
+	<!-- Allow reading external storage devices (USB drives, SD cards) -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+
+	<!-- Allow access to /Volumes for external drives -->
+	<key>com.apple.security.files.all.read-write</key>
+	<false/>
+
+	<!-- Allow access to USB and serial devices -->
+	<key>com.apple.security.device.usb</key>
+	<true/>
+
+	<!-- Allow access to microcontroller serial ports (for USB serial adapters) -->
+	<key>com.apple.security.device.serial</key>
+	<true/>
+
+	<!-- Disable library validation to allow loading of system libraries (required for PyQt6, etc.) -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+
+	<!-- Allow execution of helper tools/scripts (needed for VLC/FFmpeg calls) -->
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+
+	<!-- Allow loading of dynamically linked libraries -->
+	<key>com.apple.security.cs.allow-dyld-environment-variables</key>
+	<true/>
+</dict>
+</plist>
+

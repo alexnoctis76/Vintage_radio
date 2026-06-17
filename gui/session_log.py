@@ -8,8 +8,9 @@ Creates a timestamped log file in the system temp directory that captures:
 - GUI debug events
 
 Log files are stored in:
-  %TEMP%/VintageRadio/  (Windows)
-  /tmp/VintageRadio/    (Linux/Mac)
+  %TEMP%/VintageRadio/       (Windows)
+  $TMPDIR/VintageRadio/      (macOS: often /var/folders/.../T/VintageRadio/)
+  /tmp/VintageRadio/        (Linux)
 
 Old log files are automatically cleaned up (keeps last 10 sessions).
 """
@@ -22,10 +23,17 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import traceback
 from io import StringIO
 from pathlib import Path
 from typing import Optional
+
+
+def format_session_timestamp(now: Optional[datetime.datetime] = None) -> str:
+    """Wall time with milliseconds: ``HH:MM:SS:mmm`` (colon before ms, no duplicate brackets)."""
+    t = now or datetime.datetime.now()
+    return t.strftime("%H:%M:%S") + f":{t.microsecond // 1000:03d}"
 
 
 # ── Module-level state ──────────────────────────────────────────
@@ -45,6 +53,88 @@ def get_log_dir() -> Path:
 def get_session_log_path() -> Optional[Path]:
     """Return the path of the current session's log file (None if not initialized)."""
     return _session_log_path
+
+
+def log_gui_error(title: str, message: str) -> None:
+    """Log a GUI-visible failure (task dialog, message box) to the session log file."""
+    if not _session_log_path:
+        return
+    ts = format_session_timestamp()
+    block = f"{title}\n{message}"
+    try:
+        with open(_session_log_path, "a", encoding="utf-8", newline="\n") as f:
+            for line in block.splitlines() or [block]:
+                f.write(f"{ts} [GUI-ERROR] {line}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+
+
+def install_messagebox_session_logging() -> None:
+    """Route GUI alert boxes through the session log (GUI-ERROR).
+
+    Call once after init_session_logging() so user-visible warnings and errors
+    are always captured even when no TaskProgressDialog is involved.
+    """
+    from PyQt6.QtWidgets import QMessageBox
+
+    from gui.widgets.dialogs.vintage_message import VintageMessageBox
+
+    _orig_critical = QMessageBox.critical
+    _orig_warning = QMessageBox.warning
+
+    @staticmethod
+    def critical(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _orig_critical(parent, title, text, *args, **kwargs)
+
+    @staticmethod
+    def warning(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _orig_warning(parent, title, text, *args, **kwargs)
+
+    QMessageBox.critical = critical  # type: ignore[assignment]
+    QMessageBox.warning = warning  # type: ignore[assignment]
+
+    _v_critical = VintageMessageBox.critical
+    _v_warning = VintageMessageBox.warning
+
+    @staticmethod
+    def vintage_critical(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _v_critical(parent, title, text, *args, **kwargs)
+
+    @staticmethod
+    def vintage_warning(parent, title, text, *args, **kwargs):  # type: ignore[no-untyped-def]
+        log_gui_error(str(title), str(text))
+        return _v_warning(parent, title, text, *args, **kwargs)
+
+    VintageMessageBox.critical = vintage_critical  # type: ignore[assignment]
+    VintageMessageBox.warning = vintage_warning  # type: ignore[assignment]
+
+
+def write_session_line(message: str, *, prefix: str = "SETUP") -> None:
+    """Append one line directly to the session log file and flush + fsync.
+
+    Use this for crash-prone paths (e.g. Setup Device / mpremote). Unlike ``print()``,
+    this does not depend on ``sys.stdout`` (PyInstaller windowed builds, torn TeeWriter).
+    Survives until the OS buffers are lost (hard kill / native crash may still omit lines).
+    """
+    if not _session_log_path:
+        return
+    try:
+        ts = format_session_timestamp()
+        line = f"{ts} [{prefix}] {message}\n"
+        with open(_session_log_path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(line)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def init_session_logging(app_version: str = "dev") -> Path:
@@ -86,12 +176,28 @@ def init_session_logging(app_version: str = "dev") -> Path:
     _file_handler = logging.FileHandler(str(_session_log_path), encoding="utf-8")
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                          datefmt="%H:%M:%S")
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
     )
     root_logger = logging.getLogger()
     root_logger.addHandler(_file_handler)
     root_logger.setLevel(logging.DEBUG)
+
+    # ── Optional: verbose console logging ────────────────────
+    # Set VINTAGE_RADIO_VERBOSE=1 (or true/yes) to see DEBUG logs in the terminal as well as in the file.
+    if os.environ.get("VINTAGE_RADIO_VERBOSE", "").strip().lower() in ("1", "true", "yes"):
+        console_handler = logging.StreamHandler(_original_stdout)
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        root_logger.addHandler(console_handler)
+        print("Verbose debug logging enabled (VINTAGE_RADIO_VERBOSE)")
 
     # ── Global exception hook ────────────────────────────────
     _original_excepthook = sys.excepthook
@@ -111,6 +217,31 @@ def init_session_logging(app_version: str = "dev") -> Path:
 
     sys.excepthook = _exception_hook
 
+    # ── Thread exceptions (Python 3.8+) — otherwise silent in GUI threads ──
+    if hasattr(threading, "excepthook"):
+        _orig_thread_excepthook = threading.excepthook
+
+        def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
+            try:
+                msg = "".join(
+                    traceback.format_exception(
+                        args.exc_type, args.exc_value, args.exc_traceback
+                    )
+                )
+                log_file.write(f"\n{'!'*72}\n")
+                log_file.write(
+                    f"THREAD EXCEPTION (thread={args.thread!r}) at "
+                    f"{datetime.datetime.now().isoformat()}\n"
+                )
+                log_file.write(msg)
+                log_file.write(f"{'!'*72}\n\n")
+                log_file.flush()
+            except Exception:
+                pass
+            _orig_thread_excepthook(args)
+
+        threading.excepthook = _thread_excepthook
+
     # ── Cleanup on exit ──────────────────────────────────────
     def _on_exit():
         try:
@@ -127,6 +258,24 @@ def init_session_logging(app_version: str = "dev") -> Path:
     _cleanup_old_logs(log_dir, keep=10)
 
     print(f"Session log: {_session_log_path}")
+
+    # Dump Python stack on fault (helps when a C extension or embedded code aborts).
+    try:
+        import faulthandler
+
+        faulthandler.enable(file=log_file, all_threads=True)
+    except Exception:
+        pass
+
+    # Windows: optional minidump on native fatal exceptions (see gui/windows_crash_dump.py).
+    try:
+        if sys.platform == "win32":
+            from .windows_crash_dump import install_windows_minidump_handler
+
+            install_windows_minidump_handler(crash_dir=log_dir / "crash_dumps")
+    except Exception:
+        pass
+
     return _session_log_path
 
 
