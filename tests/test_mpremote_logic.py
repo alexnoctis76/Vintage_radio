@@ -476,6 +476,74 @@ class TestInstallToPicoWorker:
         assert len(error_raised) == 1
         assert "background thread" in error_raised[0].lower()
 
+    @mock.patch("gui.radio_manager._run_mpremote")
+    def test_cross_compiles_radio_core_and_dfplayer_to_mpy(
+        self, mock_mpremote, project_root, mock_sd_manager, tmp_path
+    ):
+        """radio_core.py / dfplayer_hardware.py should ship as precompiled .mpy when
+        mpy-cross is available, and stale .py counterparts should be removed from the
+        device (see am_wav_loader.py for why: on-device compilation of these large
+        source files fragments the heap enough to break AM WAV loading)."""
+        worker = self._get_worker()
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
+
+        fake_mpy = tmp_path / "fake_compiled.mpy"
+        fake_mpy.write_bytes(b"\x00fakebytecode")
+
+        with mock.patch(
+            "gui.radio_manager._cross_compile_to_mpy", return_value=fake_mpy
+        ) as mock_compile:
+            worker(
+                mpremote_cmd=["/usr/bin/mpremote"],
+                root=project_root,
+                sd_root=None,
+                sd_manager=mock_sd_manager,
+            )
+
+        assert mock_compile.call_count >= 2
+
+        all_args = [call[0][1] for call in mock_mpremote.call_args_list]
+        cp_calls = [a for a in all_args if _is_cp_call(a)]
+        cp_dests = [a[-1] for a in cp_calls]
+        assert ":radio_core.mpy" in cp_dests
+        assert ":components/dfplayer_hardware.mpy" in cp_dests
+        assert ":radio_core.py" not in cp_dests
+        assert ":components/dfplayer_hardware.py" not in cp_dests
+
+        rm_calls = [a for a in all_args if isinstance(a, list) and "rm" in a]
+        rm_targets = [a[-1] for a in rm_calls]
+        assert ":radio_core.py" in rm_targets
+        assert ":components/dfplayer_hardware.py" in rm_targets
+
+    @mock.patch("gui.radio_manager._run_mpremote")
+    def test_falls_back_to_py_when_mpy_cross_unavailable(
+        self, mock_mpremote, project_root, mock_sd_manager
+    ):
+        """When mpy-cross is missing/fails, install must still succeed by copying
+        plain .py source, and it should clean up any stale .mpy from a prior install."""
+        worker = self._get_worker()
+        mock_mpremote.return_value = _OK_MPREMOTE_PROBE
+
+        with mock.patch("gui.radio_manager._cross_compile_to_mpy", return_value=None):
+            result = worker(
+                mpremote_cmd=["/usr/bin/mpremote"],
+                root=project_root,
+                sd_root=None,
+                sd_manager=mock_sd_manager,
+            )
+
+        assert "successfully" in result.lower()
+        all_args = [call[0][1] for call in mock_mpremote.call_args_list]
+        cp_calls = [a for a in all_args if _is_cp_call(a)]
+        cp_dests = [a[-1] for a in cp_calls]
+        assert ":radio_core.py" in cp_dests
+        assert ":components/dfplayer_hardware.py" in cp_dests
+
+        rm_calls = [a for a in all_args if isinstance(a, list) and "rm" in a]
+        rm_targets = [a[-1] for a in rm_calls]
+        assert ":radio_core.mpy" in rm_targets
+        assert ":components/dfplayer_hardware.mpy" in rm_targets
+
 
 class TestRunMpremoteWithRetry:
     """Test the retry logic inside _install_to_pico_worker."""
@@ -527,3 +595,57 @@ class TestRunMpremoteWithRetry:
                 sd_manager=FakeSDManager(),
             )
         assert "successfully" in result.lower()
+
+
+class TestCrossCompileToMpy:
+    """Test _cross_compile_to_mpy using the real mpy-cross binary (skipped if missing).
+
+    See its docstring in gui/radio_manager.py: on-device compilation of large firmware
+    .py files fragments the MicroPython heap enough to break the AM WAV loader, which
+    is why _install_to_pico_worker ships radio_core.py / dfplayer_hardware.py as
+    precompiled .mpy bytecode instead.
+    """
+
+    def test_compiles_valid_python_to_mpy(self, tmp_path):
+        pytest.importorskip("mpy_cross")
+        from gui.radio_manager import _cross_compile_to_mpy
+
+        src = tmp_path / "sample.py"
+        src.write_text("def hello():\n    return 1\n")
+
+        out = _cross_compile_to_mpy(src)
+        try:
+            assert out is not None
+            assert out.exists()
+            assert out.suffix == ".mpy"
+            assert out.stat().st_size > 0
+        finally:
+            if out is not None:
+                out.unlink(missing_ok=True)
+
+    def test_returns_none_when_mpy_cross_missing(self, tmp_path):
+        from gui.radio_manager import _cross_compile_to_mpy
+
+        src = tmp_path / "sample.py"
+        src.write_text("def hello():\n    return 1\n")
+
+        real_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "mpy_cross":
+                raise ImportError("no mpy_cross")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            out = _cross_compile_to_mpy(src)
+        assert out is None
+
+    def test_returns_none_on_syntax_error(self, tmp_path):
+        pytest.importorskip("mpy_cross")
+        from gui.radio_manager import _cross_compile_to_mpy
+
+        src = tmp_path / "bad.py"
+        src.write_text("def hello(:\n    return 1\n")
+
+        out = _cross_compile_to_mpy(src)
+        assert out is None

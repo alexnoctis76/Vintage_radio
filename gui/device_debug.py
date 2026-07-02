@@ -33,6 +33,9 @@ def live_vrtest_arg_for_command(command: str) -> Optional[str]:
         return None
     normalized = text.rstrip(";").strip()
     lowered = normalized.lower()
+    if lowered.startswith("vrtest "):
+        normalized = normalized[7:].strip()
+        lowered = normalized.lower()
     live_map = {
         "gc.mem_free()": "mem_free",
         "import gc; gc.mem_free()": "mem_free",
@@ -44,6 +47,23 @@ def live_vrtest_arg_for_command(command: str) -> Optional[str]:
     }
     if lowered in live_map:
         return live_map[lowered]
+    live_gestures = (
+        "ping",
+        "get_state",
+        "single_tap",
+        "double_tap",
+        "triple_tap",
+        "four_tap",
+        "five_tap",
+        "long_press",
+        "tap_long_press",
+        "double_tap_long_press",
+        "triple_tap_long_press",
+    )
+    if lowered in live_gestures:
+        return normalized
+    if lowered.startswith("goto_station "):
+        return normalized
     return None
 
 
@@ -66,6 +86,16 @@ def format_live_vrtest_result(device: dict) -> str:
         )
     if cmd == "get_state" and isinstance(device.get("state"), dict):
         return json.dumps(device["state"], indent=2, sort_keys=True)
+    if cmd == "goto_station":
+        playing = device.get("playing")
+        folder = device.get("folder", "?")
+        track = device.get("track", "?")
+        tail = ""
+        if isinstance(device.get("state"), dict):
+            tail = "\n" + json.dumps(device["state"], indent=2, sort_keys=True)
+        return "goto_station folder={} track={} playing={}{}".format(
+            folder, track, playing, tail
+        )
     return json.dumps(device, indent=2, sort_keys=True)
 
 
@@ -1457,7 +1487,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     return
                 
                 if live_vrtest:
-                    result = self.run_vrtest_command(live_vrtest, timeout=10)
+                    vrtest_timeout = (
+                        25.0
+                        if live_vrtest.strip().lower().startswith("goto_station")
+                        else 10.0
+                    )
+                    result = self.run_vrtest_command(live_vrtest, timeout=vrtest_timeout)
                     self._active_operations.discard(op_id)
                     if not result.get("ok"):
                         err = result.get("error", "vrtest_failed")
