@@ -640,6 +640,24 @@ class TestCrossCompileToMpy:
             out = _cross_compile_to_mpy(src)
         assert out is None
 
+    def test_returns_none_when_mpy_cross_binary_missing(self, tmp_path):
+        """Packaged builds without mpy-cross.exe must fall back to .py, not exit the app."""
+        from gui.radio_manager import _cross_compile_to_mpy
+
+        src = tmp_path / "sample.py"
+        src.write_text("def hello():\n    return 1\n")
+
+        real_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "mpy_cross":
+                raise SystemExit("Error: No mpy-cross binary found in: fake")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            out = _cross_compile_to_mpy(src)
+        assert out is None
+
     def test_returns_none_on_syntax_error(self, tmp_path):
         pytest.importorskip("mpy_cross")
         from gui.radio_manager import _cross_compile_to_mpy

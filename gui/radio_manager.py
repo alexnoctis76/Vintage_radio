@@ -674,6 +674,10 @@ def _cross_compile_to_mpy(src_path: Path) -> Optional[Path]:
         import mpy_cross
     except ImportError:
         return None
+    except SystemExit:
+        # mpy_cross raises SystemExit (not ImportError) when mpy-cross.exe is missing
+        # from the package dir — uncaught in a QThread worker that kills the whole app.
+        return None
 
     import tempfile as _tempfile
 

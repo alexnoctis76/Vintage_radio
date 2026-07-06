@@ -67,3 +67,17 @@ def test_bundled_full_uf2_missing_returns_none(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fb, "project_root", lambda: tmp_path)
     assert fb.bundled_vintage_radio_full_uf2() is None
+
+
+def test_firmware_release_has_full_uf2_for_packaging():
+    """Release UF2 images must exist on disk before PyInstaller (see vintage_radio.spec)."""
+    root = Path(__file__).resolve().parents[2]
+    matches = sorted((root / "firmware" / "release").glob("vintage-radio-firmware-*-full.uf2"))
+    assert matches, "Add vintage-radio-firmware-*-full.uf2 under firmware/release before release build"
+
+
+def test_vintage_radio_spec_bundles_firmware_release_uf2():
+    spec = Path(__file__).resolve().parents[2] / "build" / "vintage_radio.spec"
+    text = spec.read_text(encoding="utf-8")
+    assert "firmware/release" in text
+    assert "vintage-radio-firmware-*-full.uf2" in text
