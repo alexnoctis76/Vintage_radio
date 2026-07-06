@@ -401,25 +401,42 @@ class FirmwareDetailPanel(QtWidgets.QWidget):
 
     def _build_footer(self) -> QtWidgets.QWidget:
         foot = QtWidgets.QWidget()
-        foot.setFixedHeight(t.IF_FOOTER_H)
+        foot.setMinimumHeight(t.IF_FOOTER_H)
         row = QtWidgets.QHBoxLayout(foot)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(12)
 
-        status_wrap = QtWidgets.QHBoxLayout()
+        status_host = QtWidgets.QWidget()
+        status_host.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
+        status_wrap = QtWidgets.QHBoxLayout(status_host)
+        status_wrap.setContentsMargins(0, 0, 0, 0)
         status_wrap.setSpacing(6)
+        status_wrap.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         self._status_icon = QtWidgets.QLabel()
         self._status_icon.setFixedSize(18, 18)
         self._status_icon.setPixmap(self._status_check_pix())
         self._status_icon.setVisible(True)
-        status_wrap.addWidget(self._status_icon)
+        status_wrap.addWidget(
+            self._status_icon,
+            0,
+            QtCore.Qt.AlignmentFlag.AlignTop,
+        )
 
         self._status = QtWidgets.QLabel("Ready to install.")
+        self._status.setWordWrap(True)
+        self._status.setMinimumWidth(0)
+        self._status.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
         self._status.setStyleSheet(
             f"color:{t.IF_STATUS_MSG_FG}; font-size:{u.px(t.IF_STATUS_FONT_SIZE)}px; font-weight:600;"
         )
-        status_wrap.addWidget(self._status)
-        row.addLayout(status_wrap, 1)
+        status_wrap.addWidget(self._status, 1)
+        row.addWidget(status_host, 1)
 
         self._progress = QtWidgets.QFrame()
         self._progress.setFixedSize(t.IF_PROGRESS_W, t.IF_PROGRESS_H)

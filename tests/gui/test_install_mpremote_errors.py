@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from gui import radio_manager as rm
 from gui.radio_manager import (
+    _INSTALL_ERR_DETAIL_SEP,
     _find_rp2040_serial_port,
     _format_install_mpremote_error,
     _mpremote_args_with_connect,
     _post_flash_serial_timeout_message,
     _serial_output_indicates_blocking_firmware,
     _setup_device_failure_message,
+    _split_install_error_detail,
     _wait_mpremote_serial_ready,
 )
 
@@ -32,6 +34,45 @@ def test_clearcommerror_message():
 def test_raw_repl_generic_message():
     msg = _format_install_mpremote_error("TransportError: could not enter raw repl")
     assert "raw REPL" in msg
+
+
+def test_write_timeout_message_gives_single_action():
+    err = "serial.serialutil.SerialTimeoutException: Write timeout"
+    msg = _format_install_mpremote_error(err)
+    assert "stopped responding" in msg
+    assert "Unplug the Pico's USB cable" in msg
+    # Only one recovery path should be offered, not a menu of alternatives.
+    assert "reinstall" not in msg.lower()
+    assert "BOOTSEL" not in msg
+
+
+def test_format_install_error_hides_raw_detail_behind_separator():
+    err = "Traceback (most recent call last):\n  File x\nSerialTimeoutException: Write timeout"
+    msg = _format_install_mpremote_error(err)
+    assert _INSTALL_ERR_DETAIL_SEP in msg
+    summary, detail = msg.split(_INSTALL_ERR_DETAIL_SEP, 1)
+    assert "Traceback" not in summary
+    assert "Traceback" in detail
+
+
+def test_split_install_error_detail_uses_separator():
+    msg = f"Short summary{_INSTALL_ERR_DETAIL_SEP}raw detail here"
+    summary, detail = _split_install_error_detail(msg)
+    assert summary == "Short summary"
+    assert detail == "raw detail here"
+
+
+def test_split_install_error_detail_falls_back_to_traceback_marker():
+    msg = "RuntimeError: boom\n\nTraceback (most recent call last):\n  File x, line 1"
+    summary, detail = _split_install_error_detail(msg)
+    assert summary == "RuntimeError: boom"
+    assert detail.startswith("Traceback")
+
+
+def test_split_install_error_detail_plain_message_has_no_detail():
+    summary, detail = _split_install_error_detail("Project files not found.")
+    assert summary == "Project files not found."
+    assert detail == ""
 
 
 def test_detect_blocking_serial():
@@ -153,6 +194,38 @@ def test_smart_install_uses_mpremote_when_vr_ready_and_full_uf2_present(monkeypa
     result = mgr._smart_install_vintage_radio_worker()
     assert result == {"action": "install_to_pico", "after_firmware": False}
     assert bootsel_called["v"] is False
+
+
+def test_smart_install_older_uf2_requires_bootsel_not_mpremote(monkeypatch, tmp_path):
+    from gui.radio_manager import MainWindow
+
+    release = tmp_path / "firmware" / "release"
+    release.mkdir(parents=True)
+    old = release / "vintage-radio-firmware-1.0.0-full.uf2"
+    new = release / "vintage-radio-firmware-1.0.1-full.uf2"
+    old.write_bytes(b"OLD" * 400)
+    new.write_bytes(b"NEW" * 400)
+
+    mgr = MainWindow.__new__(MainWindow)
+    monkeypatch.setattr(mgr, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(mgr, "_resolve_mpremote_cmd", lambda: ["mpremote"])
+    monkeypatch.setattr(
+        rm,
+        "_pico_install_assessment",
+        lambda *_a, **_k: {"status": "ready", "port": "COM6"},
+    )
+    monkeypatch.setattr(mgr, "_is_rpi_rp2_present", lambda: True)
+    monkeypatch.setattr(
+        mgr,
+        "_copy_uf2_to_bootsel_quiet",
+        lambda path, **_: path == old,
+    )
+
+    result = mgr._smart_install_vintage_radio_worker(full_uf2_path=str(old))
+    assert result["action"] == "message"
+    assert result["level"] == "info"
+    assert "1.0.0" in result["message"] or "v1.0.0" in result["message"]
+    assert "flashed" in result["message"].lower() or "Flashed" in result["message"]
 
 
 def test_micropython_cache_uses_app_data_dir(tmp_path, monkeypatch):

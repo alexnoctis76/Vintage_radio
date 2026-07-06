@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -304,10 +305,47 @@ def _resolve_mpremote() -> List[str]:
     return [sys.executable, "-m", "mpremote"]
 
 
+def _cross_compile_to_mpy(src_path: Path) -> Optional[Path]:
+    """Cross-compile large firmware modules to .mpy (same rationale as GUI install)."""
+    try:
+        import mpy_cross
+    except ImportError:
+        return None
+    import tempfile as _tempfile
+
+    tmp_fd, tmp_path = _tempfile.mkstemp(suffix=".mpy")
+    os.close(tmp_fd)
+    try:
+        proc = mpy_cross.run(
+            "-march=armv6m",
+            "-o",
+            tmp_path,
+            str(src_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        proc.wait()
+        if proc.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None
+        return Path(tmp_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
+
+
 def install_to_pico(firmware_dir: Path, port: str) -> None:
     """Push staged *firmware_dir* to Pico (basic layout)."""
     mp = _resolve_mpremote()
     connect = ["connect", port] if port else []
+    mpy_candidates = {"radio_core.py", "components/dfplayer_hardware.py"}
+    temp_mpy: List[Path] = []
 
     def run(args: List[str]) -> None:
         cmd = mp + connect + args
@@ -329,14 +367,34 @@ def install_to_pico(firmware_dir: Path, port: str) -> None:
             src = firmware_dir / Path(remote)
         if not src.is_file():
             raise FileNotFoundError(src)
-        print(f"  cp {remote}")
-        run(["cp", str(src), f":{remote}"])
+        upload_src = src
+        upload_remote = remote
+        if remote in mpy_candidates:
+            compiled = _cross_compile_to_mpy(src)
+            if compiled is not None:
+                temp_mpy.append(compiled)
+                upload_src = compiled
+                upload_remote = remote[: -len(".py")] + ".mpy"
+                stale_py = remote
+                print(f"  rm :{stale_py} (replacing with {upload_remote})")
+                try:
+                    run(["rm", f":{stale_py}"])
+                except RuntimeError:
+                    pass
+        print(f"  cp {upload_remote}")
+        run(["cp", str(upload_src), f":{upload_remote}"])
 
     for extra in ("pin_config.json", "VintageRadio/advanced_runtime.json", "VintageRadio/AMradioSound.wav"):
         src = firmware_dir / extra
         if src.is_file():
             print(f"  cp {extra}")
             run(["cp", str(src), f":{extra}"])
+
+    for tmp in temp_mpy:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _find_picotool() -> Optional[Path]:
