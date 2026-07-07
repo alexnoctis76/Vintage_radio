@@ -49,6 +49,7 @@ try:
 except ImportError:
     import am_wav_loader
 
+# After radio_core; before DFPlayerHardware (see am_wav_loader docstring).
 am_wav_loader.load_am_wav_cache()
 gc.collect()
 
@@ -129,6 +130,7 @@ class VintageRadioFirmware:
             fc = self.hw.query_file_count()
             if fc is not None:
                 print(f"  TF file count = {fc}")
+                self.hw._boot_tf_file_count = fc
             else:
                 print("  TF file count = TIMEOUT (GP1 not wired to DFPlayer TX?)")
 
@@ -142,6 +144,9 @@ class VintageRadioFirmware:
                 if callable(qf):
                     fc = qf(folder, suppress_errors=True, timeout_ms=700)
                     print(f"  Folder {folder:02d} file count probe (no play): {fc}")
+                    if fc is not None and int(fc) > 0:
+                        self.hw._boot_folder01_track_count = int(fc)
+                        self.hw._reference_tracks_per_folder = int(fc)
                 else:
                     print(f"  Skipping folder probe (no query_files_in_folder); first station={folder}")
         print("--- End DFPlayer check ---")
@@ -153,6 +158,9 @@ class VintageRadioFirmware:
                 reset()
             self.core.init(skip_initial_playback=True)
             self._check_hw_comms()
+            if getattr(self.core, "_defer_basic_reconcile", False):
+                self.core._defer_basic_reconcile = False
+                self.core._basic_reconcile_after_load()
             # Shuffle rebuild is deferred past init (see _load_state) so it runs after
             # DFPlayer comms check and does not fight the diagnostic probe play.
             if getattr(self.core, "_defer_basic_shuffle_rebuild", False):

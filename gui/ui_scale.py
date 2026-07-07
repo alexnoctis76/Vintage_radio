@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 ZOOM_PERCENT = 100
 
 
@@ -14,6 +16,21 @@ def set_zoom_percent(value: int) -> None:
 def px(base: float) -> int:
     """Scale a design-time pixel value for the current zoom level."""
     return max(1, int(round(float(base) * ZOOM_PERCENT / 100)))
+
+
+def qss_weight(design_weight: int) -> int:
+    """Map QSS ``font-weight`` so heavy labels match Windows on macOS.
+
+    SF Pro renders numeric weights 800/900 much darker than Segoe UI at the
+    same pixel size; pull them down one step on Darwin only.
+    """
+    weight = int(design_weight)
+    if sys.platform == "darwin":
+        if weight >= 900:
+            return 700
+        if weight >= 800:
+            return 600
+    return weight
 
 
 def px_layout(base: float, *, above_100_factor: float = 0.5) -> int:

@@ -9,6 +9,11 @@ imageio-ffmpeg
 python-vlc>=3.0.20123
 mpremote>=1.0.0
 pyserial>=3.5
+# Cross-compiles radio_core.py / dfplayer_hardware.py to .mpy before install-to-Pico.
+# On-device compilation of these large .py files fragments the MicroPython heap badly
+# enough that the AM WAV loader can't find a contiguous ~37KB block (see am_wav_loader.py).
+# Precompiled bytecode avoids that fragmentation. Falls back to plain .py if unavailable.
+mpy-cross>=1.19.1
 certifi>=2023.7.22
 pytest>=8.0.0
 # Stdio MCP bridge for Cursor: scripts/vintage_radio_debug_mcp_bridge.py

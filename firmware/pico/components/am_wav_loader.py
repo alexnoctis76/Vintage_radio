@@ -1,11 +1,12 @@
-"""AM static WAV loader — import and call load_am_wav_cache() *before* radio_core on Pico.
+"""AM static WAV loader for Pico PWM overlay.
 
-radio_core + DFPlayerHardware consume a lot of RAM; loading the WAV first avoids
-MemoryError → decimated ~6k-sample buffers (muddy PWM static).
+Call load_am_wav_cache() after radio_core import, before DFPlayerHardware().
+
+Uses v1.0.0 load (full data chunk at native rate). If heap is tight, truncates
+the clip from the start — never decimates samples and never lowers sample rate.
+Decimation / slow playback rate both produced bad-sounding static on Pico.
 """
 
-import os
-import time
 import ustruct
 
 try:
@@ -13,13 +14,7 @@ try:
 except Exception:
     gc = None
 
-try:
-    import ujson as json
-except ImportError:
-    import json
-
 WAV_FILE = "VintageRadio/AMradioSound.wav"
-MAX_AM_WAV_SAMPLES = 48000
 
 AM_TRY_PATHS = (
     "/VintageRadio/AMradioSound.wav",
@@ -31,163 +26,83 @@ AM_TRY_PATHS = (
 _CACHE = None
 
 
-def _extract_u8_from_frame(frame, bits_per_sample):
-    if bits_per_sample == 8:
-        return frame[0]
-    if bits_per_sample == 16:
-        s = ustruct.unpack_from("<h", frame, 0)[0]
-        u8 = (s + 32768) >> 8
-        if u8 < 0:
-            u8 = 0
-        elif u8 > 255:
-            u8 = 255
-        return u8
-    raise ValueError("unsupported bits_per_sample {}".format(bits_per_sample))
-
-
-def _read_wav_data_compact(f, data_bytes, channels, bits_per_sample, target_samples=MAX_AM_WAV_SAMPLES):
-    frame_bytes = channels * (bits_per_sample // 8)
-    if frame_bytes <= 0:
-        raise ValueError("invalid frame size")
-    total_frames = data_bytes // frame_bytes
-    if total_frames <= 0:
-        return b""
-    step = 1
-    if total_frames > target_samples:
-        step = (total_frames + target_samples - 1) // target_samples
-
-    n_out = (total_frames + step - 1) // step
-    out = bytearray(n_out)
-    out_idx = 0
-    remaining = data_bytes
-    frame_index = 0
-    block_size = frame_bytes * 512
-    frame_stride = bits_per_sample // 8
-    while remaining > 0:
-        take = block_size if remaining > block_size else remaining
-        block = f.read(take)
-        if not block:
+def _read_data_bytes(f, nbytes):
+    """Read exactly nbytes from current file position into a bytearray."""
+    out = bytearray(nbytes)
+    pos = 0
+    while pos < nbytes:
+        take = min(nbytes - pos, 2048)
+        chunk = f.read(take)
+        if not chunk:
             break
-        n = len(block)
-        pos = 0
-        while pos + frame_bytes <= n:
-            if frame_index % step == 0 and out_idx < n_out:
-                out[out_idx] = _extract_u8_from_frame(
-                    block[pos : pos + frame_stride], bits_per_sample
-                )
-                out_idx += 1
-            frame_index += 1
-            pos += frame_bytes
-        remaining -= n
-    if out_idx != n_out:
-        return memoryview(out)[:out_idx]
+        n = len(chunk)
+        out[pos : pos + n] = chunk
+        pos += n
+    if pos < 1:
+        raise ValueError("empty data chunk")
+    if pos < nbytes:
+        return memoryview(out)[:pos]
     return memoryview(out)
 
 
 def load_wav_u8(path):
-    """Load WAV and return (unsigned 8-bit mono bytes, samplerate)."""
-    wav_target_cap = MAX_AM_WAV_SAMPLES
+    """Load WAV; return (u8 sample bytes, native samplerate)."""
     with open(path, "rb") as f:
         if f.read(4) != b"RIFF":
-            raise ValueError("not RIFF")
+            raise ValueError("Not RIFF")
         f.read(4)
         if f.read(4) != b"WAVE":
-            raise ValueError("not WAVE")
+            raise ValueError("Not WAVE")
 
         samplerate = 8000
-        audio_fmt = 1
-        channels = 1
-        bits_per_sample = 8
         data = None
 
         while True:
             cid = f.read(4)
             if not cid:
-                break
-            sz_raw = f.read(4)
-            if len(sz_raw) < 4:
-                raise ValueError("truncated chunk header")
-            clen = ustruct.unpack("<I", sz_raw)[0]
+                raise ValueError("No data chunk")
+            clen = ustruct.unpack("<I", f.read(4))[0]
             if cid == b"fmt ":
-                chunk = f.read(clen)
-                if len(chunk) != clen:
-                    raise ValueError("truncated chunk data")
-                if clen < 16:
-                    raise ValueError("invalid fmt chunk")
-                audio_fmt, channels, samplerate = ustruct.unpack_from("<HHI", chunk, 0)
-                bits_per_sample = ustruct.unpack_from("<H", chunk, 14)[0]
+                fmt = f.read(clen)
+                if len(fmt) >= 8:
+                    samplerate = ustruct.unpack("<I", fmt[4:8])[0]
             elif cid == b"data":
-                denom = max(1, channels * (bits_per_sample // 8))
-                total = clen // denom
-                target_samples = MAX_AM_WAV_SAMPLES
-                data_start_pos = f.tell()
-                mem_retry_same = True
+                data_start = f.tell()
+                nbytes = clen
+                mem_retry = True
                 while True:
                     try:
                         if gc is not None:
                             gc.collect()
-                        f.seek(data_start_pos)
-                        data = _read_wav_data_compact(
-                            f, clen, channels, bits_per_sample, target_samples=target_samples
-                        )
-                        wav_target_cap = target_samples
+                        f.seek(data_start)
+                        data = _read_data_bytes(f, nbytes)
                         break
                     except MemoryError:
-                        if mem_retry_same:
-                            mem_retry_same = False
+                        if mem_retry:
+                            mem_retry = False
                             if gc is not None:
                                 gc.collect()
                                 gc.collect()
                             continue
-                        target_samples = max(1024, (target_samples * 3) // 4)
-                        if target_samples < 1024:
+                        if nbytes <= 1024:
                             raise
+                        nbytes = max(1024, (nbytes * 3) // 4)
                         print(
-                            "AM WAV debug: compact load retry with target_samples={}".format(
-                                target_samples
+                            "AM WAV: truncate retry nbytes={} (sr stays {})".format(
+                                nbytes, samplerate
                             )
                         )
-                if len(data) < 1:
-                    raise ValueError("empty data chunk")
-                if total > target_samples:
-                    step = (total + target_samples - 1) // target_samples
-                    samplerate = max(1000, samplerate // step)
+                if nbytes < clen:
+                    print(
+                        "AM WAV: using first {} of {} bytes at {}Hz".format(
+                            len(data), clen, samplerate
+                        )
+                    )
+                break
             else:
                 f.seek(clen, 1)
-            if clen & 1:
-                f.read(1)
 
-        if data is None:
-            raise ValueError("no data chunk")
-        if audio_fmt != 1:
-            raise ValueError("unsupported WAV encoding {}".format(audio_fmt))
-        if channels not in (1, 2):
-            raise ValueError("unsupported channel count {}".format(channels))
-
-        if bits_per_sample in (8, 16):
-            try:
-                print(
-                    "#VRDBG "
-                    + json.dumps(
-                        {
-                            "sessionId": "e8231e",
-                            "hypothesisId": "AM1",
-                            "location": "am_wav_loader.load_wav_u8",
-                            "message": "wav_loaded",
-                            "data": {
-                                "samples": len(data),
-                                "sr": int(samplerate),
-                                "target_cap": int(wav_target_cap),
-                            },
-                            "timestamp": time.ticks_ms(),
-                        }
-                    )
-                )
-            except Exception:
-                pass
-            return data, samplerate
-
-        raise ValueError("unsupported bits_per_sample {}".format(bits_per_sample))
+    return data, samplerate
 
 
 def load_am_wav_cache():
@@ -196,29 +111,18 @@ def load_am_wav_cache():
     if _CACHE is not None:
         return _CACHE
 
-    try:
-        if gc is not None:
-            gc.collect()
-        root_entries = os.listdir("/")
-        print("AM WAV debug: '/' entries =", root_entries)
-        if "VintageRadio" in root_entries:
-            try:
-                vr_entries = os.listdir("/VintageRadio")
-                print("AM WAV debug: '/VintageRadio' entries =", vr_entries)
-            except Exception as e:
-                print("AM WAV debug: cannot list /VintageRadio:", e)
-    except Exception as e:
-        print("AM WAV debug: cannot list root:", e)
+    if gc is not None:
+        gc.collect()
+        print("AM WAV: mem_free before load = {}".format(gc.mem_free()))
 
     for path in AM_TRY_PATHS:
         try:
-            print("AM WAV debug: trying path:", path)
             d, sr = load_wav_u8(path)
             _CACHE = (d, sr, path)
-            print("AM WAV loaded from Pico flash: {} -> PWM overlay enabled".format(path))
+            print("AM WAV loaded: {} ({} samples, {}Hz)".format(path, len(d), sr))
             return _CACHE
         except Exception as e:
-            print("AM WAV debug: load failed for {}: {}".format(path, e))
+            print("AM WAV load failed for {}: {}".format(path, e))
 
     _CACHE = (None, 8000, None)
     return _CACHE

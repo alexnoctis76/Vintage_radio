@@ -439,7 +439,8 @@ def _track_title_column_min_width(table: QtWidgets.QTableWidget) -> int:
     artist_font.setPixelSize(u.px(t.LM_TRACK_ARTIST_FONT_SIZE))
     artist_fm = QtGui.QFontMetrics(artist_font)
 
-    title_col_w = t.LM_TRACK_TITLE_MIN_W
+    prefix_w = t.TRACK_LEFT_PAD + t.TRACK_HANDLE_W + t.TRACK_NUM_W + u.px(t.TRACK_PAD_X)
+    title_col_w = u.px(t.LM_TRACK_TITLE_MIN_W)
     for row in range(table.rowCount()):
         title_item = table.item(row, 0)
         artist_item = table.item(row, 1)
@@ -449,22 +450,23 @@ def _track_title_column_min_width(table: QtWidgets.QTableWidget) -> int:
             title_fm.horizontalAdvance(title),
             artist_fm.horizontalAdvance(artist) if artist else 0,
         )
-        row_w = t.LM_TRACK_NUM_COL_W + t.TRACK_PAD_X + text_w + t.TRACK_PAD_RIGHT
+        row_w = prefix_w + text_w + u.px(t.TRACK_PAD_RIGHT) + t.TRACK_PENCIL_ROFF
         title_col_w = max(title_col_w, row_w)
     return title_col_w
 
 
 def _track_meta_column_widths(table: QtWidgets.QTableWidget) -> tuple[int, int]:
-    dur_w = t.LM_TRACK_DUR_COL_W
-    fmt_w = t.LM_TRACK_FMT_COL_W
+    pad = u.px(16)
+    dur_w = u.px(t.LM_TRACK_DUR_COL_W)
+    fmt_w = u.px(t.LM_TRACK_FMT_COL_W)
     cell_fm = QtGui.QFontMetrics(table.font())
     for row in range(table.rowCount()):
         dur_item = table.item(row, 2)
         fmt_item = table.item(row, 3)
         if dur_item:
-            dur_w = max(dur_w, cell_fm.horizontalAdvance(dur_item.text()) + 16)
+            dur_w = max(dur_w, cell_fm.horizontalAdvance(dur_item.text()) + pad)
         if fmt_item:
-            fmt_w = max(fmt_w, cell_fm.horizontalAdvance(fmt_item.text()) + 16)
+            fmt_w = max(fmt_w, cell_fm.horizontalAdvance(fmt_item.text()) + pad)
     return dur_w, fmt_w
 
 

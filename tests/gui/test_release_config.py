@@ -21,7 +21,7 @@ def test_zbvr_hidden_when_config_false(tmp_path, monkeypatch):
     reload_release_config()
 
     assert is_official_firmware_visible(ZBVR_FIRMWARE_ENTRY_ID) is False
-    assert is_official_firmware_visible("v1.1_stable") is True
+    assert is_official_firmware_visible("vintage_radio_1_0_1") is True
 
 
 def test_zbvr_visible_when_config_true(tmp_path, monkeypatch):

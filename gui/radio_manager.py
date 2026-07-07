@@ -459,11 +459,35 @@ class MetadataDialog(QtWidgets.QDialog):
         return fields
 
 
+# Marker embedded by _format_install_mpremote_error() to separate the short,
+# actionable summary from the raw mpremote/traceback text. Kept out of the user's
+# way behind a "More Info" toggle instead of being dumped straight into the dialog.
+_INSTALL_ERR_DETAIL_SEP = "\n\n----- Technical detail (for support) -----\n\n"
+
+
+def _split_install_error_detail(msg: str) -> Tuple[str, str]:
+    """Split a formatted install error into (short summary, technical detail).
+
+    Handles both _format_install_mpremote_error()'s own separator and the plain
+    case where some other exception's message still has a raw Python traceback
+    concatenated onto it (e.g. from a background worker's generic except clause).
+    """
+    text = (msg or "").strip()
+    if _INSTALL_ERR_DETAIL_SEP in text:
+        summary, detail = text.split(_INSTALL_ERR_DETAIL_SEP, 1)
+        return summary.strip(), detail.strip()
+    idx = text.find("Traceback (most recent call last)")
+    if idx > 0:
+        return text[:idx].strip(), text[idx:].strip()
+    return text, ""
+
+
 def _show_install_error(parent: QtWidgets.QWidget, msg: str, after_firmware: bool) -> None:
-    text = f"Error:\n\n{msg}"
+    summary, detail = _split_install_error_detail(msg)
+    text = f"Error:\n\n{summary}"
     if after_firmware:
         text += "\n\nClick Install Firmware again once the Pico shows up on USB serial."
-    VintageMessageBox.warning(parent, "Install to Pico", text)
+    VintageMessageBox.warning(parent, "Install to Pico", text, detailed_text=detail)
 
 
 def _run_install_main_thread(
@@ -636,6 +660,55 @@ def _run_mpremote(
     )
 
 
+def _cross_compile_to_mpy(src_path: Path) -> Optional[Path]:
+    """Cross-compile a firmware .py file to .mpy bytecode for RP2040 (armv6m).
+
+    On-device compilation of large source files (radio_core.py, dfplayer_hardware.py)
+    fragments the MicroPython heap badly enough that the AM WAV loader can't find a
+    contiguous ~37KB block afterward, even with 180KB+ nominally free. Precompiled
+    .mpy bytecode skips on-device parsing/compilation entirely, which eliminates that
+    fragmentation. Returns a path to a temp .mpy file, or None if mpy-cross is
+    unavailable / compilation fails (caller should fall back to the plain .py file).
+    """
+    try:
+        import mpy_cross
+    except ImportError:
+        return None
+    except SystemExit:
+        # mpy_cross raises SystemExit (not ImportError) when mpy-cross.exe is missing
+        # from the package dir — uncaught in a QThread worker that kills the whole app.
+        return None
+
+    import tempfile as _tempfile
+
+    tmp_fd, tmp_path = _tempfile.mkstemp(suffix=".mpy")
+    os.close(tmp_fd)
+    try:
+        proc = mpy_cross.run(
+            "-march=armv6m", "-o", tmp_path, str(src_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        proc.wait()
+        if proc.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            err = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace")
+            write_session_line(
+                f"mpy-cross failed for {src_path.name} (rc={proc.returncode}): {err[:300]}",
+                prefix="INSTALL",
+            )
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None
+        return Path(tmp_path)
+    except Exception as e:
+        write_session_line(f"mpy-cross exception for {src_path.name}: {e}", prefix="INSTALL")
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
+
+
 def _mpremote_failure_is_transient_no_device(result: Any) -> bool:
     if getattr(result, "returncode", 1) == 0:
         return False
@@ -714,44 +787,50 @@ def _mpremote_args_with_connect(args: List[str], port: Optional[str]) -> List[st
 
 
 def _format_install_mpremote_error(err: str) -> str:
-    """Turn mpremote stderr/stdout into actionable install guidance."""
+    """Turn mpremote stderr/stdout into one short, actionable next step.
+
+    Returns "<plain-English summary>{_INSTALL_ERR_DETAIL_SEP}<raw technical detail>".
+    Only ever names a single recovery action (not a menu of alternatives) so the
+    dialog tells the user exactly what to do; the raw mpremote/Python output is
+    still preserved after the separator for the "More Info" toggle / session log.
+    """
     combined = (err or "").strip()
     lower = combined.lower()
     if _serial_output_indicates_blocking_firmware(combined):
-        return (
+        summary = (
             "The Pico is running firmware that blocks file transfer "
             "(mpremote cannot use raw REPL).\n\n"
-            "Flash stock MicroPython first:\n"
-            "  Install Firmware will guide you through BOOTSEL, or use "
-            "Tools → MicroPython → Install MicroPython on Pico…\n"
-            "Then run Install Firmware again.\n\n"
-            f"Technical detail:\n{combined[:1400]}"
+            "Flash stock MicroPython first: Install Firmware will guide you through "
+            "BOOTSEL, or use Tools \u2192 MicroPython \u2192 Install MicroPython on "
+            "Pico\u2026 Then run Install Firmware again."
         )
-    if "clearcommerror" in lower or "does not recognize the command" in lower:
-        return (
+    elif "clearcommerror" in lower or "does not recognize the command" in lower:
+        summary = (
             "Windows lost access to the COM port during install.\n\n"
-            "Try:\n"
-            "  1. Disconnect Tools → Debugger if it is connected\n"
-            "  2. Close Thonny, serial monitors, or other apps using COM ports\n"
-            "  3. Unplug the Pico USB cable, wait 3 seconds, replug\n"
-            "  4. Run Install Firmware again (leave Debugger disconnected)\n\n"
-            f"Technical detail:\n{combined[:1400]}"
+            "Close Thonny, serial monitors, or the Tools \u2192 Debugger console if "
+            "open, unplug the Pico's USB cable, wait 3 seconds, plug it back in, "
+            "then run Install Firmware again."
         )
-    if "could not enter raw repl" in lower:
-        return (
-            "mpremote could not enter MicroPython raw REPL (required to copy files).\n\n"
-            "Common causes:\n"
-            "  • Community / custom UF2 firmware instead of stock MicroPython\n"
-            "  • Another program still using the COM port\n"
-            "  • Pico in BOOTSEL mode (RPI-RP2 drive) instead of serial mode\n\n"
-            "Fix: Tools → MicroPython to flash official MicroPython, then retry Install Firmware.\n\n"
-            f"Technical detail:\n{combined[:1400]}"
+    elif "write timeout" in lower or "serialtimeoutexception" in lower:
+        summary = (
+            "The Pico stopped responding partway through the file transfer.\n\n"
+            "Unplug the Pico's USB cable, wait a few seconds, plug it back in, "
+            "then run Install Firmware again."
         )
-    return (
-        "Failed to copy firmware files.\n\n"
-        "Ensure the Pico is connected via USB and running stock MicroPython.\n\n"
-        f"{combined}"
-    )
+    elif "could not enter raw repl" in lower:
+        summary = (
+            "mpremote could not enter MicroPython's raw REPL, which is required to "
+            "copy files.\n\n"
+            "Tools \u2192 MicroPython to flash official MicroPython, then run "
+            "Install Firmware again."
+        )
+    else:
+        summary = (
+            "Failed to copy firmware files.\n\n"
+            "Unplug the Pico's USB cable, wait a few seconds, plug it back in, "
+            "then run Install Firmware again."
+        )
+    return f"{summary}{_INSTALL_ERR_DETAIL_SEP}{combined[:4000]}"
 
 
 # REPL snippet for mpremote ``exec``: must print ``micropython`` so we do not treat a bare
@@ -762,8 +841,34 @@ _MPREMOTE_MICROPYTHON_PROBE = (
 _MPREMOTE_PROBE_TIMEOUT_S = 22
 
 
+def _serial_output_indicates_vintage_radio_firmware(text: str) -> bool:
+    """True when UART output is from our main_basic / Vintage Radio stack (not ZBVR/Retro Radio)."""
+    lower = (text or "").lower()
+    vintage_markers = (
+        "booting vintage radio",
+        "vintage radio main() [basic mode]",
+        "basic mode active",
+        "basic: discovering stations",
+        "basic: seeded",
+        "--- dfplayer comms check (basic mode) ---",
+        "#vrdbg",
+        "play_track:",
+        "auto-advanced:",
+        "track finished",
+        "starting playback:",
+    )
+    if any(marker in lower for marker in vintage_markers):
+        return True
+    # Runtime dfplayer_hardware.py lines (basic mode) — distinct from Retro Radio banners.
+    if "df: playing" in lower and "retro radio" not in lower:
+        return True
+    return False
+
+
 def _serial_output_indicates_blocking_firmware(text: str) -> Optional[str]:
     """Return a short firmware label when serial output is not stock MicroPython REPL."""
+    if _serial_output_indicates_vintage_radio_firmware(text):
+        return None
     lower = (text or "").lower()
     if "could not enter raw repl" in lower:
         return "custom firmware (raw REPL blocked)"
@@ -959,20 +1064,15 @@ def _pico_install_assessment(
             "sniff": sniff,
         }
 
-    if _sniff_suggests_stock_micropython_repl(sniff):
+    if _serial_output_indicates_vintage_radio_firmware(sniff):
+        _progress(
+            f"Vintage Radio firmware detected on {port} — preparing file update…"
+        )
+    elif _sniff_suggests_stock_micropython_repl(sniff):
         _progress(
             f"Testing MicroPython file transfer on {port} "
             f"(up to {_MPREMOTE_PROBE_TIMEOUT_S}s)…"
         )
-    elif _sniff_suggests_app_firmware(sniff):
-        label = _serial_output_indicates_blocking_firmware(sniff) or "third-party firmware"
-        _progress(f"Detected {label} on {port} — MicroPython flash required.")
-        return {
-            "status": "needs_reflash",
-            "port": port,
-            "blocking_label": label,
-            "sniff": sniff,
-        }
     else:
         _progress(
             f"Testing MicroPython file transfer on {port} "
@@ -1004,11 +1104,18 @@ def _pico_install_assessment(
             "blocking_label": _serial_output_indicates_blocking_firmware(probe_out),
             "sniff": probe_out,
         }
+    combined_sniff = probe_out or sniff
+    if _serial_output_indicates_vintage_radio_firmware(combined_sniff):
+        return {
+            "status": "vintage_radio_mpremote_failed",
+            "port": port,
+            "sniff": combined_sniff,
+        }
     return {
         "status": "needs_reflash",
         "port": port,
         "blocking_label": None,
-        "sniff": probe_out or sniff,
+        "sniff": combined_sniff,
     }
 
 
@@ -1025,6 +1132,8 @@ def _sniff_suggests_stock_micropython_repl(text: str) -> bool:
 def _sniff_suggests_app_firmware(text: str) -> bool:
     """True when UART shows a running app, not an idle MicroPython REPL."""
     if not text or len(text.strip()) < 20:
+        return False
+    if _serial_output_indicates_vintage_radio_firmware(text):
         return False
     if _sniff_suggests_stock_micropython_repl(text):
         return False
@@ -6022,7 +6131,109 @@ class MainWindow(QtWidgets.QMainWindow):
             return "Install is not available for this firmware yet.", False
         if not detected:
             return "Connect a device to install.", False
+        from gui.services.firmware_bundle import is_older_bundled_vintage_radio_full_uf2
+
+        uf2_raw = str(entry.get("uf2Path") or "").strip()
+        if uf2_raw and is_older_bundled_vintage_radio_full_uf2(Path(uf2_raw)):
+            if self._is_rpi_rp2_present():
+                return "Ready to flash.", True
+            return (
+                "BOOTSEL required — flash older releases from RPI-RP2 only.",
+                True,
+            )
         return "Ready to install.", True
+
+    def _vintage_radio_firmware_notes(self) -> str:
+        return (
+            "Vintage Radio basic-mode firmware (main_basic.py + radio_core).\n\n"
+            "Install: flashes a bundled full-flash .uf2 in BOOTSEL mode when available; "
+            "otherwise installs MicroPython automatically (if needed) and copies firmware via USB.\n\n"
+            "Stock MicroPython only (no Vintage Radio app) is under Tools → MicroPython.\n\n"
+            "Includes DFPlayer playback, AM tuning overlay, and the full gesture set.\n\n"
+            "Button presses:\n"
+            "  Single tap       — Next track\n"
+            "  Double tap       — Previous track\n"
+            "  Triple tap       — Restart station at track 1\n"
+            "  Long press       — Next station\n"
+            "  Tap + hold       — Exit shuffle, return to ordered playback\n"
+            "  Double tap + hold — Shuffle current station\n"
+            "  Triple tap + hold — First station + shuffle tracks\n"
+            "  Four taps        — Previous station\n"
+            "  Five taps        — First station (exits track shuffle)"
+        )
+
+    def _vintage_radio_official_firmware_entries(self) -> List[Dict[str, Any]]:
+        """One Install Firmware card per bundled full-flash UF2 (newest first)."""
+        from gui.services.firmware_bundle import (
+            full_uf2_version_string,
+            list_bundled_vintage_radio_full_uf2,
+            vintage_radio_firmware_entry_id,
+        )
+        from project_version import PROJECT_VERSION
+
+        notes = self._vintage_radio_firmware_notes()
+        author = updater.GITHUB_REPO_SLUG.split("/", 1)[0]
+        description = (
+            "Official firmware made with this app in mind - an improved version of Zion's original firmware with station browsing, playback control, "
+            "AM tuning overlay, shuffle modes, and the full gesture set for DFPlayer + RP2040 hardware."
+        )
+        bundled = list_bundled_vintage_radio_full_uf2()
+        entries: List[Dict[str, Any]] = []
+        for index, uf2_path in enumerate(bundled):
+            ver = full_uf2_version_string(uf2_path)
+            if ver is None:
+                continue
+            version_label = f"v{ver}"
+            is_newest = index == 0
+            entries.append(
+                {
+                    "id": vintage_radio_firmware_entry_id(ver),
+                    "name": "Vintage Radio Basic Firmware",
+                    "listName": "Default RP2040",
+                    "listSubtitle": (
+                        "Full-flash UF2 or mpremote over USB"
+                        if is_newest
+                        else "Full-flash UF2"
+                    ),
+                    "description": description,
+                    "badge": "Official",
+                    "version": version_label,
+                    "microcontroller": "RP2040",
+                    "mp3Controller": "DFPlayer",
+                    "device": "DFPlayer + RP2040",
+                    "author": author,
+                    "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
+                    "notes": notes,
+                    "recommended": is_newest,
+                    "available": True,
+                    "kind": "vintage_radio",
+                    "uf2Path": str(uf2_path),
+                    "custom": False,
+                }
+            )
+        if entries:
+            return entries
+        return [
+            {
+                "id": "vintage_radio_source",
+                "name": "Vintage Radio Basic Firmware",
+                "listName": "Default RP2040",
+                "listSubtitle": "mpremote install (no bundled UF2)",
+                "description": description,
+                "badge": "Official",
+                "version": PROJECT_VERSION,
+                "microcontroller": "RP2040",
+                "mp3Controller": "DFPlayer",
+                "device": "DFPlayer + RP2040",
+                "author": author,
+                "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
+                "notes": notes,
+                "recommended": True,
+                "available": True,
+                "kind": "vintage_radio",
+                "custom": False,
+            }
+        ]
 
     def _builtin_firmware_entries(self) -> List[Dict[str, Any]]:
         """Hardcoded built-in firmware entries shown at the top of the Advanced list.
@@ -6030,45 +6241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         Each entry has keys: ``id`` (stable), ``name``, ``description``, ``notes``,
         ``recommended`` (bool), ``available`` (bool — hide placeholders).
         """
-        return [
-            {
-                "id": "v1.1_stable",
-                "name": "Vintage Radio Basic Firmware",
-                "listName": "Default RP2040",
-                "listSubtitle": "One-step UF2 when bundled, else auto mpremote",
-                "description": (
-                    "Official firmware made with this app in mind - an improved version of Zion's original firmware with station browsing, playback control, "
-                    "AM tuning overlay, shuffle modes, and the full gesture set for DFPlayer + RP2040 hardware."
-                ),
-                "badge": "Official",
-                "version": "v1.0",
-                "microcontroller": "RP2040",
-                "mp3Controller": "DFPlayer",
-                "device": "DFPlayer + RP2040",
-                "author": updater.GITHUB_REPO_SLUG.split("/", 1)[0],
-                "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
-                "notes": (
-                    "Vintage Radio basic-mode firmware (main_basic.py + radio_core).\n\n"
-                    "Install: flashes a bundled full-flash .uf2 in BOOTSEL mode when available; "
-                    "otherwise installs MicroPython automatically (if needed) and copies firmware via USB.\n\n"
-                    "Stock MicroPython only (no Vintage Radio app) is under Tools → MicroPython.\n\n"
-                    "Includes DFPlayer playback, AM tuning overlay, and the full gesture set.\n\n"
-                    "Button presses:\n"
-                    "  Single tap       — Next track\n"
-                    "  Double tap       — Previous track\n"
-                    "  Triple tap       — Restart station at track 1\n"
-                    "  Long press       — Next station\n"
-                    "  Tap + hold       — Exit shuffle, return to ordered playback\n"
-                    "  Double tap + hold — Shuffle current station\n"
-                    "  Triple tap + hold — First station + shuffle tracks\n"
-                    "  Four taps        — Previous station\n"
-                    "  Five taps        — First station (exits track shuffle)"
-                ),
-                "recommended": True,
-                "available": True,
-                "kind": "vintage_radio",
-                "custom": False,
-            },
+        return self._vintage_radio_official_firmware_entries() + [
             {
                 "id": ZBVR_FIRMWARE_ENTRY_ID,
                 "name": "Zbvr-Firmware RP2040",
@@ -6202,6 +6375,8 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             entries = self._official_firmware_entries_for_ui()
         selected_id = self._selected_firmware_entry_id()
+        if selected_id in ("v1.1_stable", "v1.0_stable", "vintage_radio_source"):
+            selected_id = ""
         if selected_id and not any(str(e.get("id", "")) == selected_id for e in entries):
             selected_id = str(entries[0].get("id", "")) if entries else ""
             if selected_id:
@@ -6561,8 +6736,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         entry_id = str(entry.get("id", ""))
-        if entry_id == "v1.1_stable" or str(entry.get("kind") or "").lower() == "vintage_radio":
-            self._install_vintage_radio_official_firmware()
+        if str(entry.get("kind") or "").lower() == "vintage_radio":
+            self._install_vintage_radio_official_firmware(entry)
             return
         kind = str(entry.get("kind") or "micropython").lower()
         if kind == "remote_uf2":
@@ -7006,6 +7181,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         progress_callback: Optional[Callable[..., Any]] = None,
         preferred_serial_port: Optional[str] = None,
+        full_uf2_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Background worker: detect Pico state and flash MicroPython when needed."""
         write_session_line("Smart install Vintage Radio basic", prefix="INSTALL")
@@ -7014,21 +7190,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if progress_callback:
                 progress_callback(0, 0, msg)
 
-        _progress("Preparing firmware install…")
-
-        from gui.services.firmware_bundle import bundled_vintage_radio_full_uf2
-
-        full_uf2 = bundled_vintage_radio_full_uf2()
-        if full_uf2 is not None:
+        def _flash_bundled_full_uf2(full_uf2: Path, *, wait_intro: str) -> Dict[str, Any]:
             write_session_line(f"Bundled full-flash UF2: {full_uf2}", prefix="INSTALL")
             if not self._is_rpi_rp2_present():
-                intro = (
-                    "A one-file Vintage Radio firmware image is available.\n\n"
-                    "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
-                )
                 if not _wait_for_bootsel_polling(
                     progress_callback,
-                    intro=intro,
+                    intro=wait_intro,
                     is_present=self._is_rpi_rp2_present,
                     preferred_serial_port=preferred_serial_port,
                 ):
@@ -7062,124 +7229,211 @@ class MainWindow(QtWidgets.QMainWindow):
                 "message": "Could not copy the firmware .uf2 to RPI-RP2.",
             }
 
-        mpremote_cmd = self._resolve_mpremote_cmd()
-        if not mpremote_cmd:
-            return {
-                "action": "message",
-                "level": "info",
-                "title": "Install Vintage Radio",
-                "message": (
-                    "mpremote is not available. Install it with: pip install mpremote"
-                ),
-            }
+        _progress("Preparing firmware install…")
 
-        _progress("Checking Pico connection…")
-        assessment = _pico_install_assessment(
-            mpremote_cmd,
-            self._project_root(),
-            preferred_port=preferred_serial_port,
-            progress_callback=progress_callback,
+        from gui.services.firmware_bundle import (
+            bundled_vintage_radio_full_uf2,
+            full_uf2_version_string,
+            is_older_bundled_vintage_radio_full_uf2,
         )
-        status = assessment.get("status")
-        write_session_line(f"Pico install assessment: {assessment}", prefix="INSTALL")
 
-        if status == "ready":
-            write_session_line("Pico ready for mpremote install", prefix="INSTALL")
-            return {"action": "install_to_pico", "after_firmware": False}
+        full_uf2: Optional[Path] = None
+        if full_uf2_path:
+            candidate = Path(str(full_uf2_path))
+            if candidate.is_file():
+                full_uf2 = candidate
+        if full_uf2 is None:
+            full_uf2 = bundled_vintage_radio_full_uf2()
 
-        if status == "bootsel":
-            _progress("Flashing MicroPython…")
-            flashed, flash_err = self._flash_micropython_for_install(
-                progress_callback,
-                preferred_serial_port=preferred_serial_port,
-            )
-            if flashed:
-                return {"action": "install_to_pico", "after_firmware": True}
-            return {
-                "action": "message",
-                "level": "warning",
-                "title": "Install Vintage Radio",
-                "message": flash_err or (
-                    "Could not copy MicroPython to the Pico.\n\n"
-                    "Ensure RPI-RP2 is visible and try again."
-                ),
-            }
-
-        blocking_label = assessment.get("blocking_label")
-        if status == "needs_reflash":
-            if blocking_label:
-                intro = (
-                    f"Detected {blocking_label}.\n\n"
-                    "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears "
-                    "in File Explorer and the COM port disappears.\n\n"
-                    "Vintage Radio will flash official MicroPython, then install the app."
-                )
-            else:
-                intro = (
-                    "The Pico needs official MicroPython before Vintage Radio can be copied.\n\n"
-                    "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears."
-                )
-        else:
+        if full_uf2 is not None and is_older_bundled_vintage_radio_full_uf2(full_uf2):
+            ver = full_uf2_version_string(full_uf2)
+            ver_label = f"v{ver}" if ver else full_uf2.name
             intro = (
-                "No Pico detected on USB serial.\n\n"
-                "Connect the Pico and put it in BOOTSEL mode (RPI-RP2 drive) "
-                "to flash MicroPython, then Vintage Radio will install automatically."
+                f"{ver_label} must be flashed from BOOTSEL (RPI-RP2 drive).\n\n"
+                "Older releases are not copied over USB serial — only the newest "
+                "firmware can be updated that way.\n\n"
+                "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears."
             )
+            write_session_line(
+                f"Older bundled UF2 selected ({ver_label}) — BOOTSEL flash only",
+                prefix="INSTALL",
+            )
+            return _flash_bundled_full_uf2(full_uf2, wait_intro=intro)
 
-        if status in ("needs_reflash", "no_pico"):
-            if not self._is_rpi_rp2_present():
-                write_session_line(
-                    "Waiting for BOOTSEL (RPI-RP2 drive) — hold BOOTSEL and tap RESET",
-                    prefix="INSTALL",
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        assessment: Optional[Dict[str, Any]] = None
+
+        if mpremote_cmd:
+            _progress("Checking Pico connection…")
+            assessment = _pico_install_assessment(
+                mpremote_cmd,
+                self._project_root(),
+                preferred_port=preferred_serial_port,
+                progress_callback=progress_callback,
+            )
+            write_session_line(f"Pico install assessment: {assessment}", prefix="INSTALL")
+            status = assessment.get("status")
+
+            if status == "ready":
+                write_session_line("Pico ready for mpremote install", prefix="INSTALL")
+                return {"action": "install_to_pico", "after_firmware": False}
+
+            if status == "vintage_radio_mpremote_failed":
+                port = assessment.get("port") or preferred_serial_port or "the Pico"
+                return {
+                    "action": "message",
+                    "level": "info",
+                    "title": "Install Vintage Radio",
+                    "message": (
+                        f"Vintage Radio firmware is already running on {port}, but "
+                        "file transfer could not start.\n\n"
+                        "Disconnect the Device tab (or close any other app using the "
+                        "serial port), then click Install Firmware again.\n\n"
+                        "BOOTSEL is not required — the app will copy updated files over USB."
+                    ),
+                }
+
+            if status == "bootsel" and full_uf2 is not None:
+                intro = (
+                    "A one-file Vintage Radio firmware image is available.\n\n"
+                    "RPI-RP2 detected — flashing Vintage Radio firmware."
                 )
-                _progress(intro)
-                if not _wait_for_bootsel_polling(
+                return _flash_bundled_full_uf2(full_uf2, wait_intro=intro)
+
+            if status == "bootsel":
+                _progress("Flashing MicroPython…")
+                flashed, flash_err = self._flash_micropython_for_install(
                     progress_callback,
-                    intro=intro,
-                    is_present=self._is_rpi_rp2_present,
                     preferred_serial_port=preferred_serial_port,
-                ):
-                    if status == "no_pico":
+                )
+                if flashed:
+                    return {"action": "install_to_pico", "after_firmware": True}
+                return {
+                    "action": "message",
+                    "level": "warning",
+                    "title": "Install Vintage Radio",
+                    "message": flash_err or (
+                        "Could not copy MicroPython to the Pico.\n\n"
+                        "Ensure RPI-RP2 is visible and try again."
+                    ),
+                }
+
+            blocking_label = assessment.get("blocking_label")
+            if status == "needs_reflash":
+                if full_uf2 is not None:
+                    if blocking_label:
+                        intro = (
+                            f"Detected {blocking_label}.\n\n"
+                            "A one-file Vintage Radio firmware image is available.\n\n"
+                            "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
+                        )
+                    else:
+                        intro = (
+                            "A one-file Vintage Radio firmware image is available.\n\n"
+                            "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
+                        )
+                elif blocking_label:
+                    intro = (
+                        f"Detected {blocking_label}.\n\n"
+                        "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears "
+                        "in File Explorer and the COM port disappears.\n\n"
+                        "Vintage Radio will flash official MicroPython, then install the app."
+                    )
+                else:
+                    intro = (
+                        "The Pico needs official MicroPython before Vintage Radio can be copied.\n\n"
+                        "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears."
+                    )
+            else:
+                if full_uf2 is not None:
+                    intro = (
+                        "A one-file Vintage Radio firmware image is available.\n\n"
+                        "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
+                    )
+                else:
+                    intro = (
+                        "No Pico detected on USB serial.\n\n"
+                        "Connect the Pico and put it in BOOTSEL mode (RPI-RP2 drive) "
+                        "to flash MicroPython, then Vintage Radio will install automatically."
+                    )
+
+            if status in ("needs_reflash", "no_pico"):
+                if not self._is_rpi_rp2_present():
+                    write_session_line(
+                        "Waiting for BOOTSEL (RPI-RP2 drive) — hold BOOTSEL and tap RESET",
+                        prefix="INSTALL",
+                    )
+                    _progress(intro)
+                    if not _wait_for_bootsel_polling(
+                        progress_callback,
+                        intro=intro,
+                        is_present=self._is_rpi_rp2_present,
+                        preferred_serial_port=preferred_serial_port,
+                    ):
+                        if status == "no_pico":
+                            return {
+                                "action": "message",
+                                "level": "info",
+                                "title": "Install Vintage Radio",
+                                "message": (
+                                    "No Pico detected. Connect via USB and try Install Firmware again."
+                                ),
+                            }
                         return {
                             "action": "message",
                             "level": "info",
                             "title": "Install Vintage Radio",
                             "message": (
-                                "No Pico detected. Connect via USB and try Install Firmware again."
+                                "Timed out waiting for BOOTSEL (RPI-RP2 drive).\n\n"
+                                "Hold BOOTSEL while plugging in USB, then click Install Firmware again."
                             ),
                         }
-                    return {
-                        "action": "message",
-                        "level": "info",
-                        "title": "Install Vintage Radio",
-                        "message": (
-                            "Timed out waiting for BOOTSEL (RPI-RP2 drive).\n\n"
-                            "Hold BOOTSEL while plugging in USB, then click Install Firmware again."
+                if full_uf2 is not None:
+                    return _flash_bundled_full_uf2(
+                        full_uf2,
+                        wait_intro=(
+                            "RPI-RP2 detected — flashing Vintage Radio firmware."
                         ),
-                    }
-            _progress("Flashing MicroPython…")
-            flashed, flash_err = self._flash_micropython_for_install(
-                progress_callback,
-                preferred_serial_port=preferred_serial_port,
-            )
-            if flashed:
-                return {"action": "install_to_pico", "after_firmware": True}
+                    )
+                _progress("Flashing MicroPython…")
+                flashed, flash_err = self._flash_micropython_for_install(
+                    progress_callback,
+                    preferred_serial_port=preferred_serial_port,
+                )
+                if flashed:
+                    return {"action": "install_to_pico", "after_firmware": True}
+                return {
+                    "action": "message",
+                    "level": "warning",
+                    "title": "Install Vintage Radio",
+                    "message": flash_err or (
+                        "Could not copy MicroPython to the Pico.\n\n"
+                        "Ensure RPI-RP2 is visible and try again."
+                    ),
+                }
+
             return {
                 "action": "message",
                 "level": "warning",
                 "title": "Install Vintage Radio",
-                "message": flash_err or (
-                    "Could not copy MicroPython to the Pico.\n\n"
-                    "Ensure RPI-RP2 is visible and try again."
+                "message": (
+                    "Could not determine Pico state. Connect the Pico via USB and try again."
                 ),
             }
 
+        if full_uf2 is not None:
+            intro = (
+                "A one-file Vintage Radio firmware image is available.\n\n"
+                "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
+            )
+            return _flash_bundled_full_uf2(full_uf2, wait_intro=intro)
+
         return {
             "action": "message",
-            "level": "warning",
+            "level": "info",
             "title": "Install Vintage Radio",
             "message": (
-                "Could not determine Pico state. Connect the Pico via USB and try again."
+                "mpremote is not available. Install it with: pip install mpremote"
             ),
         }
 
@@ -7234,7 +7488,23 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg.set_status_message("Looking for Pico on USB…")
         QtWidgets.QApplication.processEvents()
 
-    def _run_smart_install_with_progress(self) -> None:
+    def _resolve_vintage_radio_full_uf2(
+        self, entry: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        """UF2 for smart install: selected card, else newest bundled image."""
+        from gui.services.firmware_bundle import bundled_vintage_radio_full_uf2
+
+        if entry:
+            raw = str(entry.get("uf2Path") or "").strip()
+            if raw:
+                path = Path(raw)
+                if path.is_file():
+                    return path
+        return bundled_vintage_radio_full_uf2()
+
+    def _run_smart_install_with_progress(
+        self, *, full_uf2: Optional[Path] = None,
+    ) -> None:
         """Run smart install on a worker thread with a modal progress dialog."""
         if getattr(self, "_smart_install_active", False):
             return
@@ -7259,7 +7529,10 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
             title="Install Firmware",
             func=self._smart_install_vintage_radio_worker,
-            kwargs={"preferred_serial_port": preferred},
+            kwargs={
+                "preferred_serial_port": preferred,
+                "full_uf2_path": str(full_uf2) if full_uf2 is not None else None,
+            },
             initial_message="Preparing firmware install…",
             on_before_start=lambda: self._prepare_install_serial_for_worker(dlg),
         )
@@ -7283,9 +7556,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """Detect Pico state and install using the correct path (one button)."""
         self._run_smart_install_with_progress()
 
-    def _install_vintage_radio_official_firmware(self) -> None:
+    def _install_vintage_radio_official_firmware(
+        self, entry: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Install official Vintage Radio basic firmware (smart detect + one-button flow)."""
-        self._run_smart_install_with_progress()
+        self._run_smart_install_with_progress(
+            full_uf2=self._resolve_vintage_radio_full_uf2(entry),
+        )
 
     def _auto_flash_micropython_to_bootsel(self) -> bool:
         """Download/cache stock MicroPython and copy to BOOTSEL without opening a dialog."""
@@ -12297,6 +12574,29 @@ class MainWindow(QtWidgets.QMainWindow):
             ]
             files_to_copy.append((custom_hw_driver_path, "components/dfplayer_hardware.py"))
 
+        # Cross-compile the largest modules to .mpy bytecode. On-device compilation of
+        # radio_core.py / dfplayer_hardware.py source fragments the MicroPython heap
+        # badly enough that the AM WAV loader can't find a contiguous ~37KB block
+        # afterward (180KB+ free, but max contiguous run <9KB) — see
+        # _cross_compile_to_mpy() and am_wav_loader.py. Falls back to plain .py when
+        # mpy-cross is unavailable or compilation fails.
+        _mpy_compile_candidates = {"radio_core.py", "components/dfplayer_hardware.py"}
+        _mpy_temp_files: List[Path] = []
+        _stale_remote_cleanup: List[str] = []
+        _compiled_files_to_copy: List[Tuple[str, str]] = []
+        for local, remote in files_to_copy:
+            if remote in _mpy_compile_candidates:
+                compiled = _cross_compile_to_mpy(root / local if not Path(local).is_absolute() else Path(local))
+                if compiled is not None:
+                    _mpy_temp_files.append(compiled)
+                    mpy_remote = remote[: -len(".py")] + ".mpy"
+                    _compiled_files_to_copy.append((str(compiled), mpy_remote))
+                    _stale_remote_cleanup.append(remote)
+                    continue
+                _stale_remote_cleanup.append(remote[: -len(".py")] + ".mpy")
+            _compiled_files_to_copy.append((local, remote))
+        files_to_copy = _compiled_files_to_copy
+
         write_session_line(
             "Pico install copy list: {}".format(
                 ", ".join(remote for _src, remote in files_to_copy)
@@ -12408,21 +12708,35 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Copy firmware files (one mpremote cp per file; batched cp requires dest to be a dir) ──
         _report("Copying main, radio_core, components (dfplayer + vintage_radio_ipc), …")
-        for local, remote in files_to_copy:
-            src = root / local
-            if not src.exists():
-                raise RuntimeError(
-                    "Firmware file is missing from the application bundle — cannot push to the Pico.\n\n"
-                    f"Missing source: {local}\n"
-                    f"Resolved path: {src}\n\n"
-                    "If you are running a packaged build, reinstall from a build that includes "
-                    "firmware/pico/components (e.g. am_wav_loader.py). "
-                    "From source, ensure the repo firmware tree is intact."
-                )
-            r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
-            if r.returncode != 0:
-                detail = (r.stderr or "") + (r.stdout or "")
-                raise RuntimeError(_format_install_mpremote_error(detail))
+        try:
+            for local, remote in files_to_copy:
+                src = Path(local) if Path(local).is_absolute() else root / local
+                if not src.exists():
+                    raise RuntimeError(
+                        "Firmware file is missing from the application bundle — cannot push to the Pico.\n\n"
+                        f"Missing source: {local}\n"
+                        f"Resolved path: {src}\n\n"
+                        "If you are running a packaged build, reinstall from a build that includes "
+                        "firmware/pico/components (e.g. am_wav_loader.py). "
+                        "From source, ensure the repo firmware tree is intact."
+                    )
+                r = run_mpremote_with_retry(["cp", str(src), f":{remote}"])
+                if r.returncode != 0:
+                    detail = (r.stderr or "") + (r.stdout or "")
+                    raise RuntimeError(_format_install_mpremote_error(detail))
+            # Remove stale .py/.mpy counterparts from a previous install using the other
+            # format, so the importer can't pick up outdated code (best-effort).
+            for stale_remote in _stale_remote_cleanup:
+                try:
+                    run_mpremote(["rm", f":{stale_remote}"], timeout_sec=10)
+                except Exception:
+                    pass
+        finally:
+            for tmp_mpy in _mpy_temp_files:
+                try:
+                    os.unlink(tmp_mpy)
+                except OSError:
+                    pass
 
         # ── Write pin_config.json from active profile ──
         _report("Writing pin configuration...")

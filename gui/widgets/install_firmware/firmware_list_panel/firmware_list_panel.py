@@ -247,4 +247,5 @@ class FirmwareListPanel(QtWidgets.QWidget):
         self._add_btn.setStyleSheet(_add_btn_style())
         self._paint_filter_icon()
         for card in self._cards:
+            card.reload_theme()
             card.set_selected(str(card.entry.get("id", "")) == self._selected_id)

@@ -80,6 +80,11 @@ for _fn in ('am_wav_loader.py', 'vintage_radio_ipc.py'):
     _comp = _pico_components / _fn
     if _comp.exists():
         datas.append((str(_comp), 'firmware/pico/components'))
+# Full-flash UF2 images for Install Firmware (BOOTSEL one-step install).
+_release_dir = project_dir / 'firmware' / 'release'
+if _release_dir.is_dir():
+    for _uf2 in sorted(_release_dir.glob('vintage-radio-firmware-*-full.uf2')):
+        datas.append((str(_uf2), 'firmware/release'))
 _vs1053 = project_dir / 'firmware' / 'pico' / 'vs1053_hardware.py'
 if _vs1053.exists():
     datas.append((str(_vs1053), 'firmware/pico'))
@@ -91,6 +96,16 @@ except Exception:
     mpremote_datas = []
     mpremote_binaries = []
     mpremote_hidden = []
+
+# mpy-cross: precompile radio_core / dfplayer_hardware for Pico install (heap-safe .mpy).
+# collect_all ships mpy-cross.exe + archive/; without this import raises SystemExit.
+try:
+    _mpy_cross_datas, _mpy_cross_bins, _mpy_cross_hidden = collect_all('mpy_cross')
+    datas += _mpy_cross_datas
+    mpremote_binaries += _mpy_cross_bins
+    mpremote_hidden += _mpy_cross_hidden
+except Exception:
+    pass
 
 # Bundle imageio-ffmpeg so ffmpeg executable is available in packaged app.
 # collect_all puts the static ffmpeg binary under imageio_ffmpeg/binaries/ in datas.
@@ -180,6 +195,7 @@ a = Analysis(
         'pydub',
         'imageio_ffmpeg',
         'mpremote',
+        'mpy_cross',
         'mpremote.commands',
         'mpremote.main',
         'mpremote.mip',

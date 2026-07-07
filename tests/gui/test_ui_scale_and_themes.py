@@ -15,6 +15,19 @@ def test_ui_scale_px_scales_with_zoom() -> None:
     assert u.px(10) == 8
 
 
+def test_qss_weight_reduces_heavy_weights_on_macos(monkeypatch) -> None:
+    monkeypatch.setattr(u.sys, "platform", "darwin")
+    assert u.qss_weight(900) == 700
+    assert u.qss_weight(800) == 600
+    assert u.qss_weight(600) == 600
+
+
+def test_qss_weight_unchanged_off_macos(monkeypatch) -> None:
+    monkeypatch.setattr(u.sys, "platform", "win32")
+    assert u.qss_weight(900) == 900
+    assert u.qss_weight(800) == 800
+
+
 def test_px_layout_grows_slower_above_100() -> None:
     u.set_zoom_percent(100)
     assert u.px_layout(280) == 280

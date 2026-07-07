@@ -174,6 +174,68 @@ def _cmd_gc_collect() -> dict:
     }
 
 
+def _cmd_goto_station(fw, folder: int, track: int = 1) -> dict:
+    """Jump to a DFPlayer folder (1-based) and optional track without Ctrl+C REPL."""
+    from radio_core import MODE_PLAYLIST
+
+    c = fw.core
+    folder = int(folder)
+    track = max(1, int(track))
+    playlists = getattr(c, "playlists", None) or []
+    if folder < 1:
+        return {"ok": False, "error": "invalid_folder", "folder": folder}
+    idx = folder - 1
+    if idx >= len(playlists):
+        return {
+            "ok": False,
+            "error": "folder_out_of_range",
+            "folder": folder,
+            "station_count": len(playlists),
+        }
+    c.mode = MODE_PLAYLIST
+    if hasattr(c, "_shuffle_source_type"):
+        c._shuffle_source_type = None
+    c.current_album_index = idx
+    c.current_track = track
+    if getattr(c, "basic_mode", False):
+        c._hydrate_basic_station(idx, allow_assume=True)
+        count_fn = getattr(c, "_basic_playlist_track_count", None)
+        if count_fn is not None:
+            n = count_fn(playlists[idx])
+            if n > 0 and track > n:
+                return {
+                    "ok": False,
+                    "error": "track_out_of_range",
+                    "folder": folder,
+                    "track": track,
+                    "max_track": n,
+                }
+    c._start_playback_for_current()
+    try:
+        fw.hw.save_state(
+            {
+                "album_index": c.current_album_index,
+                "track": c.current_track,
+                "mode": c.mode,
+            }
+        )
+    except Exception:
+        pass
+    playing = None
+    try:
+        playing = bool(fw.hw.is_playing())
+    except Exception:
+        playing = None
+    return {
+        "ok": True,
+        "cmd": "goto_station",
+        "folder": folder,
+        "track": c.current_track,
+        "playing": playing,
+        "state": _cmd_get_state(fw),
+    }
+
+
 def _cmd_get_state(fw) -> dict:
     c = fw.core
     playing = None
@@ -258,6 +320,25 @@ def _handle_line(fw, arg: str) -> None:
     if cmd == "triple_tap_long_press":
         _cmd_combo_tap_then_long(fw, 3)
         _emit({"ok": True, "cmd": "triple_tap_long_press"})
+        return
+    if cmd.startswith("goto_station"):
+        parts = cmd.split()
+        if len(parts) < 2:
+            _emit(
+                {
+                    "ok": False,
+                    "error": "usage",
+                    "detail": "goto_station FOLDER [TRACK]",
+                }
+            )
+            return
+        try:
+            folder = int(parts[1])
+            track = int(parts[2]) if len(parts) > 2 else 1
+        except ValueError:
+            _emit({"ok": False, "error": "invalid_args", "cmd": cmd})
+            return
+        _emit(_cmd_goto_station(fw, folder, track))
         return
     _emit({"ok": False, "error": "unknown_command", "cmd": cmd})
 

@@ -491,6 +491,7 @@ IF_SW_BADGE_PAD_H        = 10   # px
 IF_META_LABEL_FG         = _p.TEXT_SEC
 IF_META_VALUE_FG         = _p.TEXT_PRI
 IF_META_PILL_W           = 130  # px — uniform meta pill width
+IF_META_DEVICE_PILL_W    = 178  # px — fits "DFPlayer + RP2040" + icon
 IF_META_AUTHOR_PILL_W    = 180  # px — wider for GitHub link
 IF_META_PILL_H           = 36   # px
 IF_META_PILL_BORDER      = _p.BORDER_TAN

@@ -98,6 +98,9 @@ class FirmwareCard(QtWidgets.QFrame):
             tags.append("UF2")
         return tags[:3]
 
+    def reload_theme(self) -> None:
+        self._apply_style()
+
     def _apply_style(self) -> None:
         variant = "card_tag_selected" if self._selected else "card_tag_idle"
         for pill in self._tag_pills:
@@ -117,7 +120,7 @@ class FirmwareCard(QtWidgets.QFrame):
                 }}
             """)
             self._title.setStyleSheet(
-                f"font-size:{u.px(t.IF_CARD_TITLE_PX)}px; font-weight:800; color:#ffffff; background:transparent;"
+                f"font-size:{u.px(t.IF_CARD_TITLE_PX)}px; font-weight:{u.qss_weight(800)}; color:#ffffff; background:transparent;"
             )
             self._subtitle.setStyleSheet(
                 f"font-size:{u.px(t.IF_CARD_SUB_PX)}px; color:#fff6e5; background:transparent;"
@@ -132,7 +135,7 @@ class FirmwareCard(QtWidgets.QFrame):
                 }}
             """)
             self._title.setStyleSheet(
-                f"font-size:{u.px(t.IF_CARD_TITLE_PX)}px; font-weight:800; color:{t.IF_CARD_IDLE_TEXT}; background:transparent;"
+                f"font-size:{u.px(t.IF_CARD_TITLE_PX)}px; font-weight:{u.qss_weight(800)}; color:{t.IF_CARD_IDLE_TEXT}; background:transparent;"
             )
             sub = "#8a7968" if disabled else t.IF_CARD_IDLE_SUBTEXT
             self._subtitle.setStyleSheet(

@@ -76,6 +76,9 @@ ALBUM_FILE      = "VintageRadio/album_state.txt"
 METADATA_FILE   = "radio_metadata.json"
 
 BUSY_CONFIRM_MS = 5000
+BUSY_CONFIRM_MS_MAX = 15000
+# Poll query_status during play-start confirm (BUSY can lag audio on rapid auto-advance).
+PLAY_CONFIRM_QUERY_INTERVAL_MS = 400
 POST_CMD_GUARD_MS = 120
 # After stop, wait for BUSY HIGH so rapid auto-advance does not outrun the module
 BUSY_IDLE_WAIT_MS = 700
@@ -166,8 +169,7 @@ class DFPlayerHardware(HardwareInterface):
         self.pwm = None
         self.tim = None
 
-        # Load AM WAV before DFPlayer UART traffic fills the RX buffer / fragments heap.
-        # Loading later caused MemoryError → compact-load retries → ~6k samples @ ~1.3kHz (very muddy).
+        # Attach AM WAV preloaded by main_basic (see am_wav_loader.load_am_wav_cache).
         self.wav_data = None
         self.wav_sr = 8000
         self.lut = None
@@ -281,7 +283,7 @@ class DFPlayerHardware(HardwareInterface):
             return False
     
     def _load_wav(self):
-        """Attach AM WAV from am_wav_loader cache (preload from main before radio_core for RAM)."""
+        """Attach AM WAV from am_wav_loader cache (preload from main before DFPlayerHardware)."""
         data, sr, _path = am_wav_loader.load_am_wav_cache()
         self.wav_data = data
         self.wav_sr = sr
@@ -779,6 +781,92 @@ class DFPlayerHardware(HardwareInterface):
     # on error, but many clones do not send it reliably or send it late. BUSY is the
     # only definitive hardware signal that playback has actually started.
     
+    def _play_start_confirm_ms(self, folder, track):
+        """Scale play-start wait for deep SD folders and high track indices."""
+        try:
+            f = max(1, int(folder or 1))
+            t = max(1, int(track or 1))
+        except (TypeError, ValueError):
+            f, t = 1, 1
+        scaled = BUSY_CONFIRM_MS + (f - 1) * 50 + (t - 1) * 12
+        if scaled > BUSY_CONFIRM_MS_MAX:
+            return BUSY_CONFIRM_MS_MAX
+        if scaled < BUSY_CONFIRM_MS:
+            return BUSY_CONFIRM_MS
+        return scaled
+
+    def _play_pre_settle_extra_ms(self, folder):
+        """Extra idle time to give the module *before* the first play attempt,
+        scaled by folder depth.
+
+        Hardware measurement showed the post-command confirm window is NOT the
+        bottleneck for deep folders: folder 90's one observed genuine slow-but-
+        successful start took ~6.7s, well inside its ~9.45s confirm window, yet
+        attempt 1 still failed there ~90% of the time (BUSY never moved at all).
+        What reliably flips it to success is *more idle time before sending*
+        (the retry path already does this, which is why retries mostly work).
+        Fit from 3 hardware data points (folder 1 ~150-200ms, folder 10
+        ~1.1-1.2s, folder 90 ~6.7s to a confirmed start): required_ms =~
+        150 + 72*(folder-1). Applied only on attempt 0 so shallow folders
+        (the common case) are unaffected.
+        """
+        try:
+            f = max(1, int(folder or 1))
+        except (TypeError, ValueError):
+            f = 1
+        extra = int(72 * (f - 1))
+        return min(extra, 7500)
+
+    def _deep_folder_attempt0_confirm_ms(self, folder, track):
+        """One long, uninterrupted confirm window for attempt 0 on very deep
+        folders, instead of chopping the wait into shorter windows separated
+        by stop()+resend()/reset() cycles.
+
+        Hardware evidence: folder 90 tracks 11/12 got query_status()=None
+        (zero UART response at all -- not just BUSY stuck HIGH) for the
+        *entire* ~9.6s confirm window on all 4 chopped-up attempts, each
+        preceded by a fresh stop+resend (and a hard reset before the last
+        one) -- yet still failed completely. That raises the question of
+        whether the interruption itself (stop/resend/reset) aborts an
+        in-progress-but-slow module file lookup rather than the module being
+        permanently stuck. Give folder >= 70 a single long, uninterrupted
+        window on the FIRST attempt, before ever touching stop/resend/reset,
+        to test that hypothesis. Later retries (if this still fails) fall
+        back to the normal, shorter _play_start_confirm_ms window so the
+        worst-case total time stays bounded.
+        """
+        try:
+            f = max(1, int(folder or 1))
+            t = max(1, int(track or 1))
+        except (TypeError, ValueError):
+            f, t = 1, 1
+        if f < 70:
+            return None
+        extended = 22000 + (t - 1) * 12
+        return min(extended, 28000)
+
+    def _max_play_attempts(self, folder, cold_folder_jump):
+        """Attempt budget for play_track(), tiered by folder depth.
+
+        Even with the scaled pre-settle wait, hardware testing showed deep
+        folders (e.g. folder 90) can still fail every attempt occasionally
+        (non-deterministic module behavior, not something a timeout alone
+        fixes) — so very deep folders get a bounded extra attempt or two
+        rather than unlimited retries.
+        """
+        attempts = 2
+        if cold_folder_jump:
+            attempts = max(attempts, 3)
+        try:
+            f = int(folder or 1)
+        except (TypeError, ValueError):
+            f = 1
+        if f >= 70:
+            attempts = max(attempts, 4)
+        elif f >= 30:
+            attempts = max(attempts, 3)
+        return attempts
+
     def _wait_for_busy_low(self, timeout_ms=BUSY_CONFIRM_MS):
         """Wait for BUSY pin to go LOW (indicating playback started)."""
         start = time.ticks_ms()
@@ -809,10 +897,111 @@ class DFPlayerHardware(HardwareInterface):
         for BUSY HIGH debounce."""
         self._uart_track_end_armed = True
         self._playback_start_tick = time.ticks_ms()
-    
+
     def get_playback_position_ms(self):
         """Return current playback position (not supported by DFPlayer Mini)."""
         return 0
+
+    def _log_play_confirm_success(self, confirm_reason):
+        """Log how play-start confirmation succeeded."""
+        if confirm_reason == "busy_low":
+            print("DF: BUSY went LOW -> playback started")
+        elif confirm_reason == "uart_finished_during_confirm":
+            print("DF: UART track-finished during confirm -> playback started")
+        elif confirm_reason and confirm_reason.startswith("query_status"):
+            print("DF: query_status -> playing ({})".format(confirm_reason))
+        elif confirm_reason and confirm_reason.startswith("retry_probe"):
+            print("DF: playback confirmed on retry probe ({})".format(confirm_reason))
+        else:
+            print("DF: playback confirmed ({})".format(confirm_reason or "unknown"))
+
+    def _log_play_confirm_failed(self, folder, track, attempt, play_sent_tick):
+        """Log BUSY/query state when play-start confirmation timed out."""
+        elapsed = time.ticks_diff(time.ticks_ms(), play_sent_tick)
+        busy_val = self.pin_busy.value()
+        qs = self.query_status()
+        print(
+            "DF: play confirm failed folder={} track={} attempt={} ms_since_play={} busy={} query_status={}".format(
+                folder, track, attempt + 1, elapsed, busy_val, qs
+            )
+        )
+        return busy_val, qs
+
+    def _log_play_retry_probe(self, folder, track, play_sent_tick):
+        """Log module state immediately before a settle+retry stop."""
+        elapsed = time.ticks_diff(time.ticks_ms(), play_sent_tick)
+        busy_val = self.pin_busy.value()
+        qs = self.query_status()
+        print(
+            "DF: play retry probe folder={} track={} ms_since_play={} busy={} query_status={}".format(
+                folder, track, elapsed, busy_val, qs
+            )
+        )
+        return busy_val, qs
+
+    def _poll_play_start_confirm(self, confirm_ms, play_sent_tick):
+        """Wait for play-start confirmation via BUSY, periodic query_status, or UART 0x3D.
+
+        Returns (confirmed, reason, error_code). error_code is set on UART 0x40 reject.
+        UART 0x3D during confirm means the clip started and finished (short stress tracks);
+        the event is left unconsumed for the main loop.
+        """
+        poll_start = time.ticks_ms()
+        last_query_tick = play_sent_tick
+        confirmed = False
+        reason = None
+
+        while time.ticks_diff(time.ticks_ms(), poll_start) < confirm_ms:
+            self._df_read_pending()
+            if self._track_finished_via_uart:
+                confirmed = True
+                reason = "uart_finished_during_confirm"
+                break
+            if self._last_error_code is not None:
+                return False, None, self._last_error_code
+            if self.pin_busy.value() == 0:
+                confirmed = True
+                reason = "busy_low"
+                break
+            now = time.ticks_ms()
+            if time.ticks_diff(now, last_query_tick) >= PLAY_CONFIRM_QUERY_INTERVAL_MS:
+                last_query_tick = now
+                qs = self.query_status()
+                if qs == 1:
+                    confirmed = True
+                    reason = "query_status_playing"
+                    break
+            time.sleep_ms(10)
+
+        if not confirmed:
+            qs = self.query_status()
+            if qs == 1:
+                confirmed = True
+                reason = "query_status_playing_final"
+
+        return confirmed, reason, None
+
+    def _complete_play_track_start(self, folder, track, attempt, confirm_reason, start_ms):
+        """Mark play confirmed, arm track-end detection, optional seek."""
+        self._log_play_confirm_success(confirm_reason)
+        self._note_track_learned(folder, track)
+        self._set_last_start_outcome(
+            "confirmed",
+            confirm_reason or "unknown",
+            folder,
+            track,
+            attempt + 1,
+        )
+        self.ignore_busy_until = time.ticks_add(
+            time.ticks_ms(), BUSY_IGNORE_MS_AFTER_PLAY_OK
+        )
+        self._arm_dfplayer_track_end_detection()
+        if start_ms > 0:
+            start_seconds = start_ms // 1000
+            time.sleep_ms(80)
+            self._df_set_time(start_seconds)
+            print(f"DF: seeking to {start_seconds}s ({start_ms}ms)")
+        return True
     
     # ===========================
     #   HardwareInterface IMPLEMENTATION
@@ -837,10 +1026,40 @@ class DFPlayerHardware(HardwareInterface):
         if folder_wrap and track == 1:
             self._df_folder_wrap_preplay(folder)
 
-        max_attempts = 1 if fast_fail else 2
-        confirm_ms = 1200 if fast_fail else BUSY_CONFIRM_MS
+        # Jumping into a folder that isn't already loaded (station jump, goto_station,
+        # long_press station advance) can need an SD/FAT lookup the module hasn't done
+        # recently. Observed on hardware: a cold folder can fail BOTH of 2 confirm
+        # attempts (BUSY stuck HIGH for the full scaled window each time) yet a fresh
+        # 3rd attempt confirms almost immediately — the module can do it fast, it just
+        # needed one more try. Sequential same-folder playback (the common case) always
+        # confirms on attempt 1, so this costs nothing there.
+        prev_folder = getattr(self, "_playing_folder", None)
+        cold_folder_jump = prev_folder is not None and prev_folder != folder
+        max_attempts = 1 if fast_fail else self._max_play_attempts(folder, cold_folder_jump)
+        confirm_ms = 1200 if fast_fail else self._play_start_confirm_ms(folder, track)
+        attempt0_confirm_ms = (
+            None if fast_fail else self._deep_folder_attempt0_confirm_ms(folder, track)
+        )
+        play_sent_tick = 0
         for attempt in range(max_attempts):
             if attempt > 0:
+                busy_val, qs = self._log_play_retry_probe(folder, track, play_sent_tick)
+                if busy_val == 0 or qs == 1:
+                    reason = (
+                        "retry_probe_busy_low"
+                        if busy_val == 0
+                        else "retry_probe_query_playing"
+                    )
+                    print("DF: play retry skipped stop ({})".format(reason))
+                    return self._complete_play_track_start(
+                        folder, track, attempt, reason, start_ms
+                    )
+                # Last-chance attempt on an already-escalated (deep/cold) folder:
+                # a plain resend already failed 2+ times, so try a real module
+                # reset instead of just repeating the same command again.
+                if attempt == max_attempts - 1 and max_attempts > 2:
+                    print(f"DF: hard recovery reset before final attempt (folder={folder}, track={track})")
+                    self._df_reset()
                 print(f"DF: play settle+retry (folder={folder}, track={track})")
                 time.sleep_ms(POST_CMD_GUARD_MS * 2)
                 self._wait_for_busy_high(BUSY_IDLE_WAIT_MS + 400)
@@ -861,7 +1080,26 @@ class DFPlayerHardware(HardwareInterface):
                 # after BUSY goes HIGH.  Without this the play command arrives
                 # while the module is still transitioning, causing it to accept
                 # the command slowly (adding ~800 ms to the gap).
-                time.sleep_ms(200)
+                #
+                # The large *scaled* portion of this (_play_pre_settle_extra_ms)
+                # was originally added on the theory that deep folders needed
+                # more idle time before the command was even sent. Hardware
+                # evidence since then (folder 90 tracks 11/12 succeeding after
+                # ~10-21s of *uninterrupted* wait AFTER sending, once attempt 0
+                # got a long enough confirm window) shows that theory was
+                # wrong: the module's slowness is entirely in its own file
+                # lookup after receiving the play command, not idle time
+                # beforehand. Folders using the extended attempt-0 confirm
+                # window (_deep_folder_attempt0_confirm_ms) no longer need the
+                # scaled pre-settle at all -- skipping it saves ~6-7s per
+                # track transition in folders like 90-99 with no change in
+                # attempt-0 success rate.
+                extra_settle = (
+                    0
+                    if attempt0_confirm_ms is not None
+                    else self._play_pre_settle_extra_ms(folder)
+                )
+                time.sleep_ms(200 + extra_settle)
             self._df_set_vol(self._df_volume)
             time.sleep_ms(POST_CMD_GUARD_MS)
             stale_ms = 100 if attempt == 0 else 120
@@ -870,54 +1108,44 @@ class DFPlayerHardware(HardwareInterface):
             self._clear_uart_track_finished_stale(stale_ms)
             self._last_error_code = None
             self._df_play_folder_track(folder, track)
+            play_sent_tick = time.ticks_ms()
             self._clear_uart_track_finished_stale(70)
 
-            confirmed = False
-            poll_start = time.ticks_ms()
-            while time.ticks_diff(time.ticks_ms(), poll_start) < confirm_ms:
-                self._df_read_pending()
-                if self._track_finished_via_uart:
-                    self.consume_track_finished_uart()
-                if self._last_error_code is not None:
-                    err_msg = DF_ERROR_MSGS.get(self._last_error_code, f"Unknown 0x{self._last_error_code:02X}")
-                    print(f"DF: play rejected (0x{self._last_error_code:02X}): {err_msg}")
-                    self._set_last_start_outcome("explicit_error", "uart_error_0x{:02X}".format(self._last_error_code), folder, track, attempt + 1)
-                    self.ignore_busy_until = time.ticks_add(time.ticks_ms(), BUSY_IGNORE_MS_LONG)
-                    return False
-                if self.pin_busy.value() == 0:
-                    confirmed = True
-                    break
-                time.sleep_ms(10)
-
-            if confirmed:
-                print("DF: BUSY went LOW -> playback started")
-            elif self.query_status() == 1:
-                confirmed = True
-                print("DF: query_status -> playing")
-
-            if confirmed:
-                self._note_track_learned(folder, track)
+            this_confirm_ms = confirm_ms
+            if attempt == 0 and attempt0_confirm_ms is not None:
+                this_confirm_ms = attempt0_confirm_ms
+                print(
+                    f"DF: deep-folder attempt0 using extended {this_confirm_ms}ms "
+                    f"confirm window (folder={folder}, track={track})"
+                )
+            confirmed, confirm_reason, err_code = self._poll_play_start_confirm(
+                this_confirm_ms, play_sent_tick
+            )
+            if err_code is not None:
+                err_msg = DF_ERROR_MSGS.get(err_code, f"Unknown 0x{err_code:02X}")
+                print(f"DF: play rejected (0x{err_code:02X}): {err_msg}")
                 self._set_last_start_outcome(
-                    "confirmed",
-                    "busy_low" if self.pin_busy.value() == 0 else "query_status_playing",
+                    "explicit_error",
+                    "uart_error_0x{:02X}".format(err_code),
                     folder,
                     track,
                     attempt + 1,
                 )
-                self.ignore_busy_until = time.ticks_add(
-                    time.ticks_ms(), BUSY_IGNORE_MS_AFTER_PLAY_OK
-                )
-                self._arm_dfplayer_track_end_detection()
-                if start_ms > 0:
-                    start_seconds = start_ms // 1000
-                    time.sleep_ms(80)
-                    self._df_set_time(start_seconds)
-                    print(f"DF: seeking to {start_seconds}s ({start_ms}ms)")
-                return True
+                self.ignore_busy_until = time.ticks_add(time.ticks_ms(), BUSY_IGNORE_MS_LONG)
+                return False
 
-            # No UART error: worth one retry (clone timing / BUSY not idle yet)
+            if confirmed:
+                return self._complete_play_track_start(
+                    folder, track, attempt, confirm_reason, start_ms
+                )
+
+            self._log_play_confirm_failed(folder, track, attempt, play_sent_tick)
+
+            # No UART error: worth one retry (module timing / BUSY not idle yet)
             if attempt == 0 and self._last_error_code is None and max_attempts > 1:
-                self._set_last_start_outcome("pending", "retry_after_unconfirmed_start", folder, track, attempt + 1)
+                self._set_last_start_outcome(
+                    "pending", "retry_after_unconfirmed_start", folder, track, attempt + 1
+                )
                 continue
 
         print(f"DF: playback not confirmed (folder={folder}, track={track})")
@@ -1048,7 +1276,6 @@ class DFPlayerHardware(HardwareInterface):
         # Matches original: df_stop() → POST_CMD_GUARD_MS → df_play_folder_track()
         confirmed = False
         if folder is not None and track is not None:
-            self._set_last_start_outcome("pending", "am_pwm_start_requested", folder, track, 1)
             self._df_stop()
             time.sleep_ms(POST_CMD_GUARD_MS)
             print(f"AM: Starting music at volume 0 (folder={folder}, track={track})")
@@ -1204,22 +1431,6 @@ class DFPlayerHardware(HardwareInterface):
         # Ensure volume is at target after fade
         self._df_set_vol(self._df_volume)
         print(f"AM: PWM overlay complete, vol={self._df_volume}, confirmed={confirmed}")
-        # If BUSY never went LOW, retry play once (helps when nothing plays after AM on some hardware)
-        if not confirmed and folder is not None and track is not None:
-            print("AM: Playback not confirmed, retrying play command...")
-            self._df_stop()
-            time.sleep_ms(POST_CMD_GUARD_MS)
-            self._df_play_folder_track(folder, track)
-            if self._wait_for_busy_low(2000):
-                confirmed = True
-                print("AM: Retry confirmed (BUSY LOW)")
-                # New play command: always reset UART end window from this point.
-                self._arm_dfplayer_track_end_detection()
-        if folder is not None and track is not None:
-            if confirmed:
-                self._set_last_start_outcome("confirmed", "am_pwm_busy_low", folder, track, 1)
-            else:
-                self._set_last_start_outcome("timeout", "am_pwm_busy_never_low", folder, track, 1)
         return confirmed
     
     def _play_music_only_fade_after_stop(self, folder=None, track=None):

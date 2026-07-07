@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from gui import radio_manager as rm
 from gui.radio_manager import (
+    _INSTALL_ERR_DETAIL_SEP,
     _find_rp2040_serial_port,
     _format_install_mpremote_error,
     _mpremote_args_with_connect,
     _post_flash_serial_timeout_message,
     _serial_output_indicates_blocking_firmware,
     _setup_device_failure_message,
+    _split_install_error_detail,
     _wait_mpremote_serial_ready,
 )
 
@@ -34,6 +36,45 @@ def test_raw_repl_generic_message():
     assert "raw REPL" in msg
 
 
+def test_write_timeout_message_gives_single_action():
+    err = "serial.serialutil.SerialTimeoutException: Write timeout"
+    msg = _format_install_mpremote_error(err)
+    assert "stopped responding" in msg
+    assert "Unplug the Pico's USB cable" in msg
+    # Only one recovery path should be offered, not a menu of alternatives.
+    assert "reinstall" not in msg.lower()
+    assert "BOOTSEL" not in msg
+
+
+def test_format_install_error_hides_raw_detail_behind_separator():
+    err = "Traceback (most recent call last):\n  File x\nSerialTimeoutException: Write timeout"
+    msg = _format_install_mpremote_error(err)
+    assert _INSTALL_ERR_DETAIL_SEP in msg
+    summary, detail = msg.split(_INSTALL_ERR_DETAIL_SEP, 1)
+    assert "Traceback" not in summary
+    assert "Traceback" in detail
+
+
+def test_split_install_error_detail_uses_separator():
+    msg = f"Short summary{_INSTALL_ERR_DETAIL_SEP}raw detail here"
+    summary, detail = _split_install_error_detail(msg)
+    assert summary == "Short summary"
+    assert detail == "raw detail here"
+
+
+def test_split_install_error_detail_falls_back_to_traceback_marker():
+    msg = "RuntimeError: boom\n\nTraceback (most recent call last):\n  File x, line 1"
+    summary, detail = _split_install_error_detail(msg)
+    assert summary == "RuntimeError: boom"
+    assert detail.startswith("Traceback")
+
+
+def test_split_install_error_detail_plain_message_has_no_detail():
+    summary, detail = _split_install_error_detail("Project files not found.")
+    assert summary == "Project files not found."
+    assert detail == ""
+
+
 def test_detect_blocking_serial():
     label = _serial_output_indicates_blocking_firmware("Booting Retro Radio Baseline 26.0.1")
     assert label == "third-party firmware"
@@ -53,6 +94,151 @@ def test_detect_blocking_serial_idle_now_playing():
     assert _serial_output_indicates_blocking_firmware(sniff) == "third-party firmware"
 
 
+def test_vintage_radio_firmware_not_blocking():
+    from gui.radio_manager import (
+        _serial_output_indicates_vintage_radio_firmware,
+        _sniff_suggests_app_firmware,
+    )
+
+    boot = "Booting Vintage Radio (BASIC MODE)\n--- DFPlayer comms check (basic mode) ---"
+    assert _serial_output_indicates_vintage_radio_firmware(boot)
+    assert _serial_output_indicates_blocking_firmware(boot) is None
+
+    idle = "BASIC MODE active. Button patterns:\nDF: Playing folder=01 track=001"
+    assert _serial_output_indicates_vintage_radio_firmware(idle)
+    assert _serial_output_indicates_blocking_firmware(idle) is None
+    assert not _sniff_suggests_app_firmware(idle)
+
+
+def test_pico_assessment_vintage_radio_runs_mpremote(monkeypatch):
+    sniff = (
+        "Booting Vintage Radio (BASIC MODE)\n"
+        "BASIC MODE active. Button patterns:\n"
+    )
+    monkeypatch.setattr(rm, "_find_rp2040_serial_port", lambda preferred=None: "COM6")
+    monkeypatch.setattr(rm, "_sniff_rp2040_serial_text", lambda *a, **k: sniff)
+
+    probe_calls: list[str] = []
+
+    def fake_probe(_cmd, port, cwd, **kw):
+        probe_calls.append(port)
+        return type("R", (), {"returncode": 0, "stdout": "micropython", "stderr": ""})()
+
+    def fake_run(_cmd, args, **_kw):
+        return type(
+            "R",
+            (),
+            {"returncode": 0, "stdout": "VR_INSTALL_PROBE 8", "stderr": ""},
+        )()
+
+    monkeypatch.setattr(rm, "_run_mpremote_probe", fake_probe)
+    monkeypatch.setattr(rm, "_run_mpremote", fake_run)
+    result = rm._pico_install_assessment(["mpremote"], rm.Path("."))
+    assert result["status"] == "ready"
+    assert probe_calls == ["COM6"]
+
+
+def test_pico_assessment_vr_running_mpremote_fails(monkeypatch):
+    sniff = (
+        "Booting Vintage Radio (BASIC MODE)\n"
+        "BASIC MODE active. Button patterns:\n"
+        "DF: Playing folder=01 track=001\n"
+    )
+    monkeypatch.setattr(rm, "_find_rp2040_serial_port", lambda preferred=None: "COM6")
+    monkeypatch.setattr(rm, "_sniff_rp2040_serial_text", lambda *a, **k: sniff)
+    monkeypatch.setattr(
+        rm,
+        "_run_mpremote_probe",
+        lambda *_a, **_k: type(
+            "R", (), {"returncode": 1, "stdout": sniff, "stderr": "could not enter raw repl"}
+        )(),
+    )
+
+    def fail_repl(*_a, **_k):
+        raise AssertionError("VR_INSTALL_PROBE should not run when probe failed")
+
+    monkeypatch.setattr(rm, "_run_mpremote", fail_repl)
+    result = rm._pico_install_assessment(["mpremote"], rm.Path("."))
+    assert result["status"] == "vintage_radio_mpremote_failed"
+    assert result["port"] == "COM6"
+
+
+def test_smart_install_uses_mpremote_when_vr_ready_and_full_uf2_present(monkeypatch, tmp_path):
+    from gui.radio_manager import MainWindow
+
+    uf2 = tmp_path / "firmware" / "release" / "vintage-radio-firmware-1.0.0-full.uf2"
+    uf2.parent.mkdir(parents=True)
+    uf2.write_bytes(b"UF2" * 400)
+
+    mgr = MainWindow.__new__(MainWindow)
+    monkeypatch.setattr(
+        mgr,
+        "_project_root",
+        lambda: tmp_path,
+    )
+    monkeypatch.setattr(mgr, "_resolve_mpremote_cmd", lambda: ["mpremote"])
+    monkeypatch.setattr(
+        rm,
+        "_pico_install_assessment",
+        lambda *_a, **_k: {"status": "ready", "port": "COM6"},
+    )
+
+    bootsel_called = {"v": False}
+
+    def fail_bootsel(*_a, **_k):
+        bootsel_called["v"] = True
+        raise AssertionError("BOOTSEL wait should not run when assessment is ready")
+
+    monkeypatch.setattr(rm, "_wait_for_bootsel_polling", fail_bootsel)
+
+    result = mgr._smart_install_vintage_radio_worker()
+    assert result == {"action": "install_to_pico", "after_firmware": False}
+    assert bootsel_called["v"] is False
+
+
+def test_smart_install_older_uf2_requires_bootsel_not_mpremote(monkeypatch, tmp_path):
+    from gui.radio_manager import MainWindow
+
+    release = tmp_path / "firmware" / "release"
+    release.mkdir(parents=True)
+    old = release / "vintage-radio-firmware-1.0.0-full.uf2"
+    new = release / "vintage-radio-firmware-1.0.1-full.uf2"
+    old.write_bytes(b"OLD" * 400)
+    new.write_bytes(b"NEW" * 400)
+
+    mgr = MainWindow.__new__(MainWindow)
+    monkeypatch.setattr(mgr, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(mgr, "_resolve_mpremote_cmd", lambda: ["mpremote"])
+    monkeypatch.setattr(
+        rm,
+        "_pico_install_assessment",
+        lambda *_a, **_k: {"status": "ready", "port": "COM6"},
+    )
+    monkeypatch.setattr(mgr, "_is_rpi_rp2_present", lambda: True)
+    monkeypatch.setattr(
+        mgr,
+        "_copy_uf2_to_bootsel_quiet",
+        lambda path, **_: path == old,
+    )
+
+    result = mgr._smart_install_vintage_radio_worker(full_uf2_path=str(old))
+    assert result["action"] == "message"
+    assert result["level"] == "info"
+    assert "1.0.0" in result["message"] or "v1.0.0" in result["message"]
+    assert "flashed" in result["message"].lower() or "Flashed" in result["message"]
+
+
+def test_micropython_cache_uses_app_data_dir(tmp_path, monkeypatch):
+    from gui.services import firmware_bundle as fb
+
+    data = tmp_path / "appdata"
+    data.mkdir()
+    monkeypatch.setattr(fb, "app_data_dir", lambda: data)
+    cache = fb._micropython_cache_dir()
+    assert cache == data / "firmware_cache" / "micropython"
+    assert cache.is_dir()
+
+
 def test_sniff_suggests_app_firmware():
     from gui.radio_manager import _sniff_suggests_app_firmware, _sniff_suggests_stock_micropython_repl
 
@@ -60,6 +246,51 @@ def test_sniff_suggests_app_firmware():
     assert _sniff_suggests_app_firmware(idle)
     assert not _sniff_suggests_stock_micropython_repl(idle)
     assert not _sniff_suggests_app_firmware("MicroPython v1.23.0 on 2024-01-01; Raspberry Pi Pico\n>>> ")
+
+
+def test_vintage_radio_runtime_serial_not_blocking():
+    from gui.radio_manager import (
+        _serial_output_indicates_blocking_firmware,
+        _serial_output_indicates_vintage_radio_firmware,
+    )
+
+    runtime = (
+        "play_track: Starting folder=34, track=170, start_ms=0\n"
+        "DF: stop\n"
+        "Starting playback: 'Track 170' by (folder=34, track=170, start_ms=0)\n"
+        "DF: Playing folder=34, track=170\n"
+    )
+    assert _serial_output_indicates_vintage_radio_firmware(runtime)
+    assert _serial_output_indicates_blocking_firmware(runtime) is None
+
+
+def test_pico_assessment_runtime_vr_runs_mpremote(monkeypatch):
+    sniff = (
+        "play_track: Starting folder=34, track=170, start_ms=0\n"
+        "Starting playback: 'Track 170' by (folder=34, track=170, start_ms=0)\n"
+        "DF: Playing folder=34, track=170\n"
+    )
+    monkeypatch.setattr(rm, "_find_rp2040_serial_port", lambda preferred=None: "COM6")
+    monkeypatch.setattr(rm, "_sniff_rp2040_serial_text", lambda *a, **k: sniff)
+
+    probe_calls: list[str] = []
+
+    def fake_probe(_cmd, port, cwd, **kw):
+        probe_calls.append(port)
+        return type("R", (), {"returncode": 0, "stdout": "micropython", "stderr": ""})()
+
+    def fake_run(_cmd, args, **_kw):
+        return type(
+            "R",
+            (),
+            {"returncode": 0, "stdout": "VR_INSTALL_PROBE 8", "stderr": ""},
+        )()
+
+    monkeypatch.setattr(rm, "_run_mpremote_probe", fake_probe)
+    monkeypatch.setattr(rm, "_run_mpremote", fake_run)
+    result = rm._pico_install_assessment(["mpremote"], rm.Path("."))
+    assert result["status"] == "ready"
+    assert probe_calls == ["COM6"]
 
 
 def test_pico_assessment_skips_mpremote_for_idle_app(monkeypatch):

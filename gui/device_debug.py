@@ -33,6 +33,9 @@ def live_vrtest_arg_for_command(command: str) -> Optional[str]:
         return None
     normalized = text.rstrip(";").strip()
     lowered = normalized.lower()
+    if lowered.startswith("vrtest "):
+        normalized = normalized[7:].strip()
+        lowered = normalized.lower()
     live_map = {
         "gc.mem_free()": "mem_free",
         "import gc; gc.mem_free()": "mem_free",
@@ -44,6 +47,23 @@ def live_vrtest_arg_for_command(command: str) -> Optional[str]:
     }
     if lowered in live_map:
         return live_map[lowered]
+    live_gestures = (
+        "ping",
+        "get_state",
+        "single_tap",
+        "double_tap",
+        "triple_tap",
+        "four_tap",
+        "five_tap",
+        "long_press",
+        "tap_long_press",
+        "double_tap_long_press",
+        "triple_tap_long_press",
+    )
+    if lowered in live_gestures:
+        return normalized
+    if lowered.startswith("goto_station "):
+        return normalized
     return None
 
 
@@ -66,12 +86,23 @@ def format_live_vrtest_result(device: dict) -> str:
         )
     if cmd == "get_state" and isinstance(device.get("state"), dict):
         return json.dumps(device["state"], indent=2, sort_keys=True)
+    if cmd == "goto_station":
+        playing = device.get("playing")
+        folder = device.get("folder", "?")
+        track = device.get("track", "?")
+        tail = ""
+        if isinstance(device.get("state"), dict):
+            tail = "\n" + json.dumps(device["state"], indent=2, sort_keys=True)
+        return "goto_station folder={} track={} playing={}{}".format(
+            folder, track, playing, tail
+        )
     return json.dumps(device, indent=2, sort_keys=True)
 
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
+from gui import ui_scale as u
 from .sd_manager import SDManager
 from .services.serial_debug import (
     append_session_ndjson_from_vrdbg_line,
@@ -170,7 +201,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         if not self._basic_mode:
             title = QtWidgets.QLabel("Device Debug Console")
-            title.setStyleSheet("font-size: 18px; font-weight: bold;")
+            title.setStyleSheet(
+                f"font-size: {u.px(18)}px; font-weight: {u.qss_weight(700)};"
+            )
             layout.addWidget(title)
         
         # Connection banner (matches Install Firmware / Load Music storage bars)
@@ -317,10 +350,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         now_playing_layout.setContentsMargins(8, 8, 8, 8)
         
         self.now_playing_label = QtWidgets.QLabel("Not connected")
-        self.now_playing_label.setStyleSheet(
-            "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
-            "border: 1px solid #555; border-radius: 4px; color: #d4d4d4;"
-        )
+        self._apply_now_playing_idle_style()
         self.now_playing_label.setWordWrap(True)
         self.now_playing_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
         self.now_playing_label.setSizePolicy(
@@ -338,7 +368,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self.console_output.setObjectName("deviceDebugConsole")
         self.console_output.setReadOnly(True)
         self.console_output.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.console_output.setFont(QtGui.QFont("Consolas", t.TOOLS_LOG_FONT))
+        self.console_output.setFont(QtGui.QFont("Consolas", u.px(t.TOOLS_LOG_FONT)))
         self._console_scroll_wrap = wrap_with_mockup_scrollbar(
             self.console_output,
             variant="station",
@@ -438,24 +468,75 @@ class DeviceDebugWidget(QtWidgets.QWidget):
 
         if self._basic_mode:
             self.reload_vintage_theme()
+
+    def _now_playing_stylesheet(self, *, border: str, color: str) -> str:
+        font_px = u.px(12)
+        if self._basic_mode:
+            return (
+                f"font-size: {font_px}px; padding: {u.px(6)}px {u.px(8)}px; "
+                f"background: {t.TOOLS_CONSOLE_BG}; border: 1px solid {border}; "
+                f"border-radius: {u.px(t.TOOLS_PATH_FIELD_RADIUS)}px; color: {color};"
+            )
+        return (
+            f"font-size: {font_px}px; padding: {u.px(8)}px; background-color: #2d2d2d; "
+            f"border: 1px solid {border}; border-radius: {u.px(4)}px; color: {color};"
+        )
+
+    def _apply_now_playing_idle_style(self) -> None:
+        border = t.TOOLS_CONSOLE_BORDER if self._basic_mode else "#555"
+        color = t.TOOLS_CONSOLE_FG if self._basic_mode else "#d4d4d4"
+        self.now_playing_label.setStyleSheet(
+            self._now_playing_stylesheet(border=border, color=color)
+        )
+
+    def _refresh_now_playing_zoom_style(self) -> None:
+        """Re-apply now-playing chrome at the current zoom without clearing content."""
+        text = self.now_playing_label.text().strip()
+        if not text or text == "Not connected":
+            self._apply_now_playing_idle_style()
+            return
+        if text.startswith("Error") or "Error parsing" in text:
+            border, color = "#ff4444", "#ff8888"
+        elif "No status available" in text:
+            border = "#ffaa00" if not self._basic_mode else t.TOOLS_CONSOLE_BORDER
+            color = "#ffaa88" if not self._basic_mode else t.TEXT_SEC
+        else:
+            border = t.TOOLS_CONSOLE_BORDER if self._basic_mode else "#555"
+            color = t.TOOLS_CONSOLE_FG if self._basic_mode else "#d4d4d4"
+        self.now_playing_label.setStyleSheet(
+            self._now_playing_stylesheet(border=border, color=color)
+        )
+
+    def apply_ui_zoom(self) -> None:
+        """Refresh zoom-aware styles (Tools tab / basic mode)."""
+        self.reload_vintage_theme()
     
     def reload_vintage_theme(self) -> None:
         """Apply Vintage Radio cream/brown styling (basic mode / Tools tab)."""
         if not self._basic_mode:
             return
 
+        btn_h = u.px(t.TOOLS_DEBUG_BTN_H)
+        btn_font = u.px(t.IF_DEVICE_BTN_FONT)
+        combo_font = u.px(t.LIBBAR_COMBO_FONT_SIZE)
+        meta_font = u.px(t.IF_DEVICE_META_SIZE)
+        group_font = u.px(13)
+        muted_font = u.px(10)
+        muted_sm_font = u.px(9)
+        btn_weight = u.qss_weight(800)
+
         self.setStyleSheet(f"""
             #deviceDebugRoot {{
                 background: transparent;
             }}
             #deviceDebugRoot QGroupBox {{
-                font-weight: 800;
-                font-size: 13px;
+                font-weight: {btn_weight};
+                font-size: {group_font}px;
                 color: {t.IF_DEVICE_TITLE_FG};
                 border: 1px solid {t.IF_CARD_BORDER};
-                border-radius: {t.IF_CARD_RADIUS}px;
-                margin-top: 12px;
-                padding: 8px 10px 10px 10px;
+                border-radius: {u.px(t.IF_CARD_RADIUS)}px;
+                margin-top: {u.px(12)}px;
+                padding: {u.px(8)}px {u.px(10)}px {u.px(10)}px {u.px(10)}px;
                 background: qlineargradient(
                     x1:0, y1:0, x2:0, y2:1,
                     stop:0 {t.IF_CARD_INNER_TOP}, stop:1 {t.IF_CARD_INNER_BOT}
@@ -463,8 +544,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             }}
             #deviceDebugRoot QGroupBox::title {{
                 subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 6px;
+                left: {u.px(10)}px;
+                padding: 0 {u.px(6)}px;
             }}
             #deviceDebugRoot QLabel {{
                 color: {t.IF_DEVICE_TITLE_FG};
@@ -478,12 +559,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 );
                 color: {t.TEXT_PRI};
                 border: 2px solid {t.LM_SD_BTN_BORDER};
-                border-radius: {t.LM_SD_BTN_RADIUS}px;
-                padding: 0 10px;
-                font-size: {t.IF_DEVICE_BTN_FONT}px;
-                font-weight: 800;
-                min-height: {t.TOOLS_DEBUG_BTN_H}px;
-                max-height: {t.TOOLS_DEBUG_BTN_H}px;
+                border-radius: {u.px(t.LM_SD_BTN_RADIUS)}px;
+                padding: 0 {u.px(10)}px;
+                font-size: {btn_font}px;
+                font-weight: {btn_weight};
+                min-height: {btn_h}px;
+                max-height: {btn_h}px;
             }}
             #deviceDebugRoot QPushButton:hover {{
                 background: {t.LIGHT_BTN_HOVER};
@@ -510,25 +591,25 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 background: {t.TOOLS_INPUT_BG};
                 color: {t.TOOLS_INPUT_FG};
                 border: 1px solid {t.TOOLS_INPUT_BORDER};
-                border-radius: {t.TOOLS_PATH_FIELD_RADIUS}px;
-                padding: 0 10px;
-                min-height: {t.TOOLS_DEBUG_BTN_H}px;
-                max-height: {t.TOOLS_DEBUG_BTN_H}px;
-                font-size: {t.LIBBAR_COMBO_FONT_SIZE}px;
+                border-radius: {u.px(t.TOOLS_PATH_FIELD_RADIUS)}px;
+                padding: 0 {u.px(10)}px;
+                min-height: {btn_h}px;
+                max-height: {btn_h}px;
+                font-size: {combo_font}px;
             }}
             #deviceDebugRoot QCheckBox {{
                 color: {t.IF_DEVICE_TITLE_FG};
-                font-size: {t.IF_DEVICE_META_SIZE}px;
+                font-size: {meta_font}px;
             }}
             #deviceDebugRoot QLabel#deviceDebugMuted {{
                 color: {t.TOOLS_MUTED_FG};
-                font-size: 10px;
-                padding: 4px;
+                font-size: {muted_font}px;
+                padding: {u.px(4)}px;
                 font-style: italic;
             }}
             #deviceDebugRoot QLabel#deviceDebugMutedSmall {{
                 color: {t.TOOLS_MUTED_FG};
-                font-size: 9px;
+                font-size: {muted_sm_font}px;
             }}
         """)
 
@@ -539,25 +620,22 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self._run_stop_button_stylesheet(running=self._firmware_running)
         )
 
+        console_pad = u.px(6)
         console_style = (
             f"QTextEdit#deviceDebugConsole {{ "
             f"background: {t.TOOLS_CONSOLE_BG}; color: {t.TOOLS_CONSOLE_FG}; "
-            f"border: none; padding: 6px; }}"
+            f"border: none; padding: {console_pad}px; }}"
         )
-        self.now_playing_label.setStyleSheet(
-            f"font-size: 12px; padding: 6px 8px; background: {t.TOOLS_CONSOLE_BG}; "
-            f"border: 1px solid {t.TOOLS_CONSOLE_BORDER}; border-radius: {t.TOOLS_PATH_FIELD_RADIUS}px; "
-            f"color: {t.TOOLS_CONSOLE_FG};"
-        )
-        self.console_output.setFont(QtGui.QFont("Consolas", t.TOOLS_LOG_FONT))
+        self.console_output.setFont(QtGui.QFont("Consolas", u.px(t.TOOLS_LOG_FONT)))
         self.console_output.setStyleSheet(console_style)
         pal = self.console_output.palette()
         pal.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor(t.TOOLS_CONSOLE_FG))
         pal.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor(t.TOOLS_CONSOLE_BG))
         self.console_output.setPalette(pal)
         self.connection_status.setStyleSheet(
-            f"color: {t.IF_DEVICE_META_FG}; font-size: {t.IF_DEVICE_META_SIZE}px;"
+            f"color: {t.IF_DEVICE_META_FG}; font-size: {meta_font}px;"
         )
+        self._refresh_now_playing_zoom_style()
     
     def _pause_streaming(self):
         """Pause the streaming thread so we can use the serial port for a command."""
@@ -1409,7 +1487,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     return
                 
                 if live_vrtest:
-                    result = self.run_vrtest_command(live_vrtest, timeout=10)
+                    vrtest_timeout = (
+                        25.0
+                        if live_vrtest.strip().lower().startswith("goto_station")
+                        else 10.0
+                    )
+                    result = self.run_vrtest_command(live_vrtest, timeout=vrtest_timeout)
                     self._active_operations.discard(op_id)
                     if not result.get("ok"):
                         err = result.get("error", "vrtest_failed")
@@ -1798,13 +1881,14 @@ class DeviceDebugWidget(QtWidgets.QWidget):
 
     def _run_stop_button_stylesheet(self, *, running: bool) -> str:
         """Start/Stop styling — rounded like other debugger buttons."""
-        radius = t.LM_SD_BTN_RADIUS
-        btn_h = t.TOOLS_DEBUG_BTN_H
-        font = t.IF_DEVICE_BTN_FONT
+        radius = u.px(t.LM_SD_BTN_RADIUS)
+        btn_h = u.px(t.TOOLS_DEBUG_BTN_H)
+        font = u.px(t.IF_DEVICE_BTN_FONT)
+        weight = u.qss_weight(800)
         base = (
             f"min-height:{btn_h}px; max-height:{btn_h}px; "
-            f"border-radius:{radius}px; font-weight:800; "
-            f"padding:0 10px; font-size:{font}px;"
+            f"border-radius:{radius}px; font-weight:{weight}; "
+            f"padding:0 {u.px(10)}px; font-size:{font}px;"
         )
         if running:
             return (
@@ -2902,8 +2986,10 @@ GUI Commands (not sent to device):
             if not json_str or not json_str.strip():
                 self.now_playing_label.setText("No status available (device may not be responding)")
                 self.now_playing_label.setStyleSheet(
-                    "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
-                    "border: 1px solid #ffaa00; border-radius: 4px; color: #ffaa88;"
+                    self._now_playing_stylesheet(
+                        border="#ffaa00" if not self._basic_mode else t.TOOLS_CONSOLE_BORDER,
+                        color="#ffaa88" if not self._basic_mode else t.TEXT_SEC,
+                    )
                 )
                 return
             
@@ -2913,8 +2999,10 @@ GUI Commands (not sent to device):
                 self._debug_log(f"Error parsing JSON from now playing: {e}, received: {json_str[:200]}", "error")
                 self.now_playing_label.setText(f"Error parsing status: {json_str[:100]}")
                 self.now_playing_label.setStyleSheet(
-                    "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
-                    "border: 1px solid #ff4444; border-radius: 4px; color: #ff8888;"
+                    self._now_playing_stylesheet(
+                        border="#ff4444",
+                        color="#ff8888",
+                    )
                 )
                 return
             
@@ -2932,8 +3020,10 @@ GUI Commands (not sent to device):
                 else:
                     self.now_playing_label.setText(f"Error: {error_msg}")
                 self.now_playing_label.setStyleSheet(
-                    "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
-                    "border: 1px solid #ff4444; border-radius: 4px; color: #ff8888;"
+                    self._now_playing_stylesheet(
+                        border="#ff4444",
+                        color="#ff8888",
+                    )
                 )
                 return
             
@@ -2980,15 +3070,16 @@ GUI Commands (not sent to device):
             
             self.now_playing_label.setText(display_text)
             self.now_playing_label.setStyleSheet(
-                "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
-                "border: 1px solid #555; border-radius: 4px; color: #d4d4d4;"
+                self._now_playing_stylesheet(
+                    border=t.TOOLS_CONSOLE_BORDER if self._basic_mode else "#555",
+                    color=t.TOOLS_CONSOLE_FG if self._basic_mode else "#d4d4d4",
+                )
             )
         except Exception as e:
             self._debug_log(f"Error displaying now playing: {e}\n{traceback.format_exc()}", "error")
             self.now_playing_label.setText(f"Error displaying status: {str(e)[:50]}")
             self.now_playing_label.setStyleSheet(
-                "font-size: 12px; padding: 8px; background-color: #2d2d2d; "
-                "border: 1px solid #ff4444; border-radius: 4px; color: #ff8888;"
+                self._now_playing_stylesheet(border="#ff4444", color="#ff8888")
             )
     
     @QtCore.pyqtSlot(str)

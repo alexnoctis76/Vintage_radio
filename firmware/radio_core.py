@@ -89,25 +89,33 @@ BASIC_SD_SIG_FILE = "VintageRadio/basic_sd_sig.txt"
 
 
 def _parse_basic_sd_sig_line(text):
-    """Parse basic_sd_sig.txt contents; return (folder_count, n_stations) or None."""
+    """Parse basic_sd_sig.txt; return (folder_count, n_stations, tf_files|None)."""
     line = (text or "").strip()
     if not line:
         return None
     parts = line.split(",")
-    if len(parts) != 2:
-        return None
-    try:
-        return (int(parts[0].strip()), int(parts[1].strip()))
-    except (TypeError, ValueError):
-        return None
+    if len(parts) == 2:
+        try:
+            return (int(parts[0].strip()), int(parts[1].strip()), None)
+        except (TypeError, ValueError):
+            return None
+    if len(parts) == 3:
+        try:
+            return (int(parts[0].strip()), int(parts[1].strip()), int(parts[2].strip()))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _format_basic_sd_sig(sig):
     """Serialize signature for basic_sd_sig.txt."""
     if sig is None:
         return ""
-    fc, n = sig
-    return "{},{}".format(int(fc), int(n))
+    fc = int(sig[0])
+    n = int(sig[1])
+    if len(sig) >= 3 and sig[2] is not None:
+        return "{},{},{}".format(fc, n, int(sig[2]))
+    return "{},{}".format(fc, n)
 
 
 # ===========================
@@ -419,6 +427,7 @@ class RadioCore:
         # (0x4F folder count or -1 if unknown, number of seeded station slots). Used to
         # detect SD swaps while power is off and trigger soft reset + fresh boot.
         self._basic_sd_signature = None
+        self._defer_basic_reconcile = False
     def _basic_playlist_track_count(self, playlist: dict) -> int:
         tracks = playlist.get("tracks", [])
         if tracks:
@@ -601,6 +610,48 @@ class RadioCore:
             return -1
 
         count = max(0, int(count))
+        ref = getattr(self.hw, "_boot_folder01_track_count", None)
+        if ref is None:
+            ref = getattr(self.hw, "_reference_tracks_per_folder", None)
+        tf_total = getattr(self.hw, "_boot_tf_file_count", None)
+        learned = int(self.known_tracks.get(folder, 0) or 0)
+        if learned <= 0 and hasattr(self.hw, "_known_tracks"):
+            learned = int(getattr(self.hw, "_known_tracks", {}).get(folder, 0) or 0)
+        suspicious = (
+            ref is not None
+            and int(ref) >= 20
+            and count > 0
+            and count < int(ref) // 4
+        )
+        if suspicious or (learned > count):
+            if callable(drain):
+                drain(200)
+            _sleep_ms(80)
+            retry = None
+            if callable(query_consensus):
+                retry = query_consensus(folder, suppress_errors=True)
+            elif callable(query_single):
+                retry = query_single(folder, suppress_errors=True, timeout_ms=900)
+            if retry is not None and int(retry) > count:
+                self.hw.log(
+                    f"BASIC: Station folder {folder:02d} count corrected "
+                    f"{count} -> {retry} (re-query)"
+                )
+                count = int(retry)
+            elif suspicious and tf_total is not None and int(tf_total) >= int(ref) * 40:
+                self.hw.log(
+                    f"BASIC: Station folder {folder:02d} using reference count "
+                    f"{int(ref)} (0x4E returned {count}, TF={tf_total})"
+                )
+                count = int(ref)
+            elif learned > count:
+                self.hw.log(
+                    f"BASIC: Station folder {folder:02d} count raised "
+                    f"{count} -> {learned} (learned from playback)"
+                )
+                count = learned
+
+        count = max(0, int(count))
         pl["track_count"] = count
         pl["hydrated"] = True
         pl.pop("basic_hydrate_fail_count", None)
@@ -652,6 +703,18 @@ class RadioCore:
         except OSError as e:
             self.hw.log("BASIC: could not persist SD signature: %s" % (e,))
 
+    def _basic_clear_station_hydration_cache(self):
+        """Drop lazy 0x4E results so the next boot re-probes every folder."""
+        for pl in self.playlists or []:
+            pl.pop("hydrated", None)
+            pl["track_count"] = 0
+            pl.pop("basic_hydrate_negative", None)
+            pl.pop("basic_hydrate_fail_count", None)
+            pl["tracks"] = []
+        self.known_tracks.clear()
+        if hasattr(self.hw, "_known_tracks"):
+            self.hw._known_tracks.clear()
+
     def _basic_maybe_reset_persisted_state_if_sd_changed(self):
         """If SD layout differs from last boot, clear album_state.txt before _load_state."""
         if not self.basic_mode or not _IS_MICROPYTHON:
@@ -664,6 +727,7 @@ class RadioCore:
             self.hw.log(
                 "BASIC: SD layout changed since last boot; clearing saved playback state"
             )
+            self._basic_clear_station_hydration_cache()
             reset = getattr(self.hw, "reset_saved_playback_state_to_defaults", None)
             if callable(reset):
                 reset()
@@ -677,7 +741,10 @@ class RadioCore:
         if self.basic_mode:
             self._basic_maybe_reset_persisted_state_if_sd_changed()
         self._load_state()
-        self._basic_reconcile_after_load()
+        if self.basic_mode:
+            self._defer_basic_reconcile = True
+        else:
+            self._basic_reconcile_after_load()
         if self.basic_mode:
             self._basic_write_sd_signature_file()
         if self.power_on and not skip_initial_playback:
@@ -749,7 +816,18 @@ class RadioCore:
                 fc = qfc()
             except Exception:
                 fc = None
-        self._basic_sd_signature = (fc if fc is not None else -1, len(self.playlists))
+        tf = None
+        qtf = getattr(self.hw, "query_file_count", None)
+        if callable(qtf):
+            try:
+                tf = qtf()
+            except Exception:
+                tf = None
+        self._basic_sd_signature = (
+            fc if fc is not None else -1,
+            len(self.playlists),
+            tf if tf is not None else -1,
+        )
 
     def _basic_rebuild_station_shuffle_tracks(self, reason=""):
         """Rebuild shuffle_tracks for current station (after SD swap, power-on, or state load)."""

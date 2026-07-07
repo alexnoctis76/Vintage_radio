@@ -220,6 +220,15 @@ class TestLiveVrtestCommandRouting:
         assert live_vrtest_arg_for_command("print('hi')") is None
         assert live_vrtest_arg_for_command("import os\nos.listdir()") is None
 
+    def test_goto_station_and_gestures_route_live(self):
+        from gui.device_debug import live_vrtest_arg_for_command
+
+        assert live_vrtest_arg_for_command("goto_station 34") == "goto_station 34"
+        assert live_vrtest_arg_for_command("goto_station 34 170") == "goto_station 34 170"
+        assert live_vrtest_arg_for_command("VRTEST goto_station 34 1") == "goto_station 34 1"
+        assert live_vrtest_arg_for_command("get_state") == "get_state"
+        assert live_vrtest_arg_for_command("long_press") == "long_press"
+
     def test_format_mem_free(self):
         from gui.device_debug import format_live_vrtest_result
 
