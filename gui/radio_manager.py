@@ -14028,7 +14028,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if result.status == "update_available" and result.release is not None:
             if updater.is_newer(result.release.advertised_version(), __version__):
-                self._show_update_dialog(result.release)
+                try:
+                    self._show_update_dialog(result.release)
+                except Exception as e:
+                    import traceback
+
+                    write_session_line(
+                        f"Update dialog failed: {e}\n{traceback.format_exc()}",
+                        prefix="UPDATER",
+                    )
+                    if manual:
+                        VintageMessageBox.critical(
+                            self,
+                            "Check for Updates",
+                            f"An update is available ({result.release.advertised_version()}), "
+                            f"but the update dialog could not open:\n\n{e}",
+                        )
                 return
 
         if manual:

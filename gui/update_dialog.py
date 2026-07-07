@@ -67,8 +67,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         body_lay.addWidget(notes_scroll, 1)
 
         self.progress = VintageProgressBar()
-        self.progress.setMinimum(0)
-        self.progress.setMaximum(100)
+        self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setVisible(False)
         body_lay.addWidget(self.progress)

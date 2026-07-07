@@ -352,14 +352,17 @@ def run_update_check(
 ) -> UpdateCheckResult:
     """Check GitHub for updates; distinguish up-to-date from API / asset failures."""
     cur = (current_version or "").strip()
+    _log_updater(f"check started current={cur!r}")
     try:
         items = _fetch_release_list(user_agent)
     except HTTPError as e:
         msg = f"GitHub API HTTP {e.code}"
         if e.reason:
             msg = f"{msg}: {e.reason}"
+        _log_updater(f"check failed: {msg}")
         return UpdateCheckResult(status="unavailable", error=msg)
     except Exception as e:
+        _log_updater(f"check failed: {type(e).__name__}: {e}")
         return UpdateCheckResult(status="unavailable", error=str(e))
 
     if items:
@@ -422,10 +425,30 @@ def run_update_check(
     except Exception as e:
         return UpdateCheckResult(status="unavailable", error=str(e))
 
-    return UpdateCheckResult(
+    result = UpdateCheckResult(
         status="unavailable",
         error="No published releases found on GitHub.",
     )
+    _log_updater(f"check finished -> {result.status} error={result.error!r}")
+    return result
+
+
+def _log_update_check_result(result: UpdateCheckResult, *, current_version: str) -> None:
+    if result.status == "update_available" and result.release is not None:
+        _log_updater(
+            "check finished -> update_available "
+            f"{result.release.advertised_version()!r} (tag {result.release.tag_name!r}) "
+            f"current={current_version!r}"
+        )
+        return
+    if result.status == "up_to_date":
+        latest = (result.latest_published or "").strip()
+        _log_updater(
+            f"check finished -> up_to_date current={current_version!r} "
+            f"latest={latest or result.release.advertised_version() if result.release else '?'!r}"
+        )
+        return
+    _log_updater(f"check finished -> {result.status} error={result.error!r}")
 
 
 def check_latest_release(
