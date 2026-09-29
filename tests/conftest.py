@@ -125,7 +125,7 @@ def sample_audio_files(tmp_path):
 class MockHardwareInterface(HardwareInterface):
     """Records calls for testing RadioCore without real hardware."""
 
-    def __init__(self, albums=None, playlists=None, all_tracks=None):
+    def __init__(self, albums=None, playlists=None, all_tracks=None, play_failures=None):
         self.calls: List[tuple] = []
         self.logs: List[str] = []
         self._albums = albums or []
@@ -136,9 +136,17 @@ class MockHardwareInterface(HardwareInterface):
         self._volume = 100
         self._position_ms = 0
         self._delay_playback = False
+        # Remaining play_track failures per (folder, track) — simulates BUSY timeout /
+        # DFPlayer reject without real hardware (see test_track1_play_failure_*).
+        self._play_failures: Dict[tuple, int] = dict(play_failures or {})
 
     def play_track(self, folder, track, start_ms=0, folder_wrap=False):
         self.calls.append(("play_track", folder, track, start_ms, folder_wrap))
+        key = (folder, track)
+        if self._play_failures.get(key, 0) > 0:
+            self._play_failures[key] -= 1
+            self._playing = False
+            return False
         self._playing = True
         return True
 
@@ -271,8 +279,8 @@ def _make_basic_stations():
 class MockBasicHardware(MockHardwareInterface):
     """MockHardwareInterface for basic mode: has discover_stations, query_files_in_folder."""
 
-    def __init__(self, stations=None):
-        super().__init__(albums=[], playlists=[])
+    def __init__(self, stations=None, play_failures=None):
+        super().__init__(albums=[], playlists=[], play_failures=play_failures)
         self._stations = stations if stations is not None else _make_basic_stations()
         self._known_tracks = {}
 
@@ -312,11 +320,10 @@ def basic_core(mock_basic_hardware):
 # ---------------------------------------------------------------------------
 
 def build_dfplayer_packet(cmd, p1=0, p2=0, feedback=False):
-    """Build a 10-byte DFPlayer command packet (matches firmware _df_send logic)."""
-    fb = 0x01 if feedback else 0x00
-    body = bytes([0xFF, 0x06, cmd, fb, p1 & 0xFF, p2 & 0xFF])
-    csum = (-sum(body)) & 0xFFFF
-    return bytes([0x7E]) + body + bytes([(csum >> 8) & 0xFF, csum & 0xFF, 0xEF])
+    """Build a 10-byte DFPlayer command packet (production dfplayer_protocol)."""
+    from dfplayer_protocol import build_dfplayer_packet as _build
+
+    return _build(cmd, p1, p2, feedback)
 
 
 def build_dfplayer_response(cmd, p1=0, p2=0):

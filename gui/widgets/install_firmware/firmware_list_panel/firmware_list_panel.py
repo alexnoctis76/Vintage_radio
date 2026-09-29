@@ -13,6 +13,12 @@ import gui.theme as t
 from gui import ui_scale as u
 from gui.widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
 from gui.widgets.install_firmware.firmware_list_panel.firmware_card import FirmwareCard
+from gui.widgets.install_firmware.firmware_list_panel.section_header import (
+    FirmwareSectionHeader,
+)
+
+_FILTER_MCU_OPTIONS = ("all", "RP2040", "ESP32")
+_FILTER_MP3_OPTIONS = ("all", "DFPlayer", "VS1053")
 
 
 def _svg_resource(filename: str) -> Path:
@@ -82,6 +88,8 @@ class FirmwareListPanel(QtWidgets.QWidget):
         self._cards: List[FirmwareCard] = []
         self._selected_id = ""
         self._mode = "official"
+        self._filter_mcu = "all"
+        self._filter_mp3 = "all"
         self._build()
 
     @property
@@ -96,6 +104,8 @@ class FirmwareListPanel(QtWidgets.QWidget):
         if not self._selected_id:
             return None
         for entry in self._entries:
+            if entry.get("section"):
+                continue
             if str(entry.get("id", "")) == self._selected_id:
                 return entry
         return None
@@ -108,8 +118,44 @@ class FirmwareListPanel(QtWidgets.QWidget):
         show_filter: bool = False,
     ) -> None:
         self._entries = list(entries)
+        self._rebuild_list(selected_id=selected_id, show_filter=show_filter)
+
+    def _entry_passes_filter(self, entry: Dict[str, Any]) -> bool:
+        if entry.get("section"):
+            return True
+        mcu_ok = (
+            self._filter_mcu == "all"
+            or str(entry.get("microcontroller", "")) == self._filter_mcu
+        )
+        mp3_ok = (
+            self._filter_mp3 == "all"
+            or str(entry.get("mp3Controller", "")) == self._filter_mp3
+        )
+        return mcu_ok and mp3_ok
+
+    def _visible_entries(self) -> List[Dict[str, Any]]:
+        if self._mode != "official":
+            return list(self._entries)
+        visible: List[Dict[str, Any]] = []
+        pending_section: Optional[Dict[str, Any]] = None
+        for entry in self._entries:
+            if entry.get("section"):
+                pending_section = entry
+                continue
+            if not self._entry_passes_filter(entry):
+                continue
+            if pending_section is not None:
+                if not visible or visible[-1] is not pending_section:
+                    visible.append(pending_section)
+                pending_section = None
+            visible.append(entry)
+        return visible
+
+    def _rebuild_list(self, *, selected_id: str, show_filter: bool) -> None:
+        entries = self._visible_entries()
+        selectable = [e for e in entries if not e.get("section")]
         show_filter_btn = (
-            self._mode == "official" and show_filter and len(entries) > 1
+            self._mode == "official" and show_filter and len(selectable) > 1
         )
         show_strip = show_filter_btn or self._mode == "custom"
         self._filter_strip.setVisible(show_strip)
@@ -128,13 +174,17 @@ class FirmwareListPanel(QtWidgets.QWidget):
         self._cards.clear()
 
         pick_id = selected_id
-        if pick_id and not any(str(e.get("id", "")) == pick_id for e in entries):
+        if pick_id and not any(str(e.get("id", "")) == pick_id for e in selectable):
             pick_id = ""
-        if not pick_id and entries:
-            pick_id = str(entries[0].get("id", ""))
+        if not pick_id and selectable:
+            pick_id = str(selectable[0].get("id", ""))
 
         self._selected_id = pick_id
         for entry in entries:
+            if entry.get("section"):
+                header = FirmwareSectionHeader(str(entry.get("listName") or ""))
+                self._cards_lay.addWidget(header)
+                continue
             card = FirmwareCard(entry, selected=str(entry.get("id", "")) == pick_id)
             card.clicked.connect(lambda e=entry: self._on_card_clicked(e))
             self._cards_lay.addWidget(card)
@@ -143,9 +193,9 @@ class FirmwareListPanel(QtWidgets.QWidget):
         self._cards_lay.addStretch(1)
 
         if pick_id:
-            picked = next((e for e in entries if str(e.get("id", "")) == pick_id), None)
+            picked = next((e for e in selectable if str(e.get("id", "")) == pick_id), None)
             self.selection_changed.emit(picked)
-        elif not entries:
+        elif not selectable:
             self.selection_changed.emit(None)
 
     def _on_card_clicked(self, entry: Dict[str, Any]) -> None:
@@ -172,9 +222,10 @@ class FirmwareListPanel(QtWidgets.QWidget):
         self._filter_btn = QtWidgets.QPushButton()
         self._filter_btn.setFixedSize(50, 42)
         self._filter_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        self._filter_btn.setToolTip("Filter firmware (coming soon)")
+        self._filter_btn.setToolTip("Filter by microcontroller and MP3 controller")
         self._filter_btn.setStyleSheet(_filter_btn_style())
         self._filter_btn.setVisible(False)
+        self._filter_btn.clicked.connect(self._toggle_filter_menu)
         strip_lay.addWidget(self._filter_btn)
         strip_lay.addStretch(1)
 
@@ -211,7 +262,62 @@ class FirmwareListPanel(QtWidgets.QWidget):
         )
         lay.addWidget(self._scroll_wrap, 1)
 
+        self._filter_menu = QtWidgets.QMenu(self)
+        self._filter_mcu_group = QtGui.QActionGroup(self)
+        self._filter_mcu_group.setExclusive(True)
+        self._filter_mp3_group = QtGui.QActionGroup(self)
+        self._filter_mp3_group.setExclusive(True)
+        self._style_filter_menu()
         self._paint_filter_icon()
+
+    def _style_filter_menu(self) -> None:
+        self._filter_menu.setStyleSheet(f"""
+            QMenu {{
+                background: {t.IF_LIST_PANEL_TOP};
+                color: {t.IF_CARD_IDLE_TEXT};
+                border: 1px solid {t.IF_TAB_DIVIDER};
+                padding: 6px;
+            }}
+            QMenu::item:selected {{
+                background: {t.IF_CARD_SEL_TOP};
+            }}
+        """)
+
+    def _build_filter_menu(self) -> None:
+        self._filter_menu.clear()
+        mcu_menu = self._filter_menu.addMenu("Microcontroller")
+        for opt in _FILTER_MCU_OPTIONS:
+            label = "All" if opt == "all" else opt
+            action = mcu_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self._filter_mcu == opt)
+            self._filter_mcu_group.addAction(action)
+            action.triggered.connect(lambda _checked, o=opt: self._set_filter_mcu(o))
+
+        mp3_menu = self._filter_menu.addMenu("MP3 controller")
+        for opt in _FILTER_MP3_OPTIONS:
+            label = "All" if opt == "all" else opt
+            action = mp3_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self._filter_mp3 == opt)
+            self._filter_mp3_group.addAction(action)
+            action.triggered.connect(lambda _checked, o=opt: self._set_filter_mp3(o))
+
+    def _toggle_filter_menu(self) -> None:
+        self._build_filter_menu()
+        self._filter_menu.popup(
+            self._filter_btn.mapToGlobal(
+                QtCore.QPoint(0, self._filter_btn.height())
+            )
+        )
+
+    def _set_filter_mcu(self, value: str) -> None:
+        self._filter_mcu = value
+        self._rebuild_list(selected_id=self._selected_id, show_filter=True)
+
+    def _set_filter_mp3(self, value: str) -> None:
+        self._filter_mp3 = value
+        self._rebuild_list(selected_id=self._selected_id, show_filter=True)
 
     def _paint_filter_icon(self) -> None:
         size = 24

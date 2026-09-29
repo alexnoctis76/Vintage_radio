@@ -68,9 +68,9 @@ class InstallActionBar(QtWidgets.QWidget):
         self._install_btn.setFixedSize(u.px(t.IF_INSTALL_BTN_W), u.px(t.LM_SYNC_BTN_H))
         self._install_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self._install_btn.setToolTip(
-            "Install the selected software. Official Vintage Radio uses a bundled full-flash "
-            ".uf2 when available; otherwise copies firmware over USB (MicroPython is installed "
-            "automatically when possible). Community .uf2 files install in BOOTSEL mode."
+            "Install the selected software. Default RP2040 always copies firmware bundled "
+            "with this app (MicroPython first when the Pico is in BOOTSEL). Legacy releases "
+            "use a one-file UF2 in BOOTSEL only."
         )
         self._install_btn.setStyleSheet(f"""
             QPushButton {{

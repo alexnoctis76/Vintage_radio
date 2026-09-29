@@ -85,23 +85,12 @@ class TestBasicModeInit:
     def test_track1_play_failure_does_not_advance_or_mark_negative(self):
         """Failed track-1 play does not auto-advance stations or set basic_hydrate_negative
         (BUSY timeout != file not found)."""
-        hw = MockBasicHardware(stations=_make_basic_stations())
+        hw = MockBasicHardware(stations=_make_basic_stations(), play_failures={(1, 1): 1})
         seeded = [
             {"id": 1, "name": "S1", "tracks": [], "track_count": 255, "hydrated": True},
             {"id": 2, "name": "S2", "tracks": [], "track_count": 3, "hydrated": True},
         ]
         hw.discover_stations = lambda: list(seeded)
-        play_attempts = []
-
-        def play_track(folder, track, start_ms=0, folder_wrap=False):
-            play_attempts.append((folder, track))
-            hw.calls.append(("play_track", folder, track, start_ms, folder_wrap))
-            if folder == 1 and track == 1 and len([a for a in play_attempts if a == (1, 1)]) == 1:
-                return False
-            hw._playing = True
-            return True
-
-        hw.play_track = play_track
         hw._last_error_code = None
 
         rc = RadioCore(hw, basic_mode=True)
@@ -114,8 +103,9 @@ class TestBasicModeInit:
 
         assert rc.playlists[0].get("basic_hydrate_negative") is not True
         assert rc.current_album_index == 0
-        assert play_attempts.count((1, 1)) == 1
-        assert (2, 1) not in play_attempts
+        play_attempts = [c for c in hw.calls if c[0] == "play_track"]
+        assert play_attempts.count(("play_track", 1, 1, 0, False)) == 1
+        assert ("play_track", 2, 1, 0, False) not in play_attempts
 
     def test_track_count_lookup_hydrates_current_station(self):
         hw = MockBasicHardware(stations=_make_basic_stations())
@@ -358,8 +348,8 @@ class TestBasicStationCycleShuffle:
         assert rc.mode == MODE_SHUFFLE
         assert rc._shuffle_source_type == "station"
 
-    def test_station_shuffle_single_tap_on_last_wraps_same_station(self):
-        """Explicit next (single_tap) at last shuffle step wraps; does not auto-advance station."""
+    def test_station_shuffle_single_tap_on_last_advances_station(self):
+        """Clicking past the last shuffled track goes to the next station, not a wrap."""
         tracks = [
             {"id": i, "title": f"T{i}", "folder": 1, "track_number": i, "duration": 1.0}
             for i in range(1, 4)
@@ -381,7 +371,9 @@ class TestBasicStationCycleShuffle:
         rc.shuffle_index = 2
         rc.current_track = 3
         rc._single_tap()
-        assert rc.current_album_index == 0
+        assert rc.current_album_index == 1
+        assert rc.mode == MODE_SHUFFLE
+        assert rc._shuffle_source_type == "station"
         assert rc.shuffle_index == 0
         assert rc.current_track == 1
 

@@ -1642,7 +1642,7 @@ class TestModeWidget(QtWidgets.QWidget):
 
     def _current_track_count(self) -> int:
         if self.mode == "radio":
-            if self.radio_stations and self.radio_station_index < self.radio_stations:
+            if self.radio_stations and self.radio_station_index < len(self.radio_stations):
                 return max(len(self.radio_stations[self.radio_station_index].tracks), 1)
             return 1
         if self.mode == "shuffle":

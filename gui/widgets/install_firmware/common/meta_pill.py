@@ -224,6 +224,82 @@ class MetaPill(QtWidgets.QFrame):
             self._apply_value_text(self._full_value)
 
 
+def _meta_editor_style() -> str:
+    return f"""
+        QLineEdit#ifMetaPillEdit {{
+            background: transparent;
+            color: {t.IF_META_VALUE_FG};
+            border: none;
+            padding: 0;
+            font-weight: {u.qss_weight(800)};
+            font-size: {u.px(t.IF_META_VALUE_PX)}px;
+        }}
+        QLineEdit#ifMetaPillEdit:read-only {{
+            color: {t.IF_META_VALUE_FG};
+        }}
+        QLineEdit#ifMetaPillEdit:focus {{
+            border-bottom: 1px solid {t.IF_CARD_SEL_BORDER};
+        }}
+    """
+
+
+class EditableMetaPill(MetaPill):
+    """Meta pill whose value can be edited inline (custom firmware)."""
+
+    value_changed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        icon: Optional[MetaIconKind] = None,
+        width: Optional[int] = None,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(label, icon=icon, width=width, parent=parent)
+        self._value.hide()
+        self._editor = QtWidgets.QLineEdit()
+        self._editor.setObjectName("ifMetaPillEdit")
+        self._editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._editor.setStyleSheet(_meta_editor_style())
+        self._editor.setReadOnly(True)
+        self._editor.editingFinished.connect(self._on_editing_finished)
+        row_item = self.layout().itemAt(1)
+        value_row = row_item.layout() if row_item is not None else None
+        if value_row is not None:
+            idx = value_row.indexOf(self._value)
+            value_row.insertWidget(max(idx, 0), self._editor, 0)
+        self._editable = False
+
+    def set_editable(self, editable: bool) -> None:
+        self._editable = bool(editable)
+        self._editor.setReadOnly(not self._editable)
+        if self._editable:
+            self._editor.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.IBeamCursor))
+            self.setToolTip("Click to edit")
+        else:
+            self._editor.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.ArrowCursor))
+            self.setToolTip("")
+
+    def set_value(self, text: str) -> None:
+        super().set_value(text)
+        self._editor.blockSignals(True)
+        self._editor.setText(str(text or ""))
+        self._editor.blockSignals(False)
+
+    def _on_editing_finished(self) -> None:
+        if not self._editable:
+            return
+        text = self._editor.text().strip()
+        if text != self._full_value:
+            self._apply_value_text(text)
+            self.value_changed.emit(text)
+
+    def reload_theme(self) -> None:
+        super().reload_theme()
+        self._editor.setStyleSheet(_meta_editor_style())
+
+
 class AuthorMetaPill(MetaPill):
     """Author pill with GitHub icon and clickable repo link."""
 

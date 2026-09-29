@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build script for Vintage Radio application on Linux
-# Usage: bash build_linux.sh [--set-version v0.2.5-beta] [--no-clean]
+# Usage: bash build_linux.sh [--set-version v0.2.5-beta] [--no-clean] [--channel stable|dev] [--skip-smoke] [--with-pytest]
 #
 # Prerequisites:
 #   - Python 3.8+ with venv
@@ -19,6 +19,9 @@ APP_DIR="$BUILD_DIR/Vintage Radio"
 SPEC_FILE="$SCRIPT_DIR/vintage_radio.spec"
 
 CLEAN=true
+RELEASE_CHANNEL="stable"
+SKIP_SMOKE=false
+WITH_PYTEST=false
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -26,6 +29,22 @@ while [[ $# -gt 0 ]]; do
         --no-clean)
             CLEAN=false
             shift
+            ;;
+        --skip-smoke)
+            SKIP_SMOKE=true
+            shift
+            ;;
+        --with-pytest)
+            WITH_PYTEST=true
+            shift
+            ;;
+        --channel)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --channel requires stable or dev"
+                exit 1
+            fi
+            RELEASE_CHANNEL="$2"
+            shift 2
             ;;
         --set-version)
             if [ -z "${2:-}" ]; then
@@ -37,11 +56,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: bash build_linux.sh [--set-version v0.2.5-beta] [--no-clean]"
+            echo "Usage: bash build_linux.sh [--set-version v0.2.5-beta] [--no-clean] [--channel stable|dev] [--skip-smoke] [--with-pytest]"
             exit 1
             ;;
     esac
 done
+
+if [ "$WITH_PYTEST" = true ]; then
+    echo "Running source pytest before packaging..."
+    python3 -m pytest -q
+fi
 
 echo "=========================================="
 echo "Vintage Radio Linux Build Script"
@@ -49,7 +73,10 @@ echo "=========================================="
 echo "App Name: $APP_NAME"
 echo "Build Directory: $BUILD_DIR"
 echo "Clean: $CLEAN"
+echo "Release channel: $RELEASE_CHANNEL"
 echo "=========================================="
+
+python3 "$PROJECT_ROOT/scripts/apply_release_config.py" "$RELEASE_CHANNEL"
 
 # Check for PyInstaller
 if ! command -v pyinstaller &> /dev/null; then
@@ -103,6 +130,12 @@ sed -i "s|\$APP_EXECUTABLE|$EXECUTABLE|g" "$DESKTOP_FILE"
 chmod +x "$DESKTOP_FILE"
 echo "✓ Desktop shortcut created"
 
+if [ "$SKIP_SMOKE" = false ]; then
+    echo ""
+    echo "Running packaged app smoke tests..."
+    python3 "$PROJECT_ROOT/scripts/packaged_app_smoke.py" --exe "$EXECUTABLE"
+fi
+
 echo ""
 echo "=========================================="
 echo "Build Complete!"
@@ -113,5 +146,8 @@ echo "To run the app:"
 echo "  $EXECUTABLE"
 echo ""
 echo "To create a system shortcut, copy $DESKTOP_FILE to ~/.local/share/applications/"
+if [ "$SKIP_SMOKE" = false ]; then
+    echo "Packaged smoke: PASS"
+fi
 echo "=========================================="
 

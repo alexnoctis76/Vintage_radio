@@ -36,10 +36,11 @@ def test_zbvr_visible_when_config_true(tmp_path, monkeypatch):
     assert is_official_firmware_visible(ZBVR_FIRMWARE_ENTRY_ID) is True
 
 
-def test_missing_key_uses_default(tmp_path, monkeypatch):
+def test_zbvr_hidden_when_not_in_config(tmp_path, monkeypatch):
     cfg = tmp_path / "release_config.json"
-    cfg.write_text(json.dumps({"official_firmware": {}}), encoding="utf-8")
+    cfg.write_text(json.dumps({"update": {"enabled": True}}), encoding="utf-8")
     monkeypatch.setattr("gui.release_config.project_root", lambda: tmp_path)
     reload_release_config()
 
-    assert is_official_firmware_visible(ZBVR_FIRMWARE_ENTRY_ID) is True
+    assert is_official_firmware_visible(ZBVR_FIRMWARE_ENTRY_ID) is False
+    assert is_official_firmware_visible("vintage_radio_1_0_1") is True

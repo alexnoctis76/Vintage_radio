@@ -63,7 +63,9 @@ from gui.theme_presets import apply_ui_theme, normalize_theme_id
 from .widgets.common.delegates import (
     StationItemDelegate as _StationItemDelegateNew,
     TrackItemDelegate as _TrackItemDelegateNew,
+    TRACK_COMMERCIAL_ROLE,
     configure_track_title_item,
+    track_is_commercial,
     track_title_text,
     STATION_NUM_ROLE as _STATION_NUM_ROLE_NEW,
     STATION_NAME_ROLE as _STATION_NAME_ROLE_NEW,
@@ -99,6 +101,7 @@ from .widgets.dialogs.sync import (
 from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
 from . import __version__, sd_manager as sd_manager_module, updater
 from .update_dialog import UpdateAvailableDialog
+from .sync_failure_prompt import SyncFailurePrompter
 
 BASIC_MAX_TRACKS_PER_STATION = 255
 BASIC_MAX_TRACKS_EXPERIMENTAL = 999
@@ -505,6 +508,8 @@ def _run_install_main_thread(
     install_mode: str = "basic",
     dfplayer_eq: str = "normal",
     preferred_serial_port: Optional[str] = None,
+    radio_catalog_json: str = "",
+    commercials_json: str = "",
 ) -> None:
     """Run install on main thread with progress dialog. Status bar updates via processEvents()."""
     title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
@@ -529,6 +534,8 @@ def _run_install_main_thread(
             dfplayer_eq=dfplayer_eq,
             after_firmware=after_firmware,
             preferred_serial_port=preferred_serial_port,
+            radio_catalog_json=radio_catalog_json,
+            commercials_json=commercials_json,
         )
         dlg.close()
         on_success(result)
@@ -838,7 +845,22 @@ def _format_install_mpremote_error(err: str) -> str:
 _MPREMOTE_MICROPYTHON_PROBE = (
     "import sys;n=getattr(sys.implementation,'name',None);print(n if n else '')"
 )
+_MPREMOTE_USABLE_PROBE = "print('vr_ok')"
+_MPREMOTE_EXEC_READY_PROBE = "print('mpremote_ok')"
 _MPREMOTE_PROBE_TIMEOUT_S = 22
+_MPREMOTE_POST_UF2_CONFIG_DEADLINE_S = 40.0
+_MPREMOTE_POST_UF2_CONFIG_NO_PORT_FAIL_S = 18.0
+_INSTALL_CANCEL_WARNING = (
+    "Stop the firmware install?\n\n"
+    "The Pico may be in BOOTSEL mode or partially flashed. Close other tools using "
+    "the COM port, then unplug USB or hold BOOTSEL and tap RESET if the device does "
+    "not respond."
+)
+
+
+def _raise_if_install_cancelled(should_cancel: Optional[Callable[[], bool]]) -> None:
+    if should_cancel and should_cancel():
+        raise RuntimeError("Install cancelled by user.")
 
 
 def _serial_output_indicates_vintage_radio_firmware(text: str) -> bool:
@@ -1151,6 +1173,36 @@ def _mpremote_result_indicates_micropython(result: Any) -> bool:
     return "micropython" in combined
 
 
+def _post_flash_config_inject_timeout_message(port: Optional[str] = None) -> str:
+    """Actionable error when config files cannot be copied after a UF2 flash."""
+    base = (
+        "Timed out waiting for USB serial so config files could be copied to the Pico.\n\n"
+        "Config injection uses mpremote and requires MicroPython firmware. "
+        "Third-party UF2s (ZBVR, Retro Radio, etc.) do not support copying files this way."
+    )
+    if port:
+        sniff = _sniff_rp2040_serial_text(port, duration_s=1.5)
+        blocking = _serial_output_indicates_blocking_firmware(sniff)
+        if blocking:
+            return (
+                f"{base}\n\n"
+                f"The Pico on {port} appears to be running {blocking}. "
+                "Flash the UF2 without an attached config file, or flash stock MicroPython "
+                "first if you need to copy Python config files."
+            )
+        if sniff.strip():
+            write_session_line(
+                f"Post-flash config inject timeout serial ({port}): {sniff[:400]!r}",
+                prefix="INSTALL",
+            )
+    return (
+        f"{base}\n\n"
+        "If you only needed to flash the UF2, clear the attached config and try again. "
+        "Otherwise unplug USB, wait 3 seconds, replug, and retry — or close Tools → Debugger "
+        "if another app is holding the COM port."
+    )
+
+
 def _post_flash_serial_timeout_message(port: Optional[str] = None) -> str:
     """Actionable error when MicroPython does not answer after a UF2 flash."""
     base = (
@@ -1237,12 +1289,14 @@ def _wait_for_bootsel_polling(
     timeout_s: float = 180.0,
     is_present: Callable[[], bool],
     preferred_serial_port: Optional[str] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Poll until RPI-RP2 appears and USB serial is gone (safe from a worker thread)."""
     import time
 
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        _raise_if_install_cancelled(should_cancel)
         remaining = max(0, int(deadline - time.time()))
         bootsel = is_present()
         port = _find_rp2040_serial_port(preferred=preferred_serial_port)
@@ -1285,8 +1339,9 @@ def _wait_for_bootsel_polling(
 
 def _wait_for_bootsel_volume_gone(
     *,
-    timeout_s: float = 45.0,
+    timeout_s: float = 30.0,
     progress_callback: Optional[Callable[..., Any]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """After a UF2 copy the RPI-RP2 volume should disappear as the Pico reboots."""
     import time
@@ -1295,6 +1350,7 @@ def _wait_for_bootsel_volume_gone(
 
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
+        _raise_if_install_cancelled(should_cancel)
         if not SDManager.is_rp2040_bootsel_present():
             return True
         if progress_callback:
@@ -1303,11 +1359,164 @@ def _wait_for_bootsel_volume_gone(
     return False
 
 
+def _try_reboot_pico_to_bootsel(
+    mpremote_cmd: List[str],
+    port: str,
+    cwd: Optional[str],
+    *,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> None:
+    """Ask running MicroPython firmware to enter ROM BOOTSEL (machine.bootloader())."""
+    import time
+
+    if progress_callback:
+        progress_callback(
+            0,
+            0,
+            "Rebooting Pico into BOOTSEL mode (RPI-RP2 drive)…",
+        )
+    write_session_line(f"Attempting machine.bootloader() on {port}", prefix="INSTALL")
+    try:
+        _run_mpremote(
+            mpremote_cmd,
+            ["connect", port, "exec", "import machine;machine.bootloader()"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    time.sleep(2.0)
+
+
+def _mpremote_result_indicates_usable(result: Any) -> bool:
+    """True when mpremote exec succeeded and the device answered our probe."""
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    combined = (getattr(result, "stdout", None) or "") + (getattr(result, "stderr", None) or "")
+    return "vr_ok" in combined
+
+
+def _mpremote_result_indicates_exec_ready(result: Any) -> bool:
+    """True when mpremote can run Python on USB serial (config copy / file transfer)."""
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    combined = (getattr(result, "stdout", None) or "") + (getattr(result, "stderr", None) or "")
+    if "mpremote_ok" in combined:
+        return True
+    return _mpremote_result_indicates_micropython(result)
+
+
+def _wait_for_mpremote_usable_after_uf2(
+    mpremote_cmd: List[str],
+    cwd: Optional[str],
+    *,
+    progress_callback: Optional[Callable[..., Any]] = None,
+    preferred_port: Optional[str] = None,
+    deadline_s: float = _MPREMOTE_POST_UF2_CONFIG_DEADLINE_S,
+    poll_s: float = 1.5,
+    initial_sleep_s: float = 2.0,
+    no_port_fail_s: float = _MPREMOTE_POST_UF2_CONFIG_NO_PORT_FAIL_S,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Optional[str]:
+    """Wait until mpremote can copy files after a UF2 flash (MicroPython required)."""
+    import time
+
+    if initial_sleep_s > 0:
+        time.sleep(initial_sleep_s)
+    t0 = time.monotonic()
+    last_port: Optional[str] = None
+    last_blocking_label: Optional[str] = None
+    while time.monotonic() - t0 < deadline_s:
+        _raise_if_install_cancelled(should_cancel)
+        elapsed = int(time.monotonic() - t0)
+        port = _find_rp2040_serial_port(preferred=preferred_port)
+        if port != last_port and port:
+            write_session_line(f"RP2040 serial port: {port}", prefix="INSTALL")
+            last_port = port
+        if progress_callback:
+            hint = port or "waiting for COM port…"
+            progress_callback(
+                0,
+                0,
+                f"Waiting for MicroPython on {hint} "
+                f"(elapsed {elapsed}s, timeout {int(deadline_s)}s).\n\n"
+                "Config files need MicroPython on USB serial. The Pico may disconnect "
+                "briefly after flashing.",
+            )
+        if not port and elapsed >= no_port_fail_s:
+            return _post_flash_config_inject_timeout_message(None)
+        if port and elapsed >= 2:
+            sniff = _sniff_rp2040_serial_text(port, duration_s=0.8)
+            blocking = _serial_output_indicates_blocking_firmware(sniff)
+            if blocking:
+                last_blocking_label = blocking
+                write_session_line(
+                    f"Post-flash serial shows {blocking} on {port}",
+                    prefix="INSTALL",
+                )
+                return _post_flash_config_inject_timeout_message(port)
+        if port:
+            r = _run_mpremote(
+                mpremote_cmd,
+                _mpremote_args_with_connect(["exec", _MPREMOTE_EXEC_READY_PROBE], port),
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if _mpremote_result_indicates_exec_ready(r):
+                write_session_line(
+                    f"Pico ready for config file transfer on {port}",
+                    prefix="INSTALL",
+                )
+                return None
+            probe_out = ((r.stdout or "") + (r.stderr or "")).strip()
+            blocking = _serial_output_indicates_blocking_firmware(probe_out)
+            if blocking:
+                last_blocking_label = blocking
+                write_session_line(
+                    f"mpremote probe on {port} rc={r.returncode}: {blocking}",
+                    prefix="INSTALL",
+                )
+                return _post_flash_config_inject_timeout_message(port)
+        time.sleep(poll_s)
+    if last_blocking_label:
+        return _post_flash_config_inject_timeout_message(last_port)
+    return _post_flash_config_inject_timeout_message(last_port)
+
+
+_UF2_COPY_CHUNK_BYTES = 256 * 1024
+# After RPI-RP2 copy the Pico usually reboots and the USB drive vanishes — not guaranteed
+# (e.g. ZBVR documents manual RESET). Long wait only when mpremote must follow the flash.
+_UF2_REBOOT_WAIT_REQUIRED_S = 30.0
+_UF2_REBOOT_WAIT_OPTIONAL_S = 10.0
+_UF2_PICOTOOL_POST_SLEEP_S = 2.0
+
+
+def _uf2_flash_windows_busy_note() -> str:
+    """Windows may mark the app Not Responding during large RPI-RP2 writes."""
+    if sys.platform != "win32":
+        return ""
+    return (
+        "\n\nOn Windows, the window may briefly show \"Not Responding\" "
+        "while the UF2 is written to RPI-RP2. The flash is still in progress — please wait."
+    )
+
+
+def _uf2_flash_initial_progress_message(*, preparing: str) -> str:
+    return preparing + _uf2_flash_windows_busy_note()
+
+
 def _copy_uf2_to_rpi_rp2(
     uf2_path: Path,
     dest_dir: Path,
     *,
     progress_callback: Optional[Callable[..., Any]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    reboot_timeout_s: float = _UF2_REBOOT_WAIT_REQUIRED_S,
+    reboot_required: bool = True,
 ) -> Tuple[bool, str]:
     """Copy a .uf2 to RPI-RP2 (same mechanism as drag-and-drop in Explorer)."""
     authentic, auth_detail = _is_authentic_rp2040_bootsel_volume(dest_dir)
@@ -1320,12 +1529,29 @@ def _copy_uf2_to_rpi_rp2(
         f"Copying UF2 {uf2_path.name} ({src_size} bytes) → {dest_file} (RPI-RP2 at {dest_dir})",
         prefix="INSTALL",
     )
+    win_note = _uf2_flash_windows_busy_note()
+    write_msg = f"Writing {uf2_path.name} to RPI-RP2 ({dest_dir})…"
     if progress_callback:
-        progress_callback(0, 0, f"Copying {uf2_path.name} to RPI-RP2 ({dest_dir})…")
+        progress_callback(0, src_size, write_msg + win_note)
     try:
+        written = 0
         with uf2_path.open("rb") as src_f:
             with dest_file.open("wb") as dest_f:
-                shutil.copyfileobj(src_f, dest_f, length=1024 * 1024)
+                while True:
+                    _raise_if_install_cancelled(should_cancel)
+                    chunk = src_f.read(_UF2_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    dest_f.write(chunk)
+                    written += len(chunk)
+                    if progress_callback:
+                        progress_callback(written, src_size, write_msg)
+                if progress_callback:
+                    progress_callback(
+                        written,
+                        src_size,
+                        f"Finalizing UF2 write…{win_note}",
+                    )
                 dest_f.flush()
                 os.fsync(dest_f.fileno())
     except OSError as exc:
@@ -1349,15 +1575,32 @@ def _copy_uf2_to_rpi_rp2(
             )
     except OSError:
         pass
-    if not _wait_for_bootsel_volume_gone(progress_callback=progress_callback):
-        return False, (
-            "The RPI-RP2 drive is still present after copying the .uf2 — the Pico may "
-            "not have accepted the flash.\n\n"
-            "Ensure the COM port disappeared before copying. Unplug USB, hold BOOTSEL, "
-            "plug back in while holding BOOTSEL, then try drag-and-drop in File Explorer."
+    try:
+        bootsel_gone = _wait_for_bootsel_volume_gone(
+            timeout_s=reboot_timeout_s,
+            progress_callback=progress_callback,
+            should_cancel=should_cancel,
         )
-    write_session_line("RPI-RP2 drive disappeared after UF2 copy (Pico rebooted)", prefix="INSTALL")
-    return True, ""
+    except RuntimeError:
+        raise
+    if bootsel_gone:
+        write_session_line(
+            "RPI-RP2 drive disappeared after UF2 copy (Pico rebooted)",
+            prefix="INSTALL",
+        )
+        return True, ""
+    if not reboot_required:
+        write_session_line(
+            "RPI-RP2 still present after UF2 copy — flash likely OK; manual RESET may be needed",
+            prefix="INSTALL",
+        )
+        return True, ""
+    return False, (
+        "The RPI-RP2 drive is still present after copying the .uf2 — the Pico may "
+        "not have accepted the flash.\n\n"
+        "Ensure the COM port disappeared before copying. Unplug USB, hold BOOTSEL, "
+        "plug back in while holding BOOTSEL, then try drag-and-drop in File Explorer."
+    )
 
 
 def _find_picotool_executable() -> Optional[Path]:
@@ -1392,6 +1635,9 @@ def _flash_uf2_file(
     dest_dir: Path,
     *,
     progress_callback: Optional[Callable[..., Any]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    reboot_timeout_s: float = _UF2_REBOOT_WAIT_REQUIRED_S,
+    reboot_required: bool = True,
 ) -> Tuple[bool, str]:
     """Flash a UF2 via picotool load when available, else RPI-RP2 drag-and-drop copy."""
     if _find_picotool_executable() is not None:
@@ -1404,13 +1650,31 @@ def _flash_uf2_file(
         else:
             if result.returncode == 0:
                 write_session_line(f"picotool load OK: {uf2_path.name}", prefix="INSTALL")
+                _wait_for_bootsel_volume_gone(
+                    timeout_s=reboot_timeout_s,
+                    progress_callback=progress_callback,
+                    should_cancel=should_cancel,
+                )
+                if reboot_required:
+                    if progress_callback:
+                        progress_callback(0, 0, "UF2 flashed — waiting for Pico to reboot…")
+                    import time
+
+                    time.sleep(_UF2_PICOTOOL_POST_SLEEP_S)
                 return True, ""
             write_session_line(
                 f"picotool load rc={result.returncode}: "
                 f"{(result.stderr or result.stdout or '').strip()[:400]}",
                 prefix="INSTALL",
             )
-    return _copy_uf2_to_rpi_rp2(uf2_path, dest_dir, progress_callback=progress_callback)
+    return _copy_uf2_to_rpi_rp2(
+        uf2_path,
+        dest_dir,
+        progress_callback=progress_callback,
+        should_cancel=should_cancel,
+        reboot_timeout_s=reboot_timeout_s,
+        reboot_required=reboot_required,
+    )
 
 
 def _factory_erase_rp2040_flash(
@@ -1660,6 +1924,234 @@ def _run_mpremote_connect_auto_with_retry(
     return last
 
 
+def _mpremote_copy_to_pico(
+    mpremote_cmd: List[str],
+    local_path: Path,
+    remote_path: str,
+    *,
+    cwd: Optional[str] = None,
+    timeout: int = 20,
+    preferred_port: Optional[str] = None,
+) -> bool:
+    """Copy *local_path* to Pico *remote_path* via mpremote cp."""
+    ok, _err = _mpremote_copy_to_pico_verified(
+        mpremote_cmd,
+        local_path,
+        remote_path,
+        cwd=cwd,
+        timeout=timeout,
+        preferred_port=preferred_port,
+        verify=False,
+    )
+    return ok
+
+
+def _mpremote_copy_to_pico_verified(
+    mpremote_cmd: List[str],
+    local_path: Path,
+    remote_path: str,
+    *,
+    cwd: Optional[str] = None,
+    timeout: int = 30,
+    preferred_port: Optional[str] = None,
+    verify: bool = True,
+) -> Tuple[bool, str]:
+    """Copy to Pico and optionally read back to confirm bytes on flash."""
+    import tempfile
+
+    from gui.pico_config_inject import local_file_fingerprint
+
+    port = preferred_port or _find_rp2040_serial_port()
+    remote_arg = remote_path if remote_path.startswith(":") else f":{remote_path}"
+    connect_args = (
+        _mpremote_args_with_connect(["cp", str(local_path), remote_arg], port)
+        if port
+        else ["connect", "auto", "cp", str(local_path), remote_arg]
+    )
+    r = _run_mpremote(
+        mpremote_cmd,
+        connect_args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "mpremote cp failed").strip()
+        write_session_line(
+            f"mpremote cp failed ({local_path.name} → {remote_arg}): {detail[:400]}",
+            prefix="INSTALL",
+        )
+        return False, detail
+
+    if not verify:
+        write_session_line(
+            f"mpremote cp OK: {local_path.name} → {remote_arg}"
+            + (f" on {port}" if port else ""),
+            prefix="INSTALL",
+        )
+        return True, ""
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=local_path.suffix) as tmp:
+        readback_path = tmp.name
+    read_args = (
+        _mpremote_args_with_connect(["cp", remote_arg, readback_path], port)
+        if port
+        else ["connect", "auto", "cp", remote_arg, readback_path]
+    )
+    r2 = _run_mpremote(
+        mpremote_cmd,
+        read_args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r2.returncode != 0:
+        detail = (r2.stderr or r2.stdout or "read-back failed").strip()
+        write_session_line(
+            f"Config verify read-back failed for {remote_arg}: {detail[:400]}",
+            prefix="INSTALL",
+        )
+        try:
+            Path(readback_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, (
+            f"Copied {local_path.name} but could not read it back from the Pico to verify.\n\n"
+            "Close other programs using the COM port and try again."
+        )
+
+    try:
+        local_fp = local_file_fingerprint(local_path)
+        remote_fp = local_file_fingerprint(Path(readback_path))
+    finally:
+        try:
+            Path(readback_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if local_fp != remote_fp:
+        write_session_line(
+            f"Config verify mismatch for {remote_arg}: "
+            f"local={local_fp[0]}B remote={remote_fp[0]}B",
+            prefix="INSTALL",
+        )
+        return False, (
+            f"Config verify failed for {remote_arg}: "
+            f"expected {local_fp[0]} bytes on the Pico, read back {remote_fp[0]} bytes.\n\n"
+            "Another program may have held the COM port during copy."
+        )
+
+    write_session_line(
+        f"Config verified on Pico: {local_path.name} → {remote_arg} ({local_fp[0]} bytes)",
+        prefix="INSTALL",
+    )
+    return True, ""
+
+
+def _reboot_pico_after_config_inject(
+    mpremote_cmd: List[str],
+    *,
+    cwd: Optional[str] = None,
+    preferred_port: Optional[str] = None,
+    progress_callback: Optional[Callable[..., Any]] = None,
+) -> None:
+    """Soft-reset so firmware reloads config.py without dropping USB serial.
+
+    Uses ``machine.soft_reset()`` (same as Device → Soft Reset), not ``machine.reset()``.
+    A hard reset disconnects USB and Windows can take 10–30s to bring COM back.
+    """
+    import time
+
+    port = preferred_port or _find_rp2040_serial_port()
+    if not port:
+        return
+    if progress_callback:
+        progress_callback(0, 0, "Restarting Pico so config changes take effect…")
+    write_session_line(f"Soft-reset Pico on {port} after config inject", prefix="INSTALL")
+    try:
+        _run_mpremote(
+            mpremote_cmd,
+            ["connect", port, "exec", "import machine;machine.soft_reset()"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # Expected — the device resets while mpremote is still connected.
+        pass
+    time.sleep(0.8)
+
+
+def _mpremote_read_pico_radio_catalog(
+    mpremote_cmd: List[str],
+    *,
+    cwd: Optional[str] = None,
+    timeout: int = 20,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort read of ``VintageRadio/radio_catalog.json`` from Pico flash."""
+    import tempfile as _tempfile
+
+    tmpdir = _tempfile.mkdtemp()
+    try:
+        dest = Path(tmpdir) / "radio_catalog_readback.json"
+        r = _run_mpremote(
+            mpremote_cmd,
+            [
+                "connect",
+                "auto",
+                "cp",
+                ":VintageRadio/radio_catalog.json",
+                str(dest),
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if r.returncode != 0 or not dest.is_file():
+            return None
+        try:
+            data = json.loads(dest.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+    finally:
+        try:
+            shutil.rmtree(tmpdir)
+        except OSError:
+            pass
+
+
+def _push_radio_catalog_and_maybe_reset_state(
+    mpremote_cmd: List[str],
+    catalog_json: str,
+    *,
+    cwd: Optional[str] = None,
+    timeout: int = 20,
+) -> Tuple[bool, str]:
+    """Write Conductor catalog; reset playback state when layout changed."""
+    from gui.commercials import push_radio_catalog_to_pico
+
+    def _read() -> Optional[Dict[str, Any]]:
+        return _mpremote_read_pico_radio_catalog(
+            mpremote_cmd, cwd=cwd, timeout=timeout,
+        )
+
+    def _copy(local: Path, remote: str) -> bool:
+        return _mpremote_copy_to_pico(
+            mpremote_cmd, local, remote, cwd=cwd, timeout=timeout,
+        )
+
+    return push_radio_catalog_to_pico(
+        catalog_json,
+        read_remote_catalog=_read,
+        copy_to_pico=_copy,
+    )
+
+
 # After copying a .uf2, Windows/macOS often need several seconds before the new CDC port appears.
 _POST_MICROPYTHON_INSTALL_DELAY_MS = 8000
 
@@ -1799,8 +2291,16 @@ class ReorderTable(QtWidgets.QTableWidget):
 
     # -- drag (encode row indices, not song ids) ---------------------------
 
+    def _expand_moving_rows(self, rows: List[int]) -> List[int]:
+        return sorted(set(rows))
+
+    def _snap_insert_row(self, target_row: int, moving: Iterable[int]) -> int:
+        return int(target_row)
+
     def startDrag(self, supportedActions: QtCore.Qt.DropActions) -> None:
-        rows = sorted(set(idx.row() for idx in self.selectedIndexes()))
+        rows = self._expand_moving_rows(
+            sorted(set(idx.row() for idx in self.selectedIndexes()))
+        )
         if not rows:
             return
         mime = QtCore.QMimeData()
@@ -1827,6 +2327,7 @@ class ReorderTable(QtWidgets.QTableWidget):
         except ValueError:
             event.ignore()
             return
+        moving_rows = self._expand_moving_rows(moving_rows)
         if not moving_rows:
             event.ignore()
             return
@@ -1835,7 +2336,10 @@ class ReorderTable(QtWidgets.QTableWidget):
         total = len(snap)
         moving_set = set(moving_rows)
 
-        target_row = self._row_at_pos(event.position().toPoint())
+        target_row = self._snap_insert_row(
+            self._row_at_pos(event.position().toPoint()),
+            moving_set,
+        )
 
         moving_items = [snap[r] for r in moving_rows if r < total]
         staying_items = [snap[r] for r in range(total) if r not in moving_set]
@@ -1856,6 +2360,8 @@ class ReorderTable(QtWidgets.QTableWidget):
 class CollectionDropTable(ReorderTable):
     files_dropped = QtCore.pyqtSignal(list)
     edit_track_requested = QtCore.pyqtSignal(int)
+    toggle_commercial_requested = QtCore.pyqtSignal(int)
+    toggle_link_requested = QtCore.pyqtSignal(int)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -1863,23 +2369,113 @@ class CollectionDropTable(ReorderTable):
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
 
-    def _pencil_hit(self, pos: QtCore.QPoint) -> Optional[int]:
-        from gui.widgets.common.delegates import track_pencil_hit_rect
+    def _title_hit_context(self, pos: QtCore.QPoint):
+        from gui.widgets.common.delegates import (
+            TRACK_COMMERCIAL_TOGGLE_ROLE,
+            TRACK_LINK_TOGGLE_ROLE,
+        )
 
         idx = self.indexAt(pos)
         if not idx.isValid():
             return None
-        rect = self.visualRect(idx)
-        if track_pencil_hit_rect(rect).contains(pos):
-            return idx.row()
+        model = self.model()
+        if model is None:
+            return None
+        title_idx = model.index(idx.row(), 0)
+        if not title_idx.isValid():
+            return None
+        title = self.item(idx.row(), 0)
+        show_toggle = bool(title.data(TRACK_COMMERCIAL_TOGGLE_ROLE)) if title is not None else False
+        show_link = bool(title.data(TRACK_LINK_TOGGLE_ROLE)) if title is not None else False
+        return idx.row(), self.visualRect(title_idx), show_toggle, show_link
+
+    def _link_flags(self) -> List[bool]:
+        from gui.widgets.common.delegates import TRACK_LINK_ROLE
+
+        flags: List[bool] = []
+        for row in range(self.rowCount()):
+            title = self.item(row, 0)
+            flags.append(bool(title.data(TRACK_LINK_ROLE)) if title is not None else False)
+        return flags
+
+    def _expand_moving_rows(self, rows: List[int]) -> List[int]:
+        from gui.commercials import expand_linked_move_rows
+
+        return expand_linked_move_rows(rows, self._link_flags())
+
+    def _snap_insert_row(self, target_row: int, moving: Iterable[int]) -> int:
+        from gui.commercials import snap_insert_around_links
+
+        return snap_insert_around_links(target_row, self._link_flags(), moving)
+
+    def _pencil_hit(self, pos: QtCore.QPoint) -> Optional[int]:
+        from gui.widgets.common.delegates import track_pencil_hit_rect
+
+        ctx = self._title_hit_context(pos)
+        if ctx is None:
+            return None
+        row, rect, show_toggle, show_link = ctx
+        if track_pencil_hit_rect(
+            rect, show_ad_toggle=show_toggle, show_link_toggle=show_link
+        ).contains(pos):
+            return row
+        return None
+
+    def _commercial_hit(self, pos: QtCore.QPoint) -> Optional[int]:
+        from gui.widgets.common.delegates import track_commercial_hit_rect
+
+        ctx = self._title_hit_context(pos)
+        if ctx is None:
+            return None
+        row, rect, show_toggle, show_link = ctx
+        if show_toggle and track_commercial_hit_rect(
+            rect, show_link_toggle=show_link
+        ).contains(pos):
+            return row
+        return None
+
+    def _link_hit(self, pos: QtCore.QPoint) -> Optional[int]:
+        from gui.widgets.common.delegates import track_link_hit_rect
+
+        ctx = self._title_hit_context(pos)
+        if ctx is None:
+            return None
+        row, rect, show_toggle, show_link = ctx
+        if show_link and track_link_hit_rect(
+            rect, show_ad_toggle=show_toggle
+        ).contains(pos):
+            return row
         return None
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         pos = event.position().toPoint()
-        if self._pencil_hit(pos) is not None:
+        ad_row = self._commercial_hit(pos)
+        link_row = self._link_hit(pos)
+        pencil_row = self._pencil_hit(pos)
+        if ad_row is not None:
+            from gui.widgets.common.delegates import track_is_commercial
+
             self.viewport().setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            title = self.item(ad_row, 0)
+            self.setToolTip(
+                "Mark as music" if track_is_commercial(title) else "Mark as commercial"
+            )
+        elif link_row is not None:
+            from gui.widgets.common.delegates import track_is_linked
+
+            self.viewport().setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            title = self.item(link_row, 0)
+            self.setToolTip(
+                "Unlink from the track below"
+                if track_is_linked(title)
+                else "Play this commercial before the track below, including shuffle"
+            )
+        elif pencil_row is not None:
+            self.viewport().setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            self.setToolTip("Edit track")
         else:
             self.viewport().unsetCursor()
+            self.setToolTip("")
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event: QtCore.QEvent) -> None:
@@ -1889,6 +2485,18 @@ class CollectionDropTable(ReorderTable):
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
+            row = self._commercial_hit(pos)
+            if row is not None:
+                self.selectRow(row)
+                self.toggle_commercial_requested.emit(row)
+                event.accept()
+                return
+            row = self._link_hit(pos)
+            if row is not None:
+                self.selectRow(row)
+                self.toggle_link_requested.emit(row)
+                event.accept()
+                return
             row = self._pencil_hit(pos)
             if row is not None:
                 self.selectRow(row)
@@ -1923,6 +2531,23 @@ class CollectionDropTable(ReorderTable):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        from gui.widgets.common.delegates import TRACK_LINK_ROLE, draw_track_link_chain
+
+        painter = QtGui.QPainter(self.viewport())
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        for row in range(max(0, self.rowCount() - 1)):
+            title = self.item(row, 0)
+            if title is None or not bool(title.data(TRACK_LINK_ROLE)):
+                continue
+            top = self.visualRect(self.model().index(row, 0))
+            bottom = self.visualRect(self.model().index(row + 1, 0))
+            if top.isNull() or bottom.isNull():
+                continue
+            draw_track_link_chain(painter, top, bottom)
+        painter.end()
 
 
 _REORDER_MIME = "application/x-vintage-radio-list-reorder"
@@ -2173,6 +2798,7 @@ class StationImportListWidget(ReorderListWidget):
 _STATION_NUM_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 10
 _STATION_NAME_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 11
 _STATION_COUNT_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 12
+_STATION_KIND_ROLE = int(QtCore.Qt.ItemDataRole.UserRole) + 13
 
 
 class _StationItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -3106,8 +3732,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         if hasattr(self, "_library_controls_widget") and self._library_controls_widget is not None:
             self._library_controls_widget.setMinimumWidth(max(400, fm.averageCharWidth() * 55))
-        self._relayout_basic_station_rows()
         self._apply_ui_zoom_to_themed_pages()
+        self._relayout_basic_station_rows()
         footer_ver = getattr(self, "_footer_version_label", None)
         if _qt_widget_alive(footer_ver):
             footer_ver.setStyleSheet(self._footer_version_stylesheet())
@@ -4557,6 +5183,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._release_serial_if_connected_for_mpremote(log_prefix="MCP_INSTALL")
                 root = self._project_root()
                 profile = self._get_active_profile_install_params()
+                catalog_payload, commercials_payload = self._pico_runtime_payloads()
                 try:
                     msg = MainWindow._install_to_pico_worker(
                         mpremote_cmd,
@@ -4569,6 +5196,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         basic_mode=True,
                         install_mode=str(profile.get("install_mode") or "basic"),
                         dfplayer_eq=str(profile.get("dfplayer_eq") or "normal"),
+                        radio_catalog_json=catalog_payload,
+                        commercials_json=commercials_payload,
                     )
                     self.statusBar().showMessage(str(msg), 8000)
                     return {"ok": True, "message": msg}
@@ -4790,7 +5419,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.statusBar().showMessage(
-            "Acceptance suite running in background — watch Device tab / MCP log…",
+            "Acceptance suite running in background — watch Tools → Debugger / MCP log…",
             0,
         )
         self._mcp_log(
@@ -5155,6 +5784,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Connect widget signals to existing MainWindow handlers.
         bar.library_changed.connect(self._on_lib_combo_changed)
         bar.new_clicked.connect(self._new_library)
+        bar.duplicate_clicked.connect(self._duplicate_library)
         bar.rename_clicked.connect(self._rename_library)
         bar.delete_clicked.connect(self._delete_library)
         return bar
@@ -5164,8 +5794,13 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         active_slug = self._lib_registry.active_library()
+        from gui.commercials import format_library_combo_label, library_badge_tooltip
+
         for lib in self._lib_registry.list_libraries():
-            combo.addItem(lib["name"], lib["slug"])
+            combo.addItem(format_library_combo_label(lib["name"], lib), lib["slug"])
+            tip = library_badge_tooltip(lib)
+            if tip:
+                combo.setItemData(combo.count() - 1, tip, QtCore.Qt.ItemDataRole.ToolTipRole)
             if lib["slug"] == active_slug:
                 combo.setCurrentIndex(combo.count() - 1)
         combo.blockSignals(False)
@@ -5190,6 +5825,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._populate_lib_combo()
         self._switch_library(slug)
+
+    def _duplicate_library(self) -> None:
+        slug = self._lib_registry.active_library()
+        src_name = self._lib_registry.active_library_name()
+        try:
+            new_slug = self._lib_registry.duplicate_library(slug)
+        except Exception as e:
+            VintageMessageBox.warning(self, "Duplicate Library", str(e))
+            return
+        self._populate_lib_combo()
+        self._switch_library(new_slug)
+        self.statusBar().showMessage(f'Duplicated "{src_name}"', 4000)
 
     def _rename_library(self) -> None:
         slug = self._lib_registry.active_library()
@@ -5267,9 +5914,260 @@ class MainWindow(QtWidgets.QMainWindow):
             self._normalize_sidebar_view_mode()
             self._refresh_all()
             self._update_window_title()
+            self._sync_commercials_controls()
             if hasattr(self, "test_mode_widget") and self.test_mode_widget:
                 self.test_mode_widget.refresh_from_db()
             self._sd_card_tab_enter_refresh_done = False
+
+    def _active_library_meta(self) -> Dict[str, Any]:
+        try:
+            return self._lib_registry.library_meta(self._lib_registry.active_library())
+        except Exception:
+            return {
+                "firmware_family": "basic",
+                "commercials_enabled": False,
+                "commercials_mode": None,
+            }
+
+    def _commercials_ui_hidden(self) -> bool:
+        return (self.db.get_setting("advanced_software_source", "our") or "our") == "custom"
+
+    def _can_mark_track_commercial(self) -> bool:
+        from gui.commercials import can_mark_track_commercial
+
+        if self._commercials_ui_hidden():
+            return False
+        return can_mark_track_commercial(self._active_library_meta())
+
+    def _set_track_commercial(self, bst_id: int, is_commercial: bool) -> None:
+        self.db.set_basic_station_track_commercial(int(bst_id), bool(is_commercial))
+        sid = self._get_selected_basic_station_id()
+        if sid is not None:
+            self.db.sanitize_basic_station_track_links(int(sid))
+            self._refresh_basic_station_tracks(sid)
+        self._populate_lib_combo()
+
+    def _set_track_link(self, bst_id: int, link_to_next: bool) -> None:
+        self.db.set_basic_station_track_link(int(bst_id), bool(link_to_next))
+        sid = self._get_selected_basic_station_id()
+        if sid is not None:
+            self.db.sanitize_basic_station_track_links(int(sid))
+            self._refresh_basic_station_tracks(sid)
+
+    def _on_track_link_toggle(self, row: int) -> None:
+        if not self._can_mark_track_commercial():
+            return
+        table = getattr(self, "_basic_station_tracks_table", None)
+        if table is None:
+            return
+        title_item = table.item(int(row), 0)
+        if title_item is None:
+            return
+        bst_id = title_item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        if bst_id is None:
+            return
+        from gui.widgets.common.delegates import track_is_linked
+
+        self._set_track_link(int(bst_id), not track_is_linked(title_item))
+
+    def _on_track_commercial_toggle(self, row: int) -> None:
+        table = getattr(self, "_basic_station_tracks_table", None)
+        if table is None:
+            return
+        title_item = table.item(int(row), 0)
+        if title_item is None:
+            return
+        tagged = track_is_commercial(title_item)
+        if not self._can_mark_track_commercial() and not tagged:
+            return
+        bst_id = title_item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        if bst_id is None:
+            return
+        self._set_track_commercial(int(bst_id), not tagged)
+
+    def _commercials_interval_value(self) -> int:
+        try:
+            return max(1, min(99, int(self.db.get_setting("commercials_interval") or 5)))
+        except (TypeError, ValueError):
+            return 5
+
+    def _sync_commercials_controls(self) -> None:
+        page = getattr(self, "_load_music_page", None)
+        panel = None
+        if _qt_widget_alive(page) and hasattr(page, "sync_bar"):
+            panel = page.sync_bar
+        elif hasattr(self, "_basic_station_list"):
+            parent = self._basic_station_list.parent()
+            while parent is not None and not hasattr(parent, "commercials_check"):
+                parent = parent.parent()
+            panel = parent
+        meta = self._active_library_meta()
+        custom = self._commercials_ui_hidden()
+        if panel is not None and hasattr(panel, "set_commercials_visible"):
+            panel.set_commercials_visible(not custom)
+            from gui.commercials import is_folder_commercials, can_mark_track_commercial
+
+            enabled = bool(meta.get("commercials_enabled")) and not custom
+            panel.set_commercials_state(
+                enabled=enabled,
+                interval=self._commercials_interval_value(),
+                folder=enabled and is_folder_commercials(meta),
+                inline=enabled and can_mark_track_commercial(meta),
+            )
+        settings = getattr(self, "_settings_page", None)
+        if _qt_widget_alive(settings) and hasattr(settings, "set_commercials_summary"):
+            settings.set_commercials_summary(self._commercials_settings_summary())
+        if hasattr(self, "_lib_combo") and _qt_widget_alive(self._lib_combo):
+            self._populate_lib_combo()
+
+    def _commercials_settings_summary(self) -> str:
+        from gui.commercials import library_badge_text
+
+        if self._commercials_ui_hidden():
+            return "Custom firmware — commercials and Conductor are hidden."
+        meta = self._active_library_meta()
+        badge = library_badge_text(meta) or "Default (no commercials)"
+        interval = self._commercials_interval_value()
+        mode = meta.get("commercials_mode")
+        if not meta.get("commercials_enabled"):
+            return f"{badge}. Commercials are off."
+        if mode == "both":
+            return (
+                f"{badge}. Commercials station every {interval} songs plus tagged "
+                "commercial tracks in rotation (Conductor). "
+                "Use Install Firmware after you change them."
+            )
+        if mode == "inline":
+            return (
+                f"{badge}. Tagged commercial tracks play in the normal rotation. "
+                "Use Install Firmware after you change them."
+            )
+        return (
+            f"{badge}. A commercial from the Commercials station plays every {interval} songs. "
+            "Use Install Firmware after you change commercials settings."
+        )
+
+    def _persist_commercials_meta(self, meta: Dict[str, Any], *, dirty: bool = True) -> None:
+        slug = self._lib_registry.active_library()
+        self._lib_registry.set_library_firmware_family(slug, str(meta.get("firmware_family") or "basic"))
+        self._lib_registry.set_library_commercials(
+            slug,
+            enabled=bool(meta.get("commercials_enabled")),
+            mode=meta.get("commercials_mode"),
+        )
+        if dirty:
+            self._commercials_settings_dirty = True
+        self._sync_commercials_controls()
+        self._refresh_basic_station_list()
+
+    def _confirm_family_switch(self, target_family: str) -> bool:
+        from gui.commercials import effective_firmware_family, firmware_product_name
+
+        current = effective_firmware_family(self._active_library_meta())
+        target = "conductor" if str(target_family).strip().lower() == "conductor" else "basic"
+        if current == target:
+            return True
+        reply = VintageMessageBox.question(
+            self,
+            "Switch firmware family",
+            "This library will be set up for "
+            f"{firmware_product_name(target)}.\n\n"
+            "Prefer Duplicate if you want to keep the original. Continue?",
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+            VintageMessageBox.StandardButton.Cancel,
+        )
+        return reply == VintageMessageBox.StandardButton.Yes
+
+    def _commercials_sync_bar(self):
+        page = getattr(self, "_load_music_page", None)
+        if _qt_widget_alive(page) and hasattr(page, "sync_bar"):
+            return page.sync_bar
+        return None
+
+    def _confirm_mixed_commercials(self) -> bool:
+        return (
+            VintageMessageBox.question(
+                self,
+                "Commercials station + tagged tracks",
+                "Using Commercials station rotation and tagged tracks together "
+                "requires Vintage Radio Conductor.\n\n"
+                "Use Install Firmware after you change this. Continue?",
+                VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+                VintageMessageBox.StandardButton.Cancel,
+            )
+            == VintageMessageBox.StandardButton.Yes
+        )
+
+    def _apply_commercials_checkboxes(self, *, folder: bool, inline: bool) -> None:
+        from gui.commercials import FAMILY_BASIC, FAMILY_CONDUCTOR, apply_commercials_flags
+
+        if self._commercials_ui_hidden():
+            self._sync_commercials_controls()
+            return
+        meta = self._active_library_meta()
+        target_family = FAMILY_CONDUCTOR if inline else FAMILY_BASIC
+        if folder and inline:
+            if not self._confirm_mixed_commercials():
+                self._sync_commercials_controls()
+                return
+        elif str(meta.get("firmware_family") or FAMILY_BASIC) != target_family:
+            if not self._confirm_family_switch(target_family):
+                self._sync_commercials_controls()
+                return
+        try:
+            next_meta = apply_commercials_flags(
+                meta, folder=folder, inline=inline, allow_switch=True
+            )
+        except ValueError as e:
+            VintageMessageBox.warning(self, "Commercials", str(e))
+            self._sync_commercials_controls()
+            return
+        if folder:
+            self._ensure_folder_99_commercials_station()
+        self._persist_commercials_meta(next_meta)
+
+    def _on_commercials_toggled(self, enabled: bool) -> None:
+        bar = self._commercials_sync_bar()
+        inline_on = bool(bar.inline_check.isChecked()) if bar is not None else False
+        self._apply_commercials_checkboxes(folder=bool(enabled), inline=inline_on)
+
+    def _on_inline_commercials_toggled(self, enabled: bool) -> None:
+        bar = self._commercials_sync_bar()
+        folder_on = bool(bar.commercials_check.isChecked()) if bar is not None else False
+        self._apply_commercials_checkboxes(folder=folder_on, inline=bool(enabled))
+
+    def _on_commercials_interval_changed(self, value: int) -> None:
+        self.db.set_setting("commercials_interval", str(max(1, min(99, int(value)))))
+        self._commercials_settings_dirty = True
+        settings = getattr(self, "_settings_page", None)
+        if _qt_widget_alive(settings) and hasattr(settings, "set_commercials_summary"):
+            settings.set_commercials_summary(self._commercials_settings_summary())
+
+    def _reconcile_reserved_commercials_station(self) -> None:
+        from gui.commercials import is_folder_commercials
+
+        if is_folder_commercials(self._active_library_meta()):
+            self._ensure_folder_99_commercials_station()
+        else:
+            self.db.release_reserved_commercials_station()
+
+    def _ensure_folder_99_commercials_station(self) -> None:
+        row = self.db.conn.execute(
+            "SELECT id, name, folder_number FROM basic_stations WHERE folder_number = 99;"
+        ).fetchone()
+        if row is not None and str(row["name"]) not in {"Commercials / Sweepers", "Commercials"}:
+            try:
+                new_folder = self.db.next_basic_station_folder(max_folder=98)
+            except ValueError:
+                VintageMessageBox.warning(
+                    self,
+                    "Folder 99 in use",
+                    "A music station already uses folder 99 and there is no free music folder. "
+                    "Move that station first.",
+                )
+                return
+            self.db.update_basic_station(int(row["id"]), folder_number=new_folder)
+        self.db.ensure_commercials_station()
 
     def _propagate_db(self) -> None:
         """Push the current self.db to all sub-components that hold a reference."""
@@ -5815,6 +6713,7 @@ class MainWindow(QtWidgets.QMainWindow):
         page.sd_auto_detect_changed.connect(self._on_settings_sd_auto_detect_changed)
         page.ui_zoom_changed.connect(self._on_settings_ui_zoom_changed)
         page.ui_theme_changed.connect(self._on_settings_ui_theme_changed)
+        page.set_commercials_summary(self._commercials_settings_summary())
         return page
 
     def _build_help_page(self) -> QtWidgets.QWidget:
@@ -5877,6 +6776,21 @@ class MainWindow(QtWidgets.QMainWindow):
         page.detail_panel.remove_clicked.connect(self._on_firmware_remove_selected)
         page.detail_panel.add_custom_clicked.connect(self._on_add_custom_firmware_menu)
         page.detail_panel.install_clicked.connect(self._on_install_selected_firmware)
+        page.detail_panel.config_remote_changed.connect(
+            self._on_firmware_config_remote_changed
+        )
+        page.detail_panel.custom_meta_changed.connect(
+            self._on_custom_firmware_meta_changed
+        )
+        page.detail_panel.attach_config_file_clicked.connect(
+            self._on_detail_attach_config_file
+        )
+        page.detail_panel.attach_config_folder_clicked.connect(
+            self._on_detail_attach_config_folder
+        )
+        page.detail_panel.clear_config_clicked.connect(
+            self._on_detail_clear_config
+        )
 
         saved_mode = (self.db.get_setting("install_firmware_tab_mode", "") or "official").strip()
         page.set_firmware_mode(saved_mode if saved_mode in ("official", "custom") else "official")
@@ -5962,26 +6876,115 @@ class MainWindow(QtWidgets.QMainWindow):
         if _qt_widget_alive(title):
             title.setText(title_text)
 
-        install_btn = getattr(self, "_basic_install_firmware_btn", None)
-        if _qt_widget_alive(install_btn):
-            page = getattr(self, "_install_firmware_page", None)
-            entry = page.firmware_list.selected_entry() if _qt_widget_alive(page) else None
+        page = getattr(self, "_install_firmware_page", None)
+        if _qt_widget_alive(page):
+            entry = page.firmware_list.selected_entry()
             status, enabled = self._firmware_install_status(entry, detected=detected)
-            install_btn.setEnabled(enabled)
-            if _qt_widget_alive(page):
-                page.detail_panel.set_status(status)
+            page.detail_panel.set_install_enabled(enabled)
+            page.detail_panel.set_status(status)
 
         self._refresh_basic_choose_device_visibility()
 
     def _on_refresh_device_clicked(self) -> None:
-        w = getattr(self, "_basic_debug_widget", None)
-        if _qt_widget_alive(w) and hasattr(w, "_scan_ports"):
-            try:
-                w._scan_ports()
-            except Exception:
-                pass
+        for name in ("_basic_debug_widget", "_device_debug_widget"):
+            w = getattr(self, name, None)
+            if _qt_widget_alive(w) and hasattr(w, "_scan_ports"):
+                try:
+                    w._scan_ports()
+                except Exception:
+                    pass
         self._set_basic_device_presence_indicator(self._basic_device_usb_present())
         self.statusBar().showMessage("Device list refreshed.", 3000)
+
+    def _stop_install_recovery(self) -> None:
+        """Stop post-install auto-reconnect polling (dialog closed or cancelled)."""
+        self._install_recovery_attempt = 999
+        self._install_released_serial_port = None
+
+    def _on_install_dialog_aborted(self) -> None:
+        """User closed/cancelled an install progress dialog before it finished."""
+        self._stop_install_recovery()
+        write_session_line(
+            "Firmware install dialog closed before completion — worker cancelled if still running",
+            prefix="INSTALL",
+        )
+
+    def _post_config_inject_rescan_ports(self) -> None:
+        """After config inject, poll USB + try to refresh banner and reconnect."""
+        released = getattr(self, "_install_released_serial_port", None)
+        self._install_released_serial_port = None
+        self._install_recovery_port = (
+            released
+            or _read_preferred_serial_port_from_ui(self)
+            or _find_rp2040_serial_port()
+        )
+        self._install_recovery_attempt = 0
+        self._install_recovery_connect_tries = 0
+        QtCore.QTimer.singleShot(800, self._post_install_device_recovery_tick)
+
+    def _post_install_device_recovery_tick(self) -> None:
+        """Poll ports/presence after install; zbvr/custom FW can take several seconds to settle."""
+        self._install_recovery_attempt = int(getattr(self, "_install_recovery_attempt", 0)) + 1
+        port_hint = getattr(self, "_install_recovery_port", None)
+
+        for name in ("_basic_debug_widget", "_device_debug_widget"):
+            w = getattr(self, name, None)
+            if not _qt_widget_alive(w):
+                continue
+            if hasattr(w, "_scan_ports"):
+                try:
+                    w._scan_ports(from_auto_poll=True)
+                except Exception:
+                    pass
+            if hasattr(w, "_update_device_presence_led"):
+                try:
+                    w._update_device_presence_led(force_emit=True)
+                except Exception:
+                    pass
+
+        self._set_basic_device_presence_indicator(self._basic_device_usb_present())
+
+        w = self._active_debug_widget()
+        live = _find_rp2040_serial_port(preferred=port_hint) or _find_rp2040_serial_port()
+        connect_tries = int(getattr(self, "_install_recovery_connect_tries", 0))
+        if (
+            w is not None
+            and live
+            and not getattr(w, "_connected", False)
+            and "connect" not in getattr(w, "_active_operations", set())
+            and connect_tries < 10
+        ):
+            self._install_recovery_connect_tries = connect_tries + 1
+            try:
+                self._mcp_select_serial_port(w, live)
+                w._connect()
+            except Exception as exc:
+                write_session_line(
+                    f"Auto-reconnect attempt {connect_tries + 1} failed: {exc}",
+                    prefix="INSTALL",
+                )
+
+        if w is not None and getattr(w, "_connected", False):
+            self.statusBar().showMessage(
+                f"Reconnected to {live or port_hint} after config update.",
+                8000,
+            )
+            return
+
+        if self._install_recovery_attempt < 30:
+            QtCore.QTimer.singleShot(1500, self._post_install_device_recovery_tick)
+            return
+
+        if live:
+            self.statusBar().showMessage(
+                f"Config updated — click Connect on {live} (Tools → Debugger).",
+                12000,
+            )
+        else:
+            self.statusBar().showMessage(
+                "Config updated — use Autodetect when the Pico USB port appears.",
+                12000,
+            )
 
     def _basic_detected_device_meta_line(self, detected: bool) -> str:
         if not detected:
@@ -6133,107 +7136,276 @@ class MainWindow(QtWidgets.QMainWindow):
             return "Connect a device to install.", False
         from gui.services.firmware_bundle import is_older_bundled_vintage_radio_full_uf2
 
+        kind = str(entry.get("kind") or "").lower()
+        if kind in ("vintage_radio", "vintage_radio_conductor"):
+            if str(entry.get("generation") or "").lower() == "current":
+                return "Ready to install.", True
         uf2_raw = str(entry.get("uf2Path") or "").strip()
         if uf2_raw and is_older_bundled_vintage_radio_full_uf2(Path(uf2_raw)):
             if self._is_rpi_rp2_present():
-                return "Ready to flash.", True
+                return "Ready to flash release UF2.", True
             return (
                 "BOOTSEL required — flash older releases from RPI-RP2 only.",
                 True,
             )
         return "Ready to install.", True
 
-    def _vintage_radio_firmware_notes(self) -> str:
+    @staticmethod
+    def _vintage_radio_button_press_notes(
+        *, conductor: bool = False, end_of_station_skip: bool = True
+    ) -> str:
+        """Full radio-button map for Install Firmware notes."""
+        single = "  Single tap        — Next track"
+        if end_of_station_skip:
+            single += " (last track of a station goes to the next station)"
+        lines = [
+            "Button presses:",
+            single,
+            "  Double tap        — Previous track",
+            "  Triple tap        — Restart current station at track 1",
+            "  Four taps         — Previous station",
+            "  Five taps         — First station (exits track shuffle)",
+            "  Long press        — Next station",
+            "  Tap + hold        — Exit track shuffle to ordered playback",
+        ]
+        if conductor:
+            lines.extend(
+                [
+                    "  Double tap + hold — Shuffle current station, music only "
+                    "(repeat = reshuffle; linked ads stay with their track)",
+                    "  Triple tap + hold — Shuffle the whole library, music only "
+                    "(skips unlinked commercials)",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "  Double tap + hold — Shuffle current station (repeat = reshuffle)",
+                    "  Triple tap + hold — First station + track shuffle "
+                    "(stays in shuffle; repeat = reshuffle)",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _vintage_radio_firmware_notes(self, *, current: bool = True) -> str:
         return (
             "Vintage Radio basic-mode firmware (main_basic.py + radio_core).\n\n"
-            "Install: flashes a bundled full-flash .uf2 in BOOTSEL mode when available; "
-            "otherwise installs MicroPython automatically (if needed) and copies firmware via USB.\n\n"
+            "Install always copies the firmware bundled with this app — the same files "
+            "whether the Pico is on USB serial or in BOOTSEL. In BOOTSEL (RPI-RP2 drive), "
+            "official MicroPython is flashed first, then Vintage Radio is copied.\n\n"
+            "Legacy versions under this list use a one-file UF2 in BOOTSEL only.\n\n"
             "Stock MicroPython only (no Vintage Radio app) is under Tools → MicroPython.\n\n"
             "Includes DFPlayer playback, AM tuning overlay, and the full gesture set.\n\n"
-            "Button presses:\n"
-            "  Single tap       — Next track\n"
-            "  Double tap       — Previous track\n"
-            "  Triple tap       — Restart station at track 1\n"
-            "  Long press       — Next station\n"
-            "  Tap + hold       — Exit shuffle, return to ordered playback\n"
-            "  Double tap + hold — Shuffle current station\n"
-            "  Triple tap + hold — First station + shuffle tracks\n"
-            "  Four taps        — Previous station\n"
-            "  Five taps        — First station (exits track shuffle)"
+            + self._vintage_radio_button_press_notes(
+                conductor=False, end_of_station_skip=current
+            )
         )
 
-    def _vintage_radio_official_firmware_entries(self) -> List[Dict[str, Any]]:
-        """One Install Firmware card per bundled full-flash UF2 (newest first)."""
+    def _firmware_list_section(self, section_id: str, title: str) -> Dict[str, Any]:
+        return {
+            "id": section_id,
+            "section": True,
+            "listName": title,
+            "selectable": False,
+        }
+
+    def _vintage_radio_basic_uf2_entry(
+        self,
+        *,
+        uf2_path: Path,
+        author: str,
+        description: str,
+        notes: str,
+        recommended: bool,
+    ) -> Optional[Dict[str, Any]]:
         from gui.services.firmware_bundle import (
             full_uf2_version_string,
-            list_bundled_vintage_radio_full_uf2,
+            is_current_firmware_generation,
             vintage_radio_firmware_entry_id,
+        )
+
+        ver = full_uf2_version_string(uf2_path)
+        if ver is None:
+            return None
+        version_label = f"v{ver}"
+        is_current = is_current_firmware_generation(ver)
+        return {
+            "id": vintage_radio_firmware_entry_id(ver),
+            "name": "Vintage Radio Default Firmware",
+            "listName": "Default RP2040",
+            "listSubtitle": (
+                "USB copy — MicroPython first in BOOTSEL"
+                if recommended
+                else "Legacy UF2 — BOOTSEL only"
+            ),
+            "description": description,
+            "badge": "Official",
+            "version": version_label,
+            "microcontroller": "RP2040",
+            "mp3Controller": "DFPlayer",
+            "device": "DFPlayer + RP2040",
+            "author": author,
+            "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
+            "notes": notes,
+            "recommended": recommended,
+            "available": True,
+            "kind": "vintage_radio",
+            "uf2Path": str(uf2_path),
+            "custom": False,
+            "generation": "current" if is_current else "legacy",
+        }
+
+    def _vintage_radio_basic_source_entry(
+        self,
+        *,
+        author: str,
+        description: str,
+        notes: str,
+        version: str,
+    ) -> Dict[str, Any]:
+        from gui.services.firmware_bundle import vintage_radio_firmware_entry_id
+
+        ver = version.lstrip("v")
+        return {
+            "id": vintage_radio_firmware_entry_id(ver),
+            "name": "Vintage Radio Default Firmware",
+            "listName": "Default RP2040",
+            "listSubtitle": "USB copy — MicroPython first in BOOTSEL",
+            "description": description,
+            "badge": "Official",
+            "version": version if version.startswith("v") else f"v{version}",
+            "microcontroller": "RP2040",
+            "mp3Controller": "DFPlayer",
+            "device": "DFPlayer + RP2040",
+            "author": author,
+            "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
+            "notes": notes,
+            "recommended": True,
+            "available": True,
+            "kind": "vintage_radio",
+            "custom": False,
+            "generation": "current",
+        }
+
+    def _vintage_radio_official_firmware_entries(self) -> List[Dict[str, Any]]:
+        """Official cards: current generation (Default + Conductor), then legacy UF2s."""
+        from pathlib import Path
+
+        from gui.services.firmware_bundle import (
+            full_uf2_version_string,
+            is_current_firmware_generation,
+            list_bundled_vintage_radio_full_uf2,
         )
         from project_version import PROJECT_VERSION
 
         notes = self._vintage_radio_firmware_notes()
+        notes_legacy = self._vintage_radio_firmware_notes(current=False)
         author = updater.GITHUB_REPO_SLUG.split("/", 1)[0]
         description = (
             "Official firmware made with this app in mind - an improved version of Zion's original firmware with station browsing, playback control, "
             "AM tuning overlay, shuffle modes, and the full gesture set for DFPlayer + RP2040 hardware."
         )
         bundled = list_bundled_vintage_radio_full_uf2()
-        entries: List[Dict[str, Any]] = []
-        for index, uf2_path in enumerate(bundled):
+        current_uf2: Optional[Path] = None
+        legacy_uf2s: List[Path] = []
+        for uf2_path in bundled:
             ver = full_uf2_version_string(uf2_path)
             if ver is None:
                 continue
-            version_label = f"v{ver}"
-            is_newest = index == 0
-            entries.append(
-                {
-                    "id": vintage_radio_firmware_entry_id(ver),
-                    "name": "Vintage Radio Basic Firmware",
-                    "listName": "Default RP2040",
-                    "listSubtitle": (
-                        "Full-flash UF2 or mpremote over USB"
-                        if is_newest
-                        else "Full-flash UF2"
-                    ),
-                    "description": description,
-                    "badge": "Official",
-                    "version": version_label,
-                    "microcontroller": "RP2040",
-                    "mp3Controller": "DFPlayer",
-                    "device": "DFPlayer + RP2040",
-                    "author": author,
-                    "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
-                    "notes": notes,
-                    "recommended": is_newest,
-                    "available": True,
-                    "kind": "vintage_radio",
-                    "uf2Path": str(uf2_path),
-                    "custom": False,
-                }
+            if is_current_firmware_generation(ver):
+                current_uf2 = uf2_path
+            else:
+                legacy_uf2s.append(uf2_path)
+
+        entries: List[Dict[str, Any]] = []
+        if legacy_uf2s:
+            entries.append(self._firmware_list_section("__section_current__", "Current release"))
+
+        if current_uf2 is not None:
+            row = self._vintage_radio_basic_uf2_entry(
+                uf2_path=current_uf2,
+                author=author,
+                description=description,
+                notes=notes,
+                recommended=True,
             )
+            if row is not None:
+                entries.append(row)
+        else:
+            entries.append(
+                self._vintage_radio_basic_source_entry(
+                    author=author,
+                    description=description,
+                    notes=notes,
+                    version=PROJECT_VERSION,
+                )
+            )
+
+        conductor = self._vintage_radio_conductor_firmware_entry(
+            author=author, version=PROJECT_VERSION
+        )
+        conductor["generation"] = "current"
+        entries.append(conductor)
+
+        if legacy_uf2s:
+            entries.append(self._firmware_list_section("__section_legacy__", "Legacy versions"))
+            for uf2_path in legacy_uf2s:
+                row = self._vintage_radio_basic_uf2_entry(
+                    uf2_path=uf2_path,
+                    author=author,
+                    description=description,
+                    notes=notes_legacy,
+                    recommended=False,
+                )
+                if row is not None:
+                    entries.append(row)
+
         if entries:
             return entries
+
         return [
-            {
-                "id": "vintage_radio_source",
-                "name": "Vintage Radio Basic Firmware",
-                "listName": "Default RP2040",
-                "listSubtitle": "mpremote install (no bundled UF2)",
-                "description": description,
-                "badge": "Official",
-                "version": PROJECT_VERSION,
-                "microcontroller": "RP2040",
-                "mp3Controller": "DFPlayer",
-                "device": "DFPlayer + RP2040",
-                "author": author,
-                "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
-                "notes": notes,
-                "recommended": True,
-                "available": True,
-                "kind": "vintage_radio",
-                "custom": False,
-            }
+            self._vintage_radio_basic_source_entry(
+                author=author,
+                description=description,
+                notes=notes,
+                version=PROJECT_VERSION,
+            ),
+            conductor,
         ]
+
+    def _vintage_radio_conductor_firmware_entry(
+        self, *, author: str, version: str
+    ) -> Dict[str, Any]:
+        return {
+            "id": "vintage_radio_conductor",
+            "name": "Vintage Radio Conductor",
+            "listName": "Conductor RP2040",
+            "listSubtitle": "MCU catalog + library shuffle",
+            "description": (
+                "MCU-directed catalog firmware. Every library change requires Sync to SD "
+                "and a Pico catalog write. Full firmware flash is only needed when Conductor "
+                "files change. Commercials station rotation or tagged tracks — pick one "
+                "unless you use both (Conductor only)."
+            ),
+            "badge": "Official",
+            "version": version,
+            "microcontroller": "RP2040",
+            "mp3Controller": "DFPlayer",
+            "device": "DFPlayer + RP2040",
+            "author": author,
+            "repoUrl": "https://github.com/alexnoctis76/Vintage_radio",
+            "notes": (
+                "Vintage Radio Conductor plays from VintageRadio/radio_catalog.json on Pico flash.\n\n"
+                "Do not import Default firmware modules. Install copies firmware/conductor/ only.\n\n"
+                "After every SD sync, write this library's catalog to the Pico.\n\n"
+                + self._vintage_radio_button_press_notes(conductor=True)
+            ),
+            "recommended": False,
+            "available": True,
+            "kind": "vintage_radio_conductor",
+            "install_mode": "conductor",
+            "custom": False,
+        }
 
     def _builtin_firmware_entries(self) -> List[Dict[str, Any]]:
         """Hardcoded built-in firmware entries shown at the top of the Advanced list.
@@ -6274,6 +7446,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "available": True,
                 "installable": True,
                 "kind": "remote_uf2",
+                "supports_config": False,
                 "cacheKey": "zbvr_26_0_1",
                 "githubRepo": "mloit/zbvr-firmware",
                 "githubTag": "26.0.1",
@@ -6314,9 +7487,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 row["listSubtitle"] = "MicroPython file"
                 row["description"] = row.get("description") or "MicroPython source file"
             row["listName"] = row.get("name") or "Custom"
-            row["version"] = "Custom"
-            row["device"] = "RP2040"
-            row["author"] = "You"
+            row["version"] = str(row.get("version") or "Custom").strip() or "Custom"
+            row["device"] = str(row.get("device") or "RP2040").strip() or "RP2040"
+            row["author"] = str(row.get("author") or "You").strip() or "You"
             row["custom"] = True
             entries.append(row)
         return entries
@@ -6377,14 +7550,35 @@ class MainWindow(QtWidgets.QMainWindow):
         selected_id = self._selected_firmware_entry_id()
         if selected_id in ("v1.1_stable", "v1.0_stable", "vintage_radio_source"):
             selected_id = ""
-        if selected_id and not any(str(e.get("id", "")) == selected_id for e in entries):
-            selected_id = str(entries[0].get("id", "")) if entries else ""
+        if not selected_id and mode != "custom":
+            family = str(self._active_library_meta().get("firmware_family") or "basic")
+            if family == "conductor" and any(
+                str(e.get("id", "")) == "vintage_radio_conductor" for e in entries
+            ):
+                selected_id = "vintage_radio_conductor"
+            else:
+                for row in entries:
+                    if row.get("section"):
+                        continue
+                    if row.get("recommended"):
+                        selected_id = str(row.get("id", ""))
+                        break
+                if not selected_id:
+                    for row in entries:
+                        if not row.get("section"):
+                            selected_id = str(row.get("id", ""))
+                            break
+            if selected_id:
+                self._set_selected_firmware_entry_id(selected_id)
+        selectable = [e for e in entries if not e.get("section")]
+        if selected_id and not any(str(e.get("id", "")) == selected_id for e in selectable):
+            selected_id = str(selectable[0].get("id", "")) if selectable else ""
             if selected_id:
                 self._set_selected_firmware_entry_id(selected_id)
         page.firmware_list.set_entries(
             entries,
             selected_id=selected_id,
-            show_filter=len(entries) > 1,
+            show_filter=len(selectable) > 1,
         )
         entry = page.firmware_list.selected_entry()
         self._apply_firmware_detail_panel(entry, custom_empty=(mode == "custom" and not entries))
@@ -6410,10 +7604,10 @@ class MainWindow(QtWidgets.QMainWindow):
         status, enabled = self._firmware_install_status(entry, detected=detected)
         if custom_empty or not entry:
             page.detail_panel.set_status("Add a custom firmware source to continue.")
-            page.detail_panel.install_btn.setEnabled(False)
+            page.detail_panel.set_install_enabled(False)
         else:
             page.detail_panel.set_status(status)
-            page.detail_panel.install_btn.setEnabled(enabled)
+            page.detail_panel.set_install_enabled(enabled)
 
     def _on_firmware_selection_changed(self, entry: object) -> None:
         if entry is None:
@@ -6517,9 +7711,32 @@ class MainWindow(QtWidgets.QMainWindow):
                         kind = "folder"
                     else:
                         kind = "micropython"
+                from gui.uf2_install_profile import (
+                    firmware_entry_supports_config,
+                    uf2_image_likely_micropython,
+                )
+
+                path_val = str(e.get("path") or "")
+                if kind in ("folder", "micropython"):
+                    supports_config = True
+                elif kind == "uf2" and path_val and Path(path_val).is_file():
+                    supports_config = uf2_image_likely_micropython(Path(path_val))
+                elif kind == "uf2":
+                    supports_config = bool(e.get("supports_config", False))
+                else:
+                    supports_config = bool(e.get("supports_config", False))
+
+                config_path = str(e.get("config_path") or "")
+                if not supports_config:
+                    config_path = ""
+
                 desc = "Local file"
                 if kind == "uf2":
-                    desc = "Installs directly in BOOTSEL mode"
+                    desc = (
+                        "MicroPython UF2 (BOOTSEL + optional config)"
+                        if supports_config
+                        else "Standalone UF2 (BOOTSEL flash only)"
+                    )
                 elif kind == "folder":
                     desc = "MicroPython source folder"
                 else:
@@ -6533,6 +7750,13 @@ class MainWindow(QtWidgets.QMainWindow):
                         "notes": str(e.get("notes") or e.get("description") or ""),
                         "description": desc,
                         "custom": True,
+                        "version": str(e.get("version") or ""),
+                        "device": str(e.get("device") or ""),
+                        "author": str(e.get("author") or ""),
+                        "config_path": config_path,
+                        "config_remote": str(e.get("config_remote") or ""),
+                        "inject_config": bool(e.get("inject_config", True)),
+                        "supports_config": bool(supports_config),
                     }
                 )
         return out
@@ -6545,10 +7769,186 @@ class MainWindow(QtWidgets.QMainWindow):
                 "path": str(e.get("path", "")),
                 "kind": str(e.get("kind", "micropython")),
                 "notes": str(e.get("notes", "")),
+                "version": str(e.get("version") or ""),
+                "device": str(e.get("device") or ""),
+                "author": str(e.get("author") or ""),
+                "config_path": str(e.get("config_path") or ""),
+                "config_remote": str(e.get("config_remote") or ""),
+                "inject_config": bool(e.get("inject_config", True)),
+                "supports_config": bool(e.get("supports_config", False)),
             }
             for e in entries
         ]
         self.db.set_setting("custom_firmware_entries_json", json.dumps(serializable))
+
+    def _on_custom_firmware_meta_changed(self, field: str, value: str) -> None:
+        entry = self._selected_custom_firmware_entry()
+        if not entry:
+            return
+        key = str(field or "").strip().lower()
+        if key not in ("version", "device", "author"):
+            return
+        self._update_custom_firmware_entry(str(entry.get("id", "")), **{key: value})
+
+    def _update_custom_firmware_entry(self, entry_id: str, **fields: Any) -> None:
+        entries = self._custom_firmware_entries_load()
+        updated = []
+        for e in entries:
+            if str(e.get("id", "")) == entry_id:
+                merged = dict(e)
+                merged.update(fields)
+                updated.append(merged)
+            else:
+                updated.append(e)
+        self._custom_firmware_entries_save(updated)
+        self._refresh_firmware_list_ui()
+
+    def _attach_config_file_to_firmware_entry(self, entry: Dict[str, Any]) -> None:
+        from gui.uf2_install_profile import firmware_entry_supports_config
+
+        if not firmware_entry_supports_config(entry):
+            VintageMessageBox.information(
+                self,
+                "Attached config",
+                "This firmware does not support attached config files.\n\n"
+                "Standalone UF2 images (e.g. ZBVR) are flashed in BOOTSEL mode only. "
+                "To edit config.py, add the firmware source folder and use the "
+                "MicroPython deploy path.",
+            )
+            return
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Attach config file",
+            "",
+            "All files (*.*)",
+        )
+        if not path_str:
+            return
+        local = Path(path_str)
+        from gui.pico_config_inject import (
+            default_config_remote,
+            needs_config_inject_confirm,
+            validate_config_local_file,
+        )
+
+        uf2_path: Optional[Path] = None
+        if str(entry.get("kind") or "").lower() == "uf2":
+            fw = str(entry.get("path") or "").strip()
+            if fw:
+                uf2_path = Path(fw)
+        err = validate_config_local_file(local, uf2_path=uf2_path)
+        if err:
+            VintageMessageBox.warning(self, "Attach config file", err)
+            return
+        need_confirm, reason = needs_config_inject_confirm(local)
+        if need_confirm:
+            reply = VintageMessageBox.question(
+                self,
+                "Confirm config file",
+                f"{reason}\n\nAttach {local.name} to this firmware entry?",
+                VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+                VintageMessageBox.StandardButton.No,
+            )
+            if reply != VintageMessageBox.StandardButton.Yes:
+                return
+
+        remote = default_config_remote(local)
+        self._update_custom_firmware_entry(
+            str(entry.get("id", "")),
+            config_path=str(local),
+            config_remote=remote,
+            inject_config=True,
+        )
+
+    def _attach_config_folder_to_firmware_entry(self, entry: Dict[str, Any]) -> None:
+        from gui.uf2_install_profile import firmware_entry_supports_config
+
+        if not firmware_entry_supports_config(entry):
+            VintageMessageBox.information(
+                self,
+                "Attached config",
+                "This firmware does not support attached config files.\n\n"
+                "Standalone UF2 images (e.g. ZBVR) are flashed in BOOTSEL mode only. "
+                "To edit config.py, add the firmware source folder and use the "
+                "MicroPython deploy path.",
+            )
+            return
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Attach config folder",
+            str(Path.home()),
+        )
+        if not folder:
+            return
+        self._update_custom_firmware_entry(
+            str(entry.get("id", "")),
+            config_path=str(Path(folder)),
+            config_remote="",
+            inject_config=True,
+        )
+
+    def _clear_config_on_firmware_entry(self, entry: Dict[str, Any]) -> None:
+        self._update_custom_firmware_entry(
+            str(entry.get("id", "")),
+            config_path="",
+            config_remote="",
+            inject_config=True,
+        )
+
+    def _on_firmware_config_remote_changed(self, remote: str) -> None:
+        page = getattr(self, "_install_firmware_page", None)
+        if not _qt_widget_alive(page):
+            return
+        entry = page.firmware_list.selected_entry()
+        if not entry or not entry.get("custom"):
+            return
+        self._update_custom_firmware_entry(
+            str(entry.get("id", "")),
+            config_remote=str(remote).strip().replace("\\", "/").lstrip("/"),
+        )
+
+    def _selected_custom_firmware_entry(self) -> Optional[Dict[str, Any]]:
+        page = getattr(self, "_install_firmware_page", None)
+        if not _qt_widget_alive(page):
+            return None
+        entry = page.firmware_list.selected_entry()
+        if not entry or not entry.get("custom"):
+            return None
+        return entry
+
+    def _on_detail_attach_config_file(self) -> None:
+        entry = self._selected_custom_firmware_entry()
+        if entry:
+            self._attach_config_file_to_firmware_entry(entry)
+
+    def _on_detail_attach_config_folder(self) -> None:
+        entry = self._selected_custom_firmware_entry()
+        if entry:
+            self._attach_config_folder_to_firmware_entry(entry)
+
+    def _on_detail_clear_config(self) -> None:
+        entry = self._selected_custom_firmware_entry()
+        if entry:
+            self._clear_config_on_firmware_entry(entry)
+
+    def _custom_firmware_entry_for_path(
+        self, source_path: Path,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            resolved = source_path.resolve()
+        except OSError:
+            resolved = source_path
+        for entry in self._custom_firmware_entries_load():
+            raw = str(entry.get("path") or "").strip()
+            if not raw:
+                continue
+            try:
+                if Path(raw).resolve() == resolved:
+                    return entry
+            except OSError:
+                if Path(raw) == source_path:
+                    return entry
+        return None
 
     def _on_browse_custom_firmware_local(
         self,
@@ -6589,6 +7989,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         kind = "uf2" if ext == ".uf2" else "micropython"
+        supports_config = True
+        if kind == "uf2":
+            from gui.uf2_install_profile import uf2_image_supports_attached_config
+
+            supports_config = uf2_image_supports_attached_config(path)
         entries = self._custom_firmware_entries_load()
         new_id = f"custom:{path.resolve()}"
         entries = [e for e in entries if e.get("id") != new_id]
@@ -6599,6 +8004,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "path": str(path),
                 "kind": kind,
                 "notes": "",
+                "supports_config": supports_config,
             }
         )
         self._custom_firmware_entries_save(entries)
@@ -6631,6 +8037,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "path": str(path),
                 "kind": "folder",
                 "notes": "",
+                "supports_config": True,
             }
         )
         self._custom_firmware_entries_save(entries)
@@ -6654,6 +8061,17 @@ class MainWindow(QtWidgets.QMainWindow):
         act_view = menu.addAction("View notes")
         act_edit = None
         act_remove = None
+        act_attach_cfg = None
+        act_attach_cfg_folder = None
+        act_clear_cfg = None
+        from gui.uf2_install_profile import firmware_entry_supports_config
+
+        if custom and firmware_entry_supports_config(entry):
+            menu.addSeparator()
+            act_attach_cfg = menu.addAction("Attach config file…")
+            act_attach_cfg_folder = menu.addAction("Attach config folder…")
+            if str(entry.get("config_path") or "").strip():
+                act_clear_cfg = menu.addAction("Clear attached config")
         if custom:
             act_edit = menu.addAction("Edit notes")
             menu.addSeparator()
@@ -6663,6 +8081,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if chosen == act_view:
             self._show_firmware_notes_dialog(entry, custom=custom, editable=False)
+        elif act_attach_cfg is not None and chosen == act_attach_cfg:
+            self._attach_config_file_to_firmware_entry(entry)
+        elif act_attach_cfg_folder is not None and chosen == act_attach_cfg_folder:
+            self._attach_config_folder_to_firmware_entry(entry)
+        elif act_clear_cfg is not None and chosen == act_clear_cfg:
+            self._clear_config_on_firmware_entry(entry)
         elif act_edit is not None and chosen == act_edit:
             self._show_firmware_notes_dialog(entry, custom=custom, editable=True)
         elif act_remove is not None and chosen == act_remove:
@@ -6737,7 +8161,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         entry_id = str(entry.get("id", ""))
         if str(entry.get("kind") or "").lower() == "vintage_radio":
+            if not self._warn_firmware_family_mismatch(expected="basic"):
+                return
             self._install_vintage_radio_official_firmware(entry)
+            return
+        if str(entry.get("kind") or "").lower() == "vintage_radio_conductor":
+            if not self._confirm_family_switch("conductor"):
+                return
+            self._install_vintage_radio_conductor_firmware(entry)
             return
         kind = str(entry.get("kind") or "micropython").lower()
         if kind == "remote_uf2":
@@ -6748,7 +8179,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
                 "Install firmware",
                 "Install is not available for this firmware yet.\n\n"
-                "Select Vintage Radio Basic, or add a custom firmware source.",
+                "Select Vintage Radio Default, or add a custom firmware source.",
             )
             return
         path_str = str(entry.get("path") or "")
@@ -6764,7 +8195,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self, "Install firmware", f"File not found: {path}"
                 )
                 return
-            self._install_custom_uf2_to_pico(path)
+            self._install_custom_uf2_to_pico(path, entry=entry)
             return
         if not path.exists():
             VintageMessageBox.warning(
@@ -6822,7 +8253,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         write_session_line(f"Remote UF2 ready: {uf2_path}", prefix="SETUP")
-        self._flash_uf2_to_bootsel(uf2_path)
+        self._run_uf2_flash_with_progress(uf2_path, entry=entry, title="Install firmware")
 
     def _resolve_bootsel_drive(self) -> Optional[Path]:
         try:
@@ -6895,9 +8326,361 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         return True
 
-    def _install_custom_uf2_to_pico(self, uf2_path: Path) -> None:
-        """Copy a .uf2 directly to a Pico in BOOTSEL mode (no MicroPython prompt)."""
-        self._flash_uf2_to_bootsel(uf2_path)
+    def _prepare_config_injections_for_uf2(
+        self,
+        entry: Optional[Dict[str, Any]],
+        *,
+        uf2_path: Optional[Path] = None,
+    ) -> List[Tuple[str, str]]:
+        """Validate attached config on the main thread; return serializable injection pairs."""
+        from gui.pico_config_inject import (
+            build_injections_from_entry,
+            needs_config_inject_confirm,
+            validate_config_local_file,
+        )
+
+        pairs = build_injections_from_entry(entry, uf2_path=uf2_path)
+        serializable: List[Tuple[str, str]] = []
+        for local_fp, remote in pairs:
+            err = validate_config_local_file(local_fp, uf2_path=uf2_path)
+            if err:
+                raise ValueError(err)
+            need_confirm, reason = needs_config_inject_confirm(local_fp)
+            if need_confirm:
+                reply = VintageMessageBox.question(
+                    self,
+                    "Confirm config file",
+                    f"{reason}\n\nCopy {local_fp.name} to the Pico as {remote}?",
+                    VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.No,
+                    VintageMessageBox.StandardButton.No,
+                )
+                if reply != VintageMessageBox.StandardButton.Yes:
+                    raise ValueError("Config injection cancelled.")
+            serializable.append((str(local_fp), remote))
+        return serializable
+
+    def _prompt_custom_uf2_install_mode(
+        self,
+        uf2_path: Path,
+        config_pairs: List[Tuple[str, str]],
+        *,
+        title: str = "Install firmware",
+    ) -> Optional[str]:
+        """Ask how to proceed when the Pico is on USB serial but not in BOOTSEL.
+
+        Returns ``flash``, ``config_only``, or ``None`` (cancelled).
+        """
+        if self._is_rpi_rp2_present():
+            return "flash"
+
+        port = _read_preferred_serial_port_from_ui(self) or _find_rp2040_serial_port()
+        if not port:
+            return "flash"
+
+        bootsel_help = (
+            "To flash a .uf2, the Pico must be in BOOTSEL mode (RPI-RP2 USB drive):\n\n"
+            "1. Unplug USB, or hold BOOTSEL and tap RESET\n"
+            "2. Hold BOOTSEL, plug USB while still holding BOOTSEL\n"
+            "3. Release when the RPI-RP2 drive appears and the COM port is gone"
+        )
+
+        if config_pairs:
+            dlg = VintageMessageBox(self)
+            dlg.setWindowTitle(title)
+            dlg.setText(
+                f"The Pico is running on {port} but is not in BOOTSEL mode "
+                f"(no RPI-RP2 drive).\n\n{bootsel_help}"
+            )
+            dlg.setInformativeText(
+                f"Flash {uf2_path.name}, apply attached config only, or cancel?\n\n"
+                "Config files are copied over USB serial and need MicroPython. The app will "
+                "install official MicroPython automatically when needed."
+            )
+            dlg.setIcon(VintageMessageBox.Icon.Question)
+            flash_btn = dlg.addButton(
+                "Flash UF2 (BOOTSEL)",
+                VintageMessageBox.ButtonRole.AcceptRole,
+            )
+            config_btn = dlg.addButton(
+                "Apply config only",
+                VintageMessageBox.ButtonRole.ActionRole,
+            )
+            cancel_btn = dlg.addButton(
+                "Cancel",
+                VintageMessageBox.ButtonRole.RejectRole,
+            )
+            dlg.setDefaultButton(flash_btn)
+            dlg._apply_content()
+            if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return None
+            clicked = dlg.clickedButton()
+            if clicked is cancel_btn:
+                return None
+            if clicked is config_btn:
+                return "config_only"
+            return "flash"
+
+        reply = VintageMessageBox.question(
+            self,
+            title,
+            f"The Pico is on {port} but not in BOOTSEL mode (no RPI-RP2 drive).\n\n"
+            f"{bootsel_help}\n\n"
+            f"Continue and wait for BOOTSEL to flash {uf2_path.name}?",
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+            VintageMessageBox.StandardButton.Yes,
+        )
+        if reply != VintageMessageBox.StandardButton.Yes:
+            return None
+        return "flash"
+
+    def _flash_uf2_with_config_worker(
+        self,
+        progress_callback: Optional[Callable[..., Any]] = None,
+        uf2_path_str: str = "",
+        config_injections: Optional[List[Tuple[str, str]]] = None,
+        preferred_serial_port: Optional[str] = None,
+        config_only: bool = False,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        supports_config: bool = True,
+    ) -> Dict[str, Any]:
+        """Background worker: flash UF2 via BOOTSEL, optionally inject config files."""
+        from gui.pico_config_inject import inject_pico_config_files
+
+        uf2_path = Path(uf2_path_str)
+        if not uf2_path.is_file():
+            raise RuntimeError(f"Firmware file not found: {uf2_path}")
+
+        injections = [(Path(local), remote) for local, remote in (config_injections or [])]
+        if config_only and not supports_config:
+            raise RuntimeError(
+                "Config-only install is not available for standalone UF2 firmware.\n\n"
+                "Add the firmware source folder and use the MicroPython deploy path instead."
+            )
+
+        skip_uf2_flash = bool(config_only)
+
+        def _progress(msg: str) -> None:
+            if progress_callback:
+                progress_callback(0, 0, msg)
+
+        _progress("Preparing to flash firmware…")
+        _raise_if_install_cancelled(should_cancel)
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        needs_micropython = bool(injections) or config_only
+
+        if needs_micropython:
+            if not mpremote_cmd:
+                raise RuntimeError(
+                    "mpremote is not available. Install with: pip install mpremote"
+                )
+            self._ensure_micropython_for_uf2_install(
+                mpremote_cmd,
+                progress_callback=progress_callback,
+                preferred_serial_port=preferred_serial_port,
+                should_cancel=should_cancel,
+                reason="attached config files require MicroPython",
+            )
+
+        if config_only:
+            _progress("Applying attached config (skipping UF2 flash)…")
+        elif not skip_uf2_flash and not self._is_rpi_rp2_present():
+            port = _find_rp2040_serial_port(preferred=preferred_serial_port)
+            if port and mpremote_cmd:
+                _try_reboot_pico_to_bootsel(
+                    mpremote_cmd,
+                    port,
+                    str(self._project_root()),
+                    progress_callback=progress_callback,
+                )
+            _progress("Waiting for BOOTSEL (RPI-RP2 drive)…")
+            if not _wait_for_bootsel_polling(
+                progress_callback,
+                intro="Hold BOOTSEL while plugging in USB until the RPI-RP2 drive appears.",
+                timeout_s=180.0,
+                is_present=self._is_rpi_rp2_present,
+                preferred_serial_port=preferred_serial_port,
+                should_cancel=should_cancel,
+            ):
+                raise RuntimeError(
+                    "Timed out waiting for BOOTSEL. Hold BOOTSEL and try again."
+                )
+
+        if not skip_uf2_flash:
+            ok_pre, detail = self._bootsel_preflight_for_uf2_flash(preferred_serial_port)
+            if not ok_pre:
+                raise RuntimeError(detail or "BOOTSEL preflight failed.")
+            dest_dir = Path(detail)
+
+            _progress(f"Flashing {uf2_path.name}…")
+            needs_post_flash_serial = bool(injections) or config_only
+            ok_flash, err = _flash_uf2_file(
+                uf2_path,
+                dest_dir,
+                progress_callback=progress_callback,
+                should_cancel=should_cancel,
+                reboot_timeout_s=(
+                    _UF2_REBOOT_WAIT_REQUIRED_S
+                    if needs_post_flash_serial
+                    else _UF2_REBOOT_WAIT_OPTIONAL_S
+                ),
+                reboot_required=needs_post_flash_serial,
+            )
+            if not ok_flash:
+                raise RuntimeError(err or "Could not copy UF2 to RPI-RP2.")
+
+        if injections:
+            _raise_if_install_cancelled(should_cancel)
+            if not mpremote_cmd:
+                raise RuntimeError(
+                    "mpremote is not available. Install with: pip install mpremote"
+                )
+            root = str(self._project_root())
+
+            def _wait(*_args, **kwargs):
+                return _wait_for_mpremote_usable_after_uf2(
+                    mpremote_cmd,
+                    kwargs.get("cwd") or root,
+                    progress_callback=kwargs.get("progress_callback"),
+                    preferred_port=preferred_serial_port,
+                    initial_sleep_s=0.0 if skip_uf2_flash else 2.0,
+                    should_cancel=should_cancel,
+                )
+
+            def _cp(local_fp: Path, remote: str) -> bool:
+                ok, err = _mpremote_copy_to_pico_verified(
+                    mpremote_cmd,
+                    local_fp,
+                    remote,
+                    cwd=root,
+                    timeout=30,
+                    preferred_port=preferred_serial_port,
+                    verify=True,
+                )
+                if not ok:
+                    raise RuntimeError(err or f"Failed to copy config to {remote}")
+                return True
+
+            inject_pico_config_files(
+                mpremote_cmd,
+                injections,
+                cwd=root,
+                wait_serial_ready=_wait,
+                run_mpremote_cp=_cp,
+                progress_callback=progress_callback,
+            )
+            _reboot_pico_after_config_inject(
+                mpremote_cmd,
+                cwd=root,
+                preferred_port=preferred_serial_port,
+                progress_callback=progress_callback,
+            )
+
+        if skip_uf2_flash:
+            msg = f"Updated {len(injections)} config file(s) on the Pico."
+        else:
+            msg = f"Flashed {uf2_path.name}."
+            if injections:
+                msg += f"\n\nInjected and verified {len(injections)} config file(s)."
+        if injections:
+            msg += (
+                "\n\nThe Pico restarted (soft reset) so config.py changes take effect. "
+                "USB serial should stay on the same COM port.\n\n"
+                "Use Restart Firmware in Tools → Debugger if settings do not apply."
+            )
+        else:
+            msg += "\n\nThe Pico may reboot automatically after the UF2 write."
+            if not skip_uf2_flash and not supports_config:
+                msg += (
+                    "\n\nIf it did not start, press RESET on the Pico (some UF2 images, "
+                    "including ZBVR, may need a manual reset).\n\n"
+                    "Use Tools → Debugger to watch serial logs. REPL commands (Soft Reset, "
+                    "List Files) require a MicroPython deploy path."
+                )
+        return {"ok": True, "message": msg}
+
+    def _run_uf2_flash_with_progress(
+        self,
+        uf2_path: Path,
+        *,
+        entry: Optional[Dict[str, Any]] = None,
+        title: str = "Install firmware",
+    ) -> None:
+        """Flash a UF2 on a worker thread with progress UI (and optional config inject)."""
+        if not uf2_path.is_file():
+            VintageMessageBox.warning(self, title, f"Firmware file not found:\n{uf2_path}")
+            return
+        try:
+            config_pairs = self._prepare_config_injections_for_uf2(entry, uf2_path=uf2_path)
+        except ValueError as exc:
+            VintageMessageBox.warning(self, title, str(exc))
+            return
+
+        from gui.uf2_install_profile import firmware_entry_supports_config
+
+        supports_config = firmware_entry_supports_config(entry)
+        install_mode = self._prompt_custom_uf2_install_mode(
+            uf2_path,
+            config_pairs,
+            title=title,
+        )
+        if install_mode is None:
+            return
+        if install_mode == "config_only" and not config_pairs:
+            VintageMessageBox.warning(
+                self, title, "No config file attached — nothing to apply."
+            )
+            return
+
+        preferred = _read_preferred_serial_port_from_ui(self)
+        dlg = TaskProgressDialog(
+            parent=self,
+            title=title,
+            func=self._flash_uf2_with_config_worker,
+            kwargs={
+                "uf2_path_str": str(uf2_path),
+                "config_injections": config_pairs,
+                "preferred_serial_port": preferred,
+                "config_only": install_mode == "config_only",
+                "supports_config": supports_config,
+            },
+            initial_message=_uf2_flash_initial_progress_message(
+                preparing="Preparing to flash firmware…",
+            ),
+            on_before_start=lambda: self._prepare_install_serial_for_worker(dlg),
+            on_reject=self._on_install_dialog_aborted,
+            cancelable=True,
+            cancel_callback_kwarg="should_cancel",
+            cancel_warning=_INSTALL_CANCEL_WARNING,
+        )
+
+        def _on_success(result: Any) -> None:
+            self._post_config_inject_rescan_ports()
+            if isinstance(result, dict):
+                VintageMessageBox.information(
+                    self,
+                    title,
+                    str(result.get("message") or "Firmware flashed."),
+                )
+            else:
+                VintageMessageBox.information(self, title, str(result))
+
+        def _on_error(msg: str) -> None:
+            if "cancelled by user" in msg.lower():
+                self.statusBar().showMessage("Firmware install cancelled.", 8000)
+                return
+            VintageMessageBox.warning(self, title, f"Error:\n\n{msg}")
+
+        dlg.on_success = _on_success
+        dlg.on_error = _on_error
+        dlg.exec()
+
+    def _install_custom_uf2_to_pico(
+        self,
+        uf2_path: Path,
+        entry: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Flash a .uf2 to BOOTSEL with progress UI and optional config injection."""
+        self._run_uf2_flash_with_progress(uf2_path, entry=entry, title="Install firmware")
 
     def _wait_for_bootsel_with_progress(
         self,
@@ -7023,10 +8806,127 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         return True, str(dest_dir)
 
+    def _ensure_micropython_for_uf2_install(
+        self,
+        mpremote_cmd: List[str],
+        *,
+        progress_callback: Optional[Callable[..., Any]] = None,
+        preferred_serial_port: Optional[str] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        reason: str = "config and UF2 tooling require MicroPython",
+    ) -> None:
+        """Flash stock MicroPython when the Pico is not mpremote-ready."""
+        _raise_if_install_cancelled(should_cancel)
+
+        def _progress(msg: str) -> None:
+            if progress_callback:
+                progress_callback(0, 0, msg)
+
+        assessment = _pico_install_assessment(
+            mpremote_cmd,
+            self._project_root(),
+            preferred_port=preferred_serial_port,
+            progress_callback=progress_callback,
+        )
+        status = str(assessment.get("status") or "")
+        write_session_line(
+            f"UF2 install MicroPython check: status={status} assessment={assessment}",
+            prefix="INSTALL",
+        )
+
+        if status == "ready":
+            _progress("MicroPython is ready on USB serial.")
+            return
+
+        if status == "vintage_radio_mpremote_failed":
+            _progress(
+                "Vintage Radio firmware is on USB serial but the port may be busy.\n\n"
+                "Close other apps using the COM port if file transfer fails later."
+            )
+            return
+
+        if status == "bootsel":
+            _progress(f"Installing MicroPython ({reason})…")
+            ok, err = self._flash_micropython_for_install(
+                progress_callback,
+                preferred_serial_port=preferred_serial_port,
+                should_cancel=should_cancel,
+            )
+            if not ok:
+                raise RuntimeError(err or "Could not flash MicroPython.")
+            return
+
+        if status == "needs_reflash":
+            blocking = assessment.get("blocking_label")
+            label = f" ({blocking})" if blocking else ""
+            _progress(f"Replacing firmware{label} with MicroPython ({reason})…")
+            port = assessment.get("port")
+            if port and not self._is_rpi_rp2_present():
+                _try_reboot_pico_to_bootsel(
+                    mpremote_cmd,
+                    str(port),
+                    str(self._project_root()),
+                    progress_callback=progress_callback,
+                )
+            if not self._is_rpi_rp2_present():
+                if not _wait_for_bootsel_polling(
+                    progress_callback,
+                    intro=(
+                        "Hold BOOTSEL while plugging in USB until the RPI-RP2 drive appears "
+                        "so MicroPython can be installed."
+                    ),
+                    timeout_s=180.0,
+                    is_present=self._is_rpi_rp2_present,
+                    preferred_serial_port=preferred_serial_port,
+                    should_cancel=should_cancel,
+                ):
+                    raise RuntimeError(
+                        "Timed out waiting for BOOTSEL to install MicroPython."
+                    )
+            ok, err = self._flash_micropython_for_install(
+                progress_callback,
+                preferred_serial_port=preferred_serial_port,
+                should_cancel=should_cancel,
+            )
+            if not ok:
+                raise RuntimeError(err or "Could not flash MicroPython.")
+            return
+
+        if status == "no_pico":
+            _progress(f"Waiting for BOOTSEL to install MicroPython ({reason})…")
+            if not _wait_for_bootsel_polling(
+                progress_callback,
+                intro=(
+                    "Hold BOOTSEL while plugging in USB until the RPI-RP2 drive appears "
+                    "so MicroPython can be installed."
+                ),
+                timeout_s=180.0,
+                is_present=self._is_rpi_rp2_present,
+                preferred_serial_port=preferred_serial_port,
+                should_cancel=should_cancel,
+            ):
+                raise RuntimeError(
+                    "Timed out waiting for BOOTSEL to install MicroPython."
+                )
+            ok, err = self._flash_micropython_for_install(
+                progress_callback,
+                preferred_serial_port=preferred_serial_port,
+                should_cancel=should_cancel,
+            )
+            if not ok:
+                raise RuntimeError(err or "Could not flash MicroPython.")
+            return
+
+        raise RuntimeError(
+            f"Cannot install MicroPython automatically (status={status}). "
+            "Use Tools → MicroPython → Install MicroPython on Pico…"
+        )
+
     def _flash_micropython_uf2_to_bootsel_core(
         self,
         progress_callback: Optional[Callable[..., Any]] = None,
         preferred_serial_port: Optional[str] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Tuple[bool, str]:
         """Download/cache stock MicroPython and flash to BOOTSEL (no Qt dialogs)."""
         from gui.services.firmware_bundle import fetch_micropython_uf2
@@ -7051,6 +8951,7 @@ class MainWindow(QtWidgets.QMainWindow):
             Path(uf2_path),
             dest_dir,
             progress_callback=progress_callback,
+            should_cancel=should_cancel,
         )
 
     def _factory_reset_reflash_micropython(
@@ -7145,11 +9046,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         progress_callback: Optional[Callable[..., Any]] = None,
         preferred_serial_port: Optional[str] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Tuple[bool, str]:
         """Flash MicroPython, verify boot, factory-reset and retry once if needed."""
+        _raise_if_install_cancelled(should_cancel)
         flashed, flash_err = self._flash_micropython_uf2_to_bootsel_core(
             progress_callback,
             preferred_serial_port=preferred_serial_port,
+            should_cancel=should_cancel,
         )
         if not flashed:
             return False, flash_err or "Could not flash MicroPython."
@@ -7182,9 +9086,14 @@ class MainWindow(QtWidgets.QMainWindow):
         progress_callback: Optional[Callable[..., Any]] = None,
         preferred_serial_port: Optional[str] = None,
         full_uf2_path: Optional[str] = None,
+        allow_release_uf2: bool = False,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
-        """Background worker: detect Pico state and flash MicroPython when needed."""
-        write_session_line("Smart install Vintage Radio basic", prefix="INSTALL")
+        """Background worker: copy bundled code; legacy UF2 only in BOOTSEL when allowed."""
+        write_session_line(
+            f"Smart install Vintage Radio basic (release_uf2={allow_release_uf2})",
+            prefix="INSTALL",
+        )
 
         def _progress(msg: str) -> None:
             if progress_callback:
@@ -7198,6 +9107,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     intro=wait_intro,
                     is_present=self._is_rpi_rp2_present,
                     preferred_serial_port=preferred_serial_port,
+                    should_cancel=should_cancel,
                 ):
                     return {
                         "action": "message",
@@ -7209,6 +9119,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         ),
                     }
             _progress(f"Flashing {full_uf2.name}…")
+            _raise_if_install_cancelled(should_cancel)
             if self._copy_uf2_to_bootsel_quiet(
                 full_uf2, preferred_serial_port=preferred_serial_port,
             ):
@@ -7230,24 +9141,27 @@ class MainWindow(QtWidgets.QMainWindow):
             }
 
         _progress("Preparing firmware install…")
+        _raise_if_install_cancelled(should_cancel)
 
         from gui.services.firmware_bundle import (
-            bundled_vintage_radio_full_uf2,
             full_uf2_version_string,
             is_older_bundled_vintage_radio_full_uf2,
         )
 
         full_uf2: Optional[Path] = None
-        if full_uf2_path:
+        if allow_release_uf2 and full_uf2_path:
             candidate = Path(str(full_uf2_path))
             if candidate.is_file():
                 full_uf2 = candidate
-        if full_uf2 is None:
-            full_uf2 = bundled_vintage_radio_full_uf2()
 
-        if full_uf2 is not None and is_older_bundled_vintage_radio_full_uf2(full_uf2):
-            ver = full_uf2_version_string(full_uf2)
-            ver_label = f"v{ver}" if ver else full_uf2.name
+        uf2_for_bootsel = full_uf2 if allow_release_uf2 else None
+
+        if (
+            uf2_for_bootsel is not None
+            and is_older_bundled_vintage_radio_full_uf2(uf2_for_bootsel)
+        ):
+            ver = full_uf2_version_string(uf2_for_bootsel)
+            ver_label = f"v{ver}" if ver else uf2_for_bootsel.name
             intro = (
                 f"{ver_label} must be flashed from BOOTSEL (RPI-RP2 drive).\n\n"
                 "Older releases are not copied over USB serial — only the newest "
@@ -7258,7 +9172,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Older bundled UF2 selected ({ver_label}) — BOOTSEL flash only",
                 prefix="INSTALL",
             )
-            return _flash_bundled_full_uf2(full_uf2, wait_intro=intro)
+            return _flash_bundled_full_uf2(uf2_for_bootsel, wait_intro=intro)
 
         mpremote_cmd = self._resolve_mpremote_cmd()
         assessment: Optional[Dict[str, Any]] = None
@@ -7287,18 +9201,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     "message": (
                         f"Vintage Radio firmware is already running on {port}, but "
                         "file transfer could not start.\n\n"
-                        "Disconnect the Device tab (or close any other app using the "
+                        "Disconnect Tools → Debugger (or close any other app using the "
                         "serial port), then click Install Firmware again.\n\n"
                         "BOOTSEL is not required — the app will copy updated files over USB."
                     ),
                 }
 
-            if status == "bootsel" and full_uf2 is not None:
+            if status == "bootsel" and uf2_for_bootsel is not None:
                 intro = (
                     "A one-file Vintage Radio firmware image is available.\n\n"
                     "RPI-RP2 detected — flashing Vintage Radio firmware."
                 )
-                return _flash_bundled_full_uf2(full_uf2, wait_intro=intro)
+                return _flash_bundled_full_uf2(uf2_for_bootsel, wait_intro=intro)
 
             if status == "bootsel":
                 _progress("Flashing MicroPython…")
@@ -7320,7 +9234,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             blocking_label = assessment.get("blocking_label")
             if status == "needs_reflash":
-                if full_uf2 is not None:
+                if uf2_for_bootsel is not None:
                     if blocking_label:
                         intro = (
                             f"Detected {blocking_label}.\n\n"
@@ -7345,7 +9259,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Hold BOOTSEL and tap RESET until the RPI-RP2 drive appears."
                     )
             else:
-                if full_uf2 is not None:
+                if uf2_for_bootsel is not None:
                     intro = (
                         "A one-file Vintage Radio firmware image is available.\n\n"
                         "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
@@ -7388,9 +9302,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                 "Hold BOOTSEL while plugging in USB, then click Install Firmware again."
                             ),
                         }
-                if full_uf2 is not None:
+                if uf2_for_bootsel is not None:
                     return _flash_bundled_full_uf2(
-                        full_uf2,
+                        uf2_for_bootsel,
                         wait_intro=(
                             "RPI-RP2 detected — flashing Vintage Radio firmware."
                         ),
@@ -7421,12 +9335,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
             }
 
-        if full_uf2 is not None:
+        if uf2_for_bootsel is not None:
             intro = (
                 "A one-file Vintage Radio firmware image is available.\n\n"
                 "Put the Pico in BOOTSEL mode (RPI-RP2 drive) to flash it."
             )
-            return _flash_bundled_full_uf2(full_uf2, wait_intro=intro)
+            return _flash_bundled_full_uf2(uf2_for_bootsel, wait_intro=intro)
 
         return {
             "action": "message",
@@ -7472,12 +9386,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _prepare_install_serial_for_worker(self, dlg: TaskProgressDialog) -> None:
         """Main-thread setup before the install worker thread starts."""
         port = _read_preferred_serial_port_from_ui(self) or _find_rp2040_serial_port()
+        self._install_released_serial_port = None
         dlg.set_status_message("Releasing USB serial port for install…")
         QtWidgets.QApplication.processEvents()
         if self._release_serial_if_connected_for_mpremote(log_prefix="INSTALL"):
+            self._install_released_serial_port = port
             self.statusBar().showMessage(
                 "Serial console disconnected so Install Firmware can use the USB port. "
-                "Click Connect on the Device tab when finished.",
+                "The app will reconnect in Tools → Debugger when finished.",
                 12000,
             )
         if port:
@@ -7491,19 +9407,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _resolve_vintage_radio_full_uf2(
         self, entry: Optional[Dict[str, Any]] = None,
     ) -> Optional[Path]:
-        """UF2 for smart install: selected card, else newest bundled image."""
-        from gui.services.firmware_bundle import bundled_vintage_radio_full_uf2
-
+        """UF2 path for the selected card (legacy entries only)."""
         if entry:
             raw = str(entry.get("uf2Path") or "").strip()
             if raw:
                 path = Path(raw)
                 if path.is_file():
                     return path
-        return bundled_vintage_radio_full_uf2()
+        return None
+
+    @staticmethod
+    def _firmware_entry_allows_release_uf2(entry: Optional[Dict[str, Any]]) -> bool:
+        """True only for legacy Default cards that install from a bundled UF2 in BOOTSEL."""
+        if not entry:
+            return False
+        if str(entry.get("kind") or "").lower() != "vintage_radio":
+            return False
+        if str(entry.get("generation") or "").lower() == "current":
+            return False
+        return bool(str(entry.get("uf2Path") or "").strip())
 
     def _run_smart_install_with_progress(
-        self, *, full_uf2: Optional[Path] = None,
+        self,
+        *,
+        full_uf2: Optional[Path] = None,
+        allow_release_uf2: bool = False,
     ) -> None:
         """Run smart install on a worker thread with a modal progress dialog."""
         if getattr(self, "_smart_install_active", False):
@@ -7532,9 +9460,16 @@ class MainWindow(QtWidgets.QMainWindow):
             kwargs={
                 "preferred_serial_port": preferred,
                 "full_uf2_path": str(full_uf2) if full_uf2 is not None else None,
+                "allow_release_uf2": allow_release_uf2,
             },
-            initial_message="Preparing firmware install…",
+            initial_message=_uf2_flash_initial_progress_message(
+                preparing="Preparing firmware install…",
+            ),
             on_before_start=lambda: self._prepare_install_serial_for_worker(dlg),
+            on_reject=self._on_install_dialog_aborted,
+            cancelable=True,
+            cancel_callback_kwarg="should_cancel",
+            cancel_warning=_INSTALL_CANCEL_WARNING,
         )
 
         def _on_success(result: Any) -> None:
@@ -7544,6 +9479,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def _on_error(msg: str) -> None:
             self._smart_install_active = False
+            if "cancelled by user" in msg.lower():
+                self.statusBar().showMessage("Firmware install cancelled.", 8000)
+                return
             VintageMessageBox.warning(self, "Install Firmware", f"Error:\n\n{msg}")
 
         dlg.on_success = _on_success
@@ -7557,12 +9495,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_smart_install_with_progress()
 
     def _install_vintage_radio_official_firmware(
+        self,
+        entry: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Install official Default firmware — always copy bundled code; legacy UF2 in BOOTSEL only."""
+        allow_uf2 = self._firmware_entry_allows_release_uf2(entry)
+        self._run_smart_install_with_progress(
+            full_uf2=self._resolve_vintage_radio_full_uf2(entry) if allow_uf2 else None,
+            allow_release_uf2=allow_uf2,
+        )
+
+    def _install_vintage_radio_conductor_firmware(
         self, entry: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Install official Vintage Radio basic firmware (smart detect + one-button flow)."""
-        self._run_smart_install_with_progress(
-            full_uf2=self._resolve_vintage_radio_full_uf2(entry),
+        """Copy isolated Conductor firmware + this library's catalog to the Pico."""
+        _ = entry
+        slug = self._lib_registry.active_library()
+
+        def _mark_library_conductor_on_success() -> None:
+            self._lib_registry.set_library_firmware_family(slug, "conductor")
+            self._sync_commercials_controls()
+
+        self.install_to_pico(
+            install_mode="conductor",
+            post_install_success=_mark_library_conductor_on_success,
         )
+
+    def _warn_firmware_family_mismatch(self, *, expected: str) -> bool:
+        """Warn when library family differs from selected firmware. False = user cancelled."""
+        from gui.commercials import (
+            effective_firmware_family,
+            firmware_product_name,
+            library_badge_text,
+        )
+
+        meta = self._active_library_meta()
+        family = effective_firmware_family(meta)
+        expected_norm = "conductor" if expected == "conductor" else "basic"
+        if family == expected_norm:
+            return True
+        badge = library_badge_text(meta)
+        library_label = firmware_product_name(family)
+        if badge:
+            library_desc = f"{library_label} ({badge})"
+        else:
+            library_desc = library_label
+        selected_label = firmware_product_name(expected_norm)
+        reply = VintageMessageBox.warning(
+            self,
+            "Library firmware mismatch",
+            f"This library is set up for {library_desc}, but you selected "
+            f"{selected_label} to install.\n\n"
+            "Commercials and playback features from the other firmware will not work "
+            "correctly until you switch library, duplicate, or install the matching "
+            "firmware.\n\n"
+            "Continue install anyway?",
+            VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+            VintageMessageBox.StandardButton.Cancel,
+        )
+        return reply == VintageMessageBox.StandardButton.Yes
 
     def _auto_flash_micropython_to_bootsel(self) -> bool:
         """Download/cache stock MicroPython and copy to BOOTSEL without opening a dialog."""
@@ -8071,16 +10062,31 @@ class MainWindow(QtWidgets.QMainWindow):
             warn.setVisible(True)
             return
 
-        msgs = self.sd_manager.validate_basic_sd(
+        from gui.commercials import is_folder_commercials
+
+        reserved = None
+        if not self._uses_custom_software() and is_folder_commercials(self._active_library_meta()):
+            reserved = 99
+        validation = self.sd_manager.validate_basic_sd(
             root,
-            reserved_folder=(99 if not self._uses_custom_software() else None),
+            reserved_folder=reserved,
         )
-        if not msgs:
+        if not validation.has_issues:
             return
 
-        self._basic_sd_sync_issues = msgs
-        n = len(msgs)
-        if n > 30:
+        self._basic_sd_sync_validation = validation
+        n_err = len(validation.sync_errors)
+        n_diff = len(validation.differences)
+        if n_err and n_diff:
+            warn.setText(
+                f"{n_err} track{'s' if n_err != 1 else ''} failed the last sync; "
+                f"{n_diff} SD difference{'s' if n_diff != 1 else ''} found."
+            )
+        elif n_err:
+            warn.setText(
+                f"{n_err} track{'s' if n_err != 1 else ''} failed the last sync."
+            )
+        elif n_diff > 30:
             warn.setText(
                 "Your SD card looks different from your library (many changes detected). "
                 "A sync will bring it up to date."
@@ -8088,7 +10094,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             warn.setText(
                 f"Your SD card looks different from your library "
-                f"({n} difference{'s' if n != 1 else ''} found)."
+                f"({n_diff} difference{'s' if n_diff != 1 else ''} found)."
             )
         warn.setVisible(True)
         if _qt_widget_alive(details_btn):
@@ -8096,20 +10102,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_basic_sd_sync_details(self) -> None:
         """Open a scrollable dialog listing SD sync mismatch details."""
-        msgs = getattr(self, "_basic_sd_sync_issues", [])
-        if not msgs:
+        validation = getattr(self, "_basic_sd_sync_validation", None)
+        if validation is None or not validation.has_issues:
             return
-        body = "\n".join(f"  - {m}" for m in msgs)
-        if len(msgs) > 30:
-            body = (
-                "Your SD card differs from your library in many places "
-                "(first 30 shown below).\nSyncing will bring the card up to date.\n\n"
-                + "\n".join(f"  - {m}" for m in msgs[:30])
-                + f"\n  ... and {len(msgs) - 30} more."
+        sections: List[str] = []
+        if validation.sync_errors:
+            header = (
+                f"Sync errors ({len(validation.sync_errors)} track"
+                f"{'s' if len(validation.sync_errors) != 1 else ''}):"
             )
+            sections.append(
+                header
+                + "\n"
+                + "\n".join(f"  - {m}" for m in validation.sync_errors)
+            )
+        if validation.differences:
+            header = (
+                f"SD differences ({len(validation.differences)}):"
+            )
+            sections.append(
+                header
+                + "\n"
+                + "\n".join(f"  - {m}" for m in validation.differences)
+            )
+        body = "\n\n".join(sections)
+        title = "SD Sync Status"
+        if validation.sync_errors and not validation.differences:
+            title = "Sync Errors"
+        elif validation.differences and not validation.sync_errors:
+            title = "SD Card Differences"
         VintageTextDialog(
             self,
-            title="SD Card Differences",
+            title=title,
             text=body,
             read_only=True,
             min_height=280,
@@ -8198,7 +10222,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._release_serial_if_connected_for_mpremote(log_prefix="SETUP"):
                 self.statusBar().showMessage(
                     "Serial console disconnected so Setup Device can use the USB port. "
-                    "Click Connect on the Device tab when finished.",
+                    "Click Connect in Tools → Debugger when finished.",
                     12000,
                 )
 
@@ -8408,7 +10432,17 @@ class MainWindow(QtWidgets.QMainWindow):
         data = combo.currentData()
         source = "custom" if str(data) == "custom" else "our"
         self.db.set_setting("advanced_software_source", source)
+        self._sync_dfplayer_eq_ui_visibility()
         self._rebuild_tabs()
+
+    def _sync_dfplayer_eq_ui_visibility(self) -> None:
+        use_custom = (
+            self.db.get_setting("advanced_software_source", "our") or "our"
+        ) == "custom"
+        for attr in ("_advanced_dfplayer_eq_label", "_advanced_dfplayer_eq_combo"):
+            widget = getattr(self, attr, None)
+            if widget is not None and _qt_widget_alive(widget):
+                widget.setVisible(not use_custom)
 
     def _on_advanced_dfplayer_eq_changed(self, *_args) -> None:
         combo = getattr(self, "_advanced_dfplayer_eq_combo", None)
@@ -8618,9 +10652,73 @@ class MainWindow(QtWidgets.QMainWindow):
         if not out:
             return None
         mode = out[-1].strip().lower()
-        if mode in {"basic", "advanced", "legacy"}:
+        if mode in {"basic", "advanced", "legacy", "conductor"}:
             return mode
         return None
+
+    def _pico_runtime_payloads(self) -> Tuple[str, str]:
+        meta = self._active_library_meta()
+        commercials = self.sd_manager._commercials_runtime_payload(meta)
+        catalog = ""
+        if str(meta.get("firmware_family") or "") == "conductor":
+            catalog = json.dumps(
+                self.sd_manager.build_radio_catalog_from_db(meta),
+                separators=(",", ":"),
+            )
+        return catalog, json.dumps(commercials, separators=(",", ":"))
+
+    def _write_pico_radio_settings_if_connected(self) -> bool:
+        """Write commercials JSON and Conductor catalog to Pico flash (no firmware copy)."""
+        mpremote_cmd = self._resolve_mpremote_cmd()
+        if not mpremote_cmd:
+            return False
+        catalog_json, commercials_json = self._pico_runtime_payloads()
+        install_mode = str(self._active_library_meta().get("firmware_family") or "basic")
+        tmpdir = None
+        try:
+            import tempfile as _tempfile
+
+            tmpdir = _tempfile.mkdtemp()
+            runtime = Path(tmpdir) / "advanced_runtime.json"
+            runtime.write_text(
+                json.dumps(
+                    {
+                        "install_mode": install_mode,
+                        "dfplayer_eq": self._selected_dfplayer_eq(),
+                        "commercials": json.loads(commercials_json),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            r = _run_mpremote(
+                mpremote_cmd,
+                ["connect", "auto", "cp", str(runtime), ":VintageRadio/advanced_runtime.json"],
+                cwd=str(self._project_root()),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if r.returncode != 0:
+                return False
+            if catalog_json:
+                ok, _err = _push_radio_catalog_and_maybe_reset_state(
+                    mpremote_cmd,
+                    catalog_json,
+                    cwd=str(self._project_root()),
+                    timeout=20,
+                )
+                if not ok:
+                    return False
+            self._commercials_settings_dirty = False
+            return True
+        except Exception:
+            return False
+        finally:
+            if tmpdir:
+                try:
+                    shutil.rmtree(tmpdir)
+                except Exception:
+                    pass
 
     # ═══════════════════════════════════════════════════════════════════════════
     # LOAD MUSIC PAGE — widget factories
@@ -8640,7 +10738,9 @@ class MainWindow(QtWidgets.QMainWindow):
           gui/widgets/load_music/track_panel/track_panel.py
           gui/widgets/load_music/sync_bar/sync_bar.py
         """
-        self._basic_sd_sync_issues: List[str] = []
+        from gui.sd_manager import BasicSdSyncValidation
+
+        self._basic_sd_sync_validation = BasicSdSyncValidation()
 
         page = _LoadMusicPage(
             sd_root=self.sd_root or "",
@@ -8670,6 +10770,10 @@ class MainWindow(QtWidgets.QMainWindow):
         page.station_panel.folders_dropped.connect(self._import_folders_as_basic_stations)
         page.station_panel.context_menu_requested.connect(self._show_station_context_menu)
         page.station_panel.new_station_clicked.connect(self._create_basic_station)
+        page.sync_bar.commercials_toggled.connect(self._on_commercials_toggled)
+        page.sync_bar.commercials_interval_changed.connect(self._on_commercials_interval_changed)
+        page.sync_bar.inline_commercials_toggled.connect(self._on_inline_commercials_toggled)
+        self._sync_commercials_controls()
 
         # ── TrackPanel aliases and signals ────────────────────────────────────
         self._basic_station_tracks_table = page.track_panel.tracks_table
@@ -8678,11 +10782,14 @@ class MainWindow(QtWidgets.QMainWindow):
         page.track_panel.files_dropped.connect(self._import_files_to_basic_station)
         page.track_panel.order_changed.connect(self._persist_basic_station_track_order)
         page.track_panel.context_menu_requested.connect(self._show_station_track_context_menu)
+        page.track_panel.toggle_commercial_requested.connect(self._on_track_commercial_toggle)
+        page.track_panel.toggle_link_requested.connect(self._on_track_link_toggle)
 
         # ── SyncBar aliases and signals ───────────────────────────────────────
         page.sync_bar.sync_clicked.connect(self._sync_basic_to_sd)
         page.sync_bar.eject_clicked.connect(self.safely_remove_sd)
 
+        self._load_music_page = page
         self._refresh_basic_station_list()
         self._update_basic_stations_size()
         self._update_sd_root_label()
@@ -8756,10 +10863,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 prev_station_id = prev_item.data(QtCore.Qt.ItemDataRole.UserRole)
         self._basic_station_list.blockSignals(True)
         self._basic_station_list.clear()
+        self._reconcile_reserved_commercials_station()
         stations = self.db.list_basic_stations()
         track_counts = self.db.basic_station_track_counts()
         restore_row = -1
-        for idx, station in enumerate(stations):
+        from gui.commercials import is_folder_commercials
+
+        meta = self._active_library_meta()
+        display_idx = 0
+        for station in stations:
             track_count = track_counts.get(int(station["id"]), 0)
             item = QtWidgets.QListWidgetItem(
                 f'{station["name"]}  (Folder {station["folder_number"]:02d}, {track_count} tracks)'
@@ -8769,9 +10881,18 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setData(_STATION_NUM_ROLE, int(station["folder_number"]))
             item.setData(_STATION_NAME_ROLE, station["name"])
             item.setData(_STATION_COUNT_ROLE, int(track_count))
+            if (
+                meta.get("commercials_enabled")
+                and is_folder_commercials(meta)
+                and int(station["folder_number"]) == 99
+            ):
+                item.setData(_STATION_KIND_ROLE, "commercials")
+            else:
+                item.setData(_STATION_KIND_ROLE, "music")
             self._basic_station_list.addItem(item)
             if preserve_selection and prev_station_id is not None and station["id"] == prev_station_id:
-                restore_row = idx
+                restore_row = display_idx
+            display_idx += 1
         if preserve_selection and restore_row >= 0:
             self._basic_station_list.setCurrentRow(restore_row)
         else:
@@ -8860,6 +10981,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setData(_STATION_COUNT_ROLE, int(track_count))
                 break
 
+    def _track_row_is_commercial(self, song: Dict[str, Any]) -> bool:
+        if bool(song.get("is_commercial")):
+            return True
+        item = getattr(self, "_basic_station_list", None)
+        current = item.currentItem() if _qt_widget_alive(item) else None
+        if current is None:
+            return False
+        return str(current.data(_STATION_KIND_ROLE) or "") == "commercials"
+
     def _populate_basic_station_tracks_table(self, songs: list) -> None:
         """Fill the tracks table in one batched pass (no per-row filesystem checks)."""
         table = self._basic_station_tracks_table
@@ -8868,11 +10998,30 @@ class MainWindow(QtWidgets.QMainWindow):
         table.setSortingEnabled(False)
         try:
             table.setRowCount(len(songs))
+            can_mark = self._can_mark_track_commercial()
             for row_idx, song in enumerate(songs):
                 title = song.get("title") or song.get("original_filename") or ""
                 artist = song.get("artist") or ""
+                tagged = bool(song.get("is_commercial"))
+                is_ad = self._track_row_is_commercial(song)
+                next_is_ad = None
+                if row_idx + 1 < len(songs):
+                    next_is_ad = self._track_row_is_commercial(songs[row_idx + 1])
+                from gui.commercials import can_link_commercial_to_next
+
+                show_link = can_mark and can_link_commercial_to_next(is_ad, next_is_ad)
+                linked = bool(int(song.get("link_to_next") or 0)) and show_link
                 title_item = QtWidgets.QTableWidgetItem()
-                configure_track_title_item(title_item, title, artist=artist)
+                configure_track_title_item(
+                    title_item,
+                    title,
+                    artist=artist,
+                    is_commercial=is_ad,
+                    show_commercial_toggle=can_mark or tagged,
+                    link_to_next=linked,
+                    show_link_toggle=show_link,
+                    sync_error=str(song.get("sync_error") or "").strip(),
+                )
                 title_item.setData(QtCore.Qt.ItemDataRole.UserRole, song.get("id"))
                 title_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, song.get("bst_id"))
                 table.setItem(row_idx, 0, title_item)
@@ -8920,10 +11069,12 @@ class MainWindow(QtWidgets.QMainWindow):
         name, ok = get_text(self, "New Station", "Station name:")
         if not ok or not name.strip():
             return
+        from gui.commercials import is_folder_commercials
+
+        max_station_folders = 98 if is_folder_commercials(self._active_library_meta()) else 99
         try:
-            folder = self.db.next_basic_station_folder(max_folder=99)
+            folder = self.db.next_basic_station_folder(max_folder=max_station_folders)
         except ValueError:
-            max_station_folders = 99
             VintageMessageBox.warning(
                 self,
                 "Limit Reached",
@@ -8974,7 +11125,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if sid is not None:
                     ids.append(sid)
         if ids:
-            self.db.update_basic_station_order(ids)
+            from gui.commercials import is_folder_commercials
+
+            self.db.update_basic_station_order(
+                ids, pin_folder_99=is_folder_commercials(self._active_library_meta())
+            )
             self._refresh_basic_station_list()
             self._update_basic_stations_size()
 
@@ -9299,15 +11454,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         station_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
         table = self._basic_station_tracks_table
-        song_ids = []
+        bst_ids = []
         for row in range(table.rowCount()):
             title_item = table.item(row, 0)
             if title_item:
-                sid = title_item.data(QtCore.Qt.ItemDataRole.UserRole)
-                if sid is not None:
-                    song_ids.append(sid)
-        if song_ids:
-            self.db.replace_basic_station_tracks(station_id, song_ids)
+                bst_id = title_item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+                if bst_id is not None:
+                    bst_ids.append(int(bst_id))
+        if bst_ids:
+            self.db.reorder_basic_station_tracks(station_id, bst_ids)
             self._refresh_basic_station_tracks(station_id)
             self._update_basic_stations_size()
 
@@ -9387,6 +11542,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 replace_act.triggered.connect(
                     lambda checked=False, _sid=sid: self._replace_song_source_path(_sid)
                 )
+            bst_id = (
+                title_item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+                if title_item is not None
+                else None
+            )
+            is_ad = bool(title_item.data(TRACK_COMMERCIAL_ROLE)) if title_item is not None else False
+            if bst_id is not None and (self._can_mark_track_commercial() or is_ad):
+                mark_act = menu.addAction(
+                    "Mark as music" if is_ad else "Mark as commercial"
+                )
+                mark_act.triggered.connect(
+                    lambda checked=False, _bst=int(bst_id), _ad=is_ad: self._set_track_commercial(_bst, not _ad)
+                )
+                from gui.widgets.common.delegates import TRACK_LINK_TOGGLE_ROLE, track_is_linked
+
+                if bool(title_item.data(TRACK_LINK_TOGGLE_ROLE)):
+                    linked = track_is_linked(title_item)
+                    link_act = menu.addAction(
+                        "Unlink from track below" if linked else "Link to track below"
+                    )
+                    link_act.triggered.connect(
+                        lambda checked=False, _bst=int(bst_id), _on=linked: self._set_track_link(
+                            _bst, not _on
+                        )
+                    )
             remove_act = menu.addAction("Remove Selected")
             remove_act.triggered.connect(self._remove_songs_from_basic_station)
         menu.exec(table.viewport().mapToGlobal(pos))
@@ -9472,7 +11652,51 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._basic_confirm_broken_sources_before_sync():
             return
 
+        failure_prompter = SyncFailurePrompter(self)
+
+        def on_sync_failure(info: dict) -> str:
+            return failure_prompter.ask(info)
+
         software_source = self._software_source_for_sync()
+        from gui.commercials import is_folder_commercials
+
+        library_meta = self._active_library_meta()
+        if is_folder_commercials(library_meta):
+            ads = None
+            for st in stations:
+                if int(st["folder_number"]) == 99:
+                    ads = st
+                    break
+            ad_count = 0
+            if ads is not None:
+                ad_count = len(self.db.list_basic_station_songs(ads["id"]))
+            if ad_count <= 0:
+                reply = VintageMessageBox.warning(
+                    self,
+                    "No commercials yet",
+                    "Commercials are on, but the Commercials station has no tracks. "
+                    "No commercials will play until you add some and sync again.\n\nContinue sync?",
+                    VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+                    VintageMessageBox.StandardButton.Cancel,
+                )
+                if reply != VintageMessageBox.StandardButton.Yes:
+                    return
+        from gui.commercials import effective_firmware_family, firmware_product_name
+
+        pico_mode = self._read_pico_install_mode()
+        library_family = effective_firmware_family(library_meta)
+        if pico_mode and pico_mode != library_family:
+            reply = VintageMessageBox.warning(
+                self,
+                "Firmware family mismatch",
+                f"This library is set up for {firmware_product_name(library_family)}, "
+                f"but the connected Pico has {firmware_product_name(pico_mode)} installed.\n\n"
+                "Install the matching firmware, switch library, or cancel sync.",
+                VintageMessageBox.StandardButton.Yes | VintageMessageBox.StandardButton.Cancel,
+                VintageMessageBox.StandardButton.Cancel,
+            )
+            if reply != VintageMessageBox.StandardButton.Yes:
+                return
         dlg = TaskProgressDialog(
             parent=self,
             title="Sync Stations to SD" + (" (clean)" if force_clean else ""),
@@ -9483,6 +11707,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "conversion_profile": self._selected_conversion_profile(),
                 "dfplayer_eq": self._selected_dfplayer_eq() if software_source == "our" else "normal",
                 "use_conversion_cache": self._retain_conversion_cache(),
+                "on_sync_failure": on_sync_failure,
+                "library_meta": library_meta,
             },
             cancelable=True,
             cancel_callback_kwarg="should_cancel",
@@ -9490,6 +11716,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def on_success(result):
             conversion_failures: List[Dict[str, Any]] = []
+            copy_failures: List[Dict[str, Any]] = []
             missing_paths: List[Dict[str, str]] = []
             if isinstance(result, dict):
                 copied = int(result.get("copied", 0))
@@ -9497,6 +11724,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 raw_cf = result.get("conversion_failures")
                 if isinstance(raw_cf, list):
                     conversion_failures = [x for x in raw_cf if isinstance(x, dict)]
+                raw_copy = result.get("copy_failures")
+                if isinstance(raw_copy, list):
+                    copy_failures = [x for x in raw_copy if isinstance(x, dict)]
                 raw_mp = result.get("missing_source_paths")
                 if isinstance(raw_mp, list):
                     missing_paths = [x for x in raw_mp if isinstance(x, dict)]
@@ -9528,32 +11758,54 @@ class MainWindow(QtWidgets.QMainWindow):
                     ),
                     proceed_text=None,
                 )
-            if conversion_failures:
-                show_n = min(15, len(conversion_failures))
+            if conversion_failures or copy_failures:
+                show_n = min(15, len(conversion_failures) + len(copy_failures))
                 detail_lines = []
                 for item in conversion_failures[:show_n]:
+                    title = str(item.get("title") or "").strip()
                     name = str(item.get("name") or Path(str(item.get("path", ""))).name)
+                    label = title if title and title != "?" else name
                     err = str(item.get("error") or "unknown error").strip()
                     if len(err) > 200:
                         err = err[:200] + "…"
-                    detail_lines.append(f"{name}\n  {err}")
+                    station = str(item.get("station") or "").strip()
+                    prefix = f"{label} ({station})" if station else label
+                    detail_lines.append(f"{prefix}\n  {err}")
+                remaining = show_n - len(conversion_failures[:show_n])
+                for item in copy_failures[: max(0, remaining)]:
+                    name = str(item.get("name") or Path(str(item.get("path", ""))).name)
+                    err = str(item.get("error") or "copy failed").strip()
+                    if len(err) > 200:
+                        err = err[:200] + "…"
+                    detail_lines.append(f"{name} (SD copy)\n  {err}")
+                total_failures = len(conversion_failures) + len(copy_failures)
                 tail = ""
-                if len(conversion_failures) > show_n:
-                    tail = f"\n\n… and {len(conversion_failures) - show_n} more (full paths in log)."
+                if total_failures > show_n:
+                    tail = f"\n\n… and {total_failures - show_n} more (full paths in log)."
                 VintageMessageBox.warning(
                     self,
-                    "Some files failed to convert",
-                    "These library files could not be converted to MP3 and were not copied "
-                    "to the SD card. Fix or remove the bad files and sync again.\n\n"
+                    "Some files failed to sync",
+                    "These library files could not be converted or copied to the SD card. "
+                    "Fix or remove the bad files and sync again.\n\n"
                     + "\n\n".join(detail_lines)
                     + tail,
                 )
             else:
-                VintageMessageBox.information(
-                    self,
-                    "Sync complete",
-                    f"Library synced to the SD card.\n\nCopied: {copied}\nSkipped: {skipped}",
+                from gui.commercials import post_sync_warning, requires_pico_catalog
+
+                meta = self._active_library_meta()
+                extra = post_sync_warning(
+                    meta,
+                    settings_changed=bool(getattr(self, "_commercials_settings_dirty", False)),
                 )
+                body = f"Library synced to the SD card.\n\nCopied: {copied}\nSkipped: {skipped}"
+                if extra:
+                    body = f"{body}\n\n{extra}"
+                if requires_pico_catalog(meta) or extra:
+                    VintageMessageBox.information(self, "Sync complete — update the Pico", body)
+                    self._write_pico_radio_settings_if_connected()
+                else:
+                    VintageMessageBox.information(self, "Sync complete", body)
             self._refresh_library_source_health_ui()
             for _w in (
                 getattr(self, "_basic_debug_widget", None),
@@ -10295,6 +12547,38 @@ class MainWindow(QtWidgets.QMainWindow):
         pin_row.addWidget(config_pins_btn)
         layout.addLayout(pin_row)
 
+        eq_row = QtWidgets.QHBoxLayout()
+        self._advanced_dfplayer_eq_label = QtWidgets.QLabel("DFPlayer equalizer:")
+        eq_row.addWidget(self._advanced_dfplayer_eq_label)
+        self._advanced_dfplayer_eq_combo = VintageComboBox(
+            min_width=160,
+            max_width=280,
+            fixed_height=_theme.TOOLS_ACTION_BTN_H,
+        )
+        for label, value in (
+            ("Normal", "normal"),
+            ("Pop", "pop"),
+            ("Rock", "rock"),
+            ("Jazz", "jazz"),
+            ("Classical", "classic"),
+            ("Bass", "bass"),
+        ):
+            self._advanced_dfplayer_eq_combo.addItem(label, value)
+        current_eq = self._selected_dfplayer_eq()
+        idx = self._advanced_dfplayer_eq_combo.findData(current_eq)
+        if idx >= 0:
+            self._advanced_dfplayer_eq_combo.setCurrentIndex(idx)
+        self._advanced_dfplayer_eq_combo.setToolTip(
+            "Applied on the Pico when you Install Firmware or Sync to SD "
+            "(Vintage Radio firmware only)."
+        )
+        self._advanced_dfplayer_eq_combo.currentIndexChanged.connect(
+            self._on_advanced_dfplayer_eq_changed
+        )
+        eq_row.addWidget(self._advanced_dfplayer_eq_combo, 1)
+        layout.addLayout(eq_row)
+        self._sync_dfplayer_eq_ui_visibility()
+
         self._basic_sd_pico_warning = QtWidgets.QLabel()
         self._basic_sd_pico_warning.setWordWrap(True)
         self._basic_sd_pico_warning.setStyleSheet("color: #c00; font-weight: bold;")
@@ -10714,6 +12998,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_albums()
         self.refresh_playlists()
         self._refresh_basic_stations_if_visible()
+        if hasattr(self, "_sync_commercials_controls"):
+            self._sync_commercials_controls()
 
     def _refresh_basic_stations_if_visible(self) -> None:
         """Reload basic-mode station list when the active library DB changes.
@@ -10778,8 +13064,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def _decorate_track_title_item_source_health(
         self, title_item: QtWidgets.QTableWidgetItem, song: Any
     ) -> None:
-        """Show a warning icon + tooltip when the stored source path is broken."""
-        if self._song_source_path_missing(song):
+        """Show a warning icon + tooltip when the source path or last sync failed."""
+        sync_error = ""
+        try:
+            sync_error = str(song.get("sync_error") or "").strip()
+        except (TypeError, KeyError, AttributeError):
+            sync_error = ""
+
+        if sync_error:
+            title_item.setIcon(
+                self.style().standardIcon(
+                    QtWidgets.QStyle.StandardPixmap.SP_MessageBoxCritical
+                )
+            )
+            when = ""
+            try:
+                when = str(song.get("sync_error_at") or "").strip()
+            except (TypeError, KeyError, AttributeError):
+                when = ""
+            tip = f"Last SD sync failed:\n{sync_error}"
+            if when:
+                tip += f"\n\nRecorded: {when}"
+            tip += "\n\nFix the source file or conversion settings, then sync again."
+            title_item.setToolTip(tip)
+        elif self._song_source_path_missing(song):
             title_item.setIcon(
                 self.style().standardIcon(
                     QtWidgets.QStyle.StandardPixmap.SP_MessageBoxWarning
@@ -10864,6 +13172,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "file_size": metadata["file_size"],
                 "format": metadata["format"],
                 "sd_path": "",
+                "sync_error": None,
+                "sync_error_at": None,
             },
         )
         self._refresh_library_source_health_ui()
@@ -12524,6 +14834,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dfplayer_eq: str = "normal",
         after_firmware: bool = False,
         preferred_serial_port: Optional[str] = None,
+        radio_catalog_json: str = "",
+        commercials_json: str = "",
     ) -> str:
         """Background worker: copy firmware files to Pico via mpremote CLI.
 
@@ -12549,22 +14861,33 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Install mpremote for system Python: python3 -m pip install mpremote"
                     )
 
-        main_source = "firmware/pico/main_basic.py" if basic_mode else "firmware/pico/main.py"
-        files_to_copy = [
-            (main_source, "main.py"),
-            ("firmware/radio_core.py", "radio_core.py"),
-            ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
-            (
-                "firmware/pico/components/vintage_radio_ipc.py",
-                "components/vintage_radio_ipc.py",
-            ),
-            (
-                "firmware/pico/components/am_wav_loader.py",
-                "components/am_wav_loader.py",
-            ),
-            ("firmware/pin_config_loader.py", "pin_config_loader.py"),
-            ("firmware/pico/sdcard.py", "sdcard.py"),
-        ]
+        from gui.commercials import firmware_copy_pairs
+
+        install_mode_norm = (install_mode or "basic").strip().lower()
+        if install_mode_norm == "conductor":
+            files_to_copy = list(firmware_copy_pairs("conductor"))
+        elif basic_mode:
+            files_to_copy = list(firmware_copy_pairs("basic"))
+        else:
+            files_to_copy = [
+                ("firmware/pico/main.py", "main.py"),
+                ("firmware/radio_core.py", "radio_core.py"),
+                ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
+                (
+                    "firmware/pico/components/vintage_radio_ipc.py",
+                    "components/vintage_radio_ipc.py",
+                ),
+                (
+                    "firmware/pico/components/am_wav_loader.py",
+                    "components/am_wav_loader.py",
+                ),
+                (
+                    "firmware/pico/components/radio_state.py",
+                    "components/radio_state.py",
+                ),
+                ("firmware/pin_config_loader.py", "pin_config_loader.py"),
+                ("firmware/pico/sdcard.py", "sdcard.py"),
+            ]
 
         # If a custom driver is specified in the active profile, use it instead
         if custom_hw_driver_path and Path(custom_hw_driver_path).is_file():
@@ -12759,21 +15082,35 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Write advanced runtime settings used by new advanced mode ──
         _report("Writing runtime settings...")
         install_mode = (install_mode or "basic").strip().lower()
-        if install_mode not in {"basic", "advanced", "legacy"}:
+        if install_mode not in {"basic", "advanced", "legacy", "conductor"}:
             install_mode = "basic"
         dfplayer_eq = (dfplayer_eq or "normal").strip().lower()
         if dfplayer_eq not in {"normal", "pop", "rock", "jazz", "classic", "bass"}:
             dfplayer_eq = "normal"
+        runtime_payload: Dict[str, Any] = {"install_mode": install_mode, "dfplayer_eq": dfplayer_eq}
+        if commercials_json:
+            try:
+                commercials_obj = json.loads(commercials_json)
+                if isinstance(commercials_obj, dict):
+                    runtime_payload["commercials"] = commercials_obj
+            except json.JSONDecodeError:
+                pass
         tmpdir_cfg2 = _tempfile.mkdtemp()
         try:
             mode_file = Path(tmpdir_cfg2) / "advanced_runtime.json"
-            mode_file.write_text(
-                json.dumps({"install_mode": install_mode, "dfplayer_eq": dfplayer_eq}),
-                encoding="utf-8",
-            )
+            mode_file.write_text(json.dumps(runtime_payload), encoding="utf-8")
             r = run_mpremote_with_retry(["cp", str(mode_file), ":VintageRadio/advanced_runtime.json"])
             if r.returncode != 0:
                 print(f"Warning: advanced_runtime.json copy failed: {r.stderr or r.stdout}")
+            if radio_catalog_json:
+                ok_cat, err_cat = _push_radio_catalog_and_maybe_reset_state(
+                    mpremote_cmd,
+                    radio_catalog_json,
+                    cwd=_mpremote_cwd,
+                    timeout=20,
+                )
+                if not ok_cat:
+                    print(f"Warning: radio_catalog.json copy failed: {err_cat}")
         except Exception as e:
             print(f"Warning: Could not copy advanced_runtime.json: {e}")
         finally:
@@ -12929,6 +15266,7 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         install_mode: str = "basic",
         dfplayer_eq: str = "normal",
+        post_install_success: Optional[Callable[[], None]] = None,
     ) -> None:
         """Copy application files to Pico via mpremote (bundled with executable, or requires: pip install mpremote).
 
@@ -12954,7 +15292,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._release_serial_if_connected_for_mpremote(log_prefix="INSTALL"):
             self.statusBar().showMessage(
                 "Serial console disconnected so Install to Pico can use the USB port. "
-                "Click Connect on the Device tab when finished.",
+                "Click Connect in Tools → Debugger when finished.",
                 12000,
             )
 
@@ -12965,16 +15303,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         root = self._project_root()
-        main_source = "firmware/pico/main_basic.py" if basic_mode else "firmware/pico/main.py"
-        if not (root / main_source).exists():
-            VintageMessageBox.warning(self, "Install to Pico", f"{main_source} not found.")
-            return
-        if not (root / "firmware" / "radio_core.py").exists():
-            VintageMessageBox.warning(self, "Install to Pico", "Project files not found.")
-            return
-        if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
-            VintageMessageBox.warning(self, "Install to Pico", "firmware/pico/dfplayer_hardware.py not found.")
-            return
+        if install_mode == "conductor":
+            main_source = "firmware/conductor/main.py"
+            if not (root / main_source).exists():
+                VintageMessageBox.warning(self, "Install to Pico", f"{main_source} not found.")
+                return
+            if not (root / "firmware" / "conductor" / "radio_core.py").exists():
+                VintageMessageBox.warning(self, "Install to Pico", "firmware/conductor/radio_core.py not found.")
+                return
+        else:
+            main_source = "firmware/pico/main_basic.py" if basic_mode else "firmware/pico/main.py"
+            if not (root / main_source).exists():
+                VintageMessageBox.warning(self, "Install to Pico", f"{main_source} not found.")
+                return
+            if not (root / "firmware" / "radio_core.py").exists():
+                VintageMessageBox.warning(self, "Install to Pico", "Project files not found.")
+                return
+            if not (root / "firmware" / "pico" / "dfplayer_hardware.py").exists():
+                VintageMessageBox.warning(self, "Install to Pico", "firmware/pico/dfplayer_hardware.py not found.")
+                return
 
         profile_params = self._get_active_profile_install_params()
         profile_params["basic_mode"] = basic_mode
@@ -12982,14 +15329,22 @@ class MainWindow(QtWidgets.QMainWindow):
         profile_params["dfplayer_eq"] = dfplayer_eq
         profile_params["after_firmware"] = after_firmware
         profile_params["preferred_serial_port"] = _read_preferred_serial_port_from_ui(self)
+        catalog_payload, commercials_payload = self._pico_runtime_payloads()
+        profile_params["radio_catalog_json"] = catalog_payload
+        profile_params["commercials_json"] = commercials_payload
         use_inprocess = mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__"
 
         title = "Install to Pico (Basic Mode)" if basic_mode else "Install to Pico"
 
+        def _finish_install_success(msg: str) -> None:
+            if post_install_success is not None:
+                post_install_success()
+            self.statusBar().showMessage(str(msg), 5000)
+
         if use_inprocess:
             _run_install_main_thread(
                 self, mpremote_cmd, root, self.sd_root, self.sd_manager,
-                after_firmware, on_success=lambda m: self.statusBar().showMessage(str(m), 5000),
+                after_firmware, on_success=_finish_install_success,
                 on_error=lambda m: _show_install_error(self, m, after_firmware),
                 **profile_params,
             )
@@ -13008,13 +15363,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
             )
 
-            def on_success(msg):
-                self.statusBar().showMessage(str(msg), 5000)
-
             def on_error(msg):
                 _show_install_error(self, msg, after_firmware)
 
-            dlg.on_success = on_success
+            dlg.on_success = _finish_install_success
             dlg.on_error = on_error
             dlg.exec()
 
@@ -13023,6 +15375,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mpremote_cmd: List[str],
         source_path: Path,
         progress_callback: Optional[Callable[..., Any]] = None,
+        config_injections: Optional[List[Tuple[str, str]]] = None,
     ) -> str:
         import threading
         if mpremote_cmd and mpremote_cmd[0] == "__INPROCESS__":
@@ -13128,6 +15481,42 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Failed to copy custom software file:\n"
                     f"{local_fp}\n\n{r.stderr or r.stdout or ''}"
                 )
+        injections = [
+            (Path(local), remote)
+            for local, remote in (config_injections or [])
+        ]
+        if injections:
+            from gui.pico_config_inject import inject_pico_config_files
+
+            def _cp(local_fp: Path, remote: str) -> bool:
+                r = _run_mpremote_connect_auto_with_retry(
+                    mpremote_cmd,
+                    ["cp", str(local_fp), remote],
+                    cwd=_mpremote_cwd,
+                    timeout=20,
+                    creationflags=creationflags,
+                    env=env,
+                )
+                return r.returncode == 0
+
+            def _wait(*_args, **kwargs):
+                return _wait_mpremote_serial_ready(
+                    mpremote_cmd,
+                    kwargs.get("cwd") or _mpremote_cwd,
+                    progress_callback=kwargs.get("progress_callback"),
+                    total_steps=total,
+                    creationflags=creationflags,
+                    env=env,
+                    after_uf2_flash=kwargs.get("after_uf2_flash", False),
+                )
+
+            inject_pico_config_files(
+                mpremote_cmd,
+                injections,
+                wait_serial_ready=_wait,
+                run_mpremote_cp=_cp,
+                progress_callback=progress_callback,
+            )
         _report("Rebooting Pico...")
         try:
             r = _run_mpremote_connect_auto_with_retry(
@@ -13288,12 +15677,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 "mpremote is not available. Install it with:\n\npip install mpremote",
             )
             return
+        entry = self._custom_firmware_entry_for_path(source_path)
+        try:
+            config_pairs = self._prepare_config_injections_for_uf2(
+                entry, uf2_path=None,
+            )
+        except ValueError as exc:
+            VintageMessageBox.warning(self, "Custom Software", str(exc))
+            return
         dlg = TaskProgressDialog(
             parent=self,
             title="Install Custom Software",
             func=self._install_custom_software_worker,
             args=(mpremote_cmd, source_path),
-            kwargs={},
+            kwargs={"config_injections": config_pairs},
         )
 
         def on_success(msg):

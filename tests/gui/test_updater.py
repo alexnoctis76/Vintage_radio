@@ -185,6 +185,60 @@ def test_run_update_check_up_to_date_when_current_ahead_of_github():
     assert result.release is not None
 
 
+def test_preferred_macos_asset_basename_arm64():
+    with mock.patch("gui.updater.platform.machine", return_value="arm64"):
+        assert updater.preferred_macos_asset_basename() == "Vintage-Radio-macOS-arm64.zip"
+
+
+def test_preferred_macos_asset_basename_x86_64():
+    with mock.patch("gui.updater.platform.machine", return_value="x86_64"):
+        assert updater.preferred_macos_asset_basename() == "Vintage-Radio-macOS-x86_64.zip"
+
+
+def test_get_platform_asset_mac_prefers_arch_specific_zip():
+    assets = [
+        {"name": "Vintage-Radio-macOS-x86_64.zip", "browser_download_url": "https://x/intel.zip"},
+        {"name": "Vintage-Radio-macOS-arm64.zip", "browser_download_url": "https://x/arm.zip"},
+    ]
+    with mock.patch("gui.updater.platform.system", return_value="Darwin"):
+        with mock.patch("gui.updater.platform.machine", return_value="arm64"):
+            picked = updater.get_platform_asset(assets)
+    assert picked is not None
+    assert picked["name"] == "Vintage-Radio-macOS-arm64.zip"
+
+
+def test_get_platform_asset_linux():
+    assets = [
+        {"name": "Vintage-Radio-Linux.zip", "browser_download_url": "https://x/linux.zip"},
+    ]
+    with mock.patch("gui.updater.platform.system", return_value="Linux"):
+        picked = updater.get_platform_asset(assets)
+    assert picked is not None
+    assert picked["name"] == "Vintage-Radio-Linux.zip"
+
+
+def test_run_update_check_skipped_when_update_disabled():
+    items = [
+        {
+            "tag_name": "v9.9.9",
+            "draft": False,
+            "html_url": "https://github.com/a/b/releases/tag/v9.9.9",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/z.zip",
+                }
+            ],
+        }
+    ]
+    with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+        with mock.patch("gui.release_config.update_check_enabled", return_value=False):
+            result = updater.run_update_check(current_version="v0.1.0")
+    assert result.status == "up_to_date"
+    assert result.release is None
+
+
 def test_run_update_check_update_available():
     items = [
         {

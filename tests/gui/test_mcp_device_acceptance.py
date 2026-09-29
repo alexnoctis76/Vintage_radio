@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import gui.mcp_device_acceptance as mda
 from gui.mcp_device_acceptance import (
     _lines_appended,
@@ -8,7 +10,10 @@ from gui.mcp_device_acceptance import (
     measure_library_shuffle_auto_advance_serial,
     pick_line_in_device_index,
     run_acceptance_suite,
+    run_device_acceptance_full,
 )
+
+_BOOT = "VRTEST IPC: uselect stdin polling enabled"
 
 
 def _make_state(track: int, album: int = 0, power_on: bool = True, busy_pin: int = 0) -> dict:
@@ -62,6 +67,35 @@ def test_acceptance_suite_minimal_mocked():
     assert any(s["name"] == "ping" and s["ok"] for s in r["steps"])
     assert any(s["name"] == "power_on_flag" and s["ok"] for s in r["steps"])
     assert any(s["name"] == "single_tap" and s["ok"] for s in r["steps"])
+
+
+def test_acceptance_suite_partial_ok_when_track_advance_fails():
+    """Document run_acceptance_suite leniency: track advance is non-critical."""
+
+    def invoke(action: str, payload: dict) -> dict:
+        if action == "physical_gesture":
+            g = payload.get("gesture")
+            if g == "ping":
+                return {"ok": True, "device": {"ok": True, "cmd": "ping"}}
+            if g == "get_state":
+                return {
+                    "ok": True,
+                    "device": {
+                        "ok": True,
+                        "cmd": "get_state",
+                        "state": _make_state(1, 0),
+                    },
+                }
+            if g == "single_tap":
+                return {"ok": True, "device": {"ok": True, "cmd": "single_tap"}}
+        return {"ok": False, "error": "unexpected", "action": action}
+
+    r = run_acceptance_suite(invoke=invoke, target="device", suite_profile="minimal")
+    assert r["ok"] is True
+    assert r["track_changed"] is False
+    failed = [s["name"] for s in r["steps"] if not s.get("ok")]
+    assert "track_advanced_after_single_tap" in failed
+    assert "PARTIAL" in r["report_markdown"]
 
 
 def test_acceptance_suite_emulator_skips_serial_ring():
@@ -190,6 +224,65 @@ def test_pick_line_in_empty():
     assert pick_line_in_device_index([], 1) is None
 
 
+def test_rank_line_in_orders_all_name_matches_not_just_the_best():
+    """A USB device shows up once per host API under the identical name; the
+    ranked list must surface every one of them, not collapse to a single
+    index, so callers can fall back past a stale API-specific slot."""
+    from gui.mcp_device_acceptance import rank_line_in_device_candidates
+
+    devices = [
+        {"index": 2, "name": "Vintage Radio Line In"},
+        {"index": 15, "name": "Vintage Radio Line In"},
+        {"index": 33, "name": "Vintage Radio Line In"},
+        {"index": 1, "name": "Headset Microphone"},
+    ]
+    ranked = rank_line_in_device_candidates(devices, 1)
+    assert ranked == [2, 15, 33, 1]
+
+
+def test_rank_line_in_deduplicates_default_index():
+    from gui.mcp_device_acceptance import rank_line_in_device_candidates
+
+    devices = [{"index": 7, "name": "Vintage Radio Line In"}]
+    assert rank_line_in_device_candidates(devices, 7) == [7]
+
+
+def test_rank_line_in_empty():
+    from gui.mcp_device_acceptance import rank_line_in_device_candidates
+
+    assert rank_line_in_device_candidates([], 1) == []
+
+
+def test_rank_line_in_omits_mme_when_a_working_host_api_exists():
+    """Opening the stale Windows MME slot on this USB adapter hangs, pops the
+    shared codec (heard on the speaker jack), and is never needed when
+    DirectSound or WASAPI enumerate the same physical line-in."""
+    from gui.mcp_device_acceptance import rank_line_in_device_candidates
+
+    devices = [
+        {"index": 2, "name": "Vintage Radio Line In", "hostapi": "MME"},
+        {"index": 15, "name": "Vintage Radio Line In", "hostapi": "Windows DirectSound"},
+        {"index": 33, "name": "Vintage Radio Line In", "hostapi": "Windows WASAPI"},
+    ]
+    assert rank_line_in_device_candidates(devices) == [15, 33]
+
+
+def test_rank_line_in_excludes_loopback_and_mic_sharing_the_chip_name():
+    """Stereo Mix and Microphone share the "realtek usb" vendor string with the
+    real line-in jack (same USB audio chip) but capture something else - a
+    playback loopback, or the built-in mic. Observed directly: Stereo Mix
+    reported a nonsensical +40 dBFS and would otherwise win a naive
+    loudest-wins probe, silently swapping the suite onto the wrong signal."""
+    from gui.mcp_device_acceptance import rank_line_in_device_candidates
+
+    devices = [
+        {"index": 54, "name": "Microphone (Realtek USB Audio)"},
+        {"index": 55, "name": "Line In (Realtek USB Audio)"},
+        {"index": 56, "name": "Stereo Mix (Realtek USB Audio)"},
+    ]
+    assert rank_line_in_device_candidates(devices) == [55]
+
+
 def test_measure_library_shuffle_auto_advance_two_fast_gaps():
     """Busy HIGH -> busy LOW gaps under 1s should pass."""
     q = [
@@ -308,3 +401,183 @@ def test_measure_auto_advance_best_effort_does_not_fallback_when_serial_gaps_fai
     assert r["method"] == "serial_log"
     assert r["ok"] is False
     assert r["max_gap_s"] == 2.0
+
+
+class FakeFullDeviceRadio:
+    """Cooperative Pico for run_device_acceptance_full without hardware."""
+
+    def __init__(
+        self,
+        *,
+        stations: int = 3,
+        tracks: int = 5,
+        busy_stuck: bool = False,
+        station_count: int | None = None,
+    ) -> None:
+        self.stations = stations
+        self.tracks = tracks
+        self.busy_stuck = busy_stuck
+        self._station_count = station_count if station_count is not None else stations
+        self.station = 0
+        self.track = 2
+        self.mode = "playlist"
+        self.shuffle_source: str | None = None
+        self.station_cycle_shuffle = False
+        self.serial = [_BOOT, "DF: BUSY went LOW -> playback started"]
+
+    def _busy_pin(self) -> int:
+        return 1 if self.busy_stuck else 0
+
+    def state(self) -> dict:
+        return {
+            "mode": self.mode,
+            "current_track": self.track,
+            "current_album_index": self.station,
+            "playing_folder": self.station + 1,
+            "busy_pin": self._busy_pin(),
+            "is_playing": self._busy_pin() == 0,
+            "total_playlists": self._station_count,
+            "power_on": True,
+            "shuffle_source_type": self.shuffle_source,
+            "station_cycle_shuffle_active": self.station_cycle_shuffle,
+        }
+
+    def gesture(self, name: str) -> None:
+        if name == "single_tap":
+            self.track += 1
+            if self.track > self.tracks:
+                self.track = 1
+                self.station = (self.station + 1) % self.stations
+        elif name == "double_tap":
+            self.track = max(1, self.track - 1)
+            self.serial.append("Double tap: previous track")
+        elif name == "triple_tap":
+            self.track = 1
+            self.serial.append("Triple tap: restart station at track 1")
+        elif name == "long_press":
+            self.station = (self.station + 1) % self.stations
+            self.track = 1
+        elif name == "double_tap_long_press":
+            self.mode = "shuffle"
+            self.shuffle_source = "station"
+            self.track = 1
+        elif name == "triple_tap_long_press":
+            self.mode = "shuffle"
+            self.shuffle_source = "station"
+            self.station_cycle_shuffle = False
+            self.station = 0
+            self.track = 1
+        elif name == "tap_long_press":
+            self.mode = "playlist"
+            self.shuffle_source = None
+        self.serial.append("DF: BUSY went LOW -> playback started")
+
+    def invoke(self, action: str, payload: dict) -> dict:
+        if action == "physical_gesture":
+            g = payload.get("gesture")
+            if g == "ping":
+                return {"ok": True, "device": {"ok": True, "cmd": "ping"}}
+            if g == "get_state":
+                return {"ok": True, "device": {"ok": True, "state": self.state()}}
+            self.gesture(str(g))
+            return {"ok": True, "device": {"ok": True, "cmd": g}}
+        if action == "device_stream_tail":
+            limit = int(payload.get("limit", 400))
+            return {"ok": True, "lines": list(self.serial)[-limit:]}
+        return {"ok": False, "error": "unexpected", "action": action}
+
+    def request(self, method: str, params: dict) -> dict:
+        if method == "line_in_list_devices":
+            return {
+                "ok": True,
+                "default_input_index": 0,
+                "devices": [{"index": 0, "name": "Vintage Radio Line In", "channels": 2}],
+            }
+        if method == "line_in_analyze":
+            return {
+                "ok": True,
+                "summary": {"rms_dbfs": -30.0, "peak_linear": 0.5},
+            }
+        return {"ok": True}
+
+
+@pytest.fixture
+def fast_full_acceptance(monkeypatch):
+    """Shrink run_device_acceptance_full for host-only scoring tests."""
+    monkeypatch.setattr(mda.time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(mda, "_TRACKS_PER_MODE", 1)
+    monkeypatch.setattr(mda, "_MIN_PLAY_DURATION_S", 0.0)
+    monkeypatch.setattr(mda, "_TRACK_START_MAX_S", 0.05)
+    monkeypatch.setattr(mda, "_MODE_SWITCH_MAX_S", 0.05)
+    monkeypatch.setattr(mda, "_PLAYBACK_POLL_INTERVAL_S", 0.001)
+    monkeypatch.setattr(mda, "_SHUFFLE_AUTO_ADVANCE_SAMPLES", 1)
+    monkeypatch.setattr(
+        mda,
+        "measure_library_shuffle_auto_advance_best_effort",
+        lambda **k: {
+            "ok": True,
+            "method": "serial_log",
+            "gaps_detail": [{"sample": 1, "gap_s": 0.05, "ok": True}],
+            "max_gap_s": 0.05,
+            "threshold_s": 2.0,
+        },
+    )
+
+
+def _full_step(result: dict, name: str) -> dict:
+    match = [s for s in result["steps"] if s["name"] == name]
+    assert match, f"step {name!r} not found in {[s['name'] for s in result['steps']]}"
+    return match[0]
+
+
+class TestRunDeviceAcceptanceFull:
+    def test_ping_fail_is_overall_fail(self):
+        def invoke(action: str, payload: dict) -> dict:
+            if action == "physical_gesture" and payload.get("gesture") == "ping":
+                return {"ok": False, "error": "ipc_timeout"}
+            return {"ok": False}
+
+        result = run_device_acceptance_full(invoke=invoke, target="device")
+        assert not result["ok"]
+        assert _full_step(result, "ping")["ok"] is False
+        assert "FAIL" in result["report_markdown"]
+
+    def test_critical_step_fail_is_overall_fail(self, fast_full_acceptance):
+        radio = FakeFullDeviceRadio(busy_stuck=True)
+        result = run_device_acceptance_full(
+            invoke=radio.invoke,
+            request=radio.request,
+            target="device",
+        )
+        assert not result["ok"]
+        assert "playlist_5_tracks" in result["failed_steps"]
+        assert _full_step(result, "playlist_5_tracks")["ok"] is False
+        assert "## Overall: **FAIL**" in result["report_markdown"]
+
+    def test_station_discovery_fail_is_overall_fail(self, fast_full_acceptance):
+        radio = FakeFullDeviceRadio(station_count=0)
+        result = run_device_acceptance_full(
+            invoke=radio.invoke,
+            request=radio.request,
+            target="device",
+        )
+        assert not result["ok"]
+        assert "station_discovery" in result["failed_steps"]
+        assert _full_step(result, "station_discovery")["ok"] is False
+
+    def test_minimal_happy_path_passes(self, fast_full_acceptance):
+        radio = FakeFullDeviceRadio()
+        result = run_device_acceptance_full(
+            invoke=radio.invoke,
+            request=radio.request,
+            target="device",
+        )
+        assert result["ok"], result["failed_steps"]
+        assert _full_step(result, "ping")["ok"]
+        assert _full_step(result, "station_discovery")["ok"]
+        assert _full_step(result, "playlist_5_tracks")["ok"]
+        assert _full_step(result, "station_advance_3x")["ok"]
+        assert _full_step(result, "shuffle_station_mode_switch")["ok"]
+        assert _full_step(result, "revert_to_playlist")["ok"]
+        assert _full_step(result, "final_error_scan")["ok"]
+        assert "## Overall: **PASS**" in result["report_markdown"]

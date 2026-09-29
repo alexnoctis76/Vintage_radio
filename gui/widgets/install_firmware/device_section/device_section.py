@@ -102,7 +102,7 @@ def _device_btn_style(*, primary: bool = False) -> str:
 
 
 def _paint_device_chip_glyph(size: int) -> QtGui.QPixmap:
-    """Chip + download glyph (transparent background)."""
+    """Chip + download glyph on a symmetric 64×64 grid (transparent background)."""
     pix = QtGui.QPixmap(size, size)
     pix.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pix)
@@ -116,17 +116,50 @@ def _paint_device_chip_glyph(size: int) -> QtGui.QPixmap:
     p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
 
     s = size / 64.0
-    p.drawRoundedRect(QtCore.QRectF(18 * s, 14 * s, 28 * s, 36 * s), 4 * s, 4 * s)
-    for px in (24, 32, 40):
-        p.drawLine(QtCore.QPointF(px * s, 7 * s), QtCore.QPointF(px * s, 14 * s))
-        p.drawLine(QtCore.QPointF(px * s, 50 * s), QtCore.QPointF(px * s, 57 * s))
-    for py in (24, 32, 40):
-        p.drawLine(QtCore.QPointF(10 * s, py * s), QtCore.QPointF(18 * s, py * s))
-        p.drawLine(QtCore.QPointF(46 * s, py * s), QtCore.QPointF(54 * s, py * s))
-    cx = 32 * s
-    p.drawLine(QtCore.QPointF(cx, 20 * s), QtCore.QPointF(cx, 39 * s))
-    p.drawLine(QtCore.QPointF(24 * s, 31 * s), QtCore.QPointF(cx, 39 * s))
-    p.drawLine(QtCore.QPointF(40 * s, 31 * s), QtCore.QPointF(cx, 39 * s))
+    cx, cy = 32.0, 32.0
+    chip_w, chip_h = 24.0, 28.0
+    chip_x = cx - chip_w / 2
+    chip_y = cy - chip_h / 2
+    pin_len = 6.0
+
+    p.drawRoundedRect(
+        QtCore.QRectF(chip_x * s, chip_y * s, chip_w * s, chip_h * s),
+        4 * s,
+        4 * s,
+    )
+    for offset in (-8.0, 0.0, 8.0):
+        px = (cx + offset) * s
+        p.drawLine(
+            QtCore.QPointF(px, (chip_y - pin_len) * s),
+            QtCore.QPointF(px, chip_y * s),
+        )
+        p.drawLine(
+            QtCore.QPointF(px, (chip_y + chip_h) * s),
+            QtCore.QPointF(px, (chip_y + chip_h + pin_len) * s),
+        )
+        py = (cy + offset) * s
+        p.drawLine(
+            QtCore.QPointF((chip_x - pin_len) * s, py),
+            QtCore.QPointF(chip_x * s, py),
+        )
+        p.drawLine(
+            QtCore.QPointF((chip_x + chip_w) * s, py),
+            QtCore.QPointF((chip_x + chip_w + pin_len) * s, py),
+        )
+
+    ax = cx * s
+    p.drawLine(
+        QtCore.QPointF(ax, (cy - 6) * s),
+        QtCore.QPointF(ax, (cy + 8) * s),
+    )
+    p.drawLine(
+        QtCore.QPointF((cx - 6) * s, (cy + 2) * s),
+        QtCore.QPointF(ax, (cy + 8) * s),
+    )
+    p.drawLine(
+        QtCore.QPointF((cx + 6) * s, (cy + 2) * s),
+        QtCore.QPointF(ax, (cy + 8) * s),
+    )
     p.end()
     return pix
 
@@ -146,8 +179,11 @@ def _paint_device_chip_icon(size: int) -> QtGui.QPixmap:
     p.setPen(QtCore.Qt.PenStyle.NoPen)
     p.drawRoundedRect(QtCore.QRectF(size * 0.06, size * 0.06, size * 0.88, size * 0.88), r, r)
 
-    glyph = _paint_device_chip_glyph(int(size * 0.88))
-    p.drawPixmap(int(size * 0.06), int(size * 0.06), glyph)
+    pad = size * 0.06
+    inner = size - 2 * pad
+    glyph_size = int(round(inner))
+    glyph = _paint_device_chip_glyph(glyph_size)
+    p.drawPixmap(int(round(pad)), int(round(pad)), glyph)
     p.end()
     return pix
 

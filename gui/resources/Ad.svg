@@ -1,0 +1,9 @@
+<svg width="669" height="301" viewBox="0 0 669 301" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="669" height="301" rx="28" fill="black"/>
+  <text x="28" y="210" font-family="Arial Black, Arial, sans-serif" font-size="168" font-style="italic" font-weight="800" fill="white">AD</text>
+  <g fill="none" stroke="white" stroke-width="18" stroke-linecap="round">
+    <path d="M430 92a62 78 0 0 1 0 117"/>
+    <path d="M488 58a108 124 0 0 1 0 185"/>
+    <path d="M546 24a154 168 0 0 1 0 253"/>
+  </g>
+</svg>

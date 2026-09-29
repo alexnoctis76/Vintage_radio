@@ -48,3 +48,22 @@ def test_detect_sd_roots_windows_merges_and_dedupes(
     with patch.object(Path, "exists", _fake_exists):
         roots = SDManager.detect_sd_roots()
     assert len(roots) == expect_count
+
+
+@patch("gui.sd_manager.platform.system", return_value="Windows")
+@patch("gui.sd_manager._windows_get_removable_drive_roots", return_value=[])
+@patch("gui.sd_manager.psutil.disk_partitions")
+@patch("gui.sd_manager._get_volume_label", return_value="")
+def test_detect_sd_roots_windows_rejects_ntfs_non_removable(
+    _mock_label, mock_dp, mock_wrr, _plat,
+):
+    from gui.sd_manager import SDManager
+
+    mock_dp.return_value = [
+        SimpleNamespace(mountpoint="D:\\", opts="", fstype="ntfs"),
+    ]
+
+    with patch.object(Path, "exists", return_value=True):
+        roots = SDManager.detect_sd_roots()
+
+    assert roots == []

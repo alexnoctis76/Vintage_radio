@@ -325,15 +325,18 @@ class TestTrackFinished:
 
 
 class TestPowerOffOn:
-    def test_power_off_saves_state(self, core, mock_hardware):
+    def test_power_off_keeps_resume_state_in_ram_not_flash(self, core, mock_hardware):
         core._start_playback_for_current()
+        core.current_track = 3
         mock_hardware.calls.clear()
         core.power_off()
         assert core.power_on is False
-        assert any(c[0] == "save_state" for c in mock_hardware.calls)
+        assert core.resume_state is not None
+        assert core.resume_state["track"] == 3
+        assert not any(c[0] == "save_state" for c in mock_hardware.calls)
         assert any(c[0] == "stop" for c in mock_hardware.calls)
 
-    def test_power_on_restores_mode(self, core, mock_hardware):
+    def test_power_on_restores_mode_and_track(self, core, mock_hardware):
         core.switch_mode(MODE_PLAYLIST)
         core.current_album_index = 0
         core.current_track = 2
@@ -342,7 +345,7 @@ class TestPowerOffOn:
         core.power_on_handler()
         assert core.power_on is True
         assert core.mode == MODE_PLAYLIST
-        assert core.current_track == 1
+        assert core.current_track == 2
 
     def test_power_off_ignored_when_already_off(self, core, mock_hardware):
         core.power_off()
@@ -630,15 +633,15 @@ class TestPowerCycle:
     def test_power_off_in_shuffle_saves_mode(self, core, mock_hardware):
         core._init_current_shuffle()
         core.power_off()
-        saved = mock_hardware._state
-        assert saved["mode"] == "shuffle"
+        assert core.resume_state is not None
+        assert core.resume_state["mode"] == "shuffle"
 
-    def test_power_on_always_resets_track_to_1(self, core, mock_hardware):
+    def test_power_on_restores_saved_track(self, core, mock_hardware):
         core.switch_mode("playlist")
         core.current_track = 3
         core.power_off()
         core.power_on_handler()
-        assert core.current_track == 1
+        assert core.current_track == 3
 
     def test_power_on_when_already_on_is_noop(self, core, mock_hardware):
         assert core.power_on is True

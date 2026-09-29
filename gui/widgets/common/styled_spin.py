@@ -104,8 +104,8 @@ class VintageSpinBox(QtWidgets.QSpinBox):
         super().__init__(parent)
         self._fit_to_content = fit_to_content
         self._max_width = max_width
-        self._arrow_w = 10
-        self._arrow_h = 6
+        self._arrow_w = u.px(10)
+        self._arrow_h = u.px(6)
 
         self._up_arrow = QtWidgets.QLabel(self)
         self._up_arrow.setAttribute(
@@ -136,6 +136,8 @@ class VintageSpinBox(QtWidgets.QSpinBox):
         self.valueChanged.connect(self._on_content_changed)
 
     def apply_theme(self) -> None:
+        self._arrow_w = u.px(10)
+        self._arrow_h = u.px(6)
         self.setStyleSheet(vintage_spin_stylesheet())
         color = t.TEXT_PRI
         self._up_arrow.setPixmap(
@@ -214,7 +216,7 @@ class VintageSpinBox(QtWidgets.QSpinBox):
             width = content_w
         else:
             # View genuinely narrower than content (rare); still prefer readability.
-            width = max(view_cap, t.SETTINGS_SPIN_MIN_W)
+            width = max(view_cap, u.px(t.SETTINGS_SPIN_MIN_W))
 
         self.setFixedWidth(width)
 
@@ -228,7 +230,7 @@ class VintageSpinBox(QtWidgets.QSpinBox):
         QtCore.QTimer.singleShot(0, self._update_content_width)
 
     def _position_arrows(self) -> None:
-        btn_w = t.SETTINGS_SPIN_BTN_W
+        btn_w = u.px(t.SETTINGS_SPIN_BTN_W)
         half_h = self.height() // 2
         cx = self.width() - btn_w
         aw, ah = self._arrow_w, self._arrow_h

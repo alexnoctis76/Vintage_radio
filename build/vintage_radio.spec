@@ -11,6 +11,7 @@
 # The SyntaxWarnings during build come from the pydub dependency; they are harmless and the build still succeeds.
 # If the exe icon looks wrong in Explorer (e.g. small icons), try renaming the exe so Windows refreshes its icon cache.
 
+import os
 import sys
 import platform
 import subprocess
@@ -23,6 +24,11 @@ block_cipher = None
 
 # Project root (parent of build/ which contains this spec)
 project_dir = Path(SPECPATH).parent
+
+# Optional: PYINSTALLER_TARGET_ARCH=arm64|x86_64 on macOS (CI Intel build on Apple Silicon).
+_pyi_target_arch = (os.environ.get("PYINSTALLER_TARGET_ARCH") or "").strip() or None
+if _pyi_target_arch and platform.system() != "Darwin":
+    _pyi_target_arch = None
 
 
 # Windows: try to stop running instances; COLLECT uses staging (see CONF['distpath'] below).
@@ -76,10 +82,26 @@ if _release_cfg.is_file():
 # main_basic.py / main.py import these from components/; without them mpremote install silently skipped
 # missing sources (see radio_manager._install_to_pico_worker) and firmware dies at ImportError.
 _pico_components = project_dir / 'firmware' / 'pico' / 'components'
-for _fn in ('am_wav_loader.py', 'vintage_radio_ipc.py'):
+for _fn in ('am_wav_loader.py', 'vintage_radio_ipc.py', 'radio_state.py'):
     _comp = _pico_components / _fn
     if _comp.exists():
         datas.append((str(_comp), 'firmware/pico/components'))
+_conductor_root = project_dir / 'firmware' / 'conductor'
+for _fn, _dest in (
+    ('main.py', 'firmware/conductor'),
+    ('radio_core.py', 'firmware/conductor'),
+    ('dfplayer_hardware.py', 'firmware/conductor'),
+    ('pin_config_loader.py', 'firmware/conductor'),
+    ('sdcard.py', 'firmware/conductor'),
+):
+    _src = _conductor_root / _fn
+    if _src.exists():
+        datas.append((str(_src), _dest))
+_conductor_components = _conductor_root / 'components'
+for _fn in ('am_wav_loader.py', 'vintage_radio_ipc.py', 'radio_state.py'):
+    _comp = _conductor_components / _fn
+    if _comp.exists():
+        datas.append((str(_comp), 'firmware/conductor/components'))
 # Full-flash UF2 images for Install Firmware (BOOTSEL one-step install).
 _release_dir = project_dir / 'firmware' / 'release'
 if _release_dir.is_dir():
@@ -177,7 +199,7 @@ entitlements_file = str(project_dir / 'build' / 'macos_entitlements.plist') if (
 a = Analysis(
     # Absolute path: PyInstaller resolves scripts relative to the spec dir (build/).
     [str(project_dir / 'run_vintage_radio.py')],
-    pathex=[str(project_dir)],
+    pathex=[str(project_dir), str(project_dir / 'firmware')],
     binaries=mpremote_binaries,
     datas=datas,
     hiddenimports=[
@@ -226,6 +248,8 @@ a = Analysis(
         'http.client',
         'http.server',
         'ssl',
+        'pico.components.radio_state',
+        'conductor.components.radio_state',
     ] + mpremote_hidden + ffmpeg_hidden + collect_submodules('mpremote'),
     hookspath=[],
     hooksconfig={},
@@ -256,7 +280,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch=_pyi_target_arch,
     codesign_identity=None,
     entitlements_file=entitlements_file if platform.system() == "Darwin" else None,
     icon=icon_path,

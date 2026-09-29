@@ -51,6 +51,8 @@ class TrackPanel(QtWidgets.QWidget):
     order_changed          = pyqtSignal()
     context_menu_requested = pyqtSignal(QtCore.QPoint)
     edit_track_requested = pyqtSignal(int)
+    toggle_commercial_requested = pyqtSignal(int)
+    toggle_link_requested = pyqtSignal(int)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -106,7 +108,7 @@ class TrackPanel(QtWidgets.QWidget):
     def _make_header(self) -> QtWidgets.QWidget:
         header = QtWidgets.QWidget()
         header.setObjectName("trackHeader")
-        header.setFixedHeight(t.LM_PANEL_HEADER_H)
+        header.setFixedHeight(u.px(t.LM_PANEL_HEADER_H))
         header.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         header.setStyleSheet(f"""
             #trackHeader {{
@@ -148,10 +150,10 @@ class TrackPanel(QtWidgets.QWidget):
             return
         table.selectRow(row)
         rect = table.visualRect(idx)
-        pos = QtCore.QPoint(
-            rect.right() - t.TRACK_PENCIL_ROFF - 4,
-            rect.center().y(),
-        )
+        from gui.widgets.common.delegates import track_pencil_hit_rect
+
+        hit = track_pencil_hit_rect(rect)
+        pos = hit.center()
         self.context_menu_requested.emit(pos)
 
     def _make_table(self) -> QtWidgets.QWidget:
@@ -168,8 +170,8 @@ class TrackPanel(QtWidgets.QWidget):
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
         hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
         hh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
-        self._table.setColumnWidth(2, t.LM_TRACK_DUR_COL_W)
-        self._table.setColumnWidth(3, t.LM_TRACK_FMT_COL_W)
+        self._table.setColumnWidth(2, u.px(t.LM_TRACK_DUR_COL_W))
+        self._table.setColumnWidth(3, u.px(t.LM_TRACK_FMT_COL_W))
         self._table.setColumnHidden(1, True)
         self._table.setItemDelegateForColumn(0, TrackItemDelegate(self._table))
         # Apply background-only delegate to duration/format columns so selection
@@ -200,11 +202,13 @@ class TrackPanel(QtWidgets.QWidget):
         self._table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self.context_menu_requested)
         self._table.edit_track_requested.connect(self._on_edit_track_requested)
+        self._table.toggle_commercial_requested.connect(self.toggle_commercial_requested)
+        self._table.toggle_link_requested.connect(self.toggle_link_requested)
 
         return wrap_with_mockup_scrollbar(
             self._table,
             variant="track",
-            top_pad=t.LM_LIST_TOP_PAD,
+            top_pad=u.px(t.LM_LIST_TOP_PAD),
             on_viewport_resize=lambda: sync_track_table_column_widths(self._table),
         )
 
@@ -220,7 +224,7 @@ class TrackPanel(QtWidgets.QWidget):
             QTableWidget::item {{
                 background: transparent;
                 color: transparent;
-                padding-right: {t.LM_TRACK_ITEM_PAD_RIGHT}px;
+                padding-right: {u.px(t.LM_TRACK_ITEM_PAD_RIGHT)}px;
                 border: none;
             }}
             QTableWidget::item:selected {{
@@ -282,9 +286,27 @@ class TrackPanel(QtWidgets.QWidget):
         self._add_btn.setStyleSheet(self._add_btn_style())
 
     def reload_theme(self) -> None:
+        from gui.widgets.common.mockup_scrollbar import (
+            reload_wrapped_scrollbars,
+            sync_track_table_column_widths,
+        )
+
         self._apply_panel_style()
         self._refresh_header_theme()
         self._apply_table_style()
         vh = self._table.verticalHeader()
         vh.setDefaultSectionSize(u.px(t.LM_TRACK_DEFAULT_SECTION))
-        self._table.update()
+        for row in range(self._table.rowCount()):
+            self._table.setRowHeight(row, u.px(t.LM_TRACK_DEFAULT_SECTION))
+        parent = self._table.parent()
+        if parent is not None:
+            lay = parent.layout()
+            if isinstance(lay, QtWidgets.QVBoxLayout):
+                margins = lay.contentsMargins()
+                if margins.top() > 0:
+                    lay.setContentsMargins(0, u.px(t.LM_LIST_TOP_PAD), 0, 0)
+        sync_track_table_column_widths(self._table)
+        reload_wrapped_scrollbars(self._table)
+        self._table.doItemsLayout()
+        self._table.viewport().update()
+        self._table.repaint()

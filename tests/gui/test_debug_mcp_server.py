@@ -123,6 +123,55 @@ def test_device_connect_dispatches_to_invoke():
         mgr.stop()
 
 
+def test_dispatch_exception_returns_error_response():
+    def boom(_action, _payload):
+        raise RuntimeError("simulated gui callback failure")
+
+    port = _free_port()
+    mgr = DebugMcpServerManager(
+        get_connection_state=lambda: {"connected": False, "port": ""},
+        invoke_action=boom,
+        get_log_path=lambda: None,
+        log=lambda _m: None,
+    )
+    mgr.start(port=port)
+    try:
+        r = _send_line(port, {"method": "invoke_action", "params": {"action": "restart_firmware"}})
+        assert r.get("ok") is False
+        assert r.get("error") == "dispatch_exception"
+        assert "simulated gui callback failure" in str(r.get("detail", ""))
+    finally:
+        time.sleep(0.05)
+        mgr.stop()
+
+
+def test_invalid_json_returns_error_and_keeps_connection():
+    port = _free_port()
+    mgr = DebugMcpServerManager(
+        get_connection_state=lambda: {"connected": False, "port": ""},
+        invoke_action=lambda _a, _p: {"ok": True},
+        get_log_path=lambda: None,
+        log=lambda _m: None,
+    )
+    mgr.start(port=port)
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0) as c:
+            c.sendall(b"not-json\n")
+            bad = json.loads(c.recv(4096).decode("utf-8").strip())
+            assert bad.get("ok") is False
+            assert bad.get("error") == "invalid_json"
+            c.sendall((json.dumps({"method": "ping"}) + "\n").encode("utf-8"))
+            data = b""
+            while b"\n" not in data:
+                data += c.recv(4096)
+            good = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+            assert good.get("ok") is True
+            assert good.get("pong") is True
+    finally:
+        time.sleep(0.05)
+        mgr.stop()
+
+
 def test_line_in_list_devices_tcp():
     pytest.importorskip("numpy")
     pytest.importorskip("sounddevice")

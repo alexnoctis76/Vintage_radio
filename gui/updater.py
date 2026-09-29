@@ -47,9 +47,11 @@ def _log_updater(message: str) -> None:
         pass
 
 
-# Must match filenames produced by release packaging (see .github/workflows/build-release.yml).
+# Must match filenames produced by release packaging (see .github/workflows/build-test.yml).
 PREFERRED_WINDOWS_ASSET = "Vintage-Radio-Windows.zip"
-PREFERRED_MACOS_ASSET = "Vintage.Radio.dmg"
+PREFERRED_LINUX_ASSET = "Vintage-Radio-Linux.zip"
+# Legacy single-name macOS DMG (older shipped updaters expect this exact basename).
+PREFERRED_MACOS_ASSET_LEGACY = "Vintage.Radio.dmg"
 # Optional small JSON attached to each release; per-OS shipped semver may differ from tag_name.
 RELEASE_VERSIONS_MANIFEST = "release-versions.json"
 
@@ -221,13 +223,31 @@ def _fetch_release_versions_manifest_dict(browser_download_url: str) -> Optional
         return None
 
 
+def _macos_cpu_arch() -> str:
+    """Return arm64 or x86_64 for Darwin asset selection."""
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    if machine in ("x86_64", "amd64"):
+        return "x86_64"
+    return machine or "unknown"
+
+
+def preferred_macos_asset_basename() -> str:
+    """Arch-specific zip produced by CI; legacy releases used a single DMG name."""
+    return f"Vintage-Radio-macOS-{_macos_cpu_arch()}.zip"
+
+
 def _manifest_value_for_platform(data: dict) -> Optional[str]:
     pm = _platform_matcher()
     keys: list[str]
     if pm == "windows":
         keys = ["windows"]
     elif pm == "macos":
-        keys = ["macos", "mac", "darwin"]
+        arch = _macos_cpu_arch()
+        keys = [f"macos_{arch}", "macos", "mac", "darwin"]
+    elif pm == "linux":
+        keys = ["linux"]
     else:
         return None
     for ck in keys:
@@ -353,6 +373,17 @@ def run_update_check(
     """Check GitHub for updates; distinguish up-to-date from API / asset failures."""
     cur = (current_version or "").strip()
     _log_updater(f"check started current={cur!r}")
+    try:
+        from gui.release_config import update_check_enabled
+
+        if not update_check_enabled():
+            _log_updater("check skipped: update.enabled=false in release_config.json")
+            return UpdateCheckResult(
+                status="up_to_date",
+                latest_published=cur or None,
+            )
+    except Exception:
+        pass
     try:
         items = _fetch_release_list(user_agent)
     except HTTPError as e:
@@ -524,6 +555,8 @@ def _platform_matcher() -> Optional[str]:
         return "windows"
     if "darwin" in sys_name:
         return "macos"
+    if "linux" in sys_name:
+        return "linux"
     return None
 
 
@@ -532,7 +565,9 @@ def _preferred_asset_name_for_platform() -> Optional[str]:
     if m == "windows":
         return PREFERRED_WINDOWS_ASSET
     if m == "macos":
-        return PREFERRED_MACOS_ASSET
+        return preferred_macos_asset_basename()
+    if m == "linux":
+        return PREFERRED_LINUX_ASSET
     return None
 
 
@@ -579,10 +614,26 @@ def get_platform_asset(assets: list[dict]) -> Optional[dict]:
         candidates.sort(key=lambda a: len(str(a.get("name") or "")))
         return candidates[0]
 
-    preferred_mac = (PREFERRED_MACOS_ASSET or "").lower()
+    if matcher == "linux":
+        preferred = (PREFERRED_LINUX_ASSET or "").lower()
+        by_lower = {str(a.get("name") or "").lower(): a for a in assets}
+        if preferred and preferred in by_lower:
+            return by_lower[preferred]
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            if name.endswith(".zip") and "linux" in name:
+                return asset
+        return None
+
     by_lower_all = {str(a.get("name") or "").lower(): a for a in assets}
-    if preferred_mac and preferred_mac in by_lower_all:
-        return by_lower_all[preferred_mac]
+    for preferred in (
+        preferred_macos_asset_basename(),
+        PREFERRED_MACOS_ASSET_LEGACY,
+        f"Vintage-Radio-macOS-{_macos_cpu_arch()}.dmg",
+    ):
+        key = (preferred or "").lower()
+        if key and key in by_lower_all:
+            return by_lower_all[key]
 
     return _get_macos_release_asset(assets)
 
@@ -723,6 +774,8 @@ def installer_download_urls_for_release(release: ReleaseInfo) -> list[str]:
             if "macos" in name:
                 add(str(asset.get("browser_download_url") or ""))
         add(direct_download_url_for_release(tag))
+        add(_releases_download_url(tag, preferred_macos_asset_basename()))
+        add(_releases_download_url(tag, PREFERRED_MACOS_ASSET_LEGACY))
         add(_releases_download_url(tag, "Vintage Radio.dmg"))
         add(_releases_download_url(tag, "Vintage-Radio-macOS.zip"))
         _log_updater(
@@ -732,7 +785,18 @@ def installer_download_urls_for_release(release: ReleaseInfo) -> list[str]:
             _log_updater(f"  URL[{i}/{len(out)}]: {u}")
         return out
 
-    _log_updater(f"release {tag!r}: non-macOS/Windows, no installer URLs")
+    if "linux" in sys_name:
+        a = get_platform_asset(assets)
+        if a:
+            add(str(a.get("browser_download_url") or ""))
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            if name.endswith(".zip") and "linux" in name:
+                add(str(asset.get("browser_download_url") or ""))
+        add(direct_download_url_for_release(tag))
+        return out
+
+    _log_updater(f"release {tag!r}: unsupported platform for installer URLs")
     return out
 
 
@@ -788,13 +852,18 @@ def download_update_try_urls(
 
 
 def _get_macos_release_asset(assets: list[dict]) -> Optional[dict]:
-    """Pick macOS update asset: raw DMG (e.g. Vintage.Radio.dmg) preferred, else macOS .zip."""
+    """Pick macOS update asset: arch-specific zip/dmg, then legacy DMG, else macOS zip."""
+    arch = _macos_cpu_arch()
+    arch_tokens = (arch, arch.replace("_", "-"))
     dmg_scored: list[tuple[int, dict]] = []
-    zip_candidates: list[dict] = []
+    zip_scored: list[tuple[int, dict]] = []
+    zip_fallback: list[dict] = []
     for asset in assets:
         name = str(asset.get("name") or "").lower()
         if name.endswith(".dmg"):
             score = 0
+            if any(tok in name for tok in arch_tokens):
+                score += 120
             if _VINTAGE_RADIO_DMG_RE.search(name):
                 score += 100
             elif "vintage" in name and "radio" in name:
@@ -805,12 +874,20 @@ def _get_macos_release_asset(assets: list[dict]) -> Optional[dict]:
                 continue
             dmg_scored.append((score, asset))
         elif "macos" in name and name.endswith(".zip"):
-            zip_candidates.append(asset)
+            score = 100 if any(tok in name for tok in arch_tokens) else 0
+            if score:
+                zip_scored.append((score, asset))
+            else:
+                zip_fallback.append(asset)
+    if zip_scored:
+        zip_scored.sort(key=lambda t: t[0], reverse=True)
+        return zip_scored[0][1]
     if dmg_scored:
         dmg_scored.sort(key=lambda t: t[0], reverse=True)
         return dmg_scored[0][1]
-    if zip_candidates:
-        return zip_candidates[0]
+    if zip_fallback:
+        zip_fallback.sort(key=lambda a: len(str(a.get("name") or "")))
+        return zip_fallback[0]
     return None
 
 

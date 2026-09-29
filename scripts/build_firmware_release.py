@@ -50,6 +50,7 @@ def _firmware_file_pairs(basic_mode: bool = True) -> List[Tuple[str, str]]:
         ("firmware/radio_core.py", "radio_core.py"),
         ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         ("firmware/pico/components/vintage_radio_ipc.py", "components/vintage_radio_ipc.py"),
+        ("firmware/pico/components/radio_state.py", "components/radio_state.py"),
         ("firmware/pico/components/am_wav_loader.py", "components/am_wav_loader.py"),
         ("firmware/pin_config_loader.py", "pin_config_loader.py"),
         ("firmware/pico/sdcard.py", "sdcard.py"),

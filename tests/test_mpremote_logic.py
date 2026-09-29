@@ -274,6 +274,7 @@ class TestInstallToPicoWorker:
         (pico / "dfplayer_hardware.py").write_text("# dfplayer")
         (comp / "am_wav_loader.py").write_text("# am wav")
         (comp / "vintage_radio_ipc.py").write_text("# ipc")
+        (comp / "radio_state.py").write_text("# radio state")
         (fw / "pin_config_loader.py").write_text("# pins")
         (pico / "sdcard.py").write_text("# sdcard")
         (root / "AMradioSound.wav").write_bytes(b"\x00" * 100)
@@ -567,6 +568,7 @@ class TestRunMpremoteWithRetry:
         (pico / "dfplayer_hardware.py").write_text("# dfplayer")
         (comp / "am_wav_loader.py").write_text("# am wav")
         (comp / "vintage_radio_ipc.py").write_text("# ipc")
+        (comp / "radio_state.py").write_text("# radio state")
         (fw / "pin_config_loader.py").write_text("# pins")
         (pico / "sdcard.py").write_text("# sdcard")
 

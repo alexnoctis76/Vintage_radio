@@ -5,10 +5,11 @@ This guide covers building the Vintage Radio application from source on Windows,
 ## Packaging locally (summary)
 
 1. **One-time setup**: Python 3.8+ (3.11–3.12 recommended if a dependency lacks wheels), venv, `pip install -r requirements.txt pyinstaller`. The project uses **pygame-ce** (drop-in for pygame); prebuilt wheels usually avoid compiling SDL. If you ever build pygame from source on macOS, install SDL: `brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf`.
-2. **macOS**: From repo root run `bash build_macos.sh` (unsigned app) or `bash build_macos.sh --no-dmg` for app only. Optional: `--sign` for code signing, `--notarize` for notarized DMG. **Note:** CI only produces an Apple Silicon build; Intel Mac users must build locally.
-3. **Windows**: Run `build_windows.bat` (or `pyinstaller vintage_radio.spec`). Run `dist\Vintage Radio\Vintage Radio.exe`.
-4. **Linux**: Run `bash build_linux.sh` (or `pyinstaller vintage_radio.spec`). Run `dist/Vintage Radio/Vintage Radio`.
-5. **Without scripts**: `pyinstaller vintage_radio.spec --noconfirm` on any OS; output is in `dist/Vintage Radio/` (run the executable inside).
+2. **macOS**: From repo root run `bash build/build_macos.sh` (unsigned app) or `bash build/build_macos.sh --no-dmg --arch arm64` / `--arch x86_64`. Optional: `--sign`, `--notarize`. For **test builds** that must not pollute the public updater, add `--channel dev` (bundles `release_config.dev.json` with `update.enabled=false`).
+3. **Windows**: Run `build/build_windows.bat` (or `pyinstaller build/vintage_radio.spec`). For test builds, run `python scripts/apply_release_config.py dev` first.
+4. **Linux**: Run `bash build/build_linux.sh` (or `pyinstaller build/vintage_radio.spec`). Use `bash build/build_linux.sh --channel dev` for test builds.
+5. **CI test builds (manual only)**: GitHub Actions workflow **Build test artifacts** → Run workflow. Produces Windows, Linux, macOS arm64, and macOS x86_64 zips as workflow artifacts only (not GitHub Releases).
+6. **Without scripts**: `pyinstaller build/vintage_radio.spec --noconfirm` on any OS; output is in `dist/Vintage Radio/` (run the executable inside).
 
 ## Table of Contents
 

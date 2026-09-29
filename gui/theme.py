@@ -186,7 +186,7 @@ LIBBAR_BTN_RADIUS    = 8    # px — New / Rename / Delete button corner radius
 LIBBAR_BTN_PADDING   = "0px 18px"   # (vertical horizontal) button inner padding
 LIBBAR_BTN_FONT_SIZE = 13   # pt
 LIBBAR_BTN_H         = 44   # px — button fixed height
-LIBBAR_BTN_W         = 96   # px — fixed width (keeps combo ratio when window grows)
+LIBBAR_BTN_W         = 112  # px — min width so "Duplicate" is not clipped
 OUTLINE_BTN_BORDER_W     = 2    # px — outline button QSS border (New, Details, …)
 OUTLINE_BTN_EDGE_MARGIN  = 2    # px — QSS horizontal margin so border is not clipped
 OUTLINE_BTN_PAD_H        = 18   # px — horizontal padding (from LIBBAR_BTN_PADDING)
@@ -294,10 +294,13 @@ LM_STATION_WARN_BTN_W = 80   # px
 # ─── Track panel ──────────────────────────────────────────────────────────────
 LM_TRACK_VHEADER_W       = 0    # px — 0 = vertical header hidden; row# drawn in delegate
 LM_TRACK_NUM_COL_W       = 52   # px — width reserved in col-0 for row-number area (HTML: 52px)
-LM_TRACK_DEFAULT_SECTION = 66   # px — default row height (must match TRACK_ROW_H)
-LM_TRACK_NUM_FONT_SIZE   = 11   # pt
-LM_TRACK_TITLE_FONT_SIZE = 13   # px — bold title in track delegate
-LM_TRACK_ARTIST_FONT_SIZE = 11  # px — artist sub-line (must stay ≤ title)
+LM_TRACK_DEFAULT_SECTION = 72   # px — default row height (must match TRACK_ROW_H)
+LM_TRACK_NUM_FONT_SIZE   = 13   # px — row-number in track delegate
+LM_TRACK_TITLE_FONT_SIZE = 15   # px — bold title in track delegate
+LM_TRACK_ARTIST_FONT_SIZE = 13  # px — artist sub-line (must stay ≤ title)
+LM_STATION_NAME_FONT_SIZE = 15  # px — station name / number in station delegate
+LM_STATION_COUNT_FONT_SIZE = 13 # px — "7/255" count
+LM_STATION_PENCIL_FONT_SIZE = 16  # px — edit pencil on station rows
 LM_TRACK_NUM_COLOR       = "#4d3d2c"   # row-number colour (HTML: .track-row .num)
 
 LM_TRACK_ITEM_PAD_RIGHT = 8     # px
@@ -329,7 +332,7 @@ EJECT_ICON_COLOR = _p.TEXT_PRI
 #  STATION ROW DELEGATE  (StationItemDelegate)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-STATION_ROW_H        = 72   # px — row height (mockup: 84px, scaled)
+STATION_ROW_H        = 78   # px — row height (mockup: 84px, scaled)
 STATION_SEL_RADIUS   = 7    # px — corner radius on selected-row pill
 STATION_PAD_LEFT     = 14   # px — gap from widget edge to first element
 STATION_HANDLE_W     = 18   # px — ≡ drag-handle column width
@@ -340,7 +343,7 @@ STATION_NAME_RSVD    = 90   # px — reserved on right for count + pencil
 STATION_COUNT_W      = 52   # px — "N/255" count label width
 STATION_COUNT_ROFF   = 86   # px — distance from right edge to count start
 STATION_PENCIL_ROFF  = 26   # px — distance from right edge to ✎ pencil
-STATION_PENCIL_W     = 18   # px — pencil glyph column width
+STATION_PENCIL_W     = 24   # px — pencil glyph column width
 STATION_ACCENT_W     = 4    # px — coloured left accent bar on selected rows
 STATION_SEP_LIGHTER  = 130  # %  — lighter() factor for the row separator line
 STATION_COUNT_COLOR      = "#e8d5bc"  # track count on unselected rows
@@ -348,11 +351,36 @@ STATION_PENCIL_COLOR     = "#f3dcc0"  # edit pencil on unselected rows
 STATION_COUNT_COLOR_SEL  = "#fff8ef"  # track count on selected orange row
 STATION_PENCIL_COLOR_SEL = "#ffffff"  # edit pencil on selected row
 
+# Folder-99 commercials station (distinct from selection orange)
+STA_COMM_GRAD_TOP = "#3A6B63"
+STA_COMM_GRAD_MID = "#2F5D56"
+STA_COMM_GRAD_BOT = "#254A45"
+STA_COMM_SEL_GRAD_TOP = "#4A8A80"
+STA_COMM_SEL_GRAD_MID = "#3D7A70"
+STA_COMM_SEL_GRAD_BOT = "#2F5D56"
+STA_COMM_SEL_BORDER = "#8FCBBE"
+STA_COMM_TEXT = "#F4F1E6"
+STA_COMM_COUNT = "#E4F0EC"
+STA_COMM_PENCIL = "#F4F1E6"
+
+# Commercial / sweeper tracks — light sage, dark text (full-row fill)
+TRK_AD_GRAD_TOP = "#D4EBDD"
+TRK_AD_GRAD_BOT = "#C3DFD0"
+TRK_AD_SEL_GRAD_TOP = "#9FCFB4"
+TRK_AD_SEL_GRAD_BOT = "#7EB898"
+TRK_AD_SEL_BORDER = "#3D7A62"
+TRK_AD_TEXT = "#2A241C"
+TRK_AD_TAG_FG = "#2A241C"
+TRK_AD_TAG_BG = "#FFF6D6"
+TRK_AD_TAG_BORDER = "#7A5128"
+TRK_LINK_FG = "#4A321E"
+TRK_LINK_ACTIVE = "#2F5D56"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TRACK ROW DELEGATE  (TrackItemDelegate)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TRACK_ROW_H             = 66    # px — row height (mockup: 78px, scaled)
+TRACK_ROW_H             = 72    # px — row height (mockup: 78px, scaled)
 TRACK_SEL_RADIUS        = 7     # px — corner radius on selected-row pill
 TRACK_PAD_X             = 14    # px — left padding AFTER the row-number area
 TRACK_PAD_RIGHT         = 18    # px
@@ -736,9 +764,11 @@ SETTINGS_SPIN_BTN_BOT  = EJECT_BTN_GRAD_BOT
 TRACK_HANDLE_W         = 18   # px — ≡ column at row left
 TRACK_LEFT_PAD         = 10   # px — inset before handle
 TRACK_NUM_W            = 34   # px — two-digit index after handle
-TRACK_RIGHT_RSVD       = 36   # px — reserved for edit pencil
-TRACK_PENCIL_ROFF      = 22   # px — from row right edge to pencil
-TRACK_PENCIL_W         = 18   # px
+TRACK_RIGHT_RSVD       = 56   # px — reserved for edit / commercial actions
+TRACK_PENCIL_ROFF      = 30   # px — from row right edge to pencil (fallback)
+TRACK_PENCIL_W         = 24   # px — edit pencil and link control
+TRACK_AD_TOGGLE_W      = 39   # px — AD plate (~30% smaller than the 56px readable size)
+TRACK_PENCIL_FONT_PX   = 16   # px — pencil glyph
 TRACK_HANDLE_COLOR     = BORDER_SOFT
 TRACK_HANDLE_COLOR_SEL = "#7a5128"
 TRACK_PENCIL_COLOR     = "#7a5128"

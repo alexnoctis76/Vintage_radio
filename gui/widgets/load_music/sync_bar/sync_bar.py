@@ -19,6 +19,8 @@ from PyQt6.QtCore import pyqtSignal
 
 import gui.theme as t
 from gui import ui_scale as u
+from gui.widgets.common.styled_checkbox import VintageCheckBox
+from gui.widgets.common.styled_spin import VintageSpinBox
 
 
 def _svg_resource(filename: str) -> Path:
@@ -27,6 +29,13 @@ def _svg_resource(filename: str) -> Path:
 
 
 _SVG_SD_CARD = _svg_resource("SD card.svg")
+
+from gui.commercials import (
+    COMMERCIALS_STATION_LABEL,
+    COMMERCIALS_STATION_TOOLTIP,
+    COMMERCIALS_TAGGED_LABEL,
+    COMMERCIALS_TAGGED_TOOLTIP,
+)
 
 
 def _make_sd_card_icon(size: int = 32, color: str = "#ffffff") -> QtGui.QIcon:
@@ -116,6 +125,9 @@ class SyncBar(QtWidgets.QWidget):
 
     sync_clicked = pyqtSignal()
     eject_clicked = pyqtSignal()
+    commercials_toggled = pyqtSignal(bool)
+    commercials_interval_changed = pyqtSignal(int)
+    inline_commercials_toggled = pyqtSignal(bool)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -128,6 +140,7 @@ class SyncBar(QtWidgets.QWidget):
         row.setContentsMargins(0, t.LM_SYNC_TOP_MARGIN, 0, 0)
         row.setSpacing(t.LM_SYNC_SPACING)
 
+        row.addWidget(self._make_commercials_group(), 0)
         row.addStretch()
 
         icon_sz = u.px(22)
@@ -150,6 +163,90 @@ class SyncBar(QtWidgets.QWidget):
         self._add_shadow(self._eject_btn)
         row.addWidget(self._eject_btn)
 
+    def _make_commercials_group(self) -> QtWidgets.QWidget:
+        box = QtWidgets.QWidget()
+        box.setObjectName("commercialsSyncGroup")
+        box.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        col = QtWidgets.QVBoxLayout(box)
+        col.setContentsMargins(0, 0, 12, 0)
+        col.setSpacing(4)
+
+        title = QtWidgets.QLabel("Commercials / sweepers")
+        title.setStyleSheet(
+            f"color: {t.TEXT_PRI}; font-weight: 800; "
+            f"font-size: {u.px(t.LM_EJECT_BTN_FONT)}px; background: transparent;"
+        )
+        self._commercials_title = title
+        col.addWidget(title)
+
+        hint = QtWidgets.QLabel("Choose how ads play on this library")
+        hint.setStyleSheet(
+            f"color: {t.TEXT_SEC}; font-size: {u.px(max(11, t.LM_EJECT_BTN_FONT - 1))}px; "
+            f"background: transparent;"
+        )
+        self._commercials_hint = hint
+        col.addWidget(hint)
+
+        type_row = QtWidgets.QHBoxLayout()
+        type_row.setContentsMargins(0, 0, 0, 0)
+        type_row.setSpacing(u.px(14))
+        self._commercials_type_row = type_row
+
+        self.commercials_check = VintageCheckBox(COMMERCIALS_STATION_LABEL)
+        self.commercials_check.setToolTip(COMMERCIALS_STATION_TOOLTIP)
+        self.commercials_check.toggled.connect(self.commercials_toggled)
+        type_row.addWidget(self.commercials_check)
+
+        self.commercials_interval = VintageSpinBox()
+        self.commercials_interval.setRange(1, 99)
+        self.commercials_interval.setValue(5)
+        self.commercials_interval.setToolTip(
+            "Number of songs between commercials from the Commercials station."
+        )
+        self.commercials_interval.valueChanged.connect(self.commercials_interval_changed)
+        self.commercials_interval.setVisible(False)
+        type_row.addWidget(self.commercials_interval)
+
+        self.inline_check = VintageCheckBox(COMMERCIALS_TAGGED_LABEL)
+        self.inline_check.setToolTip(COMMERCIALS_TAGGED_TOOLTIP)
+        self.inline_check.toggled.connect(self.inline_commercials_toggled)
+        type_row.addWidget(self.inline_check)
+        type_row.addStretch()
+        col.addLayout(type_row)
+        self._commercials_bar = box
+        return box
+
+    def set_commercials_visible(self, visible: bool) -> None:
+        bar = getattr(self, "_commercials_bar", None)
+        if bar is not None:
+            bar.setVisible(bool(visible))
+
+    def set_commercials_state(
+        self,
+        *,
+        enabled: bool,
+        interval: int,
+        inline: bool = False,
+        folder: Optional[bool] = None,
+    ) -> None:
+        self.commercials_check.blockSignals(True)
+        self.commercials_interval.blockSignals(True)
+        self.inline_check.blockSignals(True)
+        try:
+            folder_on = bool(enabled) if folder is None else bool(folder)
+            if folder is None:
+                folder_on = bool(enabled) and not inline
+            self.commercials_check.setChecked(folder_on)
+            self.inline_check.setChecked(bool(inline))
+            self.commercials_interval.setValue(max(1, min(99, int(interval or 5))))
+            show_interval = folder_on
+            self.commercials_interval.setVisible(show_interval)
+            self.commercials_interval.setEnabled(show_interval)
+        finally:
+            self.commercials_check.blockSignals(False)
+            self.commercials_interval.blockSignals(False)
+            self.inline_check.blockSignals(False)
+
     def _add_shadow(self, btn: QtWidgets.QPushButton) -> None:
         shadow = QtWidgets.QGraphicsDropShadowEffect(btn)
         shadow.setBlurRadius(t.BTN_SHADOW_BLUR)
@@ -169,3 +266,21 @@ class SyncBar(QtWidgets.QWidget):
         self._eject_btn.setIconSize(QtCore.QSize(icon_sz, icon_sz))
         self._eject_btn.setFixedSize(u.px(t.LM_EJECT_BTN_W), u.px(t.LM_SYNC_BTN_H))
         self._eject_btn.setStyleSheet(_eject_btn_style())
+        title = getattr(self, "_commercials_title", None)
+        hint = getattr(self, "_commercials_hint", None)
+        if title is not None:
+            title.setStyleSheet(
+                f"color: {t.TEXT_PRI}; font-weight: 800; "
+                f"font-size: {u.px(t.LM_EJECT_BTN_FONT)}px; background: transparent;"
+            )
+        if hint is not None:
+            hint.setStyleSheet(
+                f"color: {t.TEXT_SEC}; font-size: {u.px(max(11, t.LM_EJECT_BTN_FONT - 1))}px; "
+                f"background: transparent;"
+            )
+        type_row = getattr(self, "_commercials_type_row", None)
+        if type_row is not None:
+            type_row.setSpacing(u.px(14))
+        self.commercials_check.apply_theme()
+        self.inline_check.apply_theme()
+        self.commercials_interval.apply_theme()

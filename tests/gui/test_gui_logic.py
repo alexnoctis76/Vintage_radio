@@ -9,6 +9,8 @@ QT_QPA_PLATFORM=offscreen (set via pytest.ini or environment).
 from __future__ import annotations
 
 import unicodedata
+from pathlib import Path
+
 import pytest
 
 
@@ -140,52 +142,26 @@ class TestUndoRedoStack:
         assert result == action
 
 
-# ---------------------------------------------------------------------------
-# _is_rpi_rp2_present logic (pure Python, mocked psutil)
-# ---------------------------------------------------------------------------
-
-def _is_rpi_rp2_present_logic(disk_partitions):
-    """Mirror of MainWindow._is_rpi_rp2_present detection logic."""
-    for dp in disk_partitions:
-        mountpoint = getattr(dp, "mountpoint", "") or ""
-        device = getattr(dp, "device", "") or ""
-        if "RPI-RP2" in mountpoint.upper() or "RPI-RP2" in device.upper():
-            return True
-    return False
-
-
 class TestBootselDetection:
-    def _fake_partition(self, mountpoint="", device=""):
-        class FakePart:
-            pass
-        p = FakePart()
-        p.mountpoint = mountpoint
-        p.device = device
-        return p
+    def test_sd_manager_detects_rpi_rp2_label(self, monkeypatch):
+        from gui.sd_manager import SDManager
 
-    def test_detects_rpi_rp2_in_mountpoint(self):
-        parts = [self._fake_partition(mountpoint="/Volumes/RPI-RP2")]
-        assert _is_rpi_rp2_present_logic(parts) is True
+        monkeypatch.setattr(
+            SDManager,
+            "detect_sd_roots",
+            staticmethod(lambda: [(Path("/Volumes/RPI-RP2"), "RPI-RP2")]),
+        )
+        assert SDManager.is_rp2040_bootsel_present() is True
 
-    def test_detects_rpi_rp2_case_insensitive(self):
-        parts = [self._fake_partition(mountpoint="/volumes/rpi-rp2")]
-        assert _is_rpi_rp2_present_logic(parts) is True
+    def test_sd_manager_absent_when_no_bootsel_volume(self, monkeypatch):
+        from gui.sd_manager import SDManager
 
-    def test_no_rpi_rp2_returns_false(self):
-        parts = [self._fake_partition(mountpoint="/Volumes/USB")]
-        assert _is_rpi_rp2_present_logic(parts) is False
-
-    def test_empty_partitions_returns_false(self):
-        assert _is_rpi_rp2_present_logic([]) is False
-
-    def test_detects_in_device_path(self):
-        parts = [self._fake_partition(device="/dev/disk2s1", mountpoint="")]
-        # No RPI-RP2 in device string
-        result = _is_rpi_rp2_present_logic(parts)
-        assert result is False
-        # Now with RPI-RP2 in device
-        parts2 = [self._fake_partition(device="RPI-RP2", mountpoint="")]
-        assert _is_rpi_rp2_present_logic(parts2) is True
+        monkeypatch.setattr(
+            SDManager,
+            "detect_sd_roots",
+            staticmethod(lambda: [(Path("/Volumes/USB"), "USB")]),
+        )
+        assert SDManager.is_rp2040_bootsel_present() is False
 
 
 # ---------------------------------------------------------------------------

@@ -93,16 +93,19 @@ class VintageRadioFirmware:
         skip_power_check = self._check_skip_power_sense()
         if skip_power_check:
             print("Power sense check DISABLED (configured via debug mode)")
+            # rail2_on stays True so playback/track logic runs on the bench;
+            # last_sense tracks real GPIO to avoid a spurious power edge.
             self.rail2_on = True
-            # Match real GPIO so handle_power_change() does not see a bogus HIGH->LOW edge
-            # (would immediately call power_off() while the pot is still physically off).
             self.last_sense = 1 if self.hw.is_power_on() else 0
             return
 
         print("Waiting for power sense HIGH...")
         print("(Turn pot on, or create skip_power_sense.txt with 'true' to skip)")
         last_hint = ticks_ms()
+        update_led = getattr(self.hw, "update_playback_led", None)
         while not self.hw.is_power_on():
+            if update_led is not None:
+                update_led(standby=True)
             if ticks_diff(ticks_ms(), last_hint) > 500:
                 print("...waiting for power sense HIGH")
                 last_hint = ticks_ms()
@@ -153,6 +156,18 @@ class VintageRadioFirmware:
 
     def boot_sequence(self):
         try:
+            led_rev = 0
+            try:
+                import components.dfplayer_hardware as _dfhw
+
+                led_rev = getattr(_dfhw, "LED_STATUS_VERSION", 0)
+            except Exception:
+                pass
+            print(
+                "Status LED profile v{} (white=standby blue=idle orange=warning purple=playing)".format(
+                    led_rev
+                )
+            )
             reset = getattr(self.hw, "reset_dfplayer", None)
             if reset is not None:
                 reset()
@@ -594,7 +609,12 @@ class VintageRadioFirmware:
 
                 update_led = getattr(self.hw, "update_playback_led", None)
                 if update_led is not None:
-                    update_led(is_playing=getattr(self.core, "is_playing", False))
+                    pot_on = self.rail2_on and self.hw.is_power_on()
+                    update_led(
+                        is_playing=getattr(self.core, "is_playing", False) if pot_on else False,
+                        standby=not pot_on,
+                        warning=self._start_unconfirmed_streak > 0 if pot_on else False,
+                    )
             except OSError as e:
                 print("Main loop recoverable error:", e)
 
@@ -622,10 +642,11 @@ def main():
             pass
         try:
             import neopixel
+            from components.dfplayer_hardware import FATAL_NEOPIX
             from pin_config_loader import get_pin
             neo_pin = get_pin("neopixel", 16)
             np = neopixel.NeoPixel(Pin(neo_pin), 1)
-            np[0] = (10, 0, 0)
+            np[0] = FATAL_NEOPIX
             np.write()
         except Exception:
             pass

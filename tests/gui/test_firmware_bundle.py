@@ -36,6 +36,19 @@ def test_vintage_radio_firmware_entry_id():
     from gui.services.firmware_bundle import vintage_radio_firmware_entry_id
 
     assert vintage_radio_firmware_entry_id("1.0.1") == "vintage_radio_1_0_1"
+    assert vintage_radio_firmware_entry_id("1.1.0") == "vintage_radio_1_1_0"
+
+
+def test_current_vs_legacy_generation():
+    from gui.services.firmware_bundle import (
+        is_current_firmware_generation,
+        is_legacy_firmware_generation,
+    )
+
+    assert is_current_firmware_generation("1.1.0")
+    assert is_current_firmware_generation("1.2.0")
+    assert not is_current_firmware_generation("1.0.1")
+    assert is_legacy_firmware_generation("1.0.0")
 
 
 def test_full_uf2_version_string():
@@ -74,6 +87,17 @@ def test_firmware_release_has_full_uf2_for_packaging():
     root = Path(__file__).resolve().parents[2]
     matches = sorted((root / "firmware" / "release").glob("vintage-radio-firmware-*-full.uf2"))
     assert matches, "Add vintage-radio-firmware-*-full.uf2 under firmware/release before release build"
+
+
+def test_list_micropython_uf2_hrefs_filters_board():
+    from gui.services.firmware_bundle import list_micropython_uf2_hrefs
+
+    html = """
+    <a href="/resources/firmware/RPI_PICO-20240602-v1.23.0.uf2">ok</a>
+    <a href="/resources/firmware/OTHER-20240602-v1.0.0.uf2">skip</a>
+    """
+    links = list_micropython_uf2_hrefs(html)
+    assert links == ["/resources/firmware/RPI_PICO-20240602-v1.23.0.uf2"]
 
 
 def test_vintage_radio_spec_bundles_firmware_release_uf2():

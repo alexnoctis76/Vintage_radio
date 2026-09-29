@@ -37,8 +37,30 @@ def reload_release_config() -> Dict[str, Any]:
     return load_release_config()
 
 
+def update_check_enabled(*, default: bool = True) -> bool:
+    """When False, packaged builds skip GitHub update checks (dev/test installers)."""
+    section = load_release_config().get("update")
+    if not isinstance(section, dict):
+        return default
+    if "enabled" not in section:
+        return default
+    return bool(section.get("enabled"))
+
+
+def update_channel(*, default: str = "stable") -> str:
+    section = load_release_config().get("update")
+    if not isinstance(section, dict):
+        return default
+    raw = str(section.get("channel") or "").strip().lower()
+    return raw or default
+
+
 def is_official_firmware_visible(entry_id: str, *, default: bool = True) -> bool:
     """Return whether an official firmware card should appear in Install Firmware."""
+    # Legacy ZBVR test card — hidden unless explicitly enabled in release_config.json
+    # (dev-only; not part of the normal release_config templates).
+    if entry_id == ZBVR_FIRMWARE_ENTRY_ID:
+        default = False
     section = load_release_config().get("official_firmware")
     if not isinstance(section, dict):
         return default

@@ -9,6 +9,11 @@ from typing import List, Optional, Tuple
 
 from gui.resource_paths import app_data_dir, project_root
 
+try:
+    from project_version import CURRENT_FIRMWARE_GENERATION
+except ImportError:
+    CURRENT_FIRMWARE_GENERATION = "1.1.0"
+
 _FULL_UF2_GLOB = "vintage-radio-firmware-*-full.uf2"
 _FULL_UF2_VERSION_RE = re.compile(
     r"^vintage-radio-firmware-(?P<ver>\d+(?:\.\d+)*)-full\.uf2$",
@@ -102,6 +107,25 @@ def full_uf2_version_string(path: Path) -> Optional[str]:
     return m.group("ver")
 
 
+def _version_tuple(version: str) -> Tuple[int, ...]:
+    parts: List[int] = []
+    for piece in str(version).strip().lstrip("v").split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            break
+    return tuple(parts) if parts else (0,)
+
+
+def is_current_firmware_generation(version: str) -> bool:
+    """True when *version* is the current shipped generation (e.g. 1.1.0+)."""
+    return _version_tuple(version) >= _version_tuple(CURRENT_FIRMWARE_GENERATION)
+
+
+def is_legacy_firmware_generation(version: str) -> bool:
+    return not is_current_firmware_generation(version)
+
+
 def vintage_radio_firmware_entry_id(version: str) -> str:
     """Stable Install Firmware list id for a bundled Vintage Radio UF2 version."""
     return "vintage_radio_" + version.replace(".", "_")
@@ -128,6 +152,11 @@ def cached_micropython_uf2() -> Optional[Path]:
     return matches[0] if matches else None
 
 
+def list_micropython_uf2_hrefs(html: str) -> List[str]:
+    """Parse official RPI_PICO MicroPython UF2 hrefs from a download page."""
+    return _UF2_PATTERN.findall(html)
+
+
 def fetch_micropython_uf2(*, force: bool = False) -> Path:
     """Download (or reuse cache) the newest RPI_PICO MicroPython UF2."""
     if not force:
@@ -140,7 +169,7 @@ def fetch_micropython_uf2(*, force: bool = False) -> Path:
     with urllib.request.urlopen(req, timeout=60) as resp:
         html = resp.read().decode("utf-8", errors="replace")
 
-    links = _UF2_PATTERN.findall(html)
+    links = list_micropython_uf2_hrefs(html)
     if not links:
         raise RuntimeError(f"No RPI_PICO .uf2 links found on {MICROPYTHON_PICO_URL}")
 
