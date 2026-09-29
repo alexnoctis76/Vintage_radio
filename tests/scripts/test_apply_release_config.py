@@ -40,6 +40,29 @@ def test_dev_channel_copies_dev_template(tmp_path: Path):
     assert data["update"]["channel"] == "dev"
 
 
+def test_test_channel_copies_test_template(tmp_path: Path):
+    (tmp_path / "release_config.test.json").write_text(
+        json.dumps(
+            {
+                "update": {
+                    "enabled": True,
+                    "channel": "test",
+                    "tag_suffix": "-upgrade-test",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    dest = tmp_path / "release_config.json"
+    dest.write_text("{}", encoding="utf-8")
+
+    apply_release_channel(tmp_path, "test")
+
+    data = json.loads(dest.read_text(encoding="utf-8"))
+    assert data["update"]["channel"] == "test"
+    assert data["update"]["tag_suffix"] == "-upgrade-test"
+
+
 def test_invalid_channel_falls_back_to_dev_template(tmp_path: Path):
     (tmp_path / "release_config.example.json").write_text(
         json.dumps({"update": {"enabled": True, "channel": "stable"}}),

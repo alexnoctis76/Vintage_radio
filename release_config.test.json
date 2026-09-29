@@ -1,0 +1,10 @@
+{
+  "update": {
+    "enabled": true,
+    "channel": "test",
+    "prerelease_only": true,
+    "tag_suffix": "-upgrade-test",
+    "repo": "alexnoctis76/Vintage_radio-upgrade-test",
+    "note": "Public QA repo (private repos return HTTP 404 to the unauthenticated updater). Stable apps ignore pre-releases on the main repo."
+  }
+}

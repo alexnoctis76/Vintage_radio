@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .resource_paths import project_root
 
@@ -52,6 +52,36 @@ def update_channel(*, default: str = "stable") -> str:
     if not isinstance(section, dict):
         return default
     raw = str(section.get("channel") or "").strip().lower()
+    return raw or default
+
+
+def _update_section() -> Dict[str, Any]:
+    section = load_release_config().get("update")
+    return section if isinstance(section, dict) else {}
+
+
+def update_repo_slug(*, default: str = "alexnoctis76/Vintage_radio") -> str:
+    """GitHub ``owner/repo`` slug for release API calls (optional override for private forks)."""
+    raw = str(_update_section().get("repo") or "").strip()
+    return raw or default
+
+
+def update_prerelease_only(*, default: Optional[bool] = None) -> bool:
+    """When True, only GitHub pre-releases count; when False, only full releases.
+
+    Defaults by channel: ``test`` -> True, ``stable`` -> False.
+    """
+    section = _update_section()
+    if "prerelease_only" in section:
+        return bool(section.get("prerelease_only"))
+    if default is not None:
+        return default
+    return update_channel() == "test"
+
+
+def update_tag_suffix(*, default: str = "") -> str:
+    """Optional tag suffix filter (e.g. ``-upgrade-test``) for the test channel."""
+    raw = str(_update_section().get("tag_suffix") or "").strip()
     return raw or default
 
 

@@ -84,7 +84,7 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
 
     def _on_download_clicked(self) -> None:
         if not self._download_url:
-            QDesktopServices.openUrl(QUrl(self.release_info.html_url or updater.GITHUB_RELEASES_URL))
+            QDesktopServices.openUrl(QUrl(self.release_info.html_url or updater.github_releases_url()))
             self.accept()
             return
 

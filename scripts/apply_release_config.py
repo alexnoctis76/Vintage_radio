@@ -10,15 +10,14 @@ from pathlib import Path
 
 
 def apply_release_channel(root: Path, channel: str) -> None:
-    """Write ``release_config.json`` under *root* for *channel* (``stable`` or ``dev``)."""
+    """Write ``release_config.json`` under *root* for *channel*."""
     dest = root / "release_config.json"
-    if channel == "stable":
-        src = root / "release_config.example.json"
-        if not src.is_file():
-            raise FileNotFoundError(f"Missing template: {src}")
-        shutil.copy2(src, dest)
-        return
-    src = root / "release_config.dev.json"
+    templates = {
+        "stable": root / "release_config.example.json",
+        "test": root / "release_config.test.json",
+        "dev": root / "release_config.dev.json",
+    }
+    src = templates.get(channel, templates["dev"])
     if not src.is_file():
         raise FileNotFoundError(f"Missing template: {src}")
     shutil.copy2(src, dest)
@@ -29,8 +28,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "channel",
-        choices=("stable", "dev"),
-        help="dev copies release_config.dev.json; stable copies release_config.example.json",
+        choices=("stable", "dev", "test"),
+        help="stable/test/dev copy the matching release_config.*.json template",
     )
     args = parser.parse_args()
     try:

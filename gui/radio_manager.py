@@ -16418,7 +16418,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 body = (
                     f"{body}\n\nIf your connection is fine, the API may be rate-limited or "
                     f"temporarily unavailable. You can open the releases page manually:\n"
-                    f"{updater.GITHUB_RELEASES_URL}"
+                    f"{updater.github_releases_url()}"
                 )
                 VintageMessageBox.warning(self, "Check for Updates", body)
             return
@@ -16460,7 +16460,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "About Vintage Radio",
             "Vintage Radio Music Manager\n"
             f"Version: {__version__}\n\n"
-            f"Releases: {updater.GITHUB_RELEASES_URL}",
+            f"Releases: {updater.github_releases_url()}",
         )
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:

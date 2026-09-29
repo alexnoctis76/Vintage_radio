@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from unittest import mock
 
 import pytest
 
 from gui import updater
+from gui.release_config import reload_release_config
+
+
+@pytest.fixture(autouse=True)
+def _clear_release_config_cache():
+    reload_release_config()
+    yield
+    reload_release_config()
 
 
 @pytest.mark.windows_only
@@ -239,11 +248,121 @@ def test_run_update_check_skipped_when_update_disabled():
     assert result.release is None
 
 
+def test_stable_channel_ignores_prerelease(tmp_path, monkeypatch):
+    cfg = tmp_path / "release_config.json"
+    cfg.write_text(
+        json.dumps({"update": {"enabled": True, "channel": "stable", "prerelease_only": False}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gui.release_config.project_root", lambda: tmp_path)
+    from gui.release_config import reload_release_config
+
+    reload_release_config()
+
+    items = [
+        {
+            "tag_name": "v9.9.9-upgrade-test",
+            "draft": False,
+            "prerelease": True,
+            "html_url": "https://github.com/a/b/releases/tag/v9.9.9-upgrade-test",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/pre.zip",
+                }
+            ],
+        },
+        {
+            "tag_name": "v1.0.2",
+            "draft": False,
+            "prerelease": False,
+            "html_url": "https://github.com/a/b/releases/tag/v1.0.2",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/stable.zip",
+                }
+            ],
+        },
+    ]
+    with mock.patch.object(updater, "_fetch_release_list", return_value=updater._filter_release_items(items)):
+        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+            result = updater.run_update_check(current_version="v1.0.0")
+    assert result.status == "update_available"
+    assert result.release is not None
+    assert result.release.tag_name == "v1.0.2"
+
+
+def test_test_channel_only_sees_matching_prerelease(tmp_path, monkeypatch):
+    cfg = tmp_path / "release_config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "update": {
+                    "enabled": True,
+                    "channel": "test",
+                    "prerelease_only": True,
+                    "tag_suffix": "-upgrade-test",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gui.release_config.project_root", lambda: tmp_path)
+    from gui.release_config import reload_release_config
+
+    reload_release_config()
+
+    items = [
+        {
+            "tag_name": "v1.2.0-beta",
+            "draft": False,
+            "prerelease": True,
+            "html_url": "https://github.com/a/b/releases/tag/v1.2.0-beta",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/beta.zip",
+                }
+            ],
+        },
+        {
+            "tag_name": "v1.1.0-upgrade-test",
+            "draft": False,
+            "prerelease": True,
+            "html_url": "https://github.com/a/b/releases/tag/v1.1.0-upgrade-test",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/test.zip",
+                }
+            ],
+        },
+    ]
+    with mock.patch.object(updater, "_fetch_release_list", return_value=updater._filter_release_items(items)):
+        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+            result = updater.run_update_check(current_version="v1.0.0")
+    assert result.status == "update_available"
+    assert result.release is not None
+    assert result.release.tag_name == "v1.1.0-upgrade-test"
+
+
+def test_macos_cpu_arch_arm64_when_rosetta_on_apple_silicon(monkeypatch):
+    monkeypatch.setattr("gui.updater.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr("gui.updater._macos_hardware_has_arm64", lambda: True)
+    assert updater._macos_cpu_arch() == "arm64"
+
+
 def test_run_update_check_update_available():
     items = [
         {
             "tag_name": "v1.1.0",
             "draft": False,
+            "prerelease": False,
             "html_url": "https://github.com/a/b/releases/tag/v1.1.0",
             "body": "",
             "assets": [

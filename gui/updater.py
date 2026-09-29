@@ -24,16 +24,71 @@ import zipfile
 # NOTE: GitHub's /releases/latest is the latest *non-prerelease* only. If every
 # release is a GitHub "Pre-release", that endpoint returns 404. Use the list
 # endpoint (newest first) so beta/prerelease tags still resolve.
-GITHUB_RELEASES_LATEST_URL = (
-    "https://api.github.com/repos/alexnoctis76/Vintage_radio/releases/latest"
-)
-GITHUB_RELEASES_LIST_URL = (
-    "https://api.github.com/repos/alexnoctis76/Vintage_radio/releases?per_page=100"
-)
-GITHUB_RELEASES_URL = "https://github.com/alexnoctis76/Vintage_radio/releases"
-GITHUB_REPO_SLUG = "alexnoctis76/Vintage_radio"
+DEFAULT_GITHUB_REPO_SLUG = "alexnoctis76/Vintage_radio"
+# Back-compat for tests / imports that referenced the old constant name.
+GITHUB_REPO_SLUG = DEFAULT_GITHUB_REPO_SLUG
 
 _LOG = logging.getLogger(__name__)
+
+
+def _github_repo_slug() -> str:
+    try:
+        from gui.release_config import update_repo_slug
+
+        return update_repo_slug(default=DEFAULT_GITHUB_REPO_SLUG)
+    except Exception:
+        return DEFAULT_GITHUB_REPO_SLUG
+
+
+def _github_releases_list_url() -> str:
+    return f"https://api.github.com/repos/{_github_repo_slug()}/releases?per_page=100"
+
+
+def _github_releases_latest_url() -> str:
+    return f"https://api.github.com/repos/{_github_repo_slug()}/releases/latest"
+
+
+def _github_releases_page_url() -> str:
+    return f"https://github.com/{_github_repo_slug()}/releases"
+
+
+def github_releases_url() -> str:
+    """Public releases page URL (respects optional ``update.repo`` override)."""
+    return _github_releases_page_url()
+
+
+# Back-compat alias for older call sites.
+GITHUB_RELEASES_URL = github_releases_url()
+
+
+def _release_passes_channel_filter(item: dict) -> bool:
+    """Apply stable vs test channel rules to a GitHub release list row."""
+    if not isinstance(item, dict) or item.get("draft"):
+        return False
+    try:
+        from gui.release_config import update_channel, update_prerelease_only, update_tag_suffix
+    except Exception:
+        update_channel = lambda **_: "stable"  # type: ignore[misc, assignment]
+        update_prerelease_only = lambda **_: False  # type: ignore[misc, assignment]
+        update_tag_suffix = lambda **_: ""  # type: ignore[misc, assignment]
+
+    is_prerelease = bool(item.get("prerelease"))
+    want_prerelease = update_prerelease_only()
+    if want_prerelease and not is_prerelease:
+        return False
+    if not want_prerelease and is_prerelease:
+        return False
+
+    suffix = update_tag_suffix()
+    if suffix and update_channel() == "test":
+        tag = str(item.get("tag_name") or "")
+        if not tag.endswith(suffix):
+            return False
+    return True
+
+
+def _filter_release_items(items: list) -> list:
+    return [i for i in items if isinstance(i, dict) and _release_passes_channel_filter(i)]
 
 
 def _log_updater(message: str) -> None:
@@ -156,7 +211,7 @@ def _fetch_release_assets_for_tag(tag: str) -> list[dict]:
     t = quote((tag or "").strip(), safe="")
     if not t:
         return []
-    url = f"https://api.github.com/repos/{GITHUB_REPO_SLUG}/releases/tags/{t}"
+    url = f"https://api.github.com/repos/{_github_repo_slug()}/releases/tags/{t}"
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "VintageRadio-Updater",
@@ -223,12 +278,29 @@ def _fetch_release_versions_manifest_dict(browser_download_url: str) -> Optional
         return None
 
 
+def _macos_hardware_has_arm64() -> bool:
+    """True when the Mac has Apple Silicon (even if this process is x86_64 under Rosetta)."""
+    if platform.system().lower() != "darwin":
+        return False
+    try:
+        out = subprocess.check_output(
+            ["sysctl", "-n", "hw.optional.arm64"],
+            text=True,
+            timeout=2,
+        ).strip()
+        return out == "1"
+    except Exception:
+        return False
+
+
 def _macos_cpu_arch() -> str:
     """Return arm64 or x86_64 for Darwin asset selection."""
     machine = platform.machine().lower()
     if machine in ("arm64", "aarch64"):
         return "arm64"
     if machine in ("x86_64", "amd64"):
+        if _macos_hardware_has_arm64():
+            return "arm64"
         return "x86_64"
     return machine or "unknown"
 
@@ -285,7 +357,7 @@ def _release_info_from_api_dict(data: dict) -> Optional[ReleaseInfo]:
         return None
     return ReleaseInfo(
         tag_name=tag,
-        html_url=str(data.get("html_url") or GITHUB_RELEASES_URL),
+        html_url=str(data.get("html_url") or _github_releases_page_url()),
         body=str(data.get("body") or "").strip(),
         assets=list(data.get("assets") or []),
     )
@@ -294,9 +366,7 @@ def _release_info_from_api_dict(data: dict) -> Optional[ReleaseInfo]:
 def _newest_release_from_list(items: list) -> Optional[ReleaseInfo]:
     """Pick the semantically newest tag; GitHub order is by publish date, not semver."""
     candidates: list[ReleaseInfo] = []
-    for item in items:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
+    for item in _filter_release_items(items):
         info = _release_info_from_api_dict(item)
         if info is not None:
             candidates.append(info)
@@ -321,9 +391,7 @@ def _newest_installable_release(items: list) -> Optional[ReleaseInfo]:
     best_info: Optional[ReleaseInfo] = None
     best_eff: Optional[str] = None
     best_tag: Optional[str] = None
-    for item in items:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
+    for item in _filter_release_items(items):
         info = _release_info_from_api_dict(item)
         if info is None or get_platform_asset(info.assets) is None:
             continue
@@ -358,11 +426,24 @@ def _fetch_release_list(user_agent: str) -> list:
         "Accept": "application/vnd.github+json",
         "User-Agent": user_agent,
     }
-    req = Request(GITHUB_RELEASES_LIST_URL, headers=headers)
+    req = Request(_github_releases_list_url(), headers=headers)
     with _urlopen_with_certs(req, timeout=20) as resp:
         raw = resp.read()
     items = json.loads(raw.decode("utf-8", errors="replace"))
-    return items if isinstance(items, list) else []
+    if not isinstance(items, list):
+        return []
+    filtered = _filter_release_items(items)
+    try:
+        from gui.release_config import update_channel
+
+        ch = update_channel()
+    except Exception:
+        ch = "stable"
+    _log_updater(
+        f"release list channel={ch!r} repo={_github_repo_slug()!r} "
+        f"raw={len(items)} visible={len(filtered)}"
+    )
+    return filtered
 
 
 def run_update_check(
@@ -420,7 +501,7 @@ def run_update_check(
 
     try:
         req = Request(
-            GITHUB_RELEASES_LATEST_URL,
+            _github_releases_latest_url(),
             headers={
                 "Accept": "application/vnd.github+json",
                 "User-Agent": user_agent,
@@ -429,7 +510,7 @@ def run_update_check(
         with _urlopen_with_certs(req, timeout=20) as resp:
             raw = resp.read()
         data = json.loads(raw.decode("utf-8", errors="replace"))
-        if isinstance(data, dict):
+        if isinstance(data, dict) and _release_passes_channel_filter(data):
             info = _release_info_from_api_dict(data)
             if info is not None and get_platform_asset(info.assets) is not None:
                 eff = _effective_platform_version(info)
@@ -458,7 +539,7 @@ def run_update_check(
 
     result = UpdateCheckResult(
         status="unavailable",
-        error="No published releases found on GitHub.",
+        error="No published releases found on GitHub for this update channel.",
     )
     _log_updater(f"check finished -> {result.status} error={result.error!r}")
     return result
@@ -502,11 +583,8 @@ def check_latest_release(
         "User-Agent": user_agent,
     }
     try:
-        req = Request(GITHUB_RELEASES_LIST_URL, headers=headers)
-        with _urlopen_with_certs(req, timeout=20) as resp:
-            raw = resp.read()
-        items = json.loads(raw.decode("utf-8", errors="replace"))
-        if isinstance(items, list) and items:
+        items = _fetch_release_list(user_agent)
+        if items:
             cur_ver = (current_version or "").strip()
             if cur_ver:
                 info = _best_release_newer_than_for_platform(items, cur_ver)
@@ -520,11 +598,11 @@ def check_latest_release(
         pass
 
     try:
-        req = Request(GITHUB_RELEASES_LATEST_URL, headers=headers)
+        req = Request(_github_releases_latest_url(), headers=headers)
         with _urlopen_with_certs(req, timeout=20) as resp:
             raw = resp.read()
         data = json.loads(raw.decode("utf-8", errors="replace"))
-        if isinstance(data, dict):
+        if isinstance(data, dict) and _release_passes_channel_filter(data):
             info = _release_info_from_api_dict(data)
             if info is not None:
                 if get_platform_asset(info.assets) is None:
@@ -646,7 +724,7 @@ def _releases_download_url(tag_name: str, basename: str) -> Optional[str]:
         return None
     t = quote(tag, safe="")
     f = quote(base, safe="")
-    return f"https://github.com/{GITHUB_REPO_SLUG}/releases/download/{t}/{f}"
+    return f"https://github.com/{_github_repo_slug()}/releases/download/{t}/{f}"
 
 
 def _best_release_newer_than_for_platform(
@@ -659,9 +737,7 @@ def _best_release_newer_than_for_platform(
     best_info: Optional[ReleaseInfo] = None
     best_eff: Optional[str] = None
     best_tag: Optional[str] = None
-    for item in items:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
+    for item in _filter_release_items(items):
         info = _release_info_from_api_dict(item)
         if info is None:
             continue
