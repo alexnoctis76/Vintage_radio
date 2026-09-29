@@ -45,7 +45,7 @@ class TestFetchMicroPythonUF2:
 
         calls: list[str] = []
 
-        def urlopen(req, timeout=60):
+        def urlopen(req, timeout=60, context=None):
             url = req.full_url if hasattr(req, "full_url") else str(req)
             calls.append(url)
             if url.endswith("/download/RPI_PICO/"):

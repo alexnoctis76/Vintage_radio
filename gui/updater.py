@@ -1001,9 +1001,23 @@ def download_update(
 
 
 def _extract_zip(zip_path: Path, extract_dir: Path) -> None:
+    """Extract a release zip; on macOS use ``ditto`` so Frameworks symlinks survive."""
     if extract_dir.exists():
         shutil.rmtree(extract_dir, ignore_errors=True)
     extract_dir.mkdir(parents=True, exist_ok=True)
+    if platform.system() == "Darwin":
+        proc = subprocess.run(
+            ["ditto", "-x", "-k", str(zip_path), str(extract_dir)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(
+                f"ditto failed to extract update zip (exit {proc.returncode})"
+                + (f": {detail}" if detail else "")
+            )
+        return
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(extract_dir)
 
@@ -1123,7 +1137,18 @@ endlocal
 
 
 def _macos_bundle_main_executable(bundle: Path) -> Path:
-    """PyInstaller one-folder bundle: ``Name.app/Contents/MacOS/Name``."""
+    """Main Mach-O inside a .app (``CFBundleExecutable``, not the ``.app`` folder name)."""
+    plist_path = bundle / "Contents" / "Info.plist"
+    if plist_path.is_file():
+        try:
+            import plistlib
+
+            data = plistlib.loads(plist_path.read_bytes())
+            exe_name = data.get("CFBundleExecutable")
+            if exe_name:
+                return bundle / "Contents" / "MacOS" / str(exe_name)
+        except Exception:
+            pass
     return bundle / "Contents" / "MacOS" / bundle.stem
 
 

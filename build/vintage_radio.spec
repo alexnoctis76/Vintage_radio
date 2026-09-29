@@ -25,6 +25,13 @@ block_cipher = None
 # Project root (parent of build/ which contains this spec)
 project_dir = Path(SPECPATH).parent
 
+sys.path.insert(0, str(project_dir))
+from project_version import PROJECT_VERSION as _project_version_label
+
+_cf_bundle_short_version = _project_version_label
+if _cf_bundle_short_version.startswith("v"):
+    _cf_bundle_short_version = _cf_bundle_short_version[1:]
+
 # Optional: PYINSTALLER_TARGET_ARCH=arm64|x86_64 on macOS (CI Intel build on Apple Silicon).
 _pyi_target_arch = (os.environ.get("PYINSTALLER_TARGET_ARCH") or "").strip() or None
 if _pyi_target_arch and platform.system() != "Darwin":
@@ -70,6 +77,7 @@ datas = [
     (str(project_dir / 'firmware' / 'pico' / 'main.py'), 'firmware/pico'),
     (str(project_dir / 'firmware' / 'pico' / 'main_basic.py'), 'firmware/pico'),
     (str(project_dir / 'firmware' / 'radio_core.py'), 'firmware'),
+    (str(project_dir / 'firmware' / 'dfplayer_protocol.py'), 'firmware'),
     (str(project_dir / 'firmware' / 'pico' / 'dfplayer_hardware.py'), 'firmware/pico'),
     (str(project_dir / 'firmware' / 'pico' / 'sdcard.py'), 'firmware/pico'),
     (str(project_dir / 'firmware' / 'custom_driver_template.py'), 'firmware'),
@@ -322,7 +330,7 @@ if platform.system() == "Darwin":
         bundle_identifier='com.zionbrock.vintage-radio',
         info_plist={
             'CFBundleDisplayName': 'Vintage Radio',
-            'CFBundleShortVersionString': '1.0.0',
+            'CFBundleShortVersionString': _cf_bundle_short_version,
             'NSHighResolutionCapable': True,
             'LSMinimumSystemVersion': '15.0',
         },

@@ -7551,7 +7551,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if selected_id in ("v1.1_stable", "v1.0_stable", "vintage_radio_source"):
             selected_id = ""
         if not selected_id and mode != "custom":
-            family = str(self._active_library_meta().get("firmware_family") or "basic")
+            from gui.commercials import effective_firmware_family
+
+            family = effective_firmware_family(self._active_library_meta())
             if family == "conductor" and any(
                 str(e.get("id", "")) == "vintage_radio_conductor" for e in entries
             ):
@@ -8166,7 +8168,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._install_vintage_radio_official_firmware(entry)
             return
         if str(entry.get("kind") or "").lower() == "vintage_radio_conductor":
-            if not self._confirm_family_switch("conductor"):
+            if not self._warn_firmware_family_mismatch(expected="conductor"):
                 return
             self._install_vintage_radio_conductor_firmware(entry)
             return
@@ -8263,14 +8265,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         if platform.system() == "Darwin":
+            from gui.sd_manager import _probe_volume_readable
+
             vols = Path("/Volumes")
             if vols.is_dir():
                 for item in vols.iterdir():
-                    try:
-                        if item.is_dir() and item.name.upper().startswith("RPI-RP2"):
-                            return item
-                    except OSError:
-                        continue
+                    if item.name.upper().startswith("RPI-RP2") and _probe_volume_readable(item):
+                        return item
         return None
 
     def _flash_uf2_to_bootsel(self, uf2_path: Path, *, success_title: str = "Install firmware") -> bool:
@@ -14872,6 +14873,7 @@ class MainWindow(QtWidgets.QMainWindow):
             files_to_copy = [
                 ("firmware/pico/main.py", "main.py"),
                 ("firmware/radio_core.py", "radio_core.py"),
+                ("firmware/dfplayer_protocol.py", "dfplayer_protocol.py"),
                 ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
                 (
                     "firmware/pico/components/vintage_radio_ipc.py",

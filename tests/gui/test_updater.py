@@ -379,3 +379,32 @@ def test_run_update_check_update_available():
     assert result.status == "update_available"
     assert result.release is not None
     assert result.release.tag_name == "v1.1.0"
+
+
+def test_extract_zip_uses_ditto_on_macos(tmp_path):
+    zip_path = tmp_path / "update.zip"
+    zip_path.write_bytes(b"fake")
+    extract_dir = tmp_path / "out"
+    with mock.patch.object(sys.modules["platform"], "system", return_value="Darwin"):
+        with mock.patch("gui.updater.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            updater._extract_zip(zip_path, extract_dir)
+    run.assert_called_once()
+    args = run.call_args[0][0]
+    assert args[:3] == ["ditto", "-x", "-k"]
+
+
+def test_macos_bundle_main_executable_uses_cf_bundle_executable(tmp_path):
+    import plistlib
+
+    bundle = tmp_path / "Vintage Radio-x86_64.app"
+    macos = bundle / "Contents" / "MacOS"
+    macos.mkdir(parents=True)
+    (macos / "Vintage Radio").write_bytes(b"")
+    plist = {
+        "CFBundleExecutable": "Vintage Radio",
+        "CFBundleShortVersionString": "1.1.0-upgrade-test",
+    }
+    (bundle / "Contents" / "Info.plist").write_bytes(plistlib.dumps(plist))
+    exe = updater._macos_bundle_main_executable(bundle)
+    assert exe == macos / "Vintage Radio"

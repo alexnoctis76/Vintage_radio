@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import ssl
 import urllib.request
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -25,6 +27,27 @@ MICROPYTHON_PICO_URL = "https://micropython.org/download/RPI_PICO/"
 FLASH_NUKE_URL = "https://datasheets.raspberrypi.com/soft/flash_nuke.uf2"
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """TLS context using certifi's CA bundle.
+
+    Python.org macOS builds and PyInstaller bundles have no usable system trust
+    store, so a bare ``urlopen`` fails with CERTIFICATE_VERIFY_FAILED.
+    """
+    try:
+        import certifi
+
+        cafile = certifi.where()
+        if cafile and os.path.isfile(cafile):
+            return ssl.create_default_context(cafile=cafile)
+    except Exception:
+        pass
+    return ssl.create_default_context()
+
+
+def _urlopen(req: urllib.request.Request, timeout: int):
+    return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
+
+
 def _writable_firmware_cache_dir(*parts: str) -> Path:
     """User-writable cache (never inside a frozen .app bundle / _MEIPASS)."""
     cache = app_data_dir().joinpath("firmware_cache", *parts)
@@ -43,7 +66,7 @@ def fetch_flash_nuke_uf2(*, force: bool = False) -> Path:
     if not force and out.is_file() and out.stat().st_size > 1000:
         return out
     req = urllib.request.Request(FLASH_NUKE_URL, headers={"User-Agent": "VintageRadio/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with _urlopen(req, timeout=120) as resp:
         data = resp.read()
     if len(data) < 1000:
         raise RuntimeError(f"flash_nuke download too small ({len(data)} bytes)")
@@ -166,7 +189,7 @@ def fetch_micropython_uf2(*, force: bool = False) -> Path:
 
     cache = _micropython_cache_dir()
     req = urllib.request.Request(MICROPYTHON_PICO_URL, headers={"User-Agent": "VintageRadio/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with _urlopen(req, timeout=60) as resp:
         html = resp.read().decode("utf-8", errors="replace")
 
     links = list_micropython_uf2_hrefs(html)
@@ -181,6 +204,6 @@ def fetch_micropython_uf2(*, force: bool = False) -> Path:
 
     download_url = "https://micropython.org" + href
     req2 = urllib.request.Request(download_url, headers={"User-Agent": "VintageRadio/1.0"})
-    with urllib.request.urlopen(req2, timeout=120) as resp:
+    with _urlopen(req2, timeout=120) as resp:
         out.write_bytes(resp.read())
     return out

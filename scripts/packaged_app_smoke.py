@@ -219,6 +219,25 @@ def run_smoke(
     if missing_fw:
         return _finish(steps, False, report_path)
 
+    update_copy_app: Optional[Path] = None
+    update_workdir: Optional[tempfile.TemporaryDirectory[str]] = None
+    if mac_app is not None:
+        scripts_dir = str(Path(__file__).resolve().parent)
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import packaged_bundle_checks as bundle_checks
+        from project_version import PROJECT_VERSION
+
+        for row in bundle_checks.run_static_checks(mac_app, PROJECT_VERSION):
+            steps.append(row)
+        # Extract the way the in-app updater does; the result is launched below because a
+        # flattened Frameworks/Python symlink only shows up as a dead app after an update.
+        update_workdir = tempfile.TemporaryDirectory(prefix="vr_smoke_update_")
+        rt_row, update_copy_app = bundle_checks.zip_and_extract_like_updater(
+            mac_app, Path(update_workdir.name)
+        )
+        steps.append(rt_row)
+
     with tempfile.TemporaryDirectory(prefix="vr_smoke_data_") as smoke_data:
         proc = _launch_packaged(
             exe=exe,
@@ -282,6 +301,20 @@ def run_smoke(
                     terminated,
                     returncode=proc.poll(),
                 )
+
+    if update_copy_app is not None:
+        with tempfile.TemporaryDirectory(prefix="vr_smoke_data_upd_") as upd_data:
+            upd_port = port + 1
+            upd_proc = _launch_packaged(
+                exe=None, mac_app=update_copy_app, port=upd_port, data_dir=Path(upd_data)
+            )
+            try:
+                up_ok, up_err = _wait_for_ping(host, upd_port, PING_TIMEOUT_S)
+                record("updater_extracted_copy_launches", up_ok, error=up_err or None)
+            finally:
+                _terminate_process(upd_proc)
+    if update_workdir is not None:
+        update_workdir.cleanup()
 
     failed = [s["name"] for s in steps if not s.get("ok")]
     overall = not failed

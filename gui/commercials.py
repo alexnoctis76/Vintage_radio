@@ -424,6 +424,7 @@ def firmware_copy_pairs(install_mode: str) -> List[Tuple[str, str]]:
         return [
             ("firmware/conductor/main.py", "main.py"),
             ("firmware/conductor/radio_core.py", "radio_core.py"),
+            ("firmware/dfplayer_protocol.py", "dfplayer_protocol.py"),
             ("firmware/conductor/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
             (
                 "firmware/conductor/components/vintage_radio_ipc.py",
@@ -443,6 +444,7 @@ def firmware_copy_pairs(install_mode: str) -> List[Tuple[str, str]]:
     return [
         ("firmware/pico/main_basic.py", "main.py"),
         ("firmware/radio_core.py", "radio_core.py"),
+        ("firmware/dfplayer_protocol.py", "dfplayer_protocol.py"),
         ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         (
             "firmware/pico/components/vintage_radio_ipc.py",

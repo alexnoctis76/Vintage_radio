@@ -283,6 +283,10 @@ if [ "$SIGN" = false ]; then
     done < <(find "$APP_BUNDLE" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
     rm -rf "$APP_BUNDLE/Contents/_CodeSignature" 2>/dev/null || true
     [ "$_strip_count" -gt 0 ] && echo "  Removed signature from $_strip_count binary(ies)"
+    # codesign --remove clears the execute bit on some Mach-O; restore for launch/update.
+    while IFS= read -r -d '' f; do
+        chmod u+x "$f" 2>/dev/null || true
+    done < <(find "$APP_BUNDLE/Contents/MacOS" -type f -print0 2>/dev/null)
 fi
 
 # Code sign only with Developer ID. Ad-hoc signing (-) causes "damaged" when the app
@@ -419,6 +423,11 @@ if [ "$SKIP_SMOKE" = false ]; then
     echo ""
     echo "Running packaged app smoke tests..."
     python3 "$PROJECT_ROOT/scripts/packaged_app_smoke.py" --mac-app "$APP_BUNDLE"
+else
+    echo ""
+    echo "WARNING: --skip-smoke set. Bundle integrity (Frameworks symlinks, mpremote_helper,"
+    echo "         mpy-cross, plist version, updater extract) was NOT verified. Do not ship this build."
+    echo "         Verify with: python3 scripts/packaged_app_smoke.py --mac-app \"$APP_BUNDLE\""
 fi
 
 echo ""

@@ -541,13 +541,18 @@ class TestFirmwareRoot:
     def test_conductor_copy_pairs_stay_in_conductor_tree(self):
         pairs = firmware_copy_pairs("conductor")
         assert pairs
-        assert all(src.startswith("firmware/conductor/") for src, _dst in pairs)
+        assert all(
+            src.startswith("firmware/conductor/") or src == "firmware/dfplayer_protocol.py"
+            for src, _dst in pairs
+        )
         assert any(dst == "main.py" for _src, dst in pairs)
         assert any(src.endswith("radio_core.py") for src, _dst in pairs)
+        assert any(dst == "dfplayer_protocol.py" for _src, dst in pairs)
 
     def test_basic_copy_pairs_use_pico_tree(self):
         pairs = firmware_copy_pairs("basic")
         assert any(src == "firmware/pico/main_basic.py" for src, _dst in pairs)
+        assert any(dst == "dfplayer_protocol.py" for _src, dst in pairs)
         assert all(not src.startswith("firmware/conductor/") for src, _dst in pairs)
 
 

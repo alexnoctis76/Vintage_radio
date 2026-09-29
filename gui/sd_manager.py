@@ -51,6 +51,48 @@ _SYNC_MANIFEST_NAME = ".sync_manifest.json"
 SyncFailureAction = Literal["stop", "skip", "skip_all"]
 OnSyncFailureCallback = Callable[[Dict[str, str]], SyncFailureAction]
 
+# A wedged removable volume (stale SMB share, hung FAT driver, USB passthrough glitch)
+# makes stat()/is_dir() block in the kernel forever. Volume scans run on the UI thread at
+# startup, so one bad mount would freeze the whole app. Probe each volume on a throwaway
+# daemon thread and give up quickly instead.
+_VOLUME_PROBE_TIMEOUT_S = 2.0
+_HUNG_VOLUME_COOLDOWN_S = 120.0
+_hung_volumes: Dict[str, float] = {}
+_hung_volumes_lock = threading.Lock()
+
+
+def _probe_volume_readable(path: Path, timeout: Optional[float] = None) -> Optional[bool]:
+    """Return True/False if *path* is a readable directory, or None if it did not answer.
+
+    None means the volume is unresponsive. It is remembered for a cooldown period so
+    repeated scans do not spawn a new blocked thread every time.
+    """
+    key = str(path)
+    now = time.monotonic()
+    with _hung_volumes_lock:
+        hung_at = _hung_volumes.get(key)
+        if hung_at is not None:
+            if now - hung_at < _HUNG_VOLUME_COOLDOWN_S:
+                return None
+            del _hung_volumes[key]
+
+    result: List[bool] = []
+
+    def _work() -> None:
+        try:
+            result.append(path.is_dir() and os.access(path, os.R_OK))
+        except OSError:
+            result.append(False)
+
+    worker = threading.Thread(target=_work, name="vr-volume-probe", daemon=True)
+    worker.start()
+    worker.join(_VOLUME_PROBE_TIMEOUT_S if timeout is None else timeout)
+    if worker.is_alive():
+        with _hung_volumes_lock:
+            _hung_volumes[key] = time.monotonic()
+        return None
+    return result[0] if result else False
+
 
 @dataclass
 class BasicSdSyncValidation:
@@ -497,7 +539,7 @@ class SDManager:
                 if not volumes.exists():
                     return False
                 for item in volumes.iterdir():
-                    if not item.is_dir():
+                    if not _probe_volume_readable(item):
                         continue
                     try:
                         if sd_root.resolve() == item.resolve():
@@ -869,7 +911,7 @@ class SDManager:
                             continue
                         if any(keyword.lower() in name.lower() for keyword in system_volume_keywords):
                             continue
-                        if not item.is_dir() or not os.access(item, os.R_OK):
+                        if not _probe_volume_readable(item):
                             continue
 
                         # Check filesystem type via psutil if available; prefer
@@ -934,11 +976,8 @@ class SDManager:
                 vols = Path("/Volumes")
                 if vols.is_dir():
                     for item in vols.iterdir():
-                        try:
-                            if item.is_dir() and item.name.upper().startswith("RPI-RP2"):
-                                return True
-                        except OSError:
-                            continue
+                        if item.name.upper().startswith("RPI-RP2") and _probe_volume_readable(item):
+                            return True
         except Exception:
             pass
         return False
