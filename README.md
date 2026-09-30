@@ -157,25 +157,15 @@ Navigation is the left sidebar: **Load Music**, **Install Firmware**, **Tools**,
 | **Conductor** | Advanced layouts  | Catalog on RP2040 flash plus SD audio; inline ads and library shuffle. |
 | **Legacy**    | Old projects only | Not recommended for new setups.                                        |
 
+
 The usual path is **Install Firmware** for **Basic** or **Conductor** (bundled Python copied over USB). **Install Firmware** also covers most MicroPython setup; if the board is empty, you may flash once via **BOOTSEL** as the app directs.
 
 **Other firmware on the RP2040** (optional):
 
-- **Tools → MicroPython** — install official **MicroPython** or other **`.uf2`** images while the board is in **BOOTSEL** mode (the `RPI-RP2` drive appears).
+- **Tools → MicroPython** — install official **MicroPython** or other `.uf2` images while the board is in **BOOTSEL** mode (the `RPI-RP2` drive appears).
 - **View → Advanced** — work with your own Python project or **custom** firmware folders.
 
 You can still use this app to manage **libraries** and **Sync to SD**. Gestures in [Button presses](#button-presses) and the **255-track** limit below apply to **Vintage Radio Basic and Conductor**; other firmware defines its own behavior.
-
-### Why use Vintage Radio firmware (not “SD card only”)?
-
-A DFPlayer module can play files from folders, but **without this project’s RP2040 firmware** you do not get the full radio experience the app is built for:
-
-- **Station-style control** from the front-panel button (next/previous track, change station, shuffle modes)—see [Button presses](#button-presses).
-- **Automatic track and station advance** when a song ends.
-- **AM-style overlay** and power-on behavior tied to the volume pot.
-- **Status LED** feedback on the NeoPixel (playing, idle, warning, and fault states—see **Help**).
-- **Commercials** on a schedule (folder 99 and, with Conductor, inline tagged ads).
-- **Install Firmware from the app** so settings stay tied to each **library**, not hand-edited scripts on the board.
 
 **Basic** discovers stations from the SD layout the app syncs—simple and predictable.
 
@@ -237,14 +227,32 @@ Inline and folder-99 commercials are configured in the app; **Sync to SD** and *
 
 ---
 
-## Commercials and optional ads
+## Personalize your radio with custom commercials!
 
-Some libraries include:
+You can sprinkle **station IDs, bumpers, and short ads** into your lineup—either on a timer or **right before a specific song**.
 
-- A **commercials station** (folder `99` on the SD) for periodic station IDs or ads between music.
-- **Tagged tracks** (Conductor) for short clips tied to specific songs.
+![Load Music — tag a commercial and link it to the track below](docs/images/readme/06-commercials.png)
 
-Configure these on the **Load Music** sync bar and in library settings, then **Sync to SD** and **Install Firmware** together whenever you update that library.
+### Two ways to play ads
+
+| Method | Firmware | What it does |
+|--------|----------|--------------|
+| **Commercials station** | Basic or Conductor | A dedicated **Commercials** station (folder `99` on the SD) plays every few **music** tracks—set the interval on the sync bar (for example every **3** songs). |
+| **Tagged tracks** | **Conductor** | Short clips live **in the same station** as your music. Mark a row as a commercial, optionally **link** it to the song **directly below**, and that ad plays immediately before that track. |
+
+You can use **Commercials station** alone on Basic, or combine both options on Conductor (**Tagged tracks** + **Commercials station**).
+
+### Link a commercial to a track (Conductor)
+
+1. On **Load Music**, turn on **Tagged tracks** on the sync bar (Conductor library).
+2. Select a **station** and put tracks in **play order**—drag rows to reorder if needed.
+3. On a short ad or ID row, click the **speaker / commercial** control (or right‑click → **Mark as commercial**). The row is tagged as an ad.
+4. Click the **link** icon on that same row (or right‑click → **Link to track below**). A chain appears between the ad and the **next** row—the song that should follow the ad.
+5. **Sync to SD**, then **Install Firmware** so the radio gets the updated catalog.
+
+**Tips:** Only **commercial** rows can link, and they link to the **track below**, not above. When you shuffle in Conductor, **linked** ads stay paired with their song; unlinked ads in the station are skipped during library shuffle.
+
+Folder **99** ads and tagged ads both need a fresh **Sync** + **Install Firmware** after you change them.
 
 ---
 
@@ -278,9 +286,7 @@ Connect the **COM port**, watch serial messages, and open **session logs** when 
 | Too many tracks in one station        | See below                                                                                 |
 
 
-**255 tracks per station:** The station list shows counts like `11/255`. **Vintage Radio Basic and Conductor do not support more than 255 tracks in one station** (one DFPlayer folder). Split a large album across **two stations** (two folders on the SD card).
-
-If you run **different firmware** (your own MicroPython code, a third-party UF2, or custom files from **View → Advanced**), you may define different limits on the board—the app may show informational warnings above 255, but that is **your** firmware’s responsibility. **Help → Re-enable 255+ track warning** turns that heads-up back on if you dismissed it.
+**255 tracks per station:** The station list shows counts like `11/255`. That matches the usual DFPlayer **255 tracks per folder** limit. **To fit more music:** add a **second station** and move or import the rest of the album there (each station is its own folder on the SD card). **Vintage Radio firmware** can work with larger folders in some setups; if you go past 255 you may see a **Track Count Warning**—read it before continuing. If you dismissed that warning, turn it back on from **Help → Re-enable 255+ track warning** (or the same item under the menu bar **Help** menu). Power-user options live under **View → Advanced** if you need the full legacy device tools.
 
 Use **Help → View session log** or **Open logs folder** when you need to share logs for support.
 
