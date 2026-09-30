@@ -48,6 +48,7 @@ def _firmware_file_pairs(basic_mode: bool = True) -> List[Tuple[str, str]]:
     return [
         (main_source, "main.py"),
         ("firmware/radio_core.py", "radio_core.py"),
+        ("firmware/dfplayer_protocol.py", "dfplayer_protocol.py"),
         ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         ("firmware/pico/components/vintage_radio_ipc.py", "components/vintage_radio_ipc.py"),
         ("firmware/pico/components/radio_state.py", "components/radio_state.py"),
@@ -214,6 +215,7 @@ try {
 $files = @(
     @("main.py", "main.py"),
     @("radio_core.py", "radio_core.py"),
+    @("dfplayer_protocol.py", "dfplayer_protocol.py"),
     @("pin_config_loader.py", "pin_config_loader.py"),
     @("sdcard.py", "sdcard.py"),
     @("pin_config.json", "pin_config.json"),
@@ -273,6 +275,7 @@ copy() {
 
 copy "$FIRMWARE/main.py" main.py
 copy "$FIRMWARE/radio_core.py" radio_core.py
+copy "$FIRMWARE/dfplayer_protocol.py" dfplayer_protocol.py
 copy "$FIRMWARE/pin_config_loader.py" pin_config_loader.py
 copy "$FIRMWARE/sdcard.py" sdcard.py
 copy "$FIRMWARE/pin_config.json" pin_config.json

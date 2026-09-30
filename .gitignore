@@ -69,6 +69,12 @@ agent_workshop/temp/
 # Agent/dev workshop (entire directory)
 agent_workshop/
 
+# Local analysis / review notes (not for commits)
+Test_Suite_Review.md
+Fable_review.md
+Sonnet_review.md
+report.md
+
 # Cursor plan files
 *.plan.md
 

@@ -186,9 +186,10 @@ def test_run_update_check_up_to_date_when_current_ahead_of_github():
             ],
         }
     ]
-    with mock.patch.object(updater, "_fetch_release_list", return_value=items):
-        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
-            result = updater.run_update_check(current_version="v1.0.0")
+    with mock.patch("gui.release_config.update_check_enabled", return_value=True):
+        with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+            with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+                result = updater.run_update_check(current_version="v1.0.0")
     assert result.status == "up_to_date"
     assert result.latest_published == "v0.2.5-beta"
     assert result.release is not None
@@ -373,9 +374,10 @@ def test_run_update_check_update_available():
             ],
         }
     ]
-    with mock.patch.object(updater, "_fetch_release_list", return_value=items):
-        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
-            result = updater.run_update_check(current_version="v1.0.0")
+    with mock.patch("gui.release_config.update_check_enabled", return_value=True):
+        with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+            with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+                result = updater.run_update_check(current_version="v1.0.0")
     assert result.status == "update_available"
     assert result.release is not None
     assert result.release.tag_name == "v1.1.0"

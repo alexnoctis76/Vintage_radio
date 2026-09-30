@@ -1,7 +1,6 @@
 {
   "update": {
-    "enabled": false,
-    "channel": "dev",
-    "note": "Bundled in local/CI test builds so Check for Updates does not offer GitHub release installers."
+    "enabled": true,
+    "channel": "stable"
   }
 }
