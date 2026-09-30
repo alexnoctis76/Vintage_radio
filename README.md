@@ -1,4 +1,4 @@
-# Vintage Radio
+# Vintage Radio Music Manager
 
 Desktop companion for **Zion Brock’s** [Vintage AM Radio](https://www.zionbrock.com/radio) build (RP2040 + DFPlayer Mini). Import and organize music on your PC, **sync it to the radio’s SD card** with the folder layout the hardware expects, and **install or update firmware** over USB—without hand-renaming hundreds of MP3s or guessing which DFPlayer folder is which.
 
