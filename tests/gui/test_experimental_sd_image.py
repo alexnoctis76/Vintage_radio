@@ -25,7 +25,15 @@ def test_fat_volume_label() -> None:
 def test_suggest_image_size_bytes_minimum() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        assert suggest_image_size_bytes(root) >= 64 * 1024 * 1024
+        assert suggest_image_size_bytes(root) == 64 * 1024 * 1024
+
+
+def test_suggest_image_size_bytes_grows_with_content() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        empty_size = suggest_image_size_bytes(root)
+        (root / "payload.bin").write_bytes(b"x" * (50 * 1024 * 1024))
+        assert suggest_image_size_bytes(root) > empty_size
 
 
 @pytest.mark.skipif(

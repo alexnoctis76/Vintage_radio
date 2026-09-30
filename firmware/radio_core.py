@@ -83,39 +83,34 @@ MODE_RADIO = "radio"
 
 ALL_MODES = [MODE_ALBUM, MODE_PLAYLIST, MODE_SHUFFLE, MODE_RADIO]
 
-# Persisted on Pico flash (alongside album_state.txt).
-# Tuple: (DFPlayer folder_count from 0x4F or -1, number of discovered stations).
-BASIC_SD_SIG_FILE = "VintageRadio/basic_sd_sig.txt"
-
-
-def _parse_basic_sd_sig_line(text):
-    """Parse basic_sd_sig.txt; return (folder_count, n_stations, tf_files|None)."""
-    line = (text or "").strip()
-    if not line:
-        return None
-    parts = line.split(",")
-    if len(parts) == 2:
-        try:
-            return (int(parts[0].strip()), int(parts[1].strip()), None)
-        except (TypeError, ValueError):
-            return None
-    if len(parts) == 3:
-        try:
-            return (int(parts[0].strip()), int(parts[1].strip()), int(parts[2].strip()))
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _format_basic_sd_sig(sig):
-    """Serialize signature for basic_sd_sig.txt."""
-    if sig is None:
-        return ""
-    fc = int(sig[0])
-    n = int(sig[1])
-    if len(sig) >= 3 and sig[2] is not None:
-        return "{},{},{}".format(fc, n, int(sig[2]))
-    return "{},{}".format(fc, n)
+try:
+    from components.radio_state import (
+        BASIC_SD_SIG_FILE,
+        basic_is_cold_power_on_reset as _basic_is_cold_power_on_reset,
+        basic_sd_signatures_equivalent as _basic_sd_signatures_equivalent,
+        basic_sd_sig_tf_count as _basic_sd_sig_tf_count,
+        format_basic_sd_sig as _format_basic_sd_sig,
+        parse_basic_sd_sig_line as _parse_basic_sd_sig_line,
+    )
+except ImportError:
+    try:
+        from firmware.pico.components.radio_state import (
+            BASIC_SD_SIG_FILE,
+            basic_is_cold_power_on_reset as _basic_is_cold_power_on_reset,
+            basic_sd_signatures_equivalent as _basic_sd_signatures_equivalent,
+            basic_sd_sig_tf_count as _basic_sd_sig_tf_count,
+            format_basic_sd_sig as _format_basic_sd_sig,
+            parse_basic_sd_sig_line as _parse_basic_sd_sig_line,
+        )
+    except ImportError:
+        from pico.components.radio_state import (
+            BASIC_SD_SIG_FILE,
+            basic_is_cold_power_on_reset as _basic_is_cold_power_on_reset,
+            basic_sd_signatures_equivalent as _basic_sd_signatures_equivalent,
+            basic_sd_sig_tf_count as _basic_sd_sig_tf_count,
+            format_basic_sd_sig as _format_basic_sd_sig,
+            parse_basic_sd_sig_line as _parse_basic_sd_sig_line,
+        )
 
 
 # ===========================
@@ -343,6 +338,38 @@ def basic_mode_max_folder_for_station_seed(fc, hi_probe_result):
     return hi
 
 
+def basic_mode_effective_folder_count(fc, ads_folder_present):
+    """Raw 0x4F folder total, adjusted to exclude the reserved ads folder (99).
+
+    Folder 99 sits outside the sequential ``01..N`` station range but 0x4F still
+    counts it, so probing at the raw total (via ``basic_mode_max_folder_for_station_seed``)
+    lands in the numeric gap between the last music folder and 99 and always reads
+    back empty -- indistinguishable from the "+1 ambiguity" signal that function
+    already treats as "one folder short". Removing folder 99 from the count first
+    keeps the probe target on folders that could plausibly be real music stations.
+    """
+    if fc is None:
+        return None
+    try:
+        fc = int(fc)
+    except (TypeError, ValueError):
+        return None
+    return max(0, fc - 1) if ads_folder_present else fc
+
+
+def basic_mode_music_folder_count(fc, hi_probe_result, ads_folder_present):
+    """Sequential (01..N) music-station count for basic-mode lazy discovery.
+
+    Same contract as ``basic_mode_max_folder_for_station_seed``, but first removes
+    the reserved ads folder (99) from the raw 0x4F total when it is physically
+    present, so a folder-99 commercials reel does not get miscounted as (or hidden
+    behind) a phantom sequential station. ``hi_probe_result`` must be the 0x4E
+    count for folder ``min(99, basic_mode_effective_folder_count(fc, ads_folder_present))``.
+    """
+    fc_effective = basic_mode_effective_folder_count(fc, ads_folder_present)
+    return basic_mode_max_folder_for_station_seed(fc_effective, hi_probe_result)
+
+
 # ===========================
 #      CORE STATE MACHINE
 # ===========================
@@ -416,7 +443,7 @@ class RadioCore:
         # Set by _next_track when looping same station: last track -> track 1 (DFPlayer quirk)
         self._folder_wrap_play = False
         
-        # Basic mode station-end behavior (fixed; folder 99 is normal music, not UART flags).
+        # Basic mode station-end behavior. Folder 99 is commercials when enabled.
         self.loop_stations = False
         # When True, after the last track of a station (or one full station shuffle pass),
         # advance to the next station instead of stopping or looping in place.
@@ -428,6 +455,167 @@ class RadioCore:
         # detect SD swaps while power is off and trigger soft reset + fresh boot.
         self._basic_sd_signature = None
         self._defer_basic_reconcile = False
+        self._init_commercials_state()
+
+    def _init_commercials_state(self):
+        cfg = {}
+        getter = getattr(self.hw, "get_commercials_config", None)
+        if callable(getter):
+            try:
+                cfg = getter() or {}
+            except Exception:
+                cfg = {}
+        self._commercials_enabled = bool(cfg.get("enabled"))
+        try:
+            self._commercials_interval = max(1, min(99, int(cfg.get("interval") or 5)))
+        except (TypeError, ValueError):
+            self._commercials_interval = 5
+        try:
+            self._commercials_folder = int(cfg.get("folder") or 99)
+        except (TypeError, ValueError):
+            self._commercials_folder = 99
+        self._music_plays_since_ad = 0
+        self._playing_commercial = False
+        self._commercial_resume = None
+        self._commercials_empty_logged = False
+        self._commercials_mode = cfg.get("mode") or "folder_99"
+
+    def _station_folder_number(self, station):
+        tracks = (station or {}).get("tracks") or []
+        if tracks:
+            try:
+                return int(tracks[0].get("folder"))
+            except (TypeError, ValueError, AttributeError):
+                pass
+        try:
+            return int((station or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _filter_commercials_stations(self, stations):
+        if not self._commercials_enabled or not stations:
+            return stations
+        out = []
+        for st in stations:
+            if self._station_folder_number(st) == self._commercials_folder:
+                continue
+            out.append(st)
+        return out
+
+    def _query_commercials_count(self):
+        q = getattr(self.hw, "query_files_in_folder", None)
+        if not callable(q):
+            return 0
+        try:
+            n = q(self._commercials_folder)
+            return int(n or 0)
+        except Exception:
+            return 0
+
+    def _play_random_commercial(self, from_track_end=False):
+        n = self._query_commercials_count()
+        if n <= 0:
+            if not self._commercials_empty_logged:
+                self.hw.log("COMMERCIALS: folder 99 empty, skipping insert")
+                self._commercials_empty_logged = True
+            return False
+        try:
+            import urandom as _rand
+        except ImportError:
+            import random as _rand
+        track = 1
+        try:
+            if hasattr(_rand, "randint"):
+                track = _rand.randint(1, n)
+            else:
+                track = (_rand.getrandbits(8) % n) + 1
+        except Exception:
+            track = 1
+        self._commercial_resume = self._commercial_resume_point(from_track_end)
+        self._playing_commercial = True
+        self._music_plays_since_ad = 0
+        self.hw.log(f"COMMERCIALS: playing folder {self._commercials_folder} track {track}")
+        self.hw.play_track(self._commercials_folder, track)
+        self.is_playing = True
+        return True
+
+    def _commercial_resume_point(self, from_track_end=False):
+        """Next music position after a folder-99 insert.
+
+        Ordered mode stores the next folder/playlist track number. Shuffle stores
+        the next 1-based shuffle_index because playback follows shuffle_tracks,
+        not current_track as a folder number.
+        """
+        album = int(self.current_album_index)
+        if self.mode == MODE_SHUFFLE:
+            n = self._shuffle_entry_count()
+            if n <= 0:
+                return (album, int(self.current_track) + 1)
+            if self.shuffle_index >= n - 1:
+                return (album, n + 1)
+            return (album, self.shuffle_index + 2)
+        return (album, int(self.current_track) + 1)
+
+    def _resume_after_commercial(self):
+        self._playing_commercial = False
+        idx, track = self._commercial_resume or (self.current_album_index, self.current_track)
+        self._commercial_resume = None
+        self.current_album_index = idx
+        if self.mode == MODE_SHUFFLE:
+            n = self._shuffle_entry_count()
+            if n > 0 and int(track) > n:
+                if self.advance_next_station:
+                    self._next_album(from_auto_advance=True)
+                else:
+                    self.hw.log(
+                        "Commercial resume: past end of shuffled station, stopping"
+                    )
+                    self.hw.stop()
+                    self.is_playing = False
+                return
+            self.shuffle_index = max(0, int(track) - 1)
+            self.current_track = self.shuffle_index + 1
+            self._start_playback_for_current()
+            return
+        total = self._get_track_count()
+        if total > 0 and track > total:
+            if self.advance_next_station:
+                self._next_album(from_auto_advance=True)
+            else:
+                self.hw.log(
+                    "Commercial resume: past end of station, wrapping to track 1"
+                )
+                self.current_track = 1
+                self._start_playback_for_current()
+            return
+        self.current_track = max(1, int(track))
+        self._start_playback_for_current()
+
+    def _cancel_pending_commercial(self):
+        """Drop folder-99 ad state when playback moves for an unrelated reason.
+
+        A gesture or station change while an ad is playing leaves the ad state
+        set, so the next track-finished event is mistaken for "ad over" and jumps
+        back to a resume point that no longer matches where the user is.
+        """
+        if not getattr(self, "_playing_commercial", False) and getattr(
+            self, "_commercial_resume", None
+        ) is None:
+            return
+        self._playing_commercial = False
+        self._commercial_resume = None
+        self.hw.log("COMMERCIALS: pending resume cancelled (playback changed)")
+
+    def _maybe_insert_commercial_after_music(self, from_track_end=False):
+        if not self.basic_mode or not self._commercials_enabled or self._playing_commercial:
+            return False
+        if getattr(self, "_commercials_mode", "folder_99") not in ("folder_99", "both"):
+            return False
+        self._music_plays_since_ad += 1
+        if self._music_plays_since_ad < self._commercials_interval:
+            return False
+        return self._play_random_commercial(from_track_end=from_track_end)
+
     def _basic_playlist_track_count(self, playlist: dict) -> int:
         tracks = playlist.get("tracks", [])
         if tracks:
@@ -723,7 +911,7 @@ class RadioCore:
         if new_sig is None:
             return
         prev = self._basic_read_sd_signature_file()
-        if prev is not None and prev != new_sig:
+        if prev is not None and not _basic_sd_signatures_equivalent(prev, new_sig):
             self.hw.log(
                 "BASIC: SD layout changed since last boot; clearing saved playback state"
             )
@@ -731,6 +919,19 @@ class RadioCore:
             reset = getattr(self.hw, "reset_saved_playback_state_to_defaults", None)
             if callable(reset):
                 reset()
+
+    def _basic_clear_persisted_state_on_cold_boot(self):
+        """Full Pico power loss: do not resume pot-off position from flash."""
+        if not self.basic_mode or not _IS_MICROPYTHON:
+            return
+        if not _basic_is_cold_power_on_reset():
+            return
+        self.hw.log(
+            "BASIC: Cold boot (power-on reset); clearing saved playback state"
+        )
+        reset = getattr(self.hw, "reset_saved_playback_state_to_defaults", None)
+        if callable(reset):
+            reset()
     
     def init(self, skip_initial_playback=False):
         """Initialize the radio - load state and optionally start playback.
@@ -739,6 +940,7 @@ class RadioCore:
         """
         self._load_data()
         if self.basic_mode:
+            self._basic_clear_persisted_state_on_cold_boot()
             self._basic_maybe_reset_persisted_state_if_sd_changed()
         self._load_state()
         if self.basic_mode:
@@ -777,6 +979,7 @@ class RadioCore:
         """
         self.albums = []
         stations = self.hw.discover_stations()
+        stations = self._filter_commercials_stations(stations)
         if stations:
             self.playlists = stations
         else:
@@ -921,9 +1124,10 @@ class RadioCore:
                     self._init_shuffle()
     
     def _save_state(self, reason="", persist=None):
-        """Capture runtime state; persist to flash only when requested.
+        """Capture runtime state in RAM; flash writes only when persist=True.
 
-        By default, persistence is pot-off checkpoint only.
+        Pot-off resume uses in-memory resume_state so toggling the knob does not
+        wear Pico flash or survive a full power disconnect.
         """
         state = {
             'mode': self.mode,
@@ -933,8 +1137,7 @@ class RadioCore:
         if not _IS_MICROPYTHON:
             state['known_tracks'] = dict(self.known_tracks)
         self._runtime_state = dict(state)
-        should_persist = (reason == "power off") if persist is None else bool(persist)
-        if should_persist:
+        if persist:
             self.hw.save_state(state)
     
     # ===========================
@@ -1317,30 +1520,35 @@ class RadioCore:
         """Move to next track.
 
         from_track_end: True when advancing because the current track finished playing
-        (hardware / UART end). Used so basic station-shuffle can advance to the next
-        station after the last entry in ``shuffle_tracks`` without treating an explicit
-        ``single_tap`` on the last shuffle step as "station complete" (tap should wrap
-        within the same shuffled station).
+        (hardware / UART end).
+
+        In ordered station/playlist mode and in station shuffle, a single_tap on
+        the last track advances to the next station (same as a natural end).
+        Manual skips also count toward the folder-99 interval so ads stay in
+        sequence when clicking through.
         """
         old_track = self.current_track
         old_album = self.current_album_index
         folder_wrap = False
         
         if self.mode == MODE_SHUFFLE:
+            if not from_track_end and self._maybe_insert_commercial_after_music():
+                return
             n = self._shuffle_entry_count()
             if n <= 0:
                 self.hw.log("_next_track: No shuffle tracks available")
                 return
             if (
-                from_track_end
-                and self.basic_mode
+                self.basic_mode
                 and self._shuffle_source_type == "station"
                 and n > 0
                 and self.shuffle_index >= n - 1
             ):
                 if self.advance_next_station:
                     self.hw.log(
-                        "Track finished: finished shuffled station, advancing to next station"
+                        "Single tap: finished shuffled station, advancing to next station"
+                        if not from_track_end
+                        else "Track finished: finished shuffled station, advancing to next station"
                     )
                     self._next_album(from_auto_advance=True)
                     return
@@ -1381,7 +1589,17 @@ class RadioCore:
                     pass
                 # #endregion
                 return
+            if not from_track_end and self._maybe_insert_commercial_after_music():
+                return
             if self.current_track >= total:
+                if self.basic_mode and self.advance_next_station:
+                    self.hw.log(
+                        "Single tap: end of station, advancing to next station"
+                        if not from_track_end
+                        else "Track finished: end of station, advancing to next station"
+                    )
+                    self._next_album(from_auto_advance=True)
+                    return
                 self.current_track = 1
                 folder_wrap = old_track >= total and total > 0
             else:
@@ -1773,6 +1991,11 @@ class RadioCore:
             pass
         # #endregion
         
+        if self._playing_commercial:
+            self.hw.log("COMMERCIALS: finished, resuming music")
+            self._resume_after_commercial()
+            return
+
         if self.mode == MODE_RADIO:
             self.hw.log("Track finished, auto-advancing (radio)")
             self._advance_radio_track()
@@ -1796,9 +2019,12 @@ class RadioCore:
                     self._handle_basic_track_not_found(folder, tn)
                     return
 
-        # Basic mode: end of station shuffle is handled inside _next_track(from_track_end=True)
-        # so the decision runs with the same shuffle_index state as a manual single_tap
-        # (which calls _next_track(from_track_end=False) and should wrap, not change station).
+        # Basic mode: end of station shuffle is handled inside _next_track
+        # (last shuffle entry advances to the next station for both natural end
+        # and single_tap).
+
+        if self._maybe_insert_commercial_after_music(from_track_end=True):
+            return
 
         # Basic mode: end of station in sequential (playlist) mode
         if self.basic_mode and self.mode == MODE_PLAYLIST:
@@ -2200,8 +2426,9 @@ class RadioCore:
             'position_ms': self.hw.get_playback_position_ms(),
         }
         
-        self._save_state("power off")
+        self._save_state("power off", persist=False)
         self.hw.stop()
+        self.is_playing = False
     
     def power_on_handler(self):
         """Handle power on."""
@@ -2215,43 +2442,23 @@ class RadioCore:
         self.hw.stop()
         self.is_playing = False
 
-        # Basic mode: SD card may have been swapped while the pot was off. Rediscover
-        # stations like boot and drop stale per-folder counts so hydration re-queries
-        # the DFPlayer (avoids playing phantom tracks from the previous card).
-        if self.basic_mode:
-            prev_sig = getattr(self, "_basic_sd_signature", None)
-            self.known_tracks = {}
-            if hasattr(self.hw, "_known_tracks"):
-                self.hw._known_tracks = {}
-            self._load_data_basic()
-            new_sig = getattr(self, "_basic_sd_signature", None)
-            if prev_sig is not None and new_sig is not None and prev_sig != new_sig:
-                self.hw.log(
-                    "BASIC: SD layout changed while power was off; restarting firmware"
-                )
-                reset = getattr(self.hw, "reset_saved_playback_state_to_defaults", None)
-                if callable(reset):
-                    reset()
-                try:
-                    import machine
-
-                    machine.soft_reset()
-                except Exception:
-                    pass
-
         # Enable playback delay so firmware can sequence AM overlay before track
         self._schedule_delayed_playback("power_on")
-        
-        # Restore only mode and album from saved state (track/position ignored; we start from track 1)
+
+        saved_track = self.current_track
         if self.resume_state:
             self.mode = self.resume_state.get('mode', MODE_ALBUM)
             self.current_album_index = self.resume_state.get('album_index', 0)
+            try:
+                saved_track = int(self.resume_state.get('track', saved_track) or saved_track)
+            except (TypeError, ValueError):
+                pass
             self.resume_state = None
 
         if self.basic_mode and self.playlists:
             if self.current_album_index >= len(self.playlists):
                 self.hw.log(
-                    "Clamping album index %d after SD rediscover (have %d stations)"
+                    "Clamping album index %d after power-on (have %d stations)"
                     % (self.current_album_index, len(self.playlists))
                 )
                 self.current_album_index = max(0, len(self.playlists) - 1)
@@ -2263,13 +2470,23 @@ class RadioCore:
         ):
             if self._basic_rebuild_station_shuffle_tracks(reason="power_on"):
                 self.hw.log("BASIC: Rebuilt station shuffle after power-on (fresh SD order)")
-        
-        # Always start from track 1 on power-on
-        self.current_track = 1
-        if self.mode == MODE_SHUFFLE and self._shuffle_entry_count() > 0:
+        elif self.mode == MODE_SHUFFLE and self._shuffle_entry_count() > 0:
             self.shuffle_index = 0
+            self.current_track = max(1, saved_track)
         elif self.mode == MODE_RADIO and self.radio_stations:
             self.radio_station_index = 0
+            self.current_track = max(1, saved_track)
+        else:
+            self.current_track = max(1, saved_track)
+            if self.basic_mode and self.playlists:
+                self._hydrate_basic_station(self.current_album_index, allow_assume=True)
+                n = self._basic_playlist_track_count(self.playlists[self.current_album_index])
+                if n > 0 and self.current_track > n:
+                    self.hw.log(
+                        "BASIC: Clamping resumed track %d to station size %d"
+                        % (self.current_track, n)
+                    )
+                    self.current_track = n
     
     # ===========================
     #   PLAYBACK HELPERS
@@ -2408,6 +2625,9 @@ class RadioCore:
                     source_name = self.albums[self.current_album_index].get('name', 'Album')
                 else:
                     source_name = "Unknown Album"
+            elif self._shuffle_source_type == 'library':
+                shuffle_type = "library"
+                source_name = "Library"
             else:
                 shuffle_type = ""
                 source_name = "Shuffle"
@@ -2430,7 +2650,8 @@ class RadioCore:
             # Combined log line — GUI parser extracts mode/source/shuffle_type/album_idx.
             self.hw.log(
                 f"_start_playback_for_current: mode={mode_label}, source={source_name}, "
-                f"shuffle_type={shuffle_type}, album_idx={self.current_album_index}"
+                f"shuffle_type={shuffle_type}, album_idx={self.current_album_index}, "
+                f"folder={folder}, track={track_num}"
             )
             self._start_playback_for_track(track, start_ms=start_ms)
         else:
@@ -2441,7 +2662,9 @@ class RadioCore:
         if not track:
             self.hw.log("_start_playback_for_track: No track provided")
             return
-        
+
+        self._cancel_pending_commercial()
+
         # For DFPlayer, we need folder/track numbers
         folder = track.get('folder', 1)
         track_num = track.get('track_number', 1)
@@ -2647,6 +2870,8 @@ class RadioCore:
                     source_name = self.playlists[self.current_album_index].get('name', 'Station')
                 else:
                     source_name = "Shuffle"
+            elif self._shuffle_source_type == 'library':
+                source_name = "Library"
             else:
                 source_name = "Shuffle"
         elif self.mode == MODE_RADIO:
@@ -2664,8 +2889,7 @@ class RadioCore:
         track = self._get_current_track()
         track_title = track.get('title', 'Unknown') if track else 'Unknown'
         track_artist = track.get('artist', 'Unknown') if track else 'Unknown'
-        
-        return {
+        status = {
             'mode': self.mode,
             'source': source_name,
             'track_number': self.current_track,
@@ -2676,5 +2900,28 @@ class RadioCore:
             'power_on': self.power_on,
             'volume': self.volume,
             'station_cycle_shuffle_active': False,
+        }
+        status.update(self._commercials_status_fields())
+        return status
+
+    def _commercials_status_fields(self):
+        """Debugger / IPC fields for folder-99, integrated, and linked commercials."""
+        folder_ad = bool(getattr(self, "_playing_commercial", False))
+        linked_ad = bool(getattr(self, "_linked_ad_playing", False))
+        inline_ad = False
+        if not folder_ad and not linked_ad:
+            track = self._get_current_track()
+            if track:
+                try:
+                    inline_ad = bool(int(track.get("ad") or 0))
+                except (TypeError, ValueError):
+                    inline_ad = False
+        return {
+            "playing_commercial": folder_ad or linked_ad or inline_ad,
+            "commercials_mode": getattr(self, "_commercials_mode", None),
+            "commercials_enabled": bool(getattr(self, "_commercials_enabled", False)),
+            "commercials_interval": getattr(self, "_commercials_interval", None),
+            "linked_ad_playing": linked_ad,
+            "folder_commercial_playing": folder_ad,
         }
 

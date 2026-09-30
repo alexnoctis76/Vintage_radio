@@ -196,6 +196,66 @@ def test_smart_install_uses_mpremote_when_vr_ready_and_full_uf2_present(monkeypa
     assert bootsel_called["v"] is False
 
 
+def test_smart_install_current_bootsel_flashes_micropython_not_release_uf2(monkeypatch, tmp_path):
+    from gui.radio_manager import MainWindow
+
+    release = tmp_path / "firmware" / "release"
+    release.mkdir(parents=True)
+    uf2 = release / "vintage-radio-firmware-1.0.1-full.uf2"
+    uf2.write_bytes(b"NEW" * 400)
+
+    mgr = MainWindow.__new__(MainWindow)
+    monkeypatch.setattr(mgr, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(mgr, "_resolve_mpremote_cmd", lambda: ["mpremote"])
+    monkeypatch.setattr(
+        rm,
+        "_pico_install_assessment",
+        lambda *_a, **_k: {"status": "bootsel", "port": None},
+    )
+    flash_uf2 = {"v": False}
+
+    def fail_uf2(*_a, **_k):
+        flash_uf2["v"] = True
+        raise AssertionError("USB install should not flash release UF2")
+
+    monkeypatch.setattr(mgr, "_copy_uf2_to_bootsel_quiet", fail_uf2)
+    monkeypatch.setattr(
+        mgr,
+        "_flash_micropython_for_install",
+        lambda *_a, **_k: (True, None),
+    )
+
+    result = mgr._smart_install_vintage_radio_worker(allow_release_uf2=False)
+    assert result == {"action": "install_to_pico", "after_firmware": True}
+    assert flash_uf2["v"] is False
+
+
+def test_smart_install_legacy_bootsel_flashes_release_uf2(monkeypatch, tmp_path):
+    from gui.radio_manager import MainWindow
+
+    release = tmp_path / "firmware" / "release"
+    release.mkdir(parents=True)
+    uf2 = release / "vintage-radio-firmware-1.0.1-full.uf2"
+    uf2.write_bytes(b"NEW" * 400)
+
+    mgr = MainWindow.__new__(MainWindow)
+    monkeypatch.setattr(mgr, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(mgr, "_resolve_mpremote_cmd", lambda: None)
+    monkeypatch.setattr(mgr, "_is_rpi_rp2_present", lambda: True)
+    monkeypatch.setattr(
+        mgr,
+        "_copy_uf2_to_bootsel_quiet",
+        lambda path, **_: path == uf2,
+    )
+
+    result = mgr._smart_install_vintage_radio_worker(
+        full_uf2_path=str(uf2),
+        allow_release_uf2=True,
+    )
+    assert result["action"] == "message"
+    assert "Flashed" in result["message"] or "flashed" in result["message"]
+
+
 def test_smart_install_older_uf2_requires_bootsel_not_mpremote(monkeypatch, tmp_path):
     from gui.radio_manager import MainWindow
 
@@ -221,7 +281,10 @@ def test_smart_install_older_uf2_requires_bootsel_not_mpremote(monkeypatch, tmp_
         lambda path, **_: path == old,
     )
 
-    result = mgr._smart_install_vintage_radio_worker(full_uf2_path=str(old))
+    result = mgr._smart_install_vintage_radio_worker(
+        full_uf2_path=str(old),
+        allow_release_uf2=True,
+    )
     assert result["action"] == "message"
     assert result["level"] == "info"
     assert "1.0.0" in result["message"] or "v1.0.0" in result["message"]

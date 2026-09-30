@@ -36,10 +36,31 @@ class LibraryRegistry:
                 with self._registry_path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
                 if "libraries" in data and "active" in data:
+                    if self._reconcile_registry_firmware_families(data):
+                        self._save(data)
                     return data
             except (json.JSONDecodeError, OSError):
                 pass
         return self._bootstrap()
+
+    @staticmethod
+    def _reconcile_registry_firmware_families(data: dict) -> bool:
+        """Fix stale firmware_family values from older registry data."""
+        from gui.commercials import effective_firmware_family
+
+        changed = False
+        for info in data.get("libraries", {}).values():
+            meta = {
+                "firmware_family": info.get("firmware_family", "basic"),
+                "commercials_enabled": bool(info.get("commercials_enabled", False)),
+                "commercials_mode": info.get("commercials_mode"),
+            }
+            effective = effective_firmware_family(meta)
+            stored = str(info.get("firmware_family") or "basic").strip().lower()
+            if stored != effective:
+                info["firmware_family"] = effective
+                changed = True
+        return changed
 
     def _bootstrap(self) -> dict:
         """Create the initial registry with a single default library."""
@@ -65,17 +86,92 @@ class LibraryRegistry:
         tmp.replace(self._registry_path)
 
     def list_libraries(self) -> List[Dict]:
-        """Return a list of ``{"slug", "name", "filename", "is_active"}`` dicts."""
+        """Return library records including firmware-family / commercials metadata."""
         active = self._data["active"]
         return [
             {
                 "slug": slug,
+                "is_active": slug == active,
+                **self.library_meta(slug),
                 "name": info["name"],
                 "filename": info["filename"],
-                "is_active": slug == active,
             }
             for slug, info in self._data["libraries"].items()
         ]
+
+    def library_meta(self, slug: str) -> Dict:
+        """Durable family/commercials fields (defaults for older registries)."""
+        info = self._data["libraries"].get(slug)
+        if info is None:
+            raise KeyError(f"Unknown library: {slug!r}")
+        meta = {
+            "firmware_family": info.get("firmware_family", "basic"),
+            "commercials_enabled": bool(info.get("commercials_enabled", False)),
+            "commercials_mode": info.get("commercials_mode"),
+        }
+        from gui.commercials import effective_firmware_family
+
+        family = effective_firmware_family(meta)
+        if str(info.get("firmware_family") or "basic").strip().lower() != family:
+            info["firmware_family"] = family
+            self._save()
+        mode = info.get("commercials_mode")
+        if mode not in {"folder_99", "inline", "both", None}:
+            mode = None
+        return {
+            "name": info.get("name", slug),
+            "firmware_family": family,
+            "commercials_enabled": bool(info.get("commercials_enabled", False)),
+            "commercials_mode": mode,
+        }
+
+    def set_library_firmware_family(self, slug: str, family: str) -> None:
+        if slug not in self._data["libraries"]:
+            raise KeyError(f"Unknown library: {slug!r}")
+        family = "conductor" if str(family).strip().lower() == "conductor" else "basic"
+        self._data["libraries"][slug]["firmware_family"] = family
+        self._save()
+
+    def set_library_commercials(
+        self,
+        slug: str,
+        *,
+        enabled: bool,
+        mode: Optional[str] = None,
+    ) -> None:
+        if slug not in self._data["libraries"]:
+            raise KeyError(f"Unknown library: {slug!r}")
+        self._data["libraries"][slug]["commercials_enabled"] = bool(enabled)
+        if enabled:
+            self._data["libraries"][slug]["commercials_mode"] = (
+                mode if mode in {"folder_99", "inline", "both"} else "folder_99"
+            )
+        else:
+            self._data["libraries"][slug]["commercials_mode"] = None
+        self._save()
+
+    def duplicate_library(self, source_slug: str, new_name: Optional[str] = None) -> str:
+        """Copy a library DB and its firmware/commercials metadata."""
+        if source_slug not in self._data["libraries"]:
+            raise KeyError(f"Unknown library: {source_slug!r}")
+        src = self._data["libraries"][source_slug]
+        name = (new_name or f"{src['name']} (copy)").strip()
+        slug = self._slugify(name)
+        filename = f"{_REGISTRY_DIR}/{slug}.db"
+        dest = self._root / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src_path = self.db_path_for(source_slug)
+        if src_path.exists():
+            shutil.copy2(src_path, dest)
+        self._data["libraries"][slug] = {
+            "name": name,
+            "filename": filename,
+            "firmware_family": src.get("firmware_family", "basic"),
+            "commercials_enabled": bool(src.get("commercials_enabled", False)),
+            "commercials_mode": src.get("commercials_mode"),
+        }
+        self._save()
+        return slug
 
     def active_library(self) -> str:
         """Return the slug of the currently active library."""
@@ -104,7 +200,13 @@ class LibraryRegistry:
         if slug in self._data["libraries"]:
             raise ValueError(f"Library already exists: {name!r}")
         filename = f"{_REGISTRY_DIR}/{slug}.db"
-        self._data["libraries"][slug] = {"name": name, "filename": filename}
+        self._data["libraries"][slug] = {
+            "name": name,
+            "filename": filename,
+            "firmware_family": "basic",
+            "commercials_enabled": False,
+            "commercials_mode": None,
+        }
         self._save()
         return slug
 

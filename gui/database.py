@@ -12,7 +12,7 @@ from .resource_paths import app_data_dir
 from typing import Any, Dict, Iterable, List, Optional
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,24 @@ class DatabaseManager:
             self._set_schema_version(6)
             current = 6
             print("[DB] Migration to v6 complete")
+        if current < 7:
+            print("[DB] Running migration to v7...")
+            self._migrate_to_v7()
+            self._set_schema_version(7)
+            current = 7
+            print("[DB] Migration to v7 complete")
+        if current < 8:
+            print("[DB] Running migration to v8...")
+            self._migrate_to_v8()
+            self._set_schema_version(8)
+            current = 8
+            print("[DB] Migration to v8 complete")
+        if current < 9:
+            print("[DB] Running migration to v9...")
+            self._migrate_to_v9()
+            self._set_schema_version(9)
+            current = 9
+            print("[DB] Migration to v9 complete")
         # Safety: ensure sort_order column exists even if version was already 3
         # (handles cases where version was bumped but ALTER TABLE didn't succeed)
         self._ensure_sort_order_columns()
@@ -359,6 +377,67 @@ class DatabaseManager:
         )
         self.conn.commit()
 
+    def _migrate_to_v7(self) -> None:
+        """Per-placement commercial flag on basic_station_tracks."""
+        tables = {
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        if "basic_station_tracks" not in tables:
+            return
+        cols = [
+            r["name"]
+            for r in self.conn.execute("PRAGMA table_info(basic_station_tracks);").fetchall()
+        ]
+        if "is_commercial" not in cols:
+            self.conn.execute(
+                "ALTER TABLE basic_station_tracks "
+                "ADD COLUMN is_commercial INTEGER NOT NULL DEFAULT 0;"
+            )
+            self.conn.commit()
+
+    def _migrate_to_v8(self) -> None:
+        """Link a commercial to the music track immediately below it."""
+        tables = {
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        if "basic_station_tracks" not in tables:
+            return
+        cols = [
+            r["name"]
+            for r in self.conn.execute("PRAGMA table_info(basic_station_tracks);").fetchall()
+        ]
+        if "link_to_next" not in cols:
+            self.conn.execute(
+                "ALTER TABLE basic_station_tracks "
+                "ADD COLUMN link_to_next INTEGER NOT NULL DEFAULT 0;"
+            )
+            self.conn.commit()
+
+    def _migrate_to_v9(self) -> None:
+        """Persist last SD sync error per library track."""
+        tables = {
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        if "songs" not in tables:
+            return
+        cols = [
+            r["name"] for r in self.conn.execute("PRAGMA table_info(songs);").fetchall()
+        ]
+        if "sync_error" not in cols:
+            self.conn.execute("ALTER TABLE songs ADD COLUMN sync_error TEXT;")
+        if "sync_error_at" not in cols:
+            self.conn.execute("ALTER TABLE songs ADD COLUMN sync_error_at TEXT;")
+        self.conn.commit()
+
     def _ensure_basic_stations_tables(self) -> None:
         """Safety: create basic_stations tables if missing."""
         tables = {
@@ -369,6 +448,8 @@ class DatabaseManager:
         }
         if "basic_stations" not in tables or "basic_station_tracks" not in tables:
             self._migrate_to_v5()
+        self._migrate_to_v7()
+        self._migrate_to_v8()
 
     def _ensure_default_device_profile(self) -> None:
         """Ensure at least one default profile exists."""
@@ -539,22 +620,121 @@ class DatabaseManager:
                 return n
         raise ValueError(f"All {max_folder} DFPlayer folders are in use")
 
-    def update_basic_station_order(self, station_ids: List[int]) -> None:
-        """Reorder stations and reassign folder numbers so position matches folder (1-indexed)."""
+    def update_basic_station_order(
+        self, station_ids: List[int], *, pin_folder_99: bool = False
+    ) -> None:
+        """Reorder stations. When Folder commercials are on, folder 99 stays pinned."""
+        rows = {int(r["id"]): r for r in self.list_basic_stations()}
+        pinned = [
+            sid
+            for sid in station_ids
+            if pin_folder_99 and sid in rows and int(rows[sid]["folder_number"] or 0) == 99
+        ]
+        music = [sid for sid in station_ids if sid not in pinned]
         with self.conn:
-            # Temporarily set folder_number to negative to avoid UNIQUE conflicts during swap
             for idx, sid in enumerate(station_ids):
                 self.conn.execute(
                     "UPDATE basic_stations SET sort_order = ?, folder_number = ? WHERE id = ?;",
                     (idx, -(idx + 1), sid),
                 )
-            for idx, sid in enumerate(station_ids):
+            folder = 1
+            max_music_folder = 98
+            for sid in music:
+                if folder > max_music_folder:
+                    raise ValueError(
+                        f"DFPlayer basic layout supports at most {max_music_folder} "
+                        f"music stations (folders 01–{max_music_folder:02d}); "
+                        f"folder 99 is reserved for commercials."
+                    )
                 self.conn.execute(
                     "UPDATE basic_stations SET folder_number = ? WHERE id = ?;",
-                    (idx + 1, sid),
+                    (folder, sid),
+                )
+                folder += 1
+            for sid in pinned:
+                self.conn.execute(
+                    "UPDATE basic_stations SET folder_number = 99 WHERE id = ?;",
+                    (sid,),
                 )
         self.conn.commit()
         self._maybe_backup()
+
+    def ensure_commercials_station(self, name: str = "Commercials / Sweepers") -> int:
+        row = self.conn.execute(
+            "SELECT id FROM basic_stations WHERE folder_number = 99;"
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        return self.create_basic_station(name, 99)
+
+    def release_reserved_commercials_station(
+        self, reserved_names: Optional[Iterable[str]] = None
+    ) -> Optional[int]:
+        """Remove the auto-created Folder commercials station so 99 can be a normal station."""
+        names = {
+            str(n).strip()
+            for n in (reserved_names or ("Commercials / Sweepers", "Commercials"))
+        }
+        row = self.conn.execute(
+            "SELECT id, name FROM basic_stations WHERE folder_number = 99;"
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row["name"] or "").strip() not in names:
+            return None
+        sid = int(row["id"])
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM basic_station_tracks WHERE station_id = ?;", (sid,)
+            )
+            self.conn.execute("DELETE FROM basic_stations WHERE id = ?;", (sid,))
+        self._maybe_backup()
+        return sid
+
+    def set_basic_station_track_commercial(self, track_row_id: int, is_commercial: bool) -> None:
+        self.conn.execute(
+            """UPDATE basic_station_tracks
+               SET is_commercial = ?,
+                   link_to_next = CASE WHEN ? = 0 THEN 0 ELSE link_to_next END
+               WHERE id = ?;""",
+            (1 if is_commercial else 0, 1 if is_commercial else 0, int(track_row_id)),
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def set_basic_station_track_link(self, track_row_id: int, link_to_next: bool) -> None:
+        self.conn.execute(
+            """UPDATE basic_station_tracks
+               SET link_to_next = ?
+               WHERE id = ? AND COALESCE(is_commercial, 0) = 1;""",
+            (1 if link_to_next else 0, int(track_row_id)),
+        )
+        self.conn.commit()
+        self._maybe_backup()
+
+    def sanitize_basic_station_track_links(self, station_id: int) -> None:
+        """Clear links that are no longer immediately above a music track."""
+        rows = self.list_basic_station_tracks(station_id)
+        dirty = False
+        for index, row in enumerate(rows):
+            if not int(row["link_to_next"] or 0):
+                continue
+            nxt = rows[index + 1] if index + 1 < len(rows) else None
+            keep = (
+                int(row["is_commercial"] or 0) == 1
+                and nxt is not None
+                and int(nxt["is_commercial"] or 0) == 0
+            )
+            if keep:
+                continue
+            self.conn.execute(
+                "UPDATE basic_station_tracks SET link_to_next = 0 WHERE id = ?;",
+                (int(row["id"]),),
+            )
+            dirty = True
+        if dirty:
+            self.conn.commit()
+            self._maybe_backup()
 
     def add_song_to_basic_station(self, station_id: int, song_id: int, track_order: int) -> None:
         with self.conn:
@@ -602,7 +782,10 @@ class DatabaseManager:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                """SELECT basic_station_tracks.id AS bst_id, songs.*
+                """SELECT basic_station_tracks.id AS bst_id,
+                          COALESCE(basic_station_tracks.is_commercial, 0) AS is_commercial,
+                          COALESCE(basic_station_tracks.link_to_next, 0) AS link_to_next,
+                          songs.*
                    FROM basic_station_tracks
                    JOIN songs ON songs.id = basic_station_tracks.song_id
                    WHERE basic_station_tracks.station_id = ?
@@ -617,7 +800,10 @@ class DatabaseManager:
         """Return all tracks for a station, including duplicates. Each row has a
         ``bst_id`` column (the basic_station_tracks row id) for individual removal."""
         return self.conn.execute(
-            """SELECT basic_station_tracks.id AS bst_id, songs.*
+            """SELECT basic_station_tracks.id AS bst_id,
+                      COALESCE(basic_station_tracks.is_commercial, 0) AS is_commercial,
+                      COALESCE(basic_station_tracks.link_to_next, 0) AS link_to_next,
+                      songs.*
                FROM basic_station_tracks
                JOIN songs ON songs.id = basic_station_tracks.song_id
                WHERE basic_station_tracks.station_id = ?
@@ -627,24 +813,67 @@ class DatabaseManager:
 
     def list_basic_station_tracks(self, station_id: int) -> List[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT id, song_id, track_order
+            """SELECT id, song_id, track_order,
+                      COALESCE(is_commercial, 0) AS is_commercial,
+                      COALESCE(link_to_next, 0) AS link_to_next
                FROM basic_station_tracks
                WHERE station_id = ?
                ORDER BY track_order ASC;""",
             (station_id,),
         ).fetchall()
 
-    def replace_basic_station_tracks(self, station_id: int, song_ids: Iterable[int]) -> None:
+    def replace_basic_station_tracks(
+        self,
+        station_id: int,
+        song_ids: Iterable[int],
+        commercial_flags: Optional[Iterable[bool]] = None,
+        link_flags: Optional[Iterable[bool]] = None,
+    ) -> None:
+        song_list = list(song_ids)
+        flags = list(commercial_flags) if commercial_flags is not None else None
+        links = list(link_flags) if link_flags is not None else None
         with self.conn:
             self.conn.execute(
                 "DELETE FROM basic_station_tracks WHERE station_id = ?;", (station_id,)
             )
-            for index, song_id in enumerate(song_ids, start=1):
+            for index, song_id in enumerate(song_list, start=1):
+                is_ad = 0
+                if flags is not None and index - 1 < len(flags):
+                    is_ad = 1 if flags[index - 1] else 0
+                linked = 0
+                if is_ad and links is not None and index - 1 < len(links):
+                    linked = 1 if links[index - 1] else 0
                 self.conn.execute(
-                    """INSERT INTO basic_station_tracks (station_id, song_id, track_order)
-                       VALUES (?, ?, ?);""",
-                    (station_id, song_id, index),
+                    """INSERT INTO basic_station_tracks
+                           (station_id, song_id, track_order, is_commercial, link_to_next)
+                       VALUES (?, ?, ?, ?, ?);""",
+                    (station_id, song_id, index, is_ad, linked),
                 )
+        self._maybe_backup()
+
+    def reorder_basic_station_tracks(
+        self, station_id: int, bst_ids: Iterable[int]
+    ) -> None:
+        """Change track order in place so flags such as is_commercial stay put."""
+        ids = [int(bst_id) for bst_id in bst_ids]
+        if not ids:
+            return
+        with self.conn:
+            for index, bst_id in enumerate(ids, start=1):
+                self.conn.execute(
+                    """UPDATE basic_station_tracks
+                       SET track_order = ?
+                       WHERE id = ? AND station_id = ?;""",
+                    (-index, bst_id, station_id),
+                )
+            for index, bst_id in enumerate(ids, start=1):
+                self.conn.execute(
+                    """UPDATE basic_station_tracks
+                       SET track_order = ?
+                       WHERE id = ? AND station_id = ?;""",
+                    (index, bst_id, station_id),
+                )
+        self.sanitize_basic_station_track_links(station_id)
         self._maybe_backup()
 
     def next_basic_station_track_order(self, station_id: int) -> int:
@@ -842,6 +1071,23 @@ class DatabaseManager:
     def update_song_sd_path(self, song_id: int, sd_path: Optional[str]) -> None:
         path_str = "" if sd_path is None else str(sd_path)
         self.update_song(song_id, {"sd_path": path_str})
+
+    def set_song_sync_error(self, song_id: int, message: str) -> None:
+        """Record a persistent SD sync failure on a library track."""
+        text = (message or "").strip()
+        if not text:
+            self.clear_song_sync_error(song_id)
+            return
+        self.update_song(
+            song_id,
+            {
+                "sync_error": text[:500],
+                "sync_error_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def clear_song_sync_error(self, song_id: int) -> None:
+        self.update_song(song_id, {"sync_error": None, "sync_error_at": None})
 
     def update_song_sd_paths_batch(self, updates: List[tuple]) -> None:
         """Update sd_path and modified_at for many songs in one transaction. items: [(song_id, sd_path), ...]."""

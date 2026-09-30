@@ -1,232 +1,317 @@
-# Vintage Radio Music Manager (this readme is outdated, updating soon)
+# Vintage Radio Music Manager
 
-This app makes it easier to load and manage music for the [Vintage AM Radio](https://www.zionbrock.com/radio) by Zion Brock—a 3D-printed, offline radio that plays from an SD card and uses a DFPlayer Mini for playback. Instead of manually formatting the card and organizing files by folder and name, you can use this desktop app to manage your library, build albums and playlists, sync to SD with automatic conversion to MP3, and test behavior before using the hardware.
+Desktop companion for **Zion Brock’s** [Vintage AM Radio](https://www.zionbrock.com/radio) build (RP2040 + DFPlayer Mini). Import and organize music on your PC, **sync it to the radio’s SD card** with the folder layout the hardware expects, and **install or update firmware** over USB—without hand-renaming hundreds of MP3s or guessing which DFPlayer folder is which.
 
-The GUI provides a modern interface for organizing music files, syncing to SD cards, and testing firmware behavior. You can **drag and drop files or folders** into the Library, Albums, or Playlists views to import music quickly.
+![Load Music — your stations and tracks, ready to sync](docs/images/readme/01-load-music.png)
 
-![Main Interface Overview](docs/images/library.png)
+---
 
-In the future I will be adding metadata support to automatically create albums from file metadata, and finalize support for the raspberry pi 2 W and raspberry pi 3 (currently implemented, but not fully tested with hardware)
+## What this app does
 
-## Features
 
-### Core Functionality
-- **Music Library Management**: Import and organize music files in any audio format (MP3, FLAC, WAV, OGG, MIDI, etc.)
-- **Album & Playlist Creation**: Create custom albums and playlists with drag-and-drop support
-- **Metadata Extraction**: Automatic extraction of title, artist, duration, and format information
-- **SD Card Sync**: Sync your library to SD cards with automatic format conversion (to MP3 for hardware compatibility)
-- **Emulator**: Full emulation of the radio device with visual radio face and interactive controls
+| You do in the app                                      | What happens on the radio                                             |
+| ------------------------------------------------------ | --------------------------------------------------------------------- |
+| Build a **library** of songs grouped into **stations** | Each station becomes a DFPlayer folder (`01`, `02`, …) on the SD card |
+| **Sync to SD**                                         | Files are copied (and converted when needed) into that layout         |
+| **Install Firmware**                                   | The RP2040 receives the radio firmware and your library settings      |
+| **Tools** (optional)                                   | Connect over USB to view serial output and troubleshoot               |
 
-### Playback Modes
-- **Album Mode**: Play tracks in album order
-- **Playlist Mode**: Play tracks in playlist order
-- **Shuffle Mode**: Shuffle current album/playlist or entire library
-- **Radio Mode**: Virtual radio stations with continuous playback and tuning dial
 
-### Advanced Features
-- **Format Conversion**: Automatic conversion to MP3 during SD sync for DFPlayer Mini compatibility
-- **Virtual Time Tracking**: Radio mode tracks continuous playback across stations
-- **AM Radio Overlay**: Authentic AM radio sound effects when tuning or switching modes
-- **State Persistence**: Resume playback from where you left off after power cycles
-- **Database Backups**: Automatic database backups with configurable retention
+**Libraries** are separate collections—use one per SD card, per radio, or whenever you want a clean split of content. Use the bar at the top to create, duplicate, rename, or switch libraries.
 
-## Requirements
+**Stations** are how the radio groups music: one station becomes one numbered folder on the SD card. If your music is already in folders on disk, drag those folders into the station list.
 
-### Python
-- Python 3.8 or higher
+**Albums and playlists** (under **View → Advanced** in the menu) are extra ways to organize music on the computer. Most people use **stations + sync** for the hardware.
 
-### Dependencies
-Install from `requirements.txt`:
+---
+
+## Get the app
+
+Official builds are on [GitHub Releases](https://github.com/alexnoctis76/Vintage_radio/releases).
+
+
+| Platform                  | Download                         | Run                                                             |
+| ------------------------- | -------------------------------- | --------------------------------------------------------------- |
+| **Windows**               | `Vintage-Radio-Windows.zip`      | Unzip, open the `Vintage Radio` folder, run `Vintage Radio.exe` |
+| **macOS (Apple Silicon)** | `Vintage-Radio-macOS-arm64.zip`  | Unzip, open `Vintage Radio.app`                                 |
+| **macOS (Intel)**         | `Vintage-Radio-macOS-x86_64.zip` | Same; use the Intel build on older Macs                         |
+| **Linux**                 | *(not in releases yet)*          | See [Linux](#linux) below                                       |
+
+
+**Updates:** When a newer release is available, the app **prompts you after launch**. You can also check anytime from **Help → Check for updates**.
+
+**MP3 conversion:** Release builds include FFmpeg, so you usually do not need to install VLC or FFmpeg separately for sync.
+
+### macOS first launch
+
+If macOS says the app is “damaged” or won’t open after download:
+
+**In Finder**
+
+1. Open the folder where you unzipped the app.
+2. **Control-click** (or right-click) **Vintage Radio.app** → **Open**.
+3. In the dialog, click **Open** again. macOS remembers this choice for that app.
+
+If it still refuses to run, clear the download quarantine in Terminal:
+
 ```bash
-pip install -r requirements.txt
+xattr -cr "/path/to/Vintage Radio.app"
 ```
 
-**Core Dependencies:**
-- `PyQt6>=6.6.0` - GUI framework
-- `mutagen>=1.47.0` - Audio metadata extraction
-- `pygame-ce>=2.5.2` - Audio playback (emulator; same API as pygame, `import pygame`)
-- `psutil>=5.9.0` - System utilities (SD card detection)
-- `pydub>=0.25.1` - Audio processing
-- `python-vlc>=3.0.20123` - Advanced audio playback (optional, for better seeking support)
+Then try **Open** again from Finder. Unsigned builds are normal outside the App Store.
 
-### Required for file conversion (sync to SD)
-To convert non-MP3 files (FLAC, WAV, OGG, etc.) to MP3 when syncing to SD card or exporting, **one of the following is required**:
+### Linux
 
-- **VLC Media Player** (recommended) – [Download from VideoLAN](https://www.videolan.org/vlc/). Install on your system; the app will use it for conversion and for better seeking in the Emulator.
-- **FFmpeg** – used by pydub for conversion fallback when VLC is unavailable. Packaged app builds bundle an FFmpeg binary; source/dev runs can also use a system FFmpeg from PATH.
+Linux builds are **not tested yet** by the maintainer. Linux packages will be added to future releases. Until then, you can build locally from source:
 
-Without either VLC or FFmpeg, only MP3 files can be synced (other formats will be skipped).
-
-### Optional
-- **VLC** also improves playback and seeking in the Emulator. **FFmpeg** is only used when VLC is not available for conversion.
-
-## Installation
-(This is if you are compiling the app yourself. If you download one of the ZIPs from the release, the only additional thing you need is VLC media player)
-1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/alexnoctis76/Vintage_radio.git
 cd Vintage_radio
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt pyinstaller
+bash build/build_linux.sh
 ```
 
-2. Create a virtual environment (recommended):
+Run the binary from `dist/Vintage Radio/Vintage Radio` (`chmod +x` if needed). You may need FFmpeg on your PATH when running from source; install steps vary by distro.
+
+---
+
+## Quick start (first SD card + firmware)
+
+### 1. Create or choose a library
+
+Use the library dropdown → **New**, or start with **Default**. Pick a name that sounds like a station lineup (for example **Classic Rock Saturday**, **Late Night Jazz**, or **Garage Oldies**).
+
+### 2. Add stations and tracks
+
+On **Load Music**:
+
+1. Insert the SD card you use in the radio (USB reader on the PC).
+2. Click **Detect** or **Select** under **Storage** until the correct drive appears.
+3. Under **Stations**, use **+ New** or **drag folders** from File Explorer—one folder per station if you already organize that way.
+4. Select a station, then **+ Add** or drag audio files into **Tracks**.
+
+The screenshot above shows a real library: a station (for example **Avenged Sevenfold - City of Evil**) with its track list on the right.
+
+Supported formats include MP3, FLAC, WAV, OGG, and more; non-MP3 formats are converted during sync when conversion is available.
+
+![Install Firmware](docs/images/readme/02-install-firmware.png)
+
+### 3. Sync to SD, then update the RP2040 (both steps)
+
+**Sync to SD Card** copies music into DFPlayer folders on the card. **Install Firmware** copies the matching control program and **library settings** onto the RP2040’s flash (commercials rules, Conductor catalog, EQ profile, and related options).
+
+Treat these as a pair:
+
+1. Click **Sync to SD Card** and wait for it to finish (first sync can take a while). Use **Safely Remove SD** before unplugging the card.
+2. With the radio’s RP2040 connected over USB (volume pot **on**), open **Install Firmware** and run install for the **same library** you just synced.
+
+**Run Install Firmware every time you sync the SD card** for that library, so the RP2040 always matches the card and the settings in the app. Skipping install after a sync is a common cause of wrong commercials behavior, missing stations, or Conductor playback that doesn’t match what you see in Load Music.
+
+If your library uses **commercials** or **tagged ad tracks**, enable the options on the sync bar and set how often ads play (for example every **3** music tracks). Details are in [Commercials and optional ads](#commercials-and-optional-ads) below.
+
+### 4. First-time firmware install
+
+1. Connect the RP2040 to the PC with USB (power on; turn the volume pot on for normal boot).
+2. Open **Install Firmware**.
+3. Choose **Basic** (recommended to start) or **Conductor** if you need the catalog and advanced ad features—see [Firmware options](#firmware-options) below.
+4. Follow the on-screen steps. The app copies MicroPython firmware over USB (mpremote). If the board is blank, you may be guided through a one-time **BOOTSEL** step; then run **Install Firmware** again.
+
+Also run **Install Firmware** whenever you change **firmware family**, **commercials mode**, or other library settings that the app says require it—even if you did not sync the SD in that session.
+
+### 5. Listen on the radio
+
+Put the SD card in the radio, power cycle, turn the pot on, and use the physical controls. **Help** explains the status LED colors (for example violet while playing, blue when idle).
+
+---
+
+## Main screens
+
+Navigation is the left sidebar: **Load Music**, **Install Firmware**, **Tools**, **Settings**, **Help**.
+
+
+| Page                 | Purpose                                                    |
+| -------------------- | ---------------------------------------------------------- |
+| **Load Music**       | SD storage, stations, tracks, sync                         |
+| **Install Firmware** | Install or update Basic / Conductor firmware               |
+| **Tools**            | USB serial console and session logs                        |
+| **Settings**         | Appearance, sync options, optional SD image sync (Windows) |
+| **Help**             | Updates, logs, LED legend, troubleshooting                 |
+
+
+![Tools](docs/images/readme/03-tools.png)
+
+![Settings](docs/images/readme/04-settings.png)
+
+![Help](docs/images/readme/05-help.png)
+
+---
+
+## Firmware options
+
+
+| Option        | Best for          | Notes                                                                  |
+| ------------- | ----------------- | ---------------------------------------------------------------------- |
+| **Basic**     | Most radios       | Stations come from folders on the SD card (`01`, `02`, …).             |
+| **Conductor** | Advanced layouts  | Catalog on RP2040 flash plus SD audio; inline ads and library shuffle. |
+| **Legacy**    | Old projects only | Not recommended for new setups.                                        |
+
+
+The usual path is **Install Firmware** for **Basic** or **Conductor** (bundled Python copied over USB). **Install Firmware** also covers most MicroPython setup; if the board is empty, you may flash once via **BOOTSEL** as the app directs.
+
+**Other firmware on the RP2040** (optional):
+
+- **Tools → MicroPython** — install official **MicroPython** or other `.uf2` images while the board is in **BOOTSEL** mode (the `RPI-RP2` drive appears).
+- **View → Advanced** — work with your own Python project or **custom** firmware folders.
+
+You can still use this app to manage **libraries** and **Sync to SD**. Gestures in [Button presses](#button-presses) and the **255-track** limit below apply to **Vintage Radio Basic and Conductor**; other firmware defines its own behavior.
+
+**Basic** discovers stations from the SD layout the app syncs—simple and predictable.
+
+**Conductor** adds a **catalog** on the RP2040 (written when you **Install Firmware**) so playback order, shuffle, and inline ads follow the library you built in the app, not only raw folder order.
+
+### Keep the RP2040 in sync with your library
+
+
+| What changed                                     | SD card                         | RP2040 (Install Firmware)                                         |
+| ------------------------------------------------ | ------------------------------- | ----------------------------------------------------------------- |
+| Added/removed/reordered tracks or stations       | **Sync to SD**                  | **Install Firmware** (same session)                               |
+| Commercials mode, interval, or Conductor ad tags | **Sync to SD**                  | **Install Firmware**                                              |
+| Switched to a different library in the app       | **Sync to SD** for that library | **Install Firmware** for that library                             |
+| App update with new firmware files only          | Optional if music unchanged     | **Install Firmware** when the app prompts or release notes say so |
+
+
+The SD card holds the **audio files**. The RP2040 holds the **brain** (firmware + catalog/settings). After every **Sync to SD**, run **Install Firmware** so the brain matches the card.
+
+---
+
+## Button presses
+
+All gestures use the **physical button** wired to the RP2040 (one momentary switch). Timing is forgiving, but distinct taps work best. Turn the **volume pot on** so the firmware is awake before testing gestures.
+
+**Tap** = quick press and release. **Hold** = press and keep held until the action triggers, then release.
+
+### Basic firmware
+
+
+| Gesture                   | Action                                                                |
+| ------------------------- | --------------------------------------------------------------------- |
+| **Single tap**            | Next track                                                            |
+| **Double tap**            | Previous track                                                        |
+| **Triple tap**            | Restart current station at track 1                                    |
+| **Four taps**             | Previous station                                                      |
+| **Five taps**             | First station (returns to ordered station mode)                       |
+| **Hold** (no taps first)  | Next station                                                          |
+| **Single tap, then hold** | Exit track shuffle → normal ordered playback on the current station   |
+| **Double tap, then hold** | Shuffle tracks **within the current station** (repeat to reshuffle)   |
+| **Triple tap, then hold** | Jump to **first station** and shuffle tracks there (stays in shuffle) |
+
+
+Tracks advance automatically when a song ends. In shuffle modes, **single tap** moves through the shuffled order.
+
+### Conductor firmware
+
+Conductor uses the **same taps and holds** as Basic for everyday listening. Differences matter most in shuffle and ads:
+
+
+| Gesture                   | Conductor behavior                                                                                              |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **Double tap, then hold** | Shuffle **current station** (music only; **linked** inline commercials stay with the track they’re attached to) |
+| **Triple tap, then hold** | Shuffle the **whole library** (music only; unlinked ad tracks are skipped)                                      |
+
+
+Station changes (**hold**, **four taps**, etc.) follow the **catalog** station list from your library, not a raw DFPlayer folder count.
+
+Inline and folder-99 commercials are configured in the app; **Sync to SD** and **Install Firmware** must both be up to date for them to behave as expected.
+
+---
+
+## Personalize your radio with custom commercials!
+
+You can sprinkle **station IDs, bumpers, and short ads** into your lineup—either on a timer or **right before a specific song**.
+
+![Load Music — tag a commercial and link it to the track below](docs/images/readme/06-commercials.png)
+
+### Two ways to play ads
+
+| Method | Firmware | What it does |
+|--------|----------|--------------|
+| **Commercials station** | Basic or Conductor | A dedicated **Commercials** station (folder `99` on the SD) plays every few **music** tracks—set the interval on the sync bar (for example every **3** songs). |
+| **Tagged tracks** | **Conductor** | Short clips live **in the same station** as your music. Mark a row as a commercial, optionally **link** it to the song **directly below**, and that ad plays immediately before that track. |
+
+You can use **Commercials station** alone on Basic, or combine both options on Conductor (**Tagged tracks** + **Commercials station**).
+
+### Link a commercial to a track (Conductor)
+
+1. On **Load Music**, turn on **Tagged tracks** on the sync bar (Conductor library).
+2. Select a **station** and put tracks in **play order**—drag rows to reorder if needed.
+3. On a short ad or ID row, click the **speaker / commercial** control (or right‑click → **Mark as commercial**). The row is tagged as an ad.
+4. Click the **link** icon on that same row (or right‑click → **Link to track below**). A chain appears between the ad and the **next** row—the song that should follow the ad.
+5. **Sync to SD**, then **Install Firmware** so the radio gets the updated catalog.
+
+**Tips:** Only **commercial** rows can link, and they link to the **track below**, not above. When you shuffle in Conductor, **linked** ads stay paired with their song; unlinked ads in the station are skipped during library shuffle.
+
+Folder **99** ads and tagged ads both need a fresh **Sync** + **Install Firmware** after you change them.
+
+---
+
+## Other useful features
+
+### View modes (menu bar)
+
+- **View → Advanced** — adds tabs such as the **Emulator** (software preview of radio behavior).
+- **View → Legacy** — older album/playlist layout; kept for long-time projects.
+
+### SD disk image (Windows, optional)
+
+In **Settings**, you can turn on **SD image sync** to write a full card image in one step—handy for the *first* load of a very large library (it's faster). Use normal **Sync to SD** for everyday changes.
+
+### Tools tab
+
+Connect the **COM port**, watch serial messages, and open **session logs** when you need to diagnose USB or playback issues (logs are also under **Help**).
+
+---
+
+## Tips and troubleshooting
+
+
+| Issue                                 | What to try                                                                               |
+| ------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Sync skips some files                 | Use a release build (bundled FFmpeg) or install FFmpeg for source installs                |
+| “Different SD card from last sync”    | Normal when swapping cards; confirm the drive letter before syncing                       |
+| Install Firmware can’t see the RP2040 | Replug USB, try another cable/port, close apps using the COM port                         |
+| COM port busy                         | Disconnect in **Tools**, close other serial programs                                      |
+| macOS won’t open the app              | Finder **Open** workaround or `xattr -cr` (see [macOS first launch](#macos-first-launch)) |
+| Too many tracks in one station        | See below                                                                                 |
+
+
+**255 tracks per station:** The station list shows counts like `11/255`. That matches the usual DFPlayer **255 tracks per folder** limit. **To fit more music:** add a **second station** and move or import the rest of the album there (each station is its own folder on the SD card). **Vintage Radio firmware** can work with larger folders in some setups; if you go past 255 you may see a **Track Count Warning**—read it before continuing. If you dismissed that warning, turn it back on from **Help → Re-enable 255+ track warning** (or the same item under the menu bar **Help** menu). Power-user options live under **View → Advanced** if you need the full legacy device tools.
+
+Use **Help → View session log** or **Open logs folder** when you need to share logs for support.
+
+---
+
+## Building from source
+
+To build the app yourself (same steps the maintainer uses for packaging):
+
 ```bash
+git clone https://github.com/alexnoctis76/Vintage_radio.git
+cd Vintage_radio
 python -m venv .venv
-.venv\Scripts\activate  # Windows
-# or
-source .venv/bin/activate  # Linux/Mac
+# Windows:  .venv\Scripts\activate
+# macOS/Linux:  source .venv/bin/activate
+pip install -r requirements.txt pyinstaller
+python run_vintage_radio.py
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+Windows: `build\build_windows.bat` — macOS: `bash build/build_macos.sh` — Linux: `bash build/build_linux.sh`. Details: **[docs/BUILD_AND_PACKAGE.md](docs/BUILD_AND_PACKAGE.md)**.
 
-4. Install VLC media player
-   if you havent already, please install VLC media player, this is required for the app to work.
-## Usage
+---
 
-### Running the Application
+## Credits
 
-```bash
-python -m gui.radio_manager
-```
+Hardware design and radio concept: [Zion Brock](https://www.zionbrock.com/radio).
 
-Or directly:
-```bash
-python gui/radio_manager.py
-```
-
-### Basic Workflow
-
-1. **Import Music Files (Library)**
-   - **Drag and drop** audio files or entire folders into the Library tab, or use Import Files / Import Folder. The library shows all tracks in a searchable table with title, artist, duration, and format; you can edit or remove entries from here and use **Sync to SD** when ready.
-   - ![Library: search, import, and sync to SD](docs/images/library.png)
-   - The library supports searching by title, artist, format, or file path, making it easy to find specific tracks in large collections.
-
-2. **Create Albums**
-   - In the Albums tab, create a new album, then **drag and drop** files or folders onto the drop area (or add selected songs from the library). Select an album to see its track list, reorder by dragging, and use the buttons to rename, edit the description, or remove tracks.
-   - ![Albums: drag and drop to add tracks](docs/images/albums.png)
-   - ![Album detail: track list and ordering](docs/images/albums-detail.png)
-
-3. **Create Playlists**
-   - In the Playlists tab, create a playlist and add tracks from the library (or drag and drop). The right panel shows the playlist’s track list; use Add Selected Songs / Remove Selected to adjust the order and contents.
-   - ![Playlists: build and edit playlists](docs/images/playlists.png)
-
-4. **Sync to SD and Devices**
-   - The Devices tab is where you set the **SD / media root** (or drag a folder onto it), run **Sync Library to SD**, validate the card, and export album or playlist contents. You can also export for RP2040 (Pico), install to Pico, or deploy to Raspberry Pi.
-   - ![Devices: SD root, sync, validate, export, Pico, and Pi](docs/images/devices.png)
-   - When syncing, a progress dialog shows real-time status with accurate progress tracking for each file being copied or converted.
-   - ![Sync Progress: Real-time sync status with file-by-file progress](docs/images/sync-progress.png)
-
-5. **Emulator**
-   - The Emulator tab emulates the radio: power on/off, volume knob, and mode buttons (Album, Playlist, Shuffle, Radio). Use the virtual dial and tap/hold controls to change tracks and stations; the event log at the bottom shows playback and state. Sync your library to SD first so the Emulator can use the same files as the hardware.
-   - ![Emulator: Album mode with radio face and playback controls](docs/images/emulator-album.png)
-   - ![Emulator: Shuffle with radio face and event log](docs/images/emulator-shuffle.png)
-   - ![Emulator: Radio mode and station info](docs/images/emulator-radio.png)
-
-6. **Device Debug Console**
-   - The Device Debug tab provides advanced debugging capabilities for the physical hardware. Connect to your device via serial port (COM port on Windows), send Python commands directly to the firmware, view debug logs showing DFPlayer commands and device responses, and interact with the device in real-time. The console displays detailed communication logs including volume changes, track playback commands, and volume adjustments. This is useful for troubleshooting hardware issues and testing firmware behavior.
-   - ![Device Debug: Connected device with console output showing DFPlayer commands and Now Playing status](docs/images/device-debug.png)
-
-### Button Controls (Works on Physical Device and Emulator - try clicking the button on the emulator radio and using the dial!)
-
-- **Single Tap**: Next track
-- **Tap + Hold**: Toggle Album/Playlist mode
-- **2 Taps + Hold**: Shuffle current album/playlist
-- **3 Taps + Hold**: Shuffle entire library
-- **Radio Dial**: Tune between radio stations
-- **Volume Knob**: Adjust volume
-- **Power Button**: Turn device on/off
-
-## Building standalone executables (Windows / Mac)
-
-Packaging behavior differs across Windows and macOS. To avoid drift, use the canonical packaging guide:
-
-- [`docs/BUILD_AND_PACKAGE.md`](docs/BUILD_AND_PACKAGE.md)
-
-Quick commands:
-
-- **Windows:** `build_windows.bat` (or `pyinstaller build/vintage_radio.spec`)
-- **macOS:** `bash build_macos.sh`
-- Output: `dist/Vintage Radio/`
-
-## Project Structure
-
-The canonical repository taxonomy and source-vs-generated policy lives in:
-
-- [`docs/REPO_STRUCTURE.md`](docs/REPO_STRUCTURE.md)
-
-## Architecture
-
-### Shared Core Logic
-`firmware/radio_core.py` contains the core state machine logic used by both:
-- The GUI emulator (`gui/hardware_emulator.py`)
-- The actual firmware (`firmware/pico/main.py`, `firmware/pi/main_pi.py`)
-
-This ensures that the emulator accurately represents device behavior.
-
-### Hardware Abstraction
-The system uses a `HardwareInterface` abstraction layer:
-- **GUI**: `PygameHardwareEmulator` - Uses pygame for audio playback
-- **Pico Firmware**: `DFPlayerHardware` (`firmware/pico/dfplayer_hardware.py`) - Uses DFPlayer Mini via UART
-- **Pi Firmware**: `PiHardware` (`firmware/pi/pi_hardware.py`) - Uses VLC and GPIO
-
-### Database Schema
-- `songs`: Music file metadata
-- `albums`: Album definitions
-- `playlists`: Playlist definitions
-- `album_songs`: Album-track relationships
-- `playlist_songs`: Playlist-track relationships
-- `sd_mapping`: SD card file mapping
-- `settings`: User preferences
-
-## Development
-
-### Testing
-The emulator provides a complete emulation of the device:
-- Visual radio face with interactive controls
-- Full audio playback
-- All modes and button combinations
-- Detailed logging
-
-### Firmware Integration
-The firmware uses `firmware/pico/dfplayer_hardware.py` (and `firmware/pi/pi_hardware.py` for Pi), implementing the same `HardwareInterface` as the GUI, ensuring compatibility.
-
-## Known Limitations
-
-- Audio seeking: Some formats (MIDI, etc.) have limited seeking support without VLC
-- SD card format: SD cards must be formatted as FAT32 or exFAT
-- File size: Large libraries may take time to sync
-
-## Troubleshooting
-
-### Audio Playback Issues
-- Ensure pygame is available: `pip install -r requirements.txt` (uses **pygame-ce**, still `import pygame`)
-- For better format support, install VLC Media Player
-- Check that audio files are not corrupted
-
-### SD Card Sync Issues
-- Verify SD card is formatted as FAT32 or exFAT
-- Check available space on SD card
-- Ensure SD card is not write-protected
-
-### Format Conversion Issues
-- Install VLC Media Player for best compatibility
-- Or install FFmpeg and add to system PATH
-- Check that source files are not corrupted
-
-## License
-
-[Add your license here]
-
-## Contributing
-
-[Add contribution guidelines here]
-
-## Acknowledgments
-
-- Built with PyQt6 for the GUI
-- Uses pygame for audio playback
-- DFPlayer Mini for hardware audio playback
-
-
+If anything here doesn’t match your app version, check **Help → About Vintage Radio**.

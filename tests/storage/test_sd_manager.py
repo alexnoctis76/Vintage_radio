@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -9,6 +10,7 @@ from unittest import mock
 import pytest
 
 from gui.audio_metadata import compute_file_hash
+from gui.resource_paths import resolve_ffmpeg_executable
 from gui.database import DatabaseManager
 from gui.sd_manager import (
     SDManager,
@@ -552,8 +554,41 @@ def test_clear_basic_sync_mp3_cache_for_library_noop_when_missing(sd_mgr, tmp_pa
 
 
 def _write_minimal_mp3(path: Path, *, repeat: int = 10) -> None:
-    frame = b"\xff\xfb\x90\x00" + b"\x00" * 413
+    """Write a DFPlayer-safe test MP3 (ffmpeg when available, else minimal frames)."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = resolve_ffmpeg_executable()
+    duration = max(0.5, repeat / 10.0)
+    if ffmpeg:
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-t",
+                f"{duration:.2f}",
+                "-codec:a",
+                "libmp3lame",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-b:a",
+                "128k",
+                str(path),
+            ],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if proc.returncode == 0 and path.is_file() and path.stat().st_size >= 512:
+            return
+    frame = b"\xff\xfb\x90\x00" + b"\x00" * 413
     path.write_bytes(frame * repeat)
 
 
@@ -662,6 +697,8 @@ class TestBasicSyncChanges:
         sd_root.mkdir()
         with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
             mgr.sync_library_basic(sd_root)
+            manifest = json.loads((sd_root / ".sync_manifest.json").read_text(encoding="utf-8"))
+            assert manifest["stations"]["01"]["tracks"]["001"].get("sd_size", 0) > 0
             with mock.patch(
                 "gui.sd_manager.compute_file_hash",
                 side_effect=AssertionError("hash should not run on manifest fast path"),
@@ -670,3 +707,167 @@ class TestBasicSyncChanges:
             hash_mock.assert_not_called()
         assert int(r2["copied"]) == 0
         assert int(r2["skipped"]) >= 2
+
+    def test_corrupt_sd_file_triggers_recopy_despite_manifest(
+        self, basic_station_setup, tmp_path
+    ):
+        """Manifest fast path must not trust SD bytes when on-card size changed."""
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_corrupt"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root)
+            slot = sd_root / "01" / "001.mp3"
+            slot.write_bytes(slot.read_bytes()[:32])
+            r2 = mgr.sync_library_basic(sd_root)
+        assert int(r2["copied"]) >= 1
+        assert slot.stat().st_size > 32
+
+
+class TestBasicSyncManifestSafety:
+    def test_prune_manifest_stations_to_sd_drops_missing_files(self, tmp_path):
+        sd_root = tmp_path / "sd"
+        (sd_root / "01").mkdir(parents=True)
+        _write_minimal_mp3(sd_root / "01" / "001.mp3")
+        manifest = {
+            "01": {
+                "name": "One",
+                "tracks": {
+                    "001": {"source_name": "a.mp3", "source_size": 1, "source_hash": "x"},
+                    "002": {"source_name": "b.mp3", "source_size": 1, "source_hash": "y"},
+                },
+            }
+        }
+        pruned = SDManager._prune_manifest_stations_to_sd(manifest, sd_root)
+        assert set(pruned["01"]["tracks"]) == {"001"}
+
+    def test_manifest_omits_failed_copies(self, basic_station_setup, tmp_path):
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_copy_fail"
+        sd_root.mkdir()
+        real_copy = mgr._atomic_copy2
+
+        def _copy_side_effect(src, dst):
+            if dst.name == "002.mp3":
+                raise OSError("simulated SD copy failure")
+            return real_copy(src, dst)
+
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            with mock.patch.object(mgr, "_atomic_copy2", side_effect=_copy_side_effect):
+                result = mgr.sync_library_basic(sd_root)
+        assert len(result.get("copy_failures", [])) == 1
+        manifest = json.loads((sd_root / ".sync_manifest.json").read_text(encoding="utf-8"))
+        tracks = manifest["stations"]["01"]["tracks"]
+        assert "001" in tracks
+        assert "002" not in tracks
+        assert (sd_root / "01" / "001.mp3").exists()
+        assert not (sd_root / "01" / "002.mp3").exists()
+
+
+def test_sd_copy_workers_default_is_four_on_all_platforms(sd_mgr):
+    assert sd_mgr._resolve_basic_sd_copy_workers(100) == 4
+    with mock.patch("gui.sd_manager.platform.system", return_value="Darwin"):
+        assert sd_mgr._resolve_basic_sd_copy_workers(100) == 4
+    with mock.patch("gui.sd_manager.platform.system", return_value="Windows"):
+        assert sd_mgr._resolve_basic_sd_copy_workers(100) == 4
+
+
+def test_hash_mismatch_stop_aborts_sync(basic_station_setup, tmp_path):
+    mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+    sd_root = tmp_path / "sd_hash_stop"
+    sd_root.mkdir()
+    _write_minimal_mp3(a, repeat=15)
+    new_hash = compute_file_hash(a)
+    db.conn.execute(
+        "UPDATE songs SET file_hash = ? WHERE id = ?;",
+        ("deadbeef" * 8, sid_a),
+    )
+    db.conn.commit()
+    with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+        with pytest.raises(RuntimeError, match="stopped by user"):
+            mgr.sync_library_basic(
+                sd_root,
+                on_sync_failure=lambda _info: "stop",
+            )
+
+
+class TestBasicSdSyncValidation:
+    def test_failed_tracks_reported_once_as_sync_errors_not_diffs(
+        self, sd_db, tmp_path
+    ):
+        """Persisted sync_error slots should not also inflate difference counts."""
+        from gui.sd_manager import SDManager
+
+        audio = tmp_path / "audio"
+        audio.mkdir()
+        _write_minimal_mp3(audio / "ok.mp3")
+        sid_ok = sd_db.add_song(
+            original_filename="ok.mp3",
+            file_path=str(audio / "ok.mp3"),
+            title="OK",
+            file_hash=compute_file_hash(audio / "ok.mp3"),
+            file_size=(audio / "ok.mp3").stat().st_size,
+            format="mp3",
+        )
+        sid_bad = sd_db.add_song(
+            original_filename="bad.mp3",
+            file_path=str(audio / "bad.mp3"),
+            title="FAIL bad",
+            file_hash="bad",
+            file_size=1,
+            format="mp3",
+        )
+        st_id = sd_db.create_basic_station("Test", 88)
+        sd_db.add_song_to_basic_station(st_id, sid_ok, 1)
+        sd_db.add_song_to_basic_station(st_id, sid_bad, 2)
+        sd_db.set_song_sync_error(sid_bad, "VLC output did not stabilize")
+
+        sd_root = tmp_path / "sd"
+        (sd_root / "88").mkdir(parents=True)
+        _write_minimal_mp3(sd_root / "88" / "001.mp3")
+        manifest = {
+            "version": 1,
+            "stations": {
+                "88": {
+                    "name": "Test",
+                    "tracks": {
+                        "001": {
+                            "source_name": "ok.mp3",
+                            "source_size": (audio / "ok.mp3").stat().st_size,
+                            "source_hash": compute_file_hash(audio / "ok.mp3"),
+                        }
+                    },
+                }
+            },
+        }
+        (sd_root / ".sync_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        mgr = SDManager(sd_db)
+        result = mgr.validate_basic_sd(sd_root)
+        assert len(result.sync_errors) == 1
+        assert "FAIL bad" in result.sync_errors[0]
+        assert "failed the last sync" in result.sync_errors[0]
+        assert not any("app has 2 tracks but last sync had 1" in d for d in result.differences)
+        assert not any("was not in the last sync" in d for d in result.differences)
+
+
+def test_hash_mismatch_skip_continues_sync(basic_station_setup, tmp_path):
+    mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+    sd_root = tmp_path / "sd_hash_skip"
+    sd_root.mkdir()
+    _write_minimal_mp3(a, repeat=15)
+    db.conn.execute(
+        "UPDATE songs SET file_hash = ? WHERE id = ?;",
+        ("deadbeef" * 8, sid_a),
+    )
+    db.conn.commit()
+    with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+        result = mgr.sync_library_basic(
+            sd_root,
+            on_sync_failure=lambda _info: "skip",
+        )
+    assert int(result["copied"]) == 1
+    assert not (sd_root / "01" / "001.mp3").exists()
+    assert (sd_root / "01" / "002.mp3").exists()

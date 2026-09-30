@@ -318,6 +318,30 @@ class TestCurrentTrackCount:
         count = TestModeWidget._current_track_count(w)
         assert count == 1
 
+    def test_radio_mode_uses_station_track_count(self):
+        stations = [
+            RadioStation(
+                name="Jazz",
+                tracks=[{"id": 1}, {"id": 2}, {"id": 3}],
+                total_duration_ms=180_000,
+                start_offset_ms=0,
+            ),
+            RadioStation(
+                name="Rock",
+                tracks=[{"id": 4}],
+                total_duration_ms=60_000,
+                start_offset_ms=0,
+            ),
+        ]
+        w = _make_mock_widget(mode="radio", radio_stations=stations, radio_station_index=0)
+        assert TestModeWidget._current_track_count(w) == 3
+        w.radio_station_index = 1
+        assert TestModeWidget._current_track_count(w) == 1
+
+    def test_radio_mode_empty_stations(self):
+        w = _make_mock_widget(mode="radio", radio_stations=[], radio_station_index=0)
+        assert TestModeWidget._current_track_count(w) == 1
+
     def test_album_mode_empty(self):
         w = _make_mock_widget(
             mode="album",

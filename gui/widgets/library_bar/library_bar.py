@@ -45,6 +45,7 @@ class LibraryBar(QtWidgets.QWidget):
     new_clicked     = pyqtSignal()
     rename_clicked  = pyqtSignal()
     delete_clicked  = pyqtSignal()
+    duplicate_clicked = pyqtSignal()
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -113,17 +114,21 @@ class LibraryBar(QtWidgets.QWidget):
         self._action_buttons: list[QtWidgets.QPushButton] = []
         for label, sig, tip in [
             ("New",    self.new_clicked,    "Create a new library"),
+            ("Duplicate", self.duplicate_clicked, "Copy this library."),
             ("Rename", self.rename_clicked, "Rename the current library"),
             ("Delete", self.delete_clicked, "Delete the current library"),
         ]:
             btn = QtWidgets.QPushButton(label)
             btn.setToolTip(tip)
-            btn.setFixedSize(u.action_button_width(btn, t.LIBBAR_BTN_W), u.px(t.LIBBAR_BTN_H))
+            btn.setStyleSheet(btn_qss)
+            btn.setFixedSize(
+                u.action_button_width(btn, t.LIBBAR_BTN_W, h_pad=32),
+                u.px(t.LIBBAR_BTN_H),
+            )
             btn.setSizePolicy(
                 QtWidgets.QSizePolicy.Policy.Fixed,
                 QtWidgets.QSizePolicy.Policy.Fixed,
             )
-            btn.setStyleSheet(btn_qss)
             btn.clicked.connect(sig)
             row.addWidget(btn)
             self._action_buttons.append(btn)
@@ -164,7 +169,10 @@ class LibraryBar(QtWidgets.QWidget):
         )
         btn_qss = self._btn_qss()
         for btn in getattr(self, "_action_buttons", []):
-            btn.setFixedSize(u.action_button_width(btn, t.LIBBAR_BTN_W), u.px(t.LIBBAR_BTN_H))
             btn.setStyleSheet(btn_qss)
+            btn.setFixedSize(
+                u.action_button_width(btn, t.LIBBAR_BTN_W, h_pad=32),
+                u.px(t.LIBBAR_BTN_H),
+            )
         self._apply_bar_style()
         self._combo.apply_theme()

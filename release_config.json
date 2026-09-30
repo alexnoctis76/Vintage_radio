@@ -1,5 +1,6 @@
 {
-  "official_firmware": {
-    "zbvr_26_0_1": false
+  "update": {
+    "enabled": true,
+    "channel": "stable"
   }
 }

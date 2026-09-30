@@ -36,7 +36,10 @@ a = Analysis(
         'urllib', 'urllib.request', 'email', 'http', 'http.client',
     ] + mpremote_hidden + _email_h + _http_h + collect_submodules('mpremote'),
     hookspath=[],
-    excludes=['PyQt6', 'PyQt5', 'PySide6', 'PySide2', 'tkinter'],
+    # mpy_cross must stay out: mpremote/romfs.py guards its import with "except ImportError",
+    # but a bundled module without the mpy-cross binary raises SystemExit at import time
+    # and kills every mpremote_helper invocation.
+    excludes=['PyQt6', 'PyQt5', 'PySide6', 'PySide2', 'tkinter', 'mpy_cross'],
     noarchive=False,
 )
 

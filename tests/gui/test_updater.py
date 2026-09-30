@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from unittest import mock
 
 import pytest
 
 from gui import updater
+from gui.release_config import reload_release_config
+
+
+@pytest.fixture(autouse=True)
+def _clear_release_config_cache():
+    reload_release_config()
+    yield
+    reload_release_config()
 
 
 @pytest.mark.windows_only
@@ -177,20 +186,53 @@ def test_run_update_check_up_to_date_when_current_ahead_of_github():
             ],
         }
     ]
-    with mock.patch.object(updater, "_fetch_release_list", return_value=items):
-        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
-            result = updater.run_update_check(current_version="v1.0.0")
+    with mock.patch("gui.release_config.update_check_enabled", return_value=True):
+        with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+            with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+                result = updater.run_update_check(current_version="v1.0.0")
     assert result.status == "up_to_date"
     assert result.latest_published == "v0.2.5-beta"
     assert result.release is not None
 
 
-def test_run_update_check_update_available():
+def test_preferred_macos_asset_basename_arm64():
+    with mock.patch("gui.updater.platform.machine", return_value="arm64"):
+        assert updater.preferred_macos_asset_basename() == "Vintage-Radio-macOS-arm64.zip"
+
+
+def test_preferred_macos_asset_basename_x86_64():
+    with mock.patch("gui.updater.platform.machine", return_value="x86_64"):
+        assert updater.preferred_macos_asset_basename() == "Vintage-Radio-macOS-x86_64.zip"
+
+
+def test_get_platform_asset_mac_prefers_arch_specific_zip():
+    assets = [
+        {"name": "Vintage-Radio-macOS-x86_64.zip", "browser_download_url": "https://x/intel.zip"},
+        {"name": "Vintage-Radio-macOS-arm64.zip", "browser_download_url": "https://x/arm.zip"},
+    ]
+    with mock.patch("gui.updater.platform.system", return_value="Darwin"):
+        with mock.patch("gui.updater.platform.machine", return_value="arm64"):
+            picked = updater.get_platform_asset(assets)
+    assert picked is not None
+    assert picked["name"] == "Vintage-Radio-macOS-arm64.zip"
+
+
+def test_get_platform_asset_linux():
+    assets = [
+        {"name": "Vintage-Radio-Linux.zip", "browser_download_url": "https://x/linux.zip"},
+    ]
+    with mock.patch("gui.updater.platform.system", return_value="Linux"):
+        picked = updater.get_platform_asset(assets)
+    assert picked is not None
+    assert picked["name"] == "Vintage-Radio-Linux.zip"
+
+
+def test_run_update_check_skipped_when_update_disabled():
     items = [
         {
-            "tag_name": "v1.1.0",
+            "tag_name": "v9.9.9",
             "draft": False,
-            "html_url": "https://github.com/a/b/releases/tag/v1.1.0",
+            "html_url": "https://github.com/a/b/releases/tag/v9.9.9",
             "body": "",
             "assets": [
                 {
@@ -201,8 +243,170 @@ def test_run_update_check_update_available():
         }
     ]
     with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+        with mock.patch("gui.release_config.update_check_enabled", return_value=False):
+            result = updater.run_update_check(current_version="v0.1.0")
+    assert result.status == "up_to_date"
+    assert result.release is None
+
+
+def test_stable_channel_ignores_prerelease(tmp_path, monkeypatch):
+    cfg = tmp_path / "release_config.json"
+    cfg.write_text(
+        json.dumps({"update": {"enabled": True, "channel": "stable", "prerelease_only": False}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gui.release_config.project_root", lambda: tmp_path)
+    from gui.release_config import reload_release_config
+
+    reload_release_config()
+
+    items = [
+        {
+            "tag_name": "v9.9.9-upgrade-test",
+            "draft": False,
+            "prerelease": True,
+            "html_url": "https://github.com/a/b/releases/tag/v9.9.9-upgrade-test",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/pre.zip",
+                }
+            ],
+        },
+        {
+            "tag_name": "v1.0.2",
+            "draft": False,
+            "prerelease": False,
+            "html_url": "https://github.com/a/b/releases/tag/v1.0.2",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/stable.zip",
+                }
+            ],
+        },
+    ]
+    with mock.patch.object(updater, "_fetch_release_list", return_value=updater._filter_release_items(items)):
         with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
             result = updater.run_update_check(current_version="v1.0.0")
     assert result.status == "update_available"
     assert result.release is not None
+    assert result.release.tag_name == "v1.0.2"
+
+
+def test_test_channel_only_sees_matching_prerelease(tmp_path, monkeypatch):
+    cfg = tmp_path / "release_config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "update": {
+                    "enabled": True,
+                    "channel": "test",
+                    "prerelease_only": True,
+                    "tag_suffix": "-upgrade-test",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gui.release_config.project_root", lambda: tmp_path)
+    from gui.release_config import reload_release_config
+
+    reload_release_config()
+
+    items = [
+        {
+            "tag_name": "v1.2.0-beta",
+            "draft": False,
+            "prerelease": True,
+            "html_url": "https://github.com/a/b/releases/tag/v1.2.0-beta",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/beta.zip",
+                }
+            ],
+        },
+        {
+            "tag_name": "v1.1.0-upgrade-test",
+            "draft": False,
+            "prerelease": True,
+            "html_url": "https://github.com/a/b/releases/tag/v1.1.0-upgrade-test",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/test.zip",
+                }
+            ],
+        },
+    ]
+    with mock.patch.object(updater, "_fetch_release_list", return_value=updater._filter_release_items(items)):
+        with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+            result = updater.run_update_check(current_version="v1.0.0")
+    assert result.status == "update_available"
+    assert result.release is not None
+    assert result.release.tag_name == "v1.1.0-upgrade-test"
+
+
+def test_macos_cpu_arch_arm64_when_rosetta_on_apple_silicon(monkeypatch):
+    monkeypatch.setattr("gui.updater.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr("gui.updater._macos_hardware_has_arm64", lambda: True)
+    assert updater._macos_cpu_arch() == "arm64"
+
+
+def test_run_update_check_update_available():
+    items = [
+        {
+            "tag_name": "v1.1.0",
+            "draft": False,
+            "prerelease": False,
+            "html_url": "https://github.com/a/b/releases/tag/v1.1.0",
+            "body": "",
+            "assets": [
+                {
+                    "name": "Vintage-Radio-Windows.zip",
+                    "browser_download_url": "https://example/z.zip",
+                }
+            ],
+        }
+    ]
+    with mock.patch("gui.release_config.update_check_enabled", return_value=True):
+        with mock.patch.object(updater, "_fetch_release_list", return_value=items):
+            with mock.patch.object(sys.modules["platform"], "system", return_value="Windows"):
+                result = updater.run_update_check(current_version="v1.0.0")
+    assert result.status == "update_available"
+    assert result.release is not None
     assert result.release.tag_name == "v1.1.0"
+
+
+def test_extract_zip_uses_ditto_on_macos(tmp_path):
+    zip_path = tmp_path / "update.zip"
+    zip_path.write_bytes(b"fake")
+    extract_dir = tmp_path / "out"
+    with mock.patch.object(sys.modules["platform"], "system", return_value="Darwin"):
+        with mock.patch("gui.updater.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            updater._extract_zip(zip_path, extract_dir)
+    run.assert_called_once()
+    args = run.call_args[0][0]
+    assert args[:3] == ["ditto", "-x", "-k"]
+
+
+def test_macos_bundle_main_executable_uses_cf_bundle_executable(tmp_path):
+    import plistlib
+
+    bundle = tmp_path / "Vintage Radio-x86_64.app"
+    macos = bundle / "Contents" / "MacOS"
+    macos.mkdir(parents=True)
+    (macos / "Vintage Radio").write_bytes(b"")
+    plist = {
+        "CFBundleExecutable": "Vintage Radio",
+        "CFBundleShortVersionString": "1.1.0-upgrade-test",
+    }
+    (bundle / "Contents" / "Info.plist").write_bytes(plistlib.dumps(plist))
+    exe = updater._macos_bundle_main_executable(bundle)
+    assert exe == macos / "Vintage Radio"

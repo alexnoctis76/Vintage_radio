@@ -35,11 +35,20 @@ def test_flash_micropython_for_install_retries_factory_reset(monkeypatch):
     calls: list[str] = []
 
     class FakeMainWindow:
-        def _flash_micropython_uf2_to_bootsel_core(self, progress_callback, preferred_serial_port):
+        def _flash_micropython_uf2_to_bootsel_core(
+            self,
+            progress_callback,
+            preferred_serial_port,
+            should_cancel=None,
+        ):
             calls.append("flash")
             return True, ""
 
-        def _factory_reset_reflash_micropython(self, progress_callback, preferred_serial_port):
+        def _factory_reset_reflash_micropython(
+            self,
+            progress_callback,
+            preferred_serial_port,
+        ):
             calls.append("factory")
             return True, ""
 
@@ -61,11 +70,20 @@ def test_flash_micropython_for_install_skips_factory_when_verified(monkeypatch):
     calls: list[str] = []
 
     class FakeMainWindow:
-        def _flash_micropython_uf2_to_bootsel_core(self, progress_callback, preferred_serial_port):
+        def _flash_micropython_uf2_to_bootsel_core(
+            self,
+            progress_callback,
+            preferred_serial_port,
+            should_cancel=None,
+        ):
             calls.append("flash")
             return True, ""
 
-        def _factory_reset_reflash_micropython(self, progress_callback, preferred_serial_port):
+        def _factory_reset_reflash_micropython(
+            self,
+            progress_callback,
+            preferred_serial_port,
+        ):
             calls.append("factory")
             return False, "should not run"
 
@@ -93,3 +111,63 @@ def test_factory_erase_prefers_picotool(tmp_path, monkeypatch):
     assert ok
     assert method == "picotool"
     assert err == ""
+
+
+def test_factory_erase_falls_back_to_flash_nuke_when_picotool_fails(
+    tmp_path, monkeypatch,
+):
+    picotool = tmp_path / "picotool"
+    picotool.write_bytes(b"stub")
+    nuke = tmp_path / "flash_nuke.uf2"
+    nuke.write_bytes(b"UF2")
+
+    monkeypatch.setattr(rm, "_find_picotool_executable", lambda: picotool)
+    monkeypatch.setattr(
+        rm,
+        "_run_picotool",
+        lambda args, **kw: SimpleNamespace(
+            returncode=1, stdout="", stderr="erase failed",
+        ),
+    )
+    monkeypatch.setattr(
+        "gui.services.firmware_bundle.fetch_flash_nuke_uf2",
+        lambda: nuke,
+    )
+    monkeypatch.setattr(
+        rm,
+        "_copy_uf2_to_rpi_rp2",
+        lambda path, dest, **kw: (True, ""),
+    )
+
+    ok, err, method = rm._factory_erase_rp2040_flash(tmp_path)
+    assert ok
+    assert method == "nuke"
+    assert err == ""
+
+
+def test_factory_erase_fails_when_picotool_and_nuke_copy_fail(tmp_path, monkeypatch):
+    picotool = tmp_path / "picotool"
+    picotool.write_bytes(b"stub")
+    nuke = tmp_path / "flash_nuke.uf2"
+    nuke.write_bytes(b"UF2")
+
+    monkeypatch.setattr(rm, "_find_picotool_executable", lambda: picotool)
+    monkeypatch.setattr(
+        rm,
+        "_run_picotool",
+        lambda args, **kw: SimpleNamespace(returncode=1, stdout="", stderr="fail"),
+    )
+    monkeypatch.setattr(
+        "gui.services.firmware_bundle.fetch_flash_nuke_uf2",
+        lambda: nuke,
+    )
+    monkeypatch.setattr(
+        rm,
+        "_copy_uf2_to_rpi_rp2",
+        lambda path, dest, **kw: (False, "RPI-RP2 drive not found"),
+    )
+
+    ok, err, method = rm._factory_erase_rp2040_flash(tmp_path)
+    assert not ok
+    assert "RPI-RP2" in err
+    assert method == ""

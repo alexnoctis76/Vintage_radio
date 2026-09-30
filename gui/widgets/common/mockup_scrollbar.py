@@ -51,16 +51,26 @@ class MockupScrollBar(QtWidgets.QWidget):
         self._dragging = False
         self._drag_offset = 0
 
-        if self._vertical:
-            self.setFixedWidth(t.LM_SCROLLBAR_W)
-        else:
-            self.setFixedHeight(t.LM_SCROLLBAR_W)
-
+        self._sync_metrics()
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setMouseTracking(True)
 
         self._bar.valueChanged.connect(self.update)
         self._bar.rangeChanged.connect(self.update)
+
+    def _sync_metrics(self) -> None:
+        self._ARROW = u.px(t.LM_SCROLLBAR_ARROW_H)
+        self._THUMB_MIN = u.px(t.LM_SCROLLBAR_HANDLE_MIN_H)
+        self._THUMB_CROSS = u.px(14)
+        self._THUMB_INSET = u.px(8)
+        if self._vertical:
+            self.setFixedWidth(u.px(t.LM_SCROLLBAR_W))
+        else:
+            self.setFixedHeight(u.px(t.LM_SCROLLBAR_W))
+
+    def apply_theme(self) -> None:
+        self._sync_metrics()
+        self.update()
 
     # ── geometry helpers ─────────────────────────────────────────────────────
 
@@ -307,8 +317,13 @@ class _ScrollCorner(QtWidgets.QWidget):
     def __init__(self, variant: Variant, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._variant = variant
-        self.setFixedSize(t.LM_SCROLLBAR_W, t.LM_SCROLLBAR_W)
+        self.apply_theme()
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+    def apply_theme(self) -> None:
+        side = u.px(t.LM_SCROLLBAR_W)
+        self.setFixedSize(side, side)
+        self.update()
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         bg = t.SB_STA_BG if self._variant == "station" else t.SB_TRK_BG
@@ -429,6 +444,21 @@ def wrap_with_mockup_scrollbar(
     return wrap
 
 
+def reload_wrapped_scrollbars(inner: QtWidgets.QWidget) -> None:
+    """Re-apply zoom-scaled rail sizes after UI zoom / theme reload."""
+    wrap: Optional[QtWidgets.QWidget] = inner
+    while wrap is not None and not hasattr(wrap, "_refresh_h_bar"):
+        wrap = wrap.parent()
+    root = wrap if wrap is not None else inner
+    for bar in root.findChildren(MockupScrollBar):
+        bar.apply_theme()
+    for corner in root.findChildren(_ScrollCorner):
+        corner.apply_theme()
+    refresh = getattr(inner, "_refresh_h_bar", None)
+    if refresh is not None:
+        refresh()
+
+
 def _track_title_column_min_width(table: QtWidgets.QTableWidget) -> int:
     """Minimum width required to show full title + artist text without clipping."""
     title_font = QtGui.QFont(table.font())
@@ -439,7 +469,14 @@ def _track_title_column_min_width(table: QtWidgets.QTableWidget) -> int:
     artist_font.setPixelSize(u.px(t.LM_TRACK_ARTIST_FONT_SIZE))
     artist_fm = QtGui.QFontMetrics(artist_font)
 
-    prefix_w = t.TRACK_LEFT_PAD + t.TRACK_HANDLE_W + t.TRACK_NUM_W + u.px(t.TRACK_PAD_X)
+    from gui.widgets.common.delegates import _track_action_layout
+
+    prefix_w = (
+        u.px(t.TRACK_LEFT_PAD)
+        + u.px(t.TRACK_HANDLE_W)
+        + u.px(t.TRACK_NUM_W)
+        + u.px(t.TRACK_PAD_X)
+    )
     title_col_w = u.px(t.LM_TRACK_TITLE_MIN_W)
     for row in range(table.rowCount()):
         title_item = table.item(row, 0)
@@ -450,7 +487,9 @@ def _track_title_column_min_width(table: QtWidgets.QTableWidget) -> int:
             title_fm.horizontalAdvance(title),
             artist_fm.horizontalAdvance(artist) if artist else 0,
         )
-        row_w = prefix_w + text_w + u.px(t.TRACK_PAD_RIGHT) + t.TRACK_PENCIL_ROFF
+        row_w = prefix_w + text_w + _track_action_layout(
+            show_ad_toggle=True, show_badge=True, font=table.font()
+        )["reserved"]
         title_col_w = max(title_col_w, row_w)
     return title_col_w
 

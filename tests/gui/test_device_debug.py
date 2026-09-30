@@ -29,17 +29,20 @@ def _parse_stream_line(line: str, state: dict, basic_mode: bool = False) -> None
                 detected = "station"
             state["mode"] = detected
 
-        source_match = re.search(r"source=([^,]*?)(?:,\s*shuffle_type=|,\s*album_idx=|$)", line)
-        if source_match:
-            val = source_match.group(1).strip()
-            if val:
-                state["source"] = val
-
         shuffle_match = re.search(r"shuffle_type=(\w*)", line)
         if shuffle_match and shuffle_match.group(1):
             state["shuffle_type"] = shuffle_match.group(1)
         elif state.get("mode") != "shuffle":
             state["shuffle_type"] = ""
+
+        source_match = re.search(r"source=([^,]*?)(?:,\s*shuffle_type=|,\s*album_idx=|$)", line)
+        if source_match:
+            val = source_match.group(1).strip()
+            if val == "Shuffle" and not state.get("shuffle_type"):
+                state["shuffle_type"] = "library"
+                state["source"] = "Library"
+            elif val:
+                state["source"] = val
 
         idx_match = re.search(r"album_idx=(\d+)", line)
         if idx_match:
@@ -188,6 +191,24 @@ class TestStreamParsing:
         )
         assert "Album" in state["source"] or state["source"] == ""  # fallback may set source
 
+    def test_shuffle_placeholder_source_maps_to_library(self):
+        state = self._fresh_state()
+        _parse_stream_line(
+            "_start_playback_for_current: mode=shuffle, source=Shuffle, "
+            "shuffle_type=, album_idx=2, folder=2, track=3",
+            state,
+        )
+        assert state["mode"] == "shuffle"
+        assert state["shuffle_type"] == "library"
+        assert state["source"] == "Library"
+
+    def test_generic_firmware_titles(self):
+        from gui.device_debug import is_generic_track_title
+
+        assert is_generic_track_title("Track 3") is True
+        assert is_generic_track_title("Track 7") is True
+        assert is_generic_track_title("Blue Moon") is False
+
     def test_mode_change_extracts_album_idx(self):
         state = self._fresh_state()
         _parse_stream_line("[MODE] album -> playlist, album_idx=3", state)
@@ -307,42 +328,100 @@ class TestCommandOutputParsing:
         assert len(lines) == 3
 
 
-# ---------------------------------------------------------------------------
-# Presence detection logic
-# ---------------------------------------------------------------------------
+class TestCommercialStreamParsing:
+    def test_folder_commercial_start(self):
+        from gui.device_debug import parse_commercial_stream_line
 
-def _compute_effective_presence(
-    raw_presence: bool,
-    mask_active: bool,
-) -> bool:
-    """
-    Mirrors DeviceDebugWidget._computed_presence_for_led:
-    during a mask window after intentional disconnect, suppress spurious
-    'device appeared' signals.
-    """
-    if mask_active:
-        return False
-    return raw_presence
+        parsed = parse_commercial_stream_line("COMMERCIALS: playing folder 99 track 3")
+        assert parsed == {"kind": "folder", "playing": True, "folder": 99, "track": 3}
+
+    def test_linked_commercial_start(self):
+        from gui.device_debug import parse_commercial_stream_line
+
+        parsed = parse_commercial_stream_line(
+            "CONDUCTOR: playing linked commercial before shuffle track"
+        )
+        assert parsed == {"kind": "linked", "playing": True}
+
+    def test_folder_commercial_finished(self):
+        from gui.device_debug import parse_commercial_stream_line
+
+        parsed = parse_commercial_stream_line("COMMERCIALS: finished, resuming music")
+        assert parsed == {"kind": "", "playing": False}
+
+    def test_linked_commercial_finished(self):
+        from gui.device_debug import parse_commercial_stream_line
+
+        parsed = parse_commercial_stream_line(
+            "CONDUCTOR: linked commercial finished, playing track"
+        )
+        assert parsed == {"kind": "", "playing": False}
+
+    def test_linked_commercial_skip_handoff(self):
+        from gui.device_debug import parse_commercial_stream_line
+
+        parsed = parse_commercial_stream_line(
+            "CONDUCTOR: skip linked commercial, playing attached track"
+        )
+        assert parsed == {"kind": "", "playing": False}
+
+    def test_unrelated_line_is_none(self):
+        from gui.device_debug import parse_commercial_stream_line
+
+        assert parse_commercial_stream_line("Starting playback: 'Song' by Artist") is None
 
 
-class TestPresenceDetection:
-    def test_device_present_emitted_as_true(self):
-        result = _compute_effective_presence(raw_presence=True, mask_active=False)
-        assert result is True
+class TestComputedPresenceForLed:
+    def _widget(self):
+        from gui.device_debug import DeviceDebugWidget
 
-    def test_device_absent_emitted_as_false(self):
-        result = _compute_effective_presence(raw_presence=False, mask_active=False)
-        assert result is False
+        w = DeviceDebugWidget.__new__(DeviceDebugWidget)
+        w._basic_mode = True
+        w._connected = False
+        w._serial_connection = None
+        w._list_rp2040_devices = lambda: []
+        w._list_port_devices = lambda: []
+        return w
 
-    def test_mask_suppresses_spurious_connect(self):
-        """After intentional disconnect, a re-detected device should be masked."""
-        result = _compute_effective_presence(raw_presence=True, mask_active=True)
-        assert result is False
+    def test_bootsel_alone_counts_as_present(self, monkeypatch):
+        w = self._widget()
+        monkeypatch.setattr(
+            "gui.device_debug.SDManager.is_rp2040_bootsel_present", lambda: True
+        )
+        assert w._computed_presence_for_led() is True
 
-    def test_mask_does_not_affect_true_absence(self):
-        result = _compute_effective_presence(raw_presence=False, mask_active=True)
-        assert result is False
+    def test_connected_requires_open_port_still_listed(self, monkeypatch):
+        w = self._widget()
+        w._connected = True
+        w._serial_connection = type("C", (), {"port": "COM7"})()
+        monkeypatch.setattr(
+            "gui.device_debug.SDManager.is_rp2040_bootsel_present", lambda: False
+        )
+        w._list_port_devices = lambda: ["COM6"]
+        assert w._computed_presence_for_led() is False
+        w._list_port_devices = lambda: ["COM7", "COM6"]
+        assert w._computed_presence_for_led() is True
 
-    def test_mask_inactive_allows_presence(self):
-        result = _compute_effective_presence(raw_presence=True, mask_active=False)
-        assert result is True
+
+class TestIpcNowPlaying:
+    def test_get_state_fills_folder_and_track(self):
+        from gui.device_debug import now_playing_fields_from_ipc_state
+
+        fields = now_playing_fields_from_ipc_state(
+            {
+                "mode": "playlist",
+                "current_album_index": 0,
+                "current_track": 1,
+                "playing_folder": 1,
+                "playing_track": 1,
+            }
+        )
+        assert fields["mode"] == "station"
+        assert fields["folder"] == 1
+        assert fields["track"] == 1
+        assert fields["source"] == "Station #1"
+
+    def test_empty_state_is_a_no_op(self):
+        from gui.device_debug import now_playing_fields_from_ipc_state
+
+        assert now_playing_fields_from_ipc_state({}) == {}

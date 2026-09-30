@@ -8,9 +8,9 @@ from gui.database import DatabaseManager
 
 
 class TestSchemaInit:
-    def test_fresh_db_reaches_schema_v6(self, tmp_db):
+    def test_fresh_db_reaches_schema_v9(self, tmp_db):
         version = tmp_db.get_setting("schema_version")
-        assert version == "6"
+        assert version == "9"
 
     def test_tables_exist(self, tmp_db):
         tables = {
@@ -483,15 +483,18 @@ class TestBasicStationTracks:
 # ---------------------------------------------------------------------------
 
 class TestSchemaMigration:
-    def test_fresh_db_at_schema_v6(self, tmp_db):
-        """Already covered, confirming v6 is reachable."""
+    def test_fresh_db_at_schema_v9(self, tmp_db):
+        """Fresh databases finish at the current schema version."""
         v = tmp_db.conn.execute(
             "SELECT value FROM settings WHERE key = 'schema_version';"
         ).fetchone()
-        assert int(v["value"]) == 6
+        assert int(v["value"]) == 9
+        cols = [r["name"] for r in tmp_db.conn.execute("PRAGMA table_info(songs);").fetchall()]
+        assert "sync_error" in cols
+        assert "sync_error_at" in cols
 
     def test_v5_to_v6_migration_adds_id_column(self, tmp_path):
-        """Simulate a v5 DB (no id column in basic_station_tracks) and migrate to v6."""
+        """Simulate a v5 DB (no id column in basic_station_tracks) and migrate to v9."""
         import sqlite3
         db_path = tmp_path / "v5_test.db"
         conn = sqlite3.connect(str(db_path))
@@ -519,16 +522,18 @@ class TestSchemaMigration:
         conn.commit()
         conn.close()
 
-        # Now open via DatabaseManager — should auto-migrate to v6
+        # Now open via DatabaseManager — should auto-migrate through v6 to v9
         from gui.database import DatabaseManager
         db = DatabaseManager(db_path=db_path, backups_dir=tmp_path / "backups")
         v = db.conn.execute(
             "SELECT value FROM settings WHERE key = 'schema_version';"
         ).fetchone()
-        assert int(v["value"]) == 6
+        assert int(v["value"]) == 9
         # id column should now exist
         cols = [r["name"] for r in db.conn.execute("PRAGMA table_info(basic_station_tracks);").fetchall()]
         assert "id" in cols
+        assert "is_commercial" in cols
+        assert "link_to_next" in cols
         db.close()
 
 
@@ -600,3 +605,125 @@ class TestDatabaseEdgeCases:
     def test_get_songs_by_ids_empty_list(self, tmp_db):
         result = tmp_db.get_songs_by_ids([])
         assert result == []
+
+
+class TestCommercialsStation:
+    def test_ensure_commercials_station_uses_folder_99(self, tmp_db):
+        sid = tmp_db.ensure_commercials_station()
+        station = tmp_db.get_basic_station(sid)
+        assert station["folder_number"] == 99
+        assert "commercial" in station["name"].lower() or "sweeper" in station["name"].lower()
+
+    def test_reorder_keeps_folder_99_pinned(self, tmp_db):
+        a = tmp_db.create_basic_station("A", 1)
+        b = tmp_db.create_basic_station("B", 2)
+        ads = tmp_db.ensure_commercials_station()
+        tmp_db.update_basic_station_order([b, ads, a], pin_folder_99=True)
+        assert tmp_db.get_basic_station(ads)["folder_number"] == 99
+        folders = [s["folder_number"] for s in tmp_db.list_basic_stations() if s["id"] != ads]
+        assert 99 not in folders
+        assert set(folders) == {1, 2}
+
+    def test_next_folder_skips_99_when_max_98(self, tmp_db):
+        tmp_db.ensure_commercials_station()
+        n = tmp_db.next_basic_station_folder(max_folder=98)
+        assert n == 1
+
+    def test_release_reserved_commercials_station(self, tmp_db):
+        ads = tmp_db.ensure_commercials_station()
+        assert tmp_db.release_reserved_commercials_station() == ads
+        assert tmp_db.get_basic_station(ads) is None
+        assert all(int(s["folder_number"]) != 99 for s in tmp_db.list_basic_stations())
+
+    def test_release_keeps_user_folder_99(self, tmp_db):
+        sid = tmp_db.create_basic_station("Late night", 99)
+        assert tmp_db.release_reserved_commercials_station() is None
+        assert tmp_db.get_basic_station(sid)["folder_number"] == 99
+
+    def test_is_commercial_flag_on_track(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        song = tmp_db.add_song(original_filename="ad.mp3", file_path="/ad.mp3")
+        tmp_db.add_song_to_basic_station(sid, song, 1)
+        row = tmp_db.list_basic_station_tracks(sid)[0]
+        tmp_db.set_basic_station_track_commercial(int(row["id"]), True)
+        songs = tmp_db.list_basic_station_songs(sid)
+        assert int(songs[0]["is_commercial"]) == 1
+
+    def test_reorder_preserves_commercial_flag(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        music = tmp_db.add_song(original_filename="song.mp3", file_path="/song.mp3")
+        ad = tmp_db.add_song(original_filename="ad.mp3", file_path="/ad.mp3")
+        tmp_db.add_song_to_basic_station(sid, ad, 1)
+        tmp_db.add_song_to_basic_station(sid, music, 2)
+        tracks = tmp_db.list_basic_station_tracks(sid)
+        ad_bst = int(tracks[0]["id"])
+        music_bst = int(tracks[1]["id"])
+        tmp_db.set_basic_station_track_commercial(ad_bst, True)
+
+        tmp_db.reorder_basic_station_tracks(sid, [music_bst, ad_bst])
+
+        after = tmp_db.list_basic_station_tracks(sid)
+        assert [int(row["song_id"]) for row in after] == [music, ad]
+        assert int(after[0]["is_commercial"]) == 0
+        assert int(after[1]["is_commercial"]) == 1
+        assert int(after[1]["id"]) == ad_bst
+
+    def test_replace_tracks_can_keep_commercial_flags(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        music = tmp_db.add_song(original_filename="song.mp3", file_path="/song.mp3")
+        ad = tmp_db.add_song(original_filename="ad.mp3", file_path="/ad.mp3")
+        tmp_db.replace_basic_station_tracks(
+            sid, [music, ad], commercial_flags=[False, True]
+        )
+        after = tmp_db.list_basic_station_tracks(sid)
+        assert int(after[0]["is_commercial"]) == 0
+        assert int(after[1]["is_commercial"]) == 1
+
+    def test_link_to_next_persists_and_moves_with_row(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        music = tmp_db.add_song(original_filename="song.mp3", file_path="/song.mp3")
+        ad = tmp_db.add_song(original_filename="ad.mp3", file_path="/ad.mp3")
+        extra = tmp_db.add_song(original_filename="song2.mp3", file_path="/song2.mp3")
+        tmp_db.add_song_to_basic_station(sid, ad, 1)
+        tmp_db.add_song_to_basic_station(sid, music, 2)
+        tmp_db.add_song_to_basic_station(sid, extra, 3)
+        tracks = tmp_db.list_basic_station_tracks(sid)
+        ad_bst = int(tracks[0]["id"])
+        music_bst = int(tracks[1]["id"])
+        extra_bst = int(tracks[2]["id"])
+        tmp_db.set_basic_station_track_commercial(ad_bst, True)
+        tmp_db.set_basic_station_track_link(ad_bst, True)
+        assert int(tmp_db.list_basic_station_tracks(sid)[0]["link_to_next"]) == 1
+
+        tmp_db.reorder_basic_station_tracks(sid, [extra_bst, ad_bst, music_bst])
+        after = tmp_db.list_basic_station_tracks(sid)
+        assert [int(row["id"]) for row in after] == [extra_bst, ad_bst, music_bst]
+        assert int(after[1]["is_commercial"]) == 1
+        assert int(after[1]["link_to_next"]) == 1
+
+    def test_unmarking_commercial_clears_link(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        music = tmp_db.add_song(original_filename="song.mp3", file_path="/song.mp3")
+        ad = tmp_db.add_song(original_filename="ad.mp3", file_path="/ad.mp3")
+        tmp_db.add_song_to_basic_station(sid, ad, 1)
+        tmp_db.add_song_to_basic_station(sid, music, 2)
+        ad_bst = int(tmp_db.list_basic_station_tracks(sid)[0]["id"])
+        tmp_db.set_basic_station_track_commercial(ad_bst, True)
+        tmp_db.set_basic_station_track_link(ad_bst, True)
+        tmp_db.set_basic_station_track_commercial(ad_bst, False)
+        row = tmp_db.list_basic_station_tracks(sid)[0]
+        assert int(row["is_commercial"]) == 0
+        assert int(row["link_to_next"]) == 0
+
+    def test_sanitize_clears_link_when_next_is_commercial(self, tmp_db):
+        sid = tmp_db.create_basic_station("S", 1)
+        first = tmp_db.add_song(original_filename="ad1.mp3", file_path="/ad1.mp3")
+        second = tmp_db.add_song(original_filename="ad2.mp3", file_path="/ad2.mp3")
+        tmp_db.add_song_to_basic_station(sid, first, 1)
+        tmp_db.add_song_to_basic_station(sid, second, 2)
+        rows = tmp_db.list_basic_station_tracks(sid)
+        tmp_db.set_basic_station_track_commercial(int(rows[0]["id"]), True)
+        tmp_db.set_basic_station_track_link(int(rows[0]["id"]), True)
+        tmp_db.set_basic_station_track_commercial(int(rows[1]["id"]), True)
+        tmp_db.sanitize_basic_station_track_links(sid)
+        assert int(tmp_db.list_basic_station_tracks(sid)[0]["link_to_next"]) == 0

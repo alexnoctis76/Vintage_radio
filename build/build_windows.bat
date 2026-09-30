@@ -1,6 +1,6 @@
 @echo off
 REM Build script for Vintage Radio application on Windows
-REM Usage: build_windows.bat [--set-version v0.2.5-beta] [--no-clean]
+REM Usage: build_windows.bat [--set-version v0.2.5-beta] [--no-clean] [--skip-smoke] [--with-pytest] [--channel stable|dev|test]
 REM        Sets gui/__init__.py __version__ before PyInstaller when --set-version is passed.
 REM
 REM Prerequisites:
@@ -37,10 +37,23 @@ if errorlevel 1 (
 REM Parse command-line arguments
 set CLEAN=true
 set SET_VERSION=
+set SKIP_SMOKE=false
+set WITH_PYTEST=false
+set RELEASE_CHANNEL=stable
 :parse_args
 if "%~1"=="" goto done_parsing
 if "%~1"=="--no-clean" (
     set CLEAN=false
+    shift
+    goto parse_args
+)
+if "%~1"=="--skip-smoke" (
+    set SKIP_SMOKE=true
+    shift
+    goto parse_args
+)
+if "%~1"=="--with-pytest" (
+    set WITH_PYTEST=true
     shift
     goto parse_args
 )
@@ -54,17 +67,48 @@ if "%~1"=="--set-version" (
     shift
     goto parse_args
 )
+if "%~1"=="--channel" (
+    if "%~2"=="" (
+        echo Error: --channel requires stable, dev, or test
+        exit /b 1
+    )
+    set RELEASE_CHANNEL=%~2
+    shift
+    shift
+    goto parse_args
+)
 echo Unknown argument: %~1
-echo Usage: build_windows.bat [--set-version v0.2.5-beta] [--no-clean]
+echo Usage: build_windows.bat [--set-version v0.2.5-beta] [--no-clean] [--skip-smoke] [--with-pytest] [--channel stable^|dev^|test]
 exit /b 1
 
 :done_parsing
+
+if "%WITH_PYTEST%"=="true" (
+    echo Running source pytest before packaging...
+    if exist "%PROJECT_ROOT%\.venv\Scripts\python.exe" (
+        "%PROJECT_ROOT%\.venv\Scripts\python.exe" -m pytest -q
+    ) else (
+        python -m pytest -q
+    )
+    if errorlevel 1 (
+        echo Error: pytest failed; fix tests before building.
+        exit /b 1
+    )
+)
 
 if defined SET_VERSION (
     echo Setting app version: !SET_VERSION!
     python "%PROJECT_ROOT%\scripts\set_app_version.py" "!SET_VERSION!"
     if errorlevel 1 exit /b 1
 )
+
+echo Applying release config channel: !RELEASE_CHANNEL!
+if exist "%PROJECT_ROOT%\.venv\Scripts\python.exe" (
+    "%PROJECT_ROOT%\.venv\Scripts\python.exe" "%PROJECT_ROOT%\scripts\apply_release_config.py" "!RELEASE_CHANNEL!"
+) else (
+    python "%PROJECT_ROOT%\scripts\apply_release_config.py" "!RELEASE_CHANNEL!"
+)
+if errorlevel 1 exit /b 1
 
 REM Force-stop Vintage Radio (process tree + retries) so dist\Vintage Radio can be deleted
 echo Force-stopping Vintage Radio (unlocks dist folder^)...
@@ -92,6 +136,20 @@ if not exist "%EXE_PATH%" (
     exit /b 1
 )
 
+if "%SKIP_SMOKE%"=="false" (
+    echo.
+    echo Running packaged app smoke tests...
+    if exist "%PROJECT_ROOT%\.venv\Scripts\python.exe" (
+        "%PROJECT_ROOT%\.venv\Scripts\python.exe" "%PROJECT_ROOT%\scripts\packaged_app_smoke.py" --exe "%EXE_PATH%"
+    ) else (
+        python "%PROJECT_ROOT%\scripts\packaged_app_smoke.py" --exe "%EXE_PATH%"
+    )
+    if errorlevel 1 (
+        echo Error: Packaged smoke tests failed.
+        exit /b 1
+    )
+)
+
 echo.
 echo ==========================================
 echo Build Complete!
@@ -100,6 +158,9 @@ echo Executable: %EXE_PATH%
 echo.
 echo To run the app, double-click:
 echo   %EXE_PATH%
+if "%SKIP_SMOKE%"=="false" (
+    echo Packaged smoke: PASS
+)
 echo ==========================================
 echo.
 

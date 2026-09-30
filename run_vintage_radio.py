@@ -13,7 +13,7 @@ Run with verbose debug logs in the console:
   python run_vintage_radio.py --verbose
   # or set env before starting:
   set VINTAGE_RADIO_VERBOSE=1   (Windows)
-  export VINTAGE_RADIO_VERBOSE=1   (Linux/macOS)
+  export VINTAGE_RADIO_VERBOSE=1   (Linux/macOS) 
 """
 import os
 import sys

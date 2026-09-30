@@ -24,16 +24,71 @@ import zipfile
 # NOTE: GitHub's /releases/latest is the latest *non-prerelease* only. If every
 # release is a GitHub "Pre-release", that endpoint returns 404. Use the list
 # endpoint (newest first) so beta/prerelease tags still resolve.
-GITHUB_RELEASES_LATEST_URL = (
-    "https://api.github.com/repos/alexnoctis76/Vintage_radio/releases/latest"
-)
-GITHUB_RELEASES_LIST_URL = (
-    "https://api.github.com/repos/alexnoctis76/Vintage_radio/releases?per_page=100"
-)
-GITHUB_RELEASES_URL = "https://github.com/alexnoctis76/Vintage_radio/releases"
-GITHUB_REPO_SLUG = "alexnoctis76/Vintage_radio"
+DEFAULT_GITHUB_REPO_SLUG = "alexnoctis76/Vintage_radio"
+# Back-compat for tests / imports that referenced the old constant name.
+GITHUB_REPO_SLUG = DEFAULT_GITHUB_REPO_SLUG
 
 _LOG = logging.getLogger(__name__)
+
+
+def _github_repo_slug() -> str:
+    try:
+        from gui.release_config import update_repo_slug
+
+        return update_repo_slug(default=DEFAULT_GITHUB_REPO_SLUG)
+    except Exception:
+        return DEFAULT_GITHUB_REPO_SLUG
+
+
+def _github_releases_list_url() -> str:
+    return f"https://api.github.com/repos/{_github_repo_slug()}/releases?per_page=100"
+
+
+def _github_releases_latest_url() -> str:
+    return f"https://api.github.com/repos/{_github_repo_slug()}/releases/latest"
+
+
+def _github_releases_page_url() -> str:
+    return f"https://github.com/{_github_repo_slug()}/releases"
+
+
+def github_releases_url() -> str:
+    """Public releases page URL (respects optional ``update.repo`` override)."""
+    return _github_releases_page_url()
+
+
+# Back-compat alias for older call sites.
+GITHUB_RELEASES_URL = github_releases_url()
+
+
+def _release_passes_channel_filter(item: dict) -> bool:
+    """Apply stable vs test channel rules to a GitHub release list row."""
+    if not isinstance(item, dict) or item.get("draft"):
+        return False
+    try:
+        from gui.release_config import update_channel, update_prerelease_only, update_tag_suffix
+    except Exception:
+        update_channel = lambda **_: "stable"  # type: ignore[misc, assignment]
+        update_prerelease_only = lambda **_: False  # type: ignore[misc, assignment]
+        update_tag_suffix = lambda **_: ""  # type: ignore[misc, assignment]
+
+    is_prerelease = bool(item.get("prerelease"))
+    want_prerelease = update_prerelease_only()
+    if want_prerelease and not is_prerelease:
+        return False
+    if not want_prerelease and is_prerelease:
+        return False
+
+    suffix = update_tag_suffix()
+    if suffix and update_channel() == "test":
+        tag = str(item.get("tag_name") or "")
+        if not tag.endswith(suffix):
+            return False
+    return True
+
+
+def _filter_release_items(items: list) -> list:
+    return [i for i in items if isinstance(i, dict) and _release_passes_channel_filter(i)]
 
 
 def _log_updater(message: str) -> None:
@@ -47,9 +102,11 @@ def _log_updater(message: str) -> None:
         pass
 
 
-# Must match filenames produced by release packaging (see .github/workflows/build-release.yml).
+# Must match filenames produced by release packaging (see .github/workflows/build-test.yml).
 PREFERRED_WINDOWS_ASSET = "Vintage-Radio-Windows.zip"
-PREFERRED_MACOS_ASSET = "Vintage.Radio.dmg"
+PREFERRED_LINUX_ASSET = "Vintage-Radio-Linux.zip"
+# Legacy single-name macOS DMG (older shipped updaters expect this exact basename).
+PREFERRED_MACOS_ASSET_LEGACY = "Vintage.Radio.dmg"
 # Optional small JSON attached to each release; per-OS shipped semver may differ from tag_name.
 RELEASE_VERSIONS_MANIFEST = "release-versions.json"
 
@@ -154,7 +211,7 @@ def _fetch_release_assets_for_tag(tag: str) -> list[dict]:
     t = quote((tag or "").strip(), safe="")
     if not t:
         return []
-    url = f"https://api.github.com/repos/{GITHUB_REPO_SLUG}/releases/tags/{t}"
+    url = f"https://api.github.com/repos/{_github_repo_slug()}/releases/tags/{t}"
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "VintageRadio-Updater",
@@ -221,13 +278,48 @@ def _fetch_release_versions_manifest_dict(browser_download_url: str) -> Optional
         return None
 
 
+def _macos_hardware_has_arm64() -> bool:
+    """True when the Mac has Apple Silicon (even if this process is x86_64 under Rosetta)."""
+    if platform.system().lower() != "darwin":
+        return False
+    try:
+        out = subprocess.check_output(
+            ["sysctl", "-n", "hw.optional.arm64"],
+            text=True,
+            timeout=2,
+        ).strip()
+        return out == "1"
+    except Exception:
+        return False
+
+
+def _macos_cpu_arch() -> str:
+    """Return arm64 or x86_64 for Darwin asset selection."""
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    if machine in ("x86_64", "amd64"):
+        if _macos_hardware_has_arm64():
+            return "arm64"
+        return "x86_64"
+    return machine or "unknown"
+
+
+def preferred_macos_asset_basename() -> str:
+    """Arch-specific zip produced by CI; legacy releases used a single DMG name."""
+    return f"Vintage-Radio-macOS-{_macos_cpu_arch()}.zip"
+
+
 def _manifest_value_for_platform(data: dict) -> Optional[str]:
     pm = _platform_matcher()
     keys: list[str]
     if pm == "windows":
         keys = ["windows"]
     elif pm == "macos":
-        keys = ["macos", "mac", "darwin"]
+        arch = _macos_cpu_arch()
+        keys = [f"macos_{arch}", "macos", "mac", "darwin"]
+    elif pm == "linux":
+        keys = ["linux"]
     else:
         return None
     for ck in keys:
@@ -265,7 +357,7 @@ def _release_info_from_api_dict(data: dict) -> Optional[ReleaseInfo]:
         return None
     return ReleaseInfo(
         tag_name=tag,
-        html_url=str(data.get("html_url") or GITHUB_RELEASES_URL),
+        html_url=str(data.get("html_url") or _github_releases_page_url()),
         body=str(data.get("body") or "").strip(),
         assets=list(data.get("assets") or []),
     )
@@ -274,9 +366,7 @@ def _release_info_from_api_dict(data: dict) -> Optional[ReleaseInfo]:
 def _newest_release_from_list(items: list) -> Optional[ReleaseInfo]:
     """Pick the semantically newest tag; GitHub order is by publish date, not semver."""
     candidates: list[ReleaseInfo] = []
-    for item in items:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
+    for item in _filter_release_items(items):
         info = _release_info_from_api_dict(item)
         if info is not None:
             candidates.append(info)
@@ -301,9 +391,7 @@ def _newest_installable_release(items: list) -> Optional[ReleaseInfo]:
     best_info: Optional[ReleaseInfo] = None
     best_eff: Optional[str] = None
     best_tag: Optional[str] = None
-    for item in items:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
+    for item in _filter_release_items(items):
         info = _release_info_from_api_dict(item)
         if info is None or get_platform_asset(info.assets) is None:
             continue
@@ -338,11 +426,24 @@ def _fetch_release_list(user_agent: str) -> list:
         "Accept": "application/vnd.github+json",
         "User-Agent": user_agent,
     }
-    req = Request(GITHUB_RELEASES_LIST_URL, headers=headers)
+    req = Request(_github_releases_list_url(), headers=headers)
     with _urlopen_with_certs(req, timeout=20) as resp:
         raw = resp.read()
     items = json.loads(raw.decode("utf-8", errors="replace"))
-    return items if isinstance(items, list) else []
+    if not isinstance(items, list):
+        return []
+    filtered = _filter_release_items(items)
+    try:
+        from gui.release_config import update_channel
+
+        ch = update_channel()
+    except Exception:
+        ch = "stable"
+    _log_updater(
+        f"release list channel={ch!r} repo={_github_repo_slug()!r} "
+        f"raw={len(items)} visible={len(filtered)}"
+    )
+    return filtered
 
 
 def run_update_check(
@@ -353,6 +454,17 @@ def run_update_check(
     """Check GitHub for updates; distinguish up-to-date from API / asset failures."""
     cur = (current_version or "").strip()
     _log_updater(f"check started current={cur!r}")
+    try:
+        from gui.release_config import update_check_enabled
+
+        if not update_check_enabled():
+            _log_updater("check skipped: update.enabled=false in release_config.json")
+            return UpdateCheckResult(
+                status="up_to_date",
+                latest_published=cur or None,
+            )
+    except Exception:
+        pass
     try:
         items = _fetch_release_list(user_agent)
     except HTTPError as e:
@@ -389,7 +501,7 @@ def run_update_check(
 
     try:
         req = Request(
-            GITHUB_RELEASES_LATEST_URL,
+            _github_releases_latest_url(),
             headers={
                 "Accept": "application/vnd.github+json",
                 "User-Agent": user_agent,
@@ -398,7 +510,7 @@ def run_update_check(
         with _urlopen_with_certs(req, timeout=20) as resp:
             raw = resp.read()
         data = json.loads(raw.decode("utf-8", errors="replace"))
-        if isinstance(data, dict):
+        if isinstance(data, dict) and _release_passes_channel_filter(data):
             info = _release_info_from_api_dict(data)
             if info is not None and get_platform_asset(info.assets) is not None:
                 eff = _effective_platform_version(info)
@@ -427,7 +539,7 @@ def run_update_check(
 
     result = UpdateCheckResult(
         status="unavailable",
-        error="No published releases found on GitHub.",
+        error="No published releases found on GitHub for this update channel.",
     )
     _log_updater(f"check finished -> {result.status} error={result.error!r}")
     return result
@@ -471,11 +583,8 @@ def check_latest_release(
         "User-Agent": user_agent,
     }
     try:
-        req = Request(GITHUB_RELEASES_LIST_URL, headers=headers)
-        with _urlopen_with_certs(req, timeout=20) as resp:
-            raw = resp.read()
-        items = json.loads(raw.decode("utf-8", errors="replace"))
-        if isinstance(items, list) and items:
+        items = _fetch_release_list(user_agent)
+        if items:
             cur_ver = (current_version or "").strip()
             if cur_ver:
                 info = _best_release_newer_than_for_platform(items, cur_ver)
@@ -489,11 +598,11 @@ def check_latest_release(
         pass
 
     try:
-        req = Request(GITHUB_RELEASES_LATEST_URL, headers=headers)
+        req = Request(_github_releases_latest_url(), headers=headers)
         with _urlopen_with_certs(req, timeout=20) as resp:
             raw = resp.read()
         data = json.loads(raw.decode("utf-8", errors="replace"))
-        if isinstance(data, dict):
+        if isinstance(data, dict) and _release_passes_channel_filter(data):
             info = _release_info_from_api_dict(data)
             if info is not None:
                 if get_platform_asset(info.assets) is None:
@@ -524,6 +633,8 @@ def _platform_matcher() -> Optional[str]:
         return "windows"
     if "darwin" in sys_name:
         return "macos"
+    if "linux" in sys_name:
+        return "linux"
     return None
 
 
@@ -532,7 +643,9 @@ def _preferred_asset_name_for_platform() -> Optional[str]:
     if m == "windows":
         return PREFERRED_WINDOWS_ASSET
     if m == "macos":
-        return PREFERRED_MACOS_ASSET
+        return preferred_macos_asset_basename()
+    if m == "linux":
+        return PREFERRED_LINUX_ASSET
     return None
 
 
@@ -579,10 +692,26 @@ def get_platform_asset(assets: list[dict]) -> Optional[dict]:
         candidates.sort(key=lambda a: len(str(a.get("name") or "")))
         return candidates[0]
 
-    preferred_mac = (PREFERRED_MACOS_ASSET or "").lower()
+    if matcher == "linux":
+        preferred = (PREFERRED_LINUX_ASSET or "").lower()
+        by_lower = {str(a.get("name") or "").lower(): a for a in assets}
+        if preferred and preferred in by_lower:
+            return by_lower[preferred]
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            if name.endswith(".zip") and "linux" in name:
+                return asset
+        return None
+
     by_lower_all = {str(a.get("name") or "").lower(): a for a in assets}
-    if preferred_mac and preferred_mac in by_lower_all:
-        return by_lower_all[preferred_mac]
+    for preferred in (
+        preferred_macos_asset_basename(),
+        PREFERRED_MACOS_ASSET_LEGACY,
+        f"Vintage-Radio-macOS-{_macos_cpu_arch()}.dmg",
+    ):
+        key = (preferred or "").lower()
+        if key and key in by_lower_all:
+            return by_lower_all[key]
 
     return _get_macos_release_asset(assets)
 
@@ -595,7 +724,7 @@ def _releases_download_url(tag_name: str, basename: str) -> Optional[str]:
         return None
     t = quote(tag, safe="")
     f = quote(base, safe="")
-    return f"https://github.com/{GITHUB_REPO_SLUG}/releases/download/{t}/{f}"
+    return f"https://github.com/{_github_repo_slug()}/releases/download/{t}/{f}"
 
 
 def _best_release_newer_than_for_platform(
@@ -608,9 +737,7 @@ def _best_release_newer_than_for_platform(
     best_info: Optional[ReleaseInfo] = None
     best_eff: Optional[str] = None
     best_tag: Optional[str] = None
-    for item in items:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
+    for item in _filter_release_items(items):
         info = _release_info_from_api_dict(item)
         if info is None:
             continue
@@ -723,6 +850,8 @@ def installer_download_urls_for_release(release: ReleaseInfo) -> list[str]:
             if "macos" in name:
                 add(str(asset.get("browser_download_url") or ""))
         add(direct_download_url_for_release(tag))
+        add(_releases_download_url(tag, preferred_macos_asset_basename()))
+        add(_releases_download_url(tag, PREFERRED_MACOS_ASSET_LEGACY))
         add(_releases_download_url(tag, "Vintage Radio.dmg"))
         add(_releases_download_url(tag, "Vintage-Radio-macOS.zip"))
         _log_updater(
@@ -732,7 +861,18 @@ def installer_download_urls_for_release(release: ReleaseInfo) -> list[str]:
             _log_updater(f"  URL[{i}/{len(out)}]: {u}")
         return out
 
-    _log_updater(f"release {tag!r}: non-macOS/Windows, no installer URLs")
+    if "linux" in sys_name:
+        a = get_platform_asset(assets)
+        if a:
+            add(str(a.get("browser_download_url") or ""))
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            if name.endswith(".zip") and "linux" in name:
+                add(str(asset.get("browser_download_url") or ""))
+        add(direct_download_url_for_release(tag))
+        return out
+
+    _log_updater(f"release {tag!r}: unsupported platform for installer URLs")
     return out
 
 
@@ -788,13 +928,18 @@ def download_update_try_urls(
 
 
 def _get_macos_release_asset(assets: list[dict]) -> Optional[dict]:
-    """Pick macOS update asset: raw DMG (e.g. Vintage.Radio.dmg) preferred, else macOS .zip."""
+    """Pick macOS update asset: arch-specific zip/dmg, then legacy DMG, else macOS zip."""
+    arch = _macos_cpu_arch()
+    arch_tokens = (arch, arch.replace("_", "-"))
     dmg_scored: list[tuple[int, dict]] = []
-    zip_candidates: list[dict] = []
+    zip_scored: list[tuple[int, dict]] = []
+    zip_fallback: list[dict] = []
     for asset in assets:
         name = str(asset.get("name") or "").lower()
         if name.endswith(".dmg"):
             score = 0
+            if any(tok in name for tok in arch_tokens):
+                score += 120
             if _VINTAGE_RADIO_DMG_RE.search(name):
                 score += 100
             elif "vintage" in name and "radio" in name:
@@ -805,12 +950,20 @@ def _get_macos_release_asset(assets: list[dict]) -> Optional[dict]:
                 continue
             dmg_scored.append((score, asset))
         elif "macos" in name and name.endswith(".zip"):
-            zip_candidates.append(asset)
+            score = 100 if any(tok in name for tok in arch_tokens) else 0
+            if score:
+                zip_scored.append((score, asset))
+            else:
+                zip_fallback.append(asset)
+    if zip_scored:
+        zip_scored.sort(key=lambda t: t[0], reverse=True)
+        return zip_scored[0][1]
     if dmg_scored:
         dmg_scored.sort(key=lambda t: t[0], reverse=True)
         return dmg_scored[0][1]
-    if zip_candidates:
-        return zip_candidates[0]
+    if zip_fallback:
+        zip_fallback.sort(key=lambda a: len(str(a.get("name") or "")))
+        return zip_fallback[0]
     return None
 
 
@@ -848,9 +1001,23 @@ def download_update(
 
 
 def _extract_zip(zip_path: Path, extract_dir: Path) -> None:
+    """Extract a release zip; on macOS use ``ditto`` so Frameworks symlinks survive."""
     if extract_dir.exists():
         shutil.rmtree(extract_dir, ignore_errors=True)
     extract_dir.mkdir(parents=True, exist_ok=True)
+    if platform.system() == "Darwin":
+        proc = subprocess.run(
+            ["ditto", "-x", "-k", str(zip_path), str(extract_dir)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(
+                f"ditto failed to extract update zip (exit {proc.returncode})"
+                + (f": {detail}" if detail else "")
+            )
+        return
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(extract_dir)
 
@@ -970,7 +1137,18 @@ endlocal
 
 
 def _macos_bundle_main_executable(bundle: Path) -> Path:
-    """PyInstaller one-folder bundle: ``Name.app/Contents/MacOS/Name``."""
+    """Main Mach-O inside a .app (``CFBundleExecutable``, not the ``.app`` folder name)."""
+    plist_path = bundle / "Contents" / "Info.plist"
+    if plist_path.is_file():
+        try:
+            import plistlib
+
+            data = plistlib.loads(plist_path.read_bytes())
+            exe_name = data.get("CFBundleExecutable")
+            if exe_name:
+                return bundle / "Contents" / "MacOS" / str(exe_name)
+        except Exception:
+            pass
     return bundle / "Contents" / "MacOS" / bundle.stem
 
 

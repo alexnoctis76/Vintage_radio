@@ -130,14 +130,22 @@ class DebugMcpServerManager:
                             except (TypeError, ValueError):
                                 dur = 5.0
                             conn.settimeout(max(60.0, min(dur + 45.0, 180.0)))
-                        elif meth in ("run_full_acceptance", "run_acceptance_suite"):
+                        elif meth in (
+                            "run_full_acceptance",
+                            "run_acceptance_suite",
+                            "run_commercials_acceptance",
+                        ):
                             # Suite runs many minutes (gestures + multiple line-in captures).
                             conn.settimeout(7200.0)
                         elif meth == "invoke_action":
                             act = str((par or {}).get("action", "")).strip()
                             if act == "install_basic_to_pico":
                                 conn.settimeout(650.0)
-                    resp = self._dispatch(req if isinstance(req, dict) else {})
+                    try:
+                        resp = self._dispatch(req if isinstance(req, dict) else {})
+                    except Exception as e:
+                        self._log("MCP dispatch error: {}".format(e))
+                        resp = {"ok": False, "error": "dispatch_exception", "detail": str(e)}
                     conn.settimeout(10.0)
                     self._send(conn, resp)
         except Exception as e:
@@ -246,6 +254,25 @@ class DebugMcpServerManager:
             return {"ok": bool(suite.get("ok")), "suite": suite}
         if method == "device_connect":
             return self._invoke_action("connect_device", params)
+        if method == "run_commercials_acceptance":
+            from .mcp_commercials_acceptance import SUITES, run_commercials_acceptance
+
+            requested = str(params.get("suite", "basic_folder")).strip().lower()
+            if requested == "list":
+                return {"ok": True, "suites": {k: v["label"] for k, v in SUITES.items()}}
+
+            def _request(method_name: str, method_params: dict) -> dict:
+                return self._dispatch({"method": method_name, "params": method_params})
+
+            suite = run_commercials_acceptance(
+                invoke=self._invoke_action,
+                request=_request,
+                target=str(params.get("target", "device")),
+                suite=requested,
+                require_audio=bool(params.get("require_audio", True)),
+                log_fn=self._log,
+            )
+            return {"ok": bool(suite.get("ok")), "suite": suite}
         if method == "line_in_list_devices":
             from .mcp_line_in_analysis import list_input_devices
 
@@ -284,6 +311,7 @@ class DebugMcpServerManager:
                 device=device,
                 reference_wav=ref_s or None,
                 windows=windows,
+                detect_ident=bool(params.get("detect_ident")),
             )
         return {"ok": False, "error": "unknown_method", "method": method}
 

@@ -71,7 +71,14 @@ def app_data_dir() -> Path:
     into data/ once.
     When frozen (packaged): use platformdirs user_data_dir() so user data survives
     app replacement/build cleanup and never writes inside the app bundle/install dir.
+
+    Override for tests/smoke: set ``VINTAGE_RADIO_DATA_DIR`` to an isolated path.
     """
+    override = os.environ.get("VINTAGE_RADIO_DATA_DIR", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     if not getattr(sys, "frozen", False):
         root = project_root()
         data_dir = root / _DATA_DIR_NAME
@@ -245,4 +252,23 @@ def resolve_ffmpeg_executable() -> str | None:
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
         return system_ffmpeg
+    return None
+
+
+def resolve_ffprobe_executable() -> str | None:
+    """Return ffprobe if available (bundled next to ffmpeg or on PATH)."""
+    override = os.environ.get("VINTAGE_RADIO_FFPROBE_EXE", "").strip()
+    if override and Path(override).exists():
+        return override
+
+    ffmpeg = resolve_ffmpeg_executable()
+    if ffmpeg:
+        ffprobe = Path(ffmpeg).with_name(Path(ffmpeg).name.replace("ffmpeg", "ffprobe", 1))
+        if ffprobe.is_file():
+            _ensure_executable(ffprobe)
+            return str(ffprobe)
+
+    system_ffprobe = shutil.which("ffprobe")
+    if system_ffprobe:
+        return system_ffprobe
     return None

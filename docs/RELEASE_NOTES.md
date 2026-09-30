@@ -4,6 +4,24 @@ Desktop application for managing your music library and syncing it to a vintage-
 
 ---
 
+# Release summary — **v1.1.0**
+
+## Personalize your radio with custom commercials
+
+- **Commercials station (Basic or Conductor)** — Enable **Commercials station** on the Load Music sync bar, choose how many **songs** play between breaks (for example every 3 tracks), and sync. Ads live in a dedicated **Commercials** station on the SD card.
+- **Tagged ads tied to a song (Conductor)** — Turn on **Tagged tracks**, mark a short clip as a **commercial**, then **link** it to the track **directly below** so it always plays right before that song. Reorder tracks by dragging; use the link control or right‑click menu on the track row.
+- After any commercials change: **Sync to SD** and **Install Firmware** together so the SD audio and the RP2040 catalog stay matched.
+
+## Also in v1.1.0
+
+- **Stable Windows and Mac builds** with in-app **Check for updates**.
+- **Conductor firmware** for richer catalogs, shuffle, and inline ads.
+- **More reliable Install Firmware** (including fixes when installing from the Mac app).
+- Refreshed **full-flash 1.1.0 firmware** image for BOOTSEL installs.
+- Updated **README** and Help-oriented docs.
+
+---
+
 # Release summary — **v0.2.1-beta**
 
 > **Conversion and audio tools.** Release builds ship with **FFmpeg** bundled; the app **prefers FFmpeg** for MP3 conversion when syncing to SD. You **do not need to install VLC** for conversion to work.

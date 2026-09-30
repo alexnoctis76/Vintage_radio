@@ -48,8 +48,10 @@ def _firmware_file_pairs(basic_mode: bool = True) -> List[Tuple[str, str]]:
     return [
         (main_source, "main.py"),
         ("firmware/radio_core.py", "radio_core.py"),
+        ("firmware/dfplayer_protocol.py", "dfplayer_protocol.py"),
         ("firmware/pico/dfplayer_hardware.py", "components/dfplayer_hardware.py"),
         ("firmware/pico/components/vintage_radio_ipc.py", "components/vintage_radio_ipc.py"),
+        ("firmware/pico/components/radio_state.py", "components/radio_state.py"),
         ("firmware/pico/components/am_wav_loader.py", "components/am_wav_loader.py"),
         ("firmware/pin_config_loader.py", "pin_config_loader.py"),
         ("firmware/pico/sdcard.py", "sdcard.py"),
@@ -213,6 +215,7 @@ try {
 $files = @(
     @("main.py", "main.py"),
     @("radio_core.py", "radio_core.py"),
+    @("dfplayer_protocol.py", "dfplayer_protocol.py"),
     @("pin_config_loader.py", "pin_config_loader.py"),
     @("sdcard.py", "sdcard.py"),
     @("pin_config.json", "pin_config.json"),
@@ -272,6 +275,7 @@ copy() {
 
 copy "$FIRMWARE/main.py" main.py
 copy "$FIRMWARE/radio_core.py" radio_core.py
+copy "$FIRMWARE/dfplayer_protocol.py" dfplayer_protocol.py
 copy "$FIRMWARE/pin_config_loader.py" pin_config_loader.py
 copy "$FIRMWARE/sdcard.py" sdcard.py
 copy "$FIRMWARE/pin_config.json" pin_config.json
@@ -420,10 +424,60 @@ def _detect_rpi_rp2() -> Optional[Path]:
     return None
 
 
+def _request_bootsel_via_mpremote(port: str) -> None:
+    """Reboot a running MicroPython Pico into USB BOOTSEL (no BOOTSEL button).
+
+    Uses mpremote's ``bootloader`` command, or ``machine.bootloader()`` on RP2040.
+    """
+    mp = _resolve_mpremote()
+    connect = ["connect", port] if port else []
+    attempts = (
+        ["bootloader"],
+        ["exec", "import machine; machine.bootloader()"],
+    )
+    errors: List[str] = []
+    for extra in attempts:
+        cmd = mp + connect + extra
+        try:
+            r = subprocess.run(
+                cmd,
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            # Expected: the USB serial device vanishes when BOOTSEL starts.
+            print(f"Requested BOOTSEL via mpremote ({port or 'auto'})")
+            return
+        if r.returncode == 0:
+            print(f"Requested BOOTSEL via mpremote ({port or 'auto'})")
+            return
+        errors.append((r.stderr or r.stdout or "").strip())
+    detail = "\n".join(e for e in errors if e) or "unknown mpremote error"
+    raise RuntimeError(f"Could not enter BOOTSEL over serial:\n{detail}")
+
+
+def _wait_for_picotool_bootsel(picotool: Path, *, timeout_s: float = 45.0) -> None:
+    """Poll picotool until the Pico is reachable in BOOTSEL (works without RPI-RP2 drive letter)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        ok, _probe = _verify_picotool_bootsel(picotool)
+        if ok:
+            return
+        time.sleep(1.5)
+    raise TimeoutError(
+        f"Picotool did not see the Pico in BOOTSEL within {timeout_s:.0f}s."
+    )
+
+
 def _wait_for_bootsel(*, timeout_s: float = 180.0) -> None:
     print(
         "\nOptional: create a full-flash .uf2 (requires picotool + a USB driver on Windows).\n"
         "The release .zip already contains firmware — you usually do not need this step.\n\n"
+        "If MicroPython is still running on USB serial, pass --install COMx on the same run\n"
+        "(or re-run with --install) so the script can call machine.bootloader() for you.\n\n"
+        "Manual fallback:\n"
         "1. Close Vintage Radio (or disconnect) so nothing holds the COM port.\n"
         "2. Unplug the Pico, hold BOOTSEL, plug in while holding BOOTSEL.\n"
         "3. Confirm RPI-RP2 appears in File Explorer (COM port should be gone).\n"
@@ -486,6 +540,7 @@ def flash_dump_uf2(
     *,
     wait_bootsel: bool = True,
     bootsel_timeout: float = 180.0,
+    serial_port: str = "",
 ) -> None:
     picotool = _find_picotool()
     if not picotool:
@@ -494,10 +549,22 @@ def flash_dump_uf2(
             "  powershell -ExecutionPolicy Bypass -File agent_workshop/download_picotool.ps1\n"
             "Or install picotool from the Raspberry Pi Pico SDK and add it to PATH."
         )
-    if wait_bootsel and _detect_rpi_rp2() is None:
-        _wait_for_bootsel(timeout_s=bootsel_timeout)
-    elif wait_bootsel and _detect_rpi_rp2() is not None:
+    port = (serial_port or "").strip()
+    if wait_bootsel:
         ok, probe = _verify_picotool_bootsel(picotool)
+        if not ok:
+            if port:
+                try:
+                    _request_bootsel_via_mpremote(port)
+                    time.sleep(2.0)
+                    _wait_for_picotool_bootsel(picotool, timeout_s=min(60.0, bootsel_timeout))
+                except (RuntimeError, TimeoutError) as exc:
+                    print(f"Software BOOTSEL did not succeed ({exc}). Waiting for manual BOOTSEL…")
+                    if _detect_rpi_rp2() is None:
+                        _wait_for_bootsel(timeout_s=bootsel_timeout)
+            elif _detect_rpi_rp2() is None:
+                _wait_for_bootsel(timeout_s=bootsel_timeout)
+            ok, probe = _verify_picotool_bootsel(picotool)
         if not ok and _picotool_zadig_needed(probe):
             raise RuntimeError(f"picotool cannot connect:\n{_format_picotool_failure(probe)}")
 
@@ -674,6 +741,7 @@ def main() -> int:
             full_uf2,
             wait_bootsel=not args.no_wait_bootsel,
             bootsel_timeout=args.bootsel_timeout,
+            serial_port=args.install,
         )
         print(f"Share this one-file UF2: {full_uf2}")
         release_copy = REPO_ROOT / "firmware" / "release"

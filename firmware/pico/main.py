@@ -104,6 +104,8 @@ class VintageRadioFirmware:
         
         if skip_power_check:
             print("Power sense check DISABLED (configured via debug mode)")
+            # rail2_on stays True so playback/track logic runs on the bench;
+            # last_sense tracks real GPIO to avoid a spurious power edge.
             self.rail2_on = True
             self.last_sense = 1 if self.hw.is_power_on() else 0
             return
@@ -111,7 +113,10 @@ class VintageRadioFirmware:
         print("Waiting for power sense HIGH...")
         print("(Turn pot on, or create skip_power_sense.txt with 'true' to skip)")
         last_hint = ticks_ms()
+        update_led = getattr(self.hw, "update_playback_led", None)
         while not self.hw.is_power_on():
+            if update_led is not None:
+                update_led(standby=True)
             if ticks_diff(ticks_ms(), last_hint) > 5000:
                 print(
                     "...still waiting for power sense HIGH "
@@ -566,7 +571,12 @@ class VintageRadioFirmware:
 
                 update_led = getattr(self.hw, "update_playback_led", None)
                 if update_led is not None:
-                    update_led(is_playing=getattr(self.core, "is_playing", False))
+                    pot_on = self.rail2_on and self.hw.is_power_on()
+                    update_led(
+                        is_playing=getattr(self.core, "is_playing", False) if pot_on else False,
+                        standby=not pot_on,
+                        warning=getattr(self, "_start_unconfirmed_streak", 0) > 0 if pot_on else False,
+                    )
             except OSError as e:
                 print("Main loop recoverable error:", e)
             
@@ -602,10 +612,11 @@ def main():
         # Red LED to signal crash (visible without serial)
         try:
             import neopixel
+            from components.dfplayer_hardware import FATAL_NEOPIX
             from pin_config_loader import get_pin
             neo_pin = get_pin("neopixel", 16)
             np = neopixel.NeoPixel(Pin(neo_pin), 1)
-            np[0] = (10, 0, 0)
+            np[0] = FATAL_NEOPIX
             np.write()
         except Exception:
             pass

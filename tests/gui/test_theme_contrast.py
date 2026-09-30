@@ -114,6 +114,13 @@ _ICON_PAIRS = [
     ("TRACK_PENCIL_COLOR", "TRK_PANE_GRAD_TOP", 4.5, "track pencil unselected"),
     # Track row: edit pencil icon (selected)
     ("TRACK_PENCIL_COLOR_SEL", "TRK_SEL_GRAD_TOP", 4.5, "track pencil selected"),
+    ("STA_COMM_TEXT", "STA_COMM_GRAD_MID", 4.5, "commercials station text"),
+    ("STA_COMM_COUNT", "STA_COMM_GRAD_MID", 4.5, "commercials station count"),
+    ("TRK_AD_TEXT", "TRK_AD_GRAD_TOP", 4.5, "commercial track text"),
+    ("TRK_AD_TEXT", "TRK_AD_SEL_GRAD_TOP", 4.5, "commercial track text selected"),
+    ("TRK_AD_TAG_FG", "TRK_AD_TAG_BG", 4.5, "commercial track tag"),
+    ("TRK_LINK_FG", "TRK_PANE_GRAD_TOP", 4.5, "track link chain"),
+    ("TRK_LINK_ACTIVE", "TRK_AD_GRAD_TOP", 4.5, "active link on commercial row"),
 ]
 
 # Hardcoded icon colours that are not palette tokens — checked with literal values.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,69 @@ def format_live_vrtest_result(device: dict) -> str:
     return json.dumps(device, indent=2, sort_keys=True)
 
 
+def is_generic_track_title(title: str) -> bool:
+    """True when firmware logged a DFPlayer placeholder like 'Track 7'."""
+    return bool(re.match(r"^Track \d+$", (title or "").strip()))
+
+
+def parse_commercial_stream_line(line: str) -> Optional[dict]:
+    """Parse firmware commercial log lines for the debugger Now Playing panel."""
+    if "COMMERCIALS: playing folder" in line:
+        match = re.search(r"folder\s+(\d+)\s+track\s+(\d+)", line)
+        if match:
+            return {
+                "kind": "folder",
+                "playing": True,
+                "folder": int(match.group(1)),
+                "track": int(match.group(2)),
+            }
+    if "CONDUCTOR: playing linked commercial" in line:
+        return {"kind": "linked", "playing": True}
+    if (
+        "COMMERCIALS: finished" in line
+        or "linked commercial finished" in line
+        or "skip linked commercial, playing attached track" in line
+    ):
+        return {"kind": "", "playing": False}
+    return None
+
+
+def now_playing_fields_from_ipc_state(state: dict, *, basic_mode: bool = True) -> dict:
+    """Map VRTEST get_state onto Now Playing fields when the stream has no current track."""
+    out: dict = {}
+    if not isinstance(state, dict):
+        return out
+    mode = state.get("mode")
+    if mode:
+        mode_s = str(mode)
+        if basic_mode and mode_s == "playlist":
+            mode_s = "station"
+        out["mode"] = mode_s
+    shuffle = state.get("shuffle_source_type")
+    if shuffle:
+        out["shuffle_type"] = str(shuffle)
+    folder = state.get("playing_folder")
+    track = state.get("playing_track")
+    if track is None:
+        track = state.get("current_track")
+    try:
+        if folder is not None:
+            out["folder"] = int(folder)
+        if track is not None:
+            out["track"] = int(track)
+    except (TypeError, ValueError):
+        pass
+    album = state.get("current_album_index")
+    try:
+        if album is not None:
+            out["album_idx"] = int(album)
+            if "source" not in out:
+                out["source"] = f"Station #{out['album_idx'] + 1}"
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
@@ -134,6 +198,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         #: If set, always read the active library DB from the manager (survives library switch / reconnect).
         self._db_getter = db_getter
         self._mpremote_cmd = None
+        self._session_port: Optional[str] = None
         self._connected = False
         self._output_thread = None
         self._stop_output = False
@@ -146,11 +211,17 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._use_mpremote = False  # Set to False to disable mpremote entirely (serial-only mode)
         self._streaming_pause_event = threading.Event()  # Set = streaming paused
         self._streaming_resume_event = threading.Event()  # Set = streaming can resume
+        self._streaming_pause_quiet = False  # Suppress pause/resume info logs (VRTEST resync)
+        self._vrtest_ipc_available: Optional[bool] = None  # None=unknown; False after probe timeout
         self._current_device_mode = ""  # Track current mode from stream output
         self._current_device_source = ""  # Track current source (album/playlist name)
         self._current_shuffle_type = ""  # Track shuffle type: 'library', 'album', 'playlist', 'source'
         self._current_track_title = ""
         self._current_track_artist = ""
+        self._current_is_commercial = False
+        self._current_commercial_kind = ""
+        self._current_basic_folder = None
+        self._current_basic_track = None
         self._current_album_idx = 0  # Track album/playlist index for fallback display
         self._am_wav_loaded = None  # None = unknown, True/False = detected from stream
         self._last_presence_emitted: Optional[bool] = None
@@ -158,6 +229,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._poll_usb_signature: Optional[Tuple[Tuple[str, ...], bool]] = None
         self._stream_ring_lock = threading.Lock()
         self._stream_ring: deque[str] = deque(maxlen=2500)
+        self._serial_error_count = 0
         self._setup_ui()
         self._scan_ports()  # Port scanning uses serial.tools.list_ports (no mpremote needed)
         self._presence_poll_timer = QtCore.QTimer(self)
@@ -165,6 +237,22 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._presence_poll_timer.timeout.connect(self._poll_serial_presence)
         self._presence_poll_timer.start()
         self._debug_log("DeviceDebugWidget initialized", "info")
+
+    def _selected_port(self) -> Optional[str]:
+        """COM port for the active session (combo may be disabled while connected)."""
+        data = self.port_combo.currentData()
+        if data is not None:
+            text = str(data).strip()
+            if text and text.lower() not in ("none", "(no com ports found)"):
+                return text
+        if self._session_port:
+            return self._session_port
+        combo_text = self.port_combo.currentText().strip()
+        if combo_text.startswith("COM") and " " in combo_text:
+            return combo_text.split()[0]
+        if combo_text.startswith("/dev/"):
+            return combo_text.split()[0]
+        return None
 
     def _effective_db(self):
         """Database used for station/track lookup (getter wins when provided)."""
@@ -253,7 +341,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self.list_files_btn.setToolTip("List files on the device")
         self.list_files_btn.clicked.connect(self._list_files)
         self.list_files_btn.setEnabled(False)
-        
+
         self.clear_console_btn = QtWidgets.QPushButton("Clear Console")
         self.clear_console_btn.clicked.connect(self._clear_console)
         
@@ -284,9 +372,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._firmware_running = False
         self._set_run_stop_button_state(running=False, enabled=False)
 
-        self.test_basic_fw_btn = QtWidgets.QPushButton("Flash Basic Mode Firmware")
+        self.test_basic_fw_btn = QtWidgets.QPushButton("Flash Default Firmware")
         self.test_basic_fw_btn.setToolTip(
-            "Flash basic-mode firmware (discovers stations from DFPlayer folders via UART queries). "
+            "Flash Default firmware (discovers stations from DFPlayer folders via UART queries). "
             "Use this to test DFPlayer 0x4F/0x4E query support on your hardware."
         )
         self.test_basic_fw_btn.clicked.connect(self._flash_basic_firmware)
@@ -637,10 +725,35 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         )
         self._refresh_now_playing_zoom_style()
     
-    def _pause_streaming(self):
+    def _emit_serial_bytes_to_stream(self, data: bytes) -> None:
+        """Push raw serial bytes into the console (used when draining before VRTEST)."""
+        if not data:
+            return
+        text = data.decode("utf-8", errors="replace")
+        for raw_line in text.split("\n"):
+            line = raw_line.rstrip("\r")
+            if line.strip():
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_display_stream_output",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, line),
+                )
+
+    def _drain_serial_to_stream(self, ser) -> None:
+        """Read any bytes already waiting on the port into the console."""
+        try:
+            waiting = ser.in_waiting
+            if waiting:
+                self._emit_serial_bytes_to_stream(ser.read(waiting))
+        except Exception:
+            pass
+
+    def _pause_streaming(self, *, quiet: bool = False):
         """Pause the streaming thread so we can use the serial port for a command."""
         if not self._streaming_thread or not self._streaming_thread.is_alive():
             return  # Not streaming, nothing to pause
+        self._streaming_pause_quiet = bool(quiet)
         self._streaming_resume_event.clear()
         self._streaming_pause_event.set()  # Signal streaming to pause
         # Wait up to 2s for streaming to actually pause (it will set resume_event when paused)
@@ -825,13 +938,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         with self._port_lock:
             was_streaming = self._streaming_thread and self._streaming_thread.is_alive()
             if was_streaming:
-                self._pause_streaming()
+                self._pause_streaming(quiet=True)
             try:
-                try:
-                    if ser.in_waiting:
-                        ser.read(ser.in_waiting)
-                except Exception:
-                    pass
+                self._drain_serial_to_stream(ser)
                 ser.write(payload_line.encode("utf-8"))
                 buf = b""
                 start = time.time()
@@ -1006,7 +1115,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 port_name = port_info.device
                 description = f"{port_info.description or 'Unknown'} {port_info.hwid or ''}".strip()
                 self.port_combo.addItem(f"{port_name} - {description}", port_name)
-                if self._basic_mode and rp2040_index is None and self._is_rp2040_port(port_info):
+                if rp2040_index is None and self._is_rp2040_port(port_info):
                     rp2040_index = self.port_combo.count() - 1
                 if not from_auto_poll:
                     self._debug_log(f"Added port: {port_name} - {description}", "info")
@@ -1019,10 +1128,17 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                         restored_preserve = True
                         break
 
-            if self._basic_mode and rp2040_index is not None:
-                # In basic mode we always prefer an attached RP2040 over unrelated serial devices.
-                if not restored_preserve or self.port_combo.currentIndex() != rp2040_index:
+            if rp2040_index is not None:
+                if self._basic_mode:
+                    # Basic mode always prefers RP2040 over unrelated serial devices.
+                    if not restored_preserve or self.port_combo.currentIndex() != rp2040_index:
+                        self.port_combo.setCurrentIndex(rp2040_index)
+                elif not restored_preserve:
+                    # Device tab: after Pico reset/unplug, snap to RP2040 — not COM4 (BT).
                     self.port_combo.setCurrentIndex(rp2040_index)
+            elif preserve and not restored_preserve:
+                # Previous Pico port gone and no RP2040 yet — clear stale selection.
+                self.port_combo.setCurrentIndex(-1)
 
             if self.port_combo.count() == 0:
                 self.port_combo.addItem("(No COM ports found)", None)
@@ -1233,7 +1349,9 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         
         if self._streaming_thread and self._streaming_thread.is_alive():
             self._streaming_thread.join(timeout=3.0)
-        
+        self._streaming_pause_event.clear()
+        self._streaming_resume_event.clear()
+
         # Close the persistent serial connection
         if self._serial_connection:
             try:
@@ -1246,6 +1364,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 self._serial_connection = None
         
         self._connected = False
+        self._vrtest_ipc_available = None
         self._active_operations.clear()
         self._restore_disconnected_state()
         self._log("Disconnected", "info")
@@ -1280,6 +1399,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 self.get_status_btn.setEnabled(True)
                 self.list_files_btn.setEnabled(True)
                 self.view_debug_log_btn.setEnabled(True)
+                self._session_port = port or self._selected_port()
                 self.check_firmware_btn.setEnabled(True)
                 self.send_btn.setEnabled(True)
                 self.stream_output_btn.setEnabled(True)
@@ -1295,6 +1415,10 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 # Auto-start streaming so user sees logs immediately
                 self._stop_streaming = False
                 self._stop_output = False
+                self._streaming_pause_event.clear()
+                self._streaming_resume_event.clear()
+                self._streaming_pause_quiet = False
+                self._vrtest_ipc_available = None
                 if not self._basic_mode:
                     self.stream_output_btn.setText("Stop Streaming")
                 self._log("Auto-starting output stream...", "info")
@@ -1391,6 +1515,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self.get_status_btn.setEnabled(False)
             self.list_files_btn.setEnabled(False)
             self.view_debug_log_btn.setEnabled(False)
+            self._session_port = None
             self.check_firmware_btn.setEnabled(False)
             self.send_btn.setEnabled(False)
             self.stream_output_btn.setEnabled(False)
@@ -1404,6 +1529,8 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self._current_shuffle_type = ""
             self._current_track_title = ""
             self._current_track_artist = ""
+            self._current_is_commercial = False
+            self._current_commercial_kind = ""
             self._current_basic_folder = None
             self._current_basic_track = None
             
@@ -1422,7 +1549,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         command = self.cmd_input.text().strip()
         if not command:
             return
-        
+
+        lowered = command.lower().strip()
+        if lowered in ("list files", "list_files", "ls"):
+            self.cmd_input.clear()
+            self._list_files()
+            return
         if command == "help":
             self._show_help()
             self.cmd_input.clear()
@@ -1468,8 +1600,12 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         self._log(f">>> {command}  [{route}]", "command")
         self.cmd_input.clear()
         
-        port = self.port_combo.currentData()
+        port = self._selected_port()
         self._debug_log(f"Sending command to {port}: {command[:100]} via {route}", "info")
+        if not port:
+            self._active_operations.discard(op_id)
+            self._log("No COM port for this session — reconnect.", "error")
+            return
         
         def run_command():
             try:
@@ -1731,7 +1867,11 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             return
         
         self._active_operations.add("list_files")
-        port = self.port_combo.currentData()
+        port = self._selected_port()
+        if not port:
+            self._active_operations.discard("list_files")
+            self._log("No COM port for this session — reconnect.", "error")
+            return
         self._debug_log(f"Listing files on {port}...", "info")
         self._log("Listing files...", "info")
         
@@ -1778,7 +1918,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 )
         
         threading.Thread(target=list_files, daemon=True).start()
-    
+
     def _clear_console(self) -> None:
         """Clear the console output."""
         self.console_output.clear()
@@ -1876,7 +2016,10 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             self._streaming_thread.join(timeout=3.0)
             if self._streaming_thread.is_alive():
                 self._debug_log("Warning: Streaming thread did not stop within timeout", "warning")
-        
+        self._streaming_thread = None
+        self._streaming_pause_event.clear()
+        self._streaming_resume_event.clear()
+        self._stop_streaming = False
         self._stop_output = False  # Reset for next start
 
     def _run_stop_button_stylesheet(self, *, running: bool) -> str:
@@ -2000,8 +2143,95 @@ class DeviceDebugWidget(QtWidgets.QWidget):
     
     def _schedule_now_playing_resync(self) -> None:
         """Re-parse the console after streaming starts — catches mid-track connect when boot lines are already in the buffer."""
-        for ms in (80, 250, 900, 2200, 5000):
+        for ms in (80, 250, 900, 2200, 5000, 6000):
             QtCore.QTimer.singleShot(ms, self.refresh_library_db_and_now_playing)
+        # Vintage Radio VRTEST IPC only — third-party UF2 (e.g. ZBVR) skips after fast probe.
+        QtCore.QTimer.singleShot(400, lambda: self._request_now_playing_from_ipc(timeout=1.5))
+        QtCore.QTimer.singleShot(6000, self._request_now_playing_from_ipc_if_unknown)
+
+    def _now_playing_is_unknown(self) -> bool:
+        return not (
+            getattr(self, "_current_track_title", "")
+            or (
+                getattr(self, "_current_basic_folder", None)
+                and getattr(self, "_current_basic_track", None)
+            )
+        )
+
+    def _request_now_playing_from_ipc_if_unknown(self) -> None:
+        if self._vrtest_ipc_available is False:
+            return
+        if self._now_playing_is_unknown():
+            self._request_now_playing_from_ipc(timeout=2.0)
+
+    def _request_now_playing_from_ipc(self, *, timeout: float = 1.5) -> None:
+        """Ask the Pico what is playing now; stream parse only sees lines after connect."""
+        if not self._connected:
+            return
+        if self._vrtest_ipc_available is False:
+            return
+
+        def work() -> None:
+            result = self.run_vrtest_command("get_state", timeout=timeout)
+            if not result.get("ok"):
+                if result.get("error") == "timeout":
+                    self._vrtest_ipc_available = False
+                    self._debug_log(
+                        "VRTEST IPC not available (third-party firmware?) — skipping now-playing polls",
+                        "info",
+                    )
+                return
+            self._vrtest_ipc_available = True
+            device = result.get("device") if result.get("ok") else None
+            state = device.get("state") if isinstance(device, dict) else None
+            if not isinstance(state, dict):
+                return
+            try:
+                raw = json.dumps(state)
+            except (TypeError, ValueError):
+                return
+            QtCore.QMetaObject.invokeMethod(
+                self,
+                "_apply_ipc_state_json",
+                QtCore.Qt.ConnectionType.QueuedConnection,
+                QtCore.Q_ARG(str, raw),
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @QtCore.pyqtSlot(str)
+    def _apply_ipc_state_json(self, raw: str) -> None:
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        fields = now_playing_fields_from_ipc_state(state, basic_mode=self._basic_mode)
+        if not fields:
+            return
+        if fields.get("mode"):
+            self._current_device_mode = fields["mode"]
+        if fields.get("shuffle_type"):
+            self._current_shuffle_type = fields["shuffle_type"]
+        if fields.get("source") and not getattr(self, "_current_device_source", ""):
+            self._current_device_source = fields["source"]
+        if "album_idx" in fields:
+            self._current_album_idx = fields["album_idx"]
+        if "folder" in fields:
+            self._current_basic_folder = fields["folder"]
+        if "track" in fields:
+            self._current_basic_track = fields["track"]
+        if (
+            self._basic_mode
+            and self._effective_db()
+            and self._current_basic_folder
+            and self._current_basic_track
+        ):
+            resolved = self._resolve_basic_track_name(
+                self._current_basic_folder, self._current_basic_track
+            )
+            if resolved:
+                self._current_track_title, self._current_track_artist = resolved
+        self._update_now_playing_display()
     
     def _start_streaming(self) -> None:
         """Start streaming output from the Pico using the persistent serial connection."""
@@ -2011,11 +2241,17 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         if not SERIAL_AVAILABLE:
             self._log("pyserial not available", "error")
             return
+
+        if self._streaming_thread and self._streaming_thread.is_alive():
+            self._stop_streaming_forcefully()
         
         ser = self._serial_connection
         if not ser or not ser.is_open:
             self._log("No serial connection. Connect first.", "error")
             return
+
+        # Show anything already printed (boot lines) instead of discarding the USB buffer.
+        self._drain_serial_to_stream(ser)
         
         # Reset stop flags
         self._stop_streaming = False
@@ -2061,17 +2297,22 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     if not self._connected:
                         break
                     
-                    # Check if we've been asked to pause (a command wants the port)
+                    # Check if we've been asked to pause (REPL command or VRTEST IPC)
                     if self._streaming_pause_event.is_set():
-                        self._debug_log("Streaming paused for command", "info")
+                        if not getattr(self, "_streaming_pause_quiet", False):
+                            self._debug_log("Streaming paused for serial command", "info")
                         self._streaming_resume_event.set()  # Signal that we've paused
                         # Wait until pause is cleared (command finished)
                         while self._streaming_pause_event.is_set():
                             if self._stop_streaming or self._stop_output:
                                 return
                             time.sleep(0.05)
-                        self._debug_log("Streaming resumed", "info")
+                        quiet = bool(getattr(self, "_streaming_pause_quiet", False))
+                        self._streaming_pause_quiet = False
+                        if not quiet:
+                            self._debug_log("Streaming resumed", "info")
                         ser = self._serial_connection
+                        self._serial_error_count = 0
                         # Do **not** discard ser.in_waiting here: that bytes contained
                         # firmware print() output emitted while VRTEST held the port. Dropping
                         # it removed lines from the stream ring and broke Now Playing parsing.
@@ -2225,8 +2466,29 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         Handles combined log format: _start_playback_for_current: mode=X, source=Y, shuffle_type=Z, album_idx=N, ...
         Also handles older firmware that may have separate lines.
         """
-        import re
         try:
+            commercial = parse_commercial_stream_line(line)
+            if commercial:
+                self._current_is_commercial = bool(commercial.get("playing"))
+                self._current_commercial_kind = str(commercial.get("kind") or "")
+                folder = commercial.get("folder")
+                track = commercial.get("track")
+                if folder is not None and track is not None:
+                    self._current_basic_folder = int(folder)
+                    self._current_basic_track = int(track)
+                    if self._basic_mode and self._effective_db():
+                        resolved = self._resolve_basic_track_name(
+                            self._current_basic_folder,
+                            self._current_basic_track,
+                            update_source=False,
+                        )
+                        if resolved:
+                            self._current_track_title, self._current_track_artist = resolved
+                    self._current_is_commercial = True
+                    self._current_commercial_kind = self._current_commercial_kind or "folder"
+                self._update_now_playing_display()
+                return
+
             # Detect combined mode/source/shuffle_type from _start_playback_for_current log:
             #   "_start_playback_for_current: mode=album, source=Toxicity, shuffle_type=, album_idx=1, ..."
             if "_start_playback_for_current: mode=" in line:
@@ -2241,17 +2503,20 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 
                 # Extract source name (everything between "source=" and the next ", shuffle_type=" or ", album_idx=")
                 source_match = re.search(r"source=([^,]*?)(?:,\s*shuffle_type=|,\s*album_idx=|$)", line)
-                if source_match:
-                    source_val = source_match.group(1).strip()
-                    if source_val:
-                        self._current_device_source = source_val
-                
                 # Extract shuffle_type
                 shuffle_match = re.search(r"shuffle_type=(\w*)", line)
                 if shuffle_match and shuffle_match.group(1):
                     self._current_shuffle_type = shuffle_match.group(1)
                 elif self._current_device_mode != "shuffle":
                     self._current_shuffle_type = ""
+
+                if source_match:
+                    source_val = source_match.group(1).strip()
+                    if source_val == "Shuffle" and not self._current_shuffle_type:
+                        self._current_shuffle_type = "library"
+                        self._current_device_source = "Library"
+                    elif source_val:
+                        self._current_device_source = source_val
 
                 # Extract album_idx as fallback for source name
                 idx_match = re.search(r"album_idx=(\d+)", line)
@@ -2352,7 +2617,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     title = match.group(1)
                     artist = match.group(2).strip()
                     # In basic mode, resolve generic "Track N" to real song name
-                    if self._basic_mode and self._effective_db() and re.match(r"^Track \d+$", title):
+                    if self._basic_mode and self._effective_db() and is_generic_track_title(title):
                         folder_match = re.search(r"folder=(\d+),?\s*track=(\d+)", line)
                         if folder_match:
                             self._current_basic_folder = int(folder_match.group(1))
@@ -2362,7 +2627,7 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                             )
                             if resolved:
                                 title, artist = resolved
-                        elif not re.match(r"^Track \d+$", getattr(self, '_current_track_title', '')):
+                        elif not is_generic_track_title(getattr(self, '_current_track_title', '')):
                             # No folder info on this line but we already have a real resolved
                             # title from the combined _start_playback_for_current: mode= line.
                             # Don't overwrite it with the generic "Track N" placeholder.
@@ -2374,21 +2639,23 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                     return
             
             # Detect track auto-advance: "Auto-advanced: 'old' -> 'new'" (legacy: "Track finished:")
+            # "(station N track M -> ...)" is playlist/shuffle index, not DFPlayer folder/track.
             if "Auto-advanced:" in line or "Track finished:" in line:
                 match = re.search(r"'([^']+)'\s*->\s*'([^']+)'", line)
                 if match:
                     new_title = match.group(2)
-                    new_artist = "(auto-advanced)"
-                    if self._basic_mode and self._effective_db() and re.match(r"^Track \d+$", new_title):
-                        folder_match = re.search(r"station (\d+) track (\d+) -> station (\d+) track (\d+)", line)
-                        if folder_match:
+                    if is_generic_track_title(new_title):
+                        if self._basic_mode and self._effective_db() and self._current_basic_folder and self._current_basic_track:
                             resolved = self._resolve_basic_track_name(
-                                int(folder_match.group(3)), int(folder_match.group(4))
+                                self._current_basic_folder, self._current_basic_track
                             )
                             if resolved:
-                                new_title, new_artist = resolved
-                    self._current_track_title = new_title
-                    self._current_track_artist = new_artist
+                                self._current_track_title, self._current_track_artist = resolved
+                        if not self._current_track_artist:
+                            self._current_track_artist = "(auto-advanced)"
+                    else:
+                        self._current_track_title = new_title
+                        self._current_track_artist = "(auto-advanced)"
                     self._update_now_playing_display()
         except Exception:
             pass  # Non-critical - don't let parsing errors affect streaming
@@ -2402,6 +2669,13 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                 return
             lines = text.split('\n')
             import re as _re
+            for line in reversed(lines):
+                parsed = parse_commercial_stream_line(line)
+                if parsed and parsed.get("playing"):
+                    self._parse_stream_for_now_playing(line)
+                    return
+                if parsed and not parsed.get("playing"):
+                    break
             # Prefer full metadata lines (same order as stream parsing)
             for line in reversed(lines):
                 if "_start_playback_for_current: mode=" in line:
@@ -2462,11 +2736,17 @@ class DeviceDebugWidget(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _resolve_basic_track_name(self, folder_num: int, track_num: int):
+    def _resolve_basic_track_name(
+        self,
+        folder_num: int,
+        track_num: int,
+        update_source: bool = True,
+    ):
         """Look up the actual song name from the station database given a DFPlayer folder/track.
         Returns (title, artist) or None if not found.
         Also updates _current_device_source to the station name so the display
-        shows which station the track belongs to (useful for library shuffle)."""
+        shows which station the track belongs to (useful for library shuffle).
+        Folder-99 commercial inserts keep the current music station as source."""
         try:
             db = self._effective_db()
             if db is None:
@@ -2488,7 +2768,23 @@ class DeviceDebugWidget(QtWidgets.QWidget):
                             artist = song["artist"] or ""
                         except (KeyError, TypeError):
                             artist = ""
-                        self._current_device_source = station_name
+                        try:
+                            is_ad = bool(int(song["is_commercial"] or 0))
+                        except (KeyError, TypeError, ValueError):
+                            is_ad = False
+                        reserved_ads = "commercial" in station_name.lower()
+                        if reserved_ads:
+                            is_ad = True
+                        if update_source and not reserved_ads:
+                            self._current_device_source = station_name
+                        self._current_is_commercial = is_ad
+                        if is_ad:
+                            if not self._current_commercial_kind:
+                                self._current_commercial_kind = (
+                                    "folder" if reserved_ads else "integrated"
+                                )
+                        else:
+                            self._current_commercial_kind = ""
                         return (title, artist)
                     break
         except Exception:
@@ -2537,6 +2833,13 @@ class DeviceDebugWidget(QtWidgets.QWidget):
             if mode.lower() != "shuffle" and source:
                 parts.append(
                     f"<span style='color: {self._now_playing_color('source')};'>{source}</span>"
+                )
+
+            if getattr(self, "_current_is_commercial", False):
+                kind = getattr(self, "_current_commercial_kind", "") or ""
+                label = "Linked commercial" if kind == "linked" else "Commercial"
+                parts.append(
+                    f"<span style='color: {self._now_playing_color('commercial')};'>{label}</span>"
                 )
             
             if title:
@@ -2708,6 +3011,7 @@ Example Commands (sent to device):
   import os; os.listdir()
 
 GUI Commands (not sent to device):
+  list files - List files on the Pico (uses REPL; stops firmware until Restart)
   check_amplifier - Run amplifier diagnostic
   help - Show this help message
         """
@@ -2888,6 +3192,8 @@ GUI Commands (not sent to device):
         }
         if role == "artist":
             return t.TOOLS_CONSOLE_FG if self._basic_mode else "#9cdcfe"
+        if role == "commercial":
+            return getattr(t, "TRK_AD_SEL_BORDER", "#3D7A62") if self._basic_mode else "#4ec9b0"
         return colors.get(role, "#d4d4d4")
 
     @QtCore.pyqtSlot(str, str)
@@ -3036,6 +3342,17 @@ GUI Commands (not sent to device):
             track_count = status.get("track_count", 0)
             is_playing = status.get("is_playing", False)
             power_on = status.get("power_on", False)
+            playing_commercial = bool(
+                status.get("playing_commercial") or status.get("linked_ad_playing")
+            )
+            commercial_line = ""
+            if playing_commercial:
+                label = (
+                    "Linked commercial"
+                    if status.get("linked_ad_playing")
+                    else "Commercial"
+                )
+                commercial_line = f"<br><b>Playing:</b> {label}"
             
             # Build display text
             playing_status = "▶ Playing" if is_playing else "⏸ Paused"
@@ -3044,7 +3361,8 @@ GUI Commands (not sent to device):
             if mode == "shuffle":
                 display_text = (
                     f"<b>Mode:</b> {mode.title()}<br>"
-                    f"<b>Status:</b> {playing_status} | Power: {power_status}<br>"
+                    f"<b>Status:</b> {playing_status} | Power: {power_status}"
+                    f"{commercial_line}<br>"
                     f"<b>Track:</b> {track_number}/{track_count}<br>"
                     f"<b>Title:</b> {track_title}<br>"
                     f"<b>Artist:</b> {track_artist}"
@@ -3053,7 +3371,8 @@ GUI Commands (not sent to device):
                 display_text = (
                     f"<b>Mode:</b> {mode.title()}<br>"
                     f"<b>Station:</b> {source}<br>"
-                    f"<b>Status:</b> {playing_status} | Power: {power_status}<br>"
+                    f"<b>Status:</b> {playing_status} | Power: {power_status}"
+                    f"{commercial_line}<br>"
                     f"<b>Track:</b> {track_number}/{track_count}<br>"
                     f"<b>Now Playing:</b> {track_title}<br>"
                     f"<b>Artist:</b> {track_artist}"
@@ -3062,7 +3381,8 @@ GUI Commands (not sent to device):
                 display_text = (
                     f"<b>Mode:</b> {mode.title()}<br>"
                     f"<b>Source:</b> {source}<br>"
-                    f"<b>Status:</b> {playing_status} | Power: {power_status}<br>"
+                    f"<b>Status:</b> {playing_status} | Power: {power_status}"
+                    f"{commercial_line}<br>"
                     f"<b>Track:</b> {track_number}/{track_count}<br>"
                     f"<b>Title:</b> {track_title}<br>"
                     f"<b>Artist:</b> {track_artist}"

@@ -551,6 +551,109 @@ def log_device_serial_tail(
     log_fn("  --- end Pico serial ---")
 
 
+#: Device names that share a vendor/product string with the real line-in jack
+#: (same USB audio chip) but capture something else entirely: Stereo Mix is a
+#: playback loopback/monitor, not the external line-in signal; Microphone and
+#: "What U Hear" are similarly a different physical/virtual input. Observed
+#: directly: "Stereo Mix (Realtek USB Audio)" reported a nonsensical +40 dBFS
+#: (real audio cannot exceed 0 dBFS unclipped) yet "won" a naive loudest-wins
+#: probe, silently swapping the acceptance suite onto the wrong signal path.
+_LINE_IN_EXCLUDE_TERMS = ("stereo mix", "microphone", "what u hear", "loopback", "wave out mix")
+
+
+def _line_in_hostapi_rank(device: JsonDict) -> int:
+    """Lower is better. MME is last: on this USB adapter it is the slot that
+    goes stale after a replug, hangs, and reconfigures the shared ADC/DAC clock
+    (audible pops on the speaker jack) when opened."""
+    api = str(device.get("hostapi") or "").lower()
+    if "directsound" in api:
+        return 0
+    if "wasapi" in api:
+        return 1
+    if "mme" in api:
+        return 3
+    return 2
+
+
+def _line_in_is_mme(device: JsonDict) -> bool:
+    return "mme" in str(device.get("hostapi") or "").lower()
+
+
+def rank_line_in_device_candidates(
+    devices: List[JsonDict], default_index: Optional[int] = None
+) -> List[int]:
+    """All candidate input device indices for Vintage Radio line-in tests, ranked.
+
+    Same name-preference order as ``pick_line_in_device_index``, but returns every
+    match instead of only the best one. A USB audio device is enumerated once per
+    host API (MME, DirectSound, WASAPI) under the identical name, and one API's
+    slot can silently go stale after the device is hot-unplugged/replugged while
+    the others correctly bind to the new device instance -- observed directly:
+    MME read -96 dBFS (pure noise floor) on a device while DirectSound on the
+    same physical hardware read -45 dBFS moments later. Callers that need to
+    actually hear something should probe each ranked candidate rather than
+    trusting the first name match; see ``pick_line_in_device_index`` for callers
+    that just want a single best-effort guess without probing.
+
+    When a non-MME host-API slot exists for the same name match, MME is omitted
+    entirely rather than probed-then-skipped. Opening that stale MME instance
+    was hanging for minutes and, with the short-lived InputStream abort path,
+    popping the shared USB codec that also drives the adapter's speakers.
+    """
+    if not devices:
+        return []
+    rows: List[Tuple[JsonDict, str]] = [
+        (d, (d.get("name") or "").lower()) for d in devices
+    ]
+    seen: set = set()
+    ordered: List[int] = []
+
+    def add_all(pred) -> None:
+        batch: List[JsonDict] = []
+        for d, name in rows:
+            # These share the physical USB audio chip's vendor/product name
+            # with the real line-in jack (e.g. "Stereo Mix (Realtek USB
+            # Audio)"), so a broad "realtek + usb" tier would otherwise match
+            # them too. They capture something other than the line-in signal
+            # (playback loopback, or the built-in mic), so they must never be
+            # offered as a line-in candidate regardless of which tier matches.
+            if any(term in name for term in _LINE_IN_EXCLUDE_TERMS):
+                continue
+            if not pred(name):
+                continue
+            ix = d.get("index")
+            if ix is None:
+                continue
+            ix = int(ix)
+            if ix in seen:
+                continue
+            batch.append(d)
+        if any(not _line_in_is_mme(d) for d in batch):
+            batch = [d for d in batch if not _line_in_is_mme(d)]
+        batch.sort(key=lambda d: (_line_in_hostapi_rank(d), int(d.get("index", 0))))
+        for d in batch:
+            ix = int(d["index"])
+            seen.add(ix)
+            ordered.append(ix)
+
+    add_all(lambda n: "vintage radio line in" in n)
+    add_all(lambda n: "vintage radio" in n and "line" in n)
+    add_all(lambda n: "realtek" in n and "usb" in n and "line" in n)
+    add_all(lambda n: "realtek" in n and "usb" in n)
+    add_all(lambda n: "line in" in n)
+    if default_index is not None and int(default_index) not in seen:
+        ordered.append(int(default_index))
+        seen.add(int(default_index))
+    if not ordered:
+        ix0 = devices[0].get("index")
+        if ix0 is not None:
+            ordered.append(int(ix0))
+    by_ix = {int(d["index"]): d for d in devices if d.get("index") is not None}
+    if any(not _line_in_is_mme(by_ix[i]) for i in ordered if i in by_ix):
+        ordered = [i for i in ordered if i not in by_ix or not _line_in_is_mme(by_ix[i])]
+    return ordered
+
+
 def pick_line_in_device_index(
     devices: List[JsonDict], default_index: Optional[int] = None
 ) -> Optional[int]:
@@ -558,41 +661,12 @@ def pick_line_in_device_index(
 
     Prefer a device renamed in Windows to **Vintage Radio Line In**, then
     legacy Realtek USB Line In, then any name containing ``line in``, then
-    *default_index*, then the first listed input.
+    *default_index*, then the first listed input. This is a single best-effort
+    guess with no probing; see ``rank_line_in_device_candidates`` for callers
+    that need every match, e.g. to fall back past a stale host-API device slot.
     """
-    if not devices:
-        return None
-    rows: List[Tuple[JsonDict, str]] = [
-        (d, (d.get("name") or "").lower()) for d in devices
-    ]
-
-    def first_match(pred) -> Optional[int]:
-        for d, name in rows:
-            if pred(name):
-                ix = d.get("index")
-                if ix is not None:
-                    return int(ix)
-        return None
-
-    i = first_match(lambda n: "vintage radio line in" in n)
-    if i is not None:
-        return i
-    i = first_match(lambda n: "vintage radio" in n and "line" in n)
-    if i is not None:
-        return i
-    i = first_match(lambda n: "realtek" in n and "usb" in n and "line" in n)
-    if i is not None:
-        return i
-    i = first_match(lambda n: "realtek" in n and "usb" in n)
-    if i is not None:
-        return i
-    i = first_match(lambda n: "line in" in n)
-    if i is not None:
-        return i
-    if default_index is not None:
-        return int(default_index)
-    ix0 = devices[0].get("index")
-    return int(ix0) if ix0 is not None else None
+    candidates = rank_line_in_device_candidates(devices, default_index)
+    return candidates[0] if candidates else None
 
 
 def run_acceptance_suite(

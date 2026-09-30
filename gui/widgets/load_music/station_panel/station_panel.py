@@ -98,7 +98,7 @@ class StationPanel(QtWidgets.QWidget):
     def _make_header(self) -> QtWidgets.QWidget:
         header = QtWidgets.QWidget()
         header.setObjectName("stationHeader")
-        header.setFixedHeight(t.LM_PANEL_HEADER_H)
+        header.setFixedHeight(u.px(t.LM_PANEL_HEADER_H))
         header.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         header.setStyleSheet(f"""
             #stationHeader {{
@@ -144,26 +144,10 @@ class StationPanel(QtWidgets.QWidget):
 
         self._list = StationImportListWidget()
         self._list.setItemDelegate(StationItemDelegate(self._max_tracks, self._list))
-        self._list.setStyleSheet(f"""
-            QListWidget {{
-                background: transparent;
-                border: none;
-                outline: none;
-                selection-background-color: transparent;
-                selection-color: #ffffff;
-            }}
-            QListWidget::item {{
-                background: transparent;
-                border: none;
-            }}
-            QListWidget::item:selected {{
-                background: transparent;
-                color: #ffffff;
-            }}
-        """)
+        self._apply_list_style()
 
         # Top gap between header bar and first row (see also LM_LIST_TOP_PAD on track wrap)
-        self._list.setViewportMargins(0, t.LM_LIST_TOP_PAD, 0, 0)
+        self._list.setViewportMargins(0, u.px(t.LM_LIST_TOP_PAD), 0, 0)
 
         self._list.currentItemChanged.connect(self._on_station_item_changed)
         self._list.order_changed.connect(self.order_changed)
@@ -217,6 +201,29 @@ class StationPanel(QtWidgets.QWidget):
             QPushButton:pressed {{ background: {t.MINI_BTN_GRAD_BOT}; }}
         """
 
+    def _apply_list_style(self) -> None:
+        self._list.setStyleSheet(f"""
+            QListWidget {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {t.STA_PANE_GRAD_TOP},
+                    stop:1 {t.STA_PANE_GRAD_BOT}
+                );
+                border: none;
+                outline: none;
+                selection-background-color: transparent;
+                selection-color: #ffffff;
+            }}
+            QListWidget::item {{
+                background: transparent;
+                border: none;
+            }}
+            QListWidget::item:selected {{
+                background: transparent;
+                color: #ffffff;
+            }}
+        """)
+
     def _refresh_header_theme(self) -> None:
         self._header.setFixedHeight(u.px(t.LM_PANEL_HEADER_H))
         self._header.setStyleSheet(f"""
@@ -235,6 +242,25 @@ class StationPanel(QtWidgets.QWidget):
         self._new_btn.setStyleSheet(self._new_btn_style())
 
     def reload_theme(self) -> None:
+        from gui.widgets.common.mockup_scrollbar import reload_wrapped_scrollbars
+
         self._apply_panel_style()
         self._refresh_header_theme()
-        self._list.update()
+        self._apply_list_style()
+        self._list.setViewportMargins(0, u.px(t.LM_LIST_TOP_PAD), 0, 0)
+        reload_wrapped_scrollbars(self._list)
+        delegate = self._list.itemDelegate()
+        model = self._list.model()
+        if delegate is not None and model is not None:
+            option = QtWidgets.QStyleOptionViewItem()
+            self._list.initViewItemOption(option)
+            vw = max(self._list.viewport().width(), 100)
+            for i in range(self._list.count()):
+                item = self._list.item(i)
+                if item is None:
+                    continue
+                option.rect = QtCore.QRect(0, 0, vw, 0)
+                item.setSizeHint(delegate.sizeHint(option, model.index(i, 0)))
+        self._list.doItemsLayout()
+        self._list.viewport().update()
+        self._list.repaint()

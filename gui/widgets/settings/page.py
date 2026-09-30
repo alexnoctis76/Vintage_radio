@@ -361,6 +361,11 @@ class SettingsPage(QtWidgets.QWidget):
     def ui_theme_combo(self) -> VintageComboBox:
         return self._theme_combo
 
+    def set_commercials_summary(self, text: str) -> None:
+        lbl = getattr(self, "_commercials_summary", None)
+        if lbl is not None:
+            lbl.setText(text or "")
+
     def _build(self) -> None:
         self.setObjectName("settingsPage")
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -405,6 +410,16 @@ class SettingsPage(QtWidgets.QWidget):
     def _build_sync_card(self) -> _SettingsInnerCard:
         card = _SettingsInnerCard()
         card.add_header("Sync & SD Card")
+
+        self._commercials_summary = _transparent_label(
+            "Commercials: choose Commercials station or Tagged tracks next to Sync to SD Card. "
+            "Use Install Firmware after you change commercials settings.",
+            style=_hint_style(),
+            word_wrap=True,
+        )
+        self._commercials_summary.setObjectName("settingsCommercialsSummary")
+        card.add_full_width(self._commercials_summary)
+        card.add_divider()
 
         self._auto_eject_cb = _transparent_checkbox(
             "Automatically safely remove SD card after syncing"

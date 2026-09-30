@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build script for Vintage Radio application on macOS
 # Usage: bash build_macos.sh [--set-version v0.2.5-beta] [--sign] [--notarize] [--no-dmg]
+#        [--arch arm64|x86_64] [--channel stable|dev]
 #
 # Options:
 #   --sign         Code sign the app with entitlements (requires Apple Developer ID)
@@ -39,10 +40,22 @@ ENTITLEMENTS_FILE="$SCRIPT_DIR/macos_entitlements.plist"
 SIGN=false
 NOTARIZE=false
 BUILD_DMG=true
+MAC_ARCH=""
+RELEASE_CHANNEL="stable"
+SKIP_SMOKE=false
+WITH_PYTEST=false
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --skip-smoke)
+            SKIP_SMOKE=true
+            shift
+            ;;
+        --with-pytest)
+            WITH_PYTEST=true
+            shift
+            ;;
         --sign)
             SIGN=true
             shift
@@ -56,6 +69,22 @@ while [[ $# -gt 0 ]]; do
             BUILD_DMG=false
             shift
             ;;
+        --arch)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --arch requires arm64 or x86_64"
+                exit 1
+            fi
+            MAC_ARCH="$2"
+            shift 2
+            ;;
+        --channel)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --channel requires stable or dev"
+                exit 1
+            fi
+            RELEASE_CHANNEL="$2"
+            shift 2
+            ;;
         --set-version)
             if [ -z "${2:-}" ]; then
                 echo "Error: --set-version requires a tag, e.g. v0.2.5-beta"
@@ -66,11 +95,23 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: bash build_macos.sh [--set-version v0.2.5-beta] [--sign] [--notarize] [--no-dmg]"
+            echo "Usage: bash build_macos.sh [--set-version v0.2.5-beta] [--sign] [--notarize] [--no-dmg] [--arch arm64|x86_64] [--channel stable|dev] [--skip-smoke] [--with-pytest]"
             exit 1
             ;;
     esac
 done
+
+if [ "$WITH_PYTEST" = true ]; then
+    echo "Running source pytest before packaging..."
+    python3 -m pytest -q
+fi
+
+if [ -n "$MAC_ARCH" ] && [ "$MAC_ARCH" != "arm64" ] && [ "$MAC_ARCH" != "x86_64" ]; then
+    echo "Error: --arch must be arm64 or x86_64 (got $MAC_ARCH)"
+    exit 1
+fi
+
+python3 "$PROJECT_ROOT/scripts/apply_release_config.py" "$RELEASE_CHANNEL"
 
 echo "=========================================="
 echo "Vintage Radio macOS Build Script"
@@ -80,7 +121,17 @@ echo "Build Directory: $BUILD_DIR"
 echo "Code Sign: $SIGN"
 echo "Notarize: $NOTARIZE"
 echo "Create DMG: $BUILD_DMG"
+echo "Target arch: ${MAC_ARCH:-native}"
+echo "Release channel: $RELEASE_CHANNEL"
 echo "=========================================="
+
+_run_python() {
+    if [ "$MAC_ARCH" = "x86_64" ] && [ "$(uname -m)" = "arm64" ]; then
+        arch -x86_64 python3 "$@"
+    else
+        python3 "$@"
+    fi
+}
 
 # Check for PyInstaller (use same Python as venv for consistent build)
 if ! python3 -c "import PyInstaller" 2>/dev/null; then
@@ -168,13 +219,28 @@ mkdir -p "$BUILD_DIR"
 
 # Run PyInstaller (spec now produces a .app bundle on macOS via BUNDLE step)
 echo "Building application with PyInstaller..."
-python3 -m PyInstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$PROJECT_ROOT/build/pyinstaller_temp"
+if [ -n "$MAC_ARCH" ]; then
+    export PYINSTALLER_TARGET_ARCH="$MAC_ARCH"
+fi
+_run_python -m PyInstaller "$SPEC_FILE" --noconfirm --distpath "$BUILD_DIR" --workpath "$PROJECT_ROOT/build/pyinstaller_temp"
 
 # Verify the .app bundle was created
 if [ ! -d "$APP_BUNDLE" ]; then
     echo "Error: PyInstaller build failed - expected .app bundle at: $APP_BUNDLE"
     echo "Check the PyInstaller output above for errors."
     exit 1
+fi
+
+if [ "$MAC_ARCH" = "x86_64" ]; then
+    ARCH_APP_BUNDLE="$BUILD_DIR/Vintage Radio-x86_64.app"
+    rm -rf "$ARCH_APP_BUNDLE"
+    mv "$APP_BUNDLE" "$ARCH_APP_BUNDLE"
+    APP_BUNDLE="$ARCH_APP_BUNDLE"
+elif [ "$MAC_ARCH" = "arm64" ]; then
+    ARCH_APP_BUNDLE="$BUILD_DIR/Vintage Radio-arm64.app"
+    rm -rf "$ARCH_APP_BUNDLE"
+    mv "$APP_BUNDLE" "$ARCH_APP_BUNDLE"
+    APP_BUNDLE="$ARCH_APP_BUNDLE"
 fi
 
 APP_EXE="$APP_BUNDLE/Contents/MacOS/Vintage Radio"
@@ -193,7 +259,7 @@ HELPER_SPEC="$SCRIPT_DIR/mpremote_helper.spec"
 HELPER_DIR="$BUILD_DIR/mpremote_helper"
 HELPER_EXE="$HELPER_DIR/mpremote_helper"
 mkdir -p "$PROJECT_ROOT/build/pyinstaller_temp/mpremote_helper"
-if python3 -m PyInstaller "$HELPER_SPEC" --noconfirm --distpath "$BUILD_DIR" --workpath "$PROJECT_ROOT/build/pyinstaller_temp/mpremote_helper"; then
+if _run_python -m PyInstaller "$HELPER_SPEC" --noconfirm --distpath "$BUILD_DIR" --workpath "$PROJECT_ROOT/build/pyinstaller_temp/mpremote_helper"; then
     if [ -d "$HELPER_DIR" ] && [ -f "$HELPER_EXE" ]; then
         cp -R "$HELPER_DIR" "$APP_BUNDLE/Contents/MacOS/"
         chmod +x "$APP_BUNDLE/Contents/MacOS/mpremote_helper/mpremote_helper"
@@ -217,6 +283,10 @@ if [ "$SIGN" = false ]; then
     done < <(find "$APP_BUNDLE" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
     rm -rf "$APP_BUNDLE/Contents/_CodeSignature" 2>/dev/null || true
     [ "$_strip_count" -gt 0 ] && echo "  Removed signature from $_strip_count binary(ies)"
+    # codesign --remove clears the execute bit on some Mach-O; restore for launch/update.
+    while IFS= read -r -d '' f; do
+        chmod u+x "$f" 2>/dev/null || true
+    done < <(find "$APP_BUNDLE/Contents/MacOS" -type f -print0 2>/dev/null)
 fi
 
 # Code sign only with Developer ID. Ad-hoc signing (-) causes "damaged" when the app
@@ -349,6 +419,17 @@ if [ "$NOTARIZE" = true ]; then
     done
 fi
 
+if [ "$SKIP_SMOKE" = false ]; then
+    echo ""
+    echo "Running packaged app smoke tests..."
+    python3 "$PROJECT_ROOT/scripts/packaged_app_smoke.py" --mac-app "$APP_BUNDLE"
+else
+    echo ""
+    echo "WARNING: --skip-smoke set. Bundle integrity (Frameworks symlinks, mpremote_helper,"
+    echo "         mpy-cross, plist version, updater extract) was NOT verified. Do not ship this build."
+    echo "         Verify with: python3 scripts/packaged_app_smoke.py --mac-app \"$APP_BUNDLE\""
+fi
+
 echo ""
 echo "=========================================="
 echo "Build Complete!"
@@ -370,5 +451,8 @@ if [ "$BUILD_DMG" = true ] && [ -f "$DMG_OUTPUT" ]; then
 fi
 if [ "$SIGN" = true ]; then
     echo "Signed: yes"
+fi
+if [ "$SKIP_SMOKE" = false ]; then
+    echo "Packaged smoke: PASS"
 fi
 echo "=========================================="

@@ -92,6 +92,47 @@ class TestSetActive:
             registry.set_active("nope")
 
 
+class TestDuplicateAndFamily:
+    def test_duplicate_copies_db_and_metadata(self, registry, tmp_path):
+        slug = registry.create_library("Jazz Nights")
+        db_path = registry.db_path_for(slug)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"sqlite-placeholder")
+        registry.set_library_firmware_family(slug, "conductor")
+        registry.set_library_commercials(slug, enabled=True, mode="inline")
+
+        new_slug = registry.duplicate_library(slug)
+        libs = {lib["slug"]: lib for lib in registry.list_libraries()}
+        assert libs[new_slug]["name"] == "Jazz Nights (copy)"
+        assert libs[slug]["name"] == "Jazz Nights"
+        assert libs[new_slug]["firmware_family"] == "conductor"
+        assert libs[new_slug]["commercials_enabled"] is True
+        assert libs[new_slug]["commercials_mode"] == "inline"
+        assert registry.db_path_for(new_slug).read_bytes() == b"sqlite-placeholder"
+        assert registry.db_path_for(slug).read_bytes() == b"sqlite-placeholder"
+
+    def test_both_commercials_mode_persists(self, registry):
+        slug = registry.create_library("Mix")
+        registry.set_library_firmware_family(slug, "conductor")
+        registry.set_library_commercials(slug, enabled=True, mode="both")
+        info = registry.library_meta(slug)
+        assert info["commercials_mode"] == "both"
+        assert info["firmware_family"] == "conductor"
+
+    def test_default_library_is_basic_without_commercials(self, registry):
+        info = registry.library_meta("default")
+        assert info["firmware_family"] == "basic"
+        assert info["commercials_enabled"] is False
+
+    def test_stale_conductor_family_reconciled_for_folder_commercials(self, registry):
+        slug = registry.create_library("Commercials Test")
+        registry.set_library_firmware_family(slug, "conductor")
+        registry.set_library_commercials(slug, enabled=True, mode="folder_99")
+        info = registry.library_meta(slug)
+        assert info["firmware_family"] == "basic"
+        assert info["commercials_mode"] == "folder_99"
+
+
 class TestDbPathFor:
     def test_default_path(self, registry, tmp_path):
         path = registry.db_path_for("default")

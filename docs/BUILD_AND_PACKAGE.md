@@ -5,10 +5,42 @@ This guide covers building the Vintage Radio application from source on Windows,
 ## Packaging locally (summary)
 
 1. **One-time setup**: Python 3.8+ (3.11–3.12 recommended if a dependency lacks wheels), venv, `pip install -r requirements.txt pyinstaller`. The project uses **pygame-ce** (drop-in for pygame); prebuilt wheels usually avoid compiling SDL. If you ever build pygame from source on macOS, install SDL: `brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf`.
-2. **macOS**: From repo root run `bash build_macos.sh` (unsigned app) or `bash build_macos.sh --no-dmg` for app only. Optional: `--sign` for code signing, `--notarize` for notarized DMG. **Note:** CI only produces an Apple Silicon build; Intel Mac users must build locally.
-3. **Windows**: Run `build_windows.bat` (or `pyinstaller vintage_radio.spec`). Run `dist\Vintage Radio\Vintage Radio.exe`.
-4. **Linux**: Run `bash build_linux.sh` (or `pyinstaller vintage_radio.spec`). Run `dist/Vintage Radio/Vintage Radio`.
-5. **Without scripts**: `pyinstaller vintage_radio.spec --noconfirm` on any OS; output is in `dist/Vintage Radio/` (run the executable inside).
+2. **macOS**: From repo root run `bash build/build_macos.sh` (unsigned app) or `bash build/build_macos.sh --no-dmg --arch arm64` / `--arch x86_64`. Optional: `--sign`, `--notarize`. For **test builds** that must not pollute the public updater, add `--channel dev` (bundles `release_config.dev.json` with `update.enabled=false`).
+3. **Windows**: Run `build/build_windows.bat` (or `pyinstaller build/vintage_radio.spec`). For test builds, run `python scripts/apply_release_config.py dev` first.
+4. **Linux**: Run `bash build/build_linux.sh` (or `pyinstaller build/vintage_radio.spec`). Use `bash build/build_linux.sh --channel dev` for test builds.
+5. **CI test builds (manual only)**: GitHub Actions workflow **Build test artifacts** → Run workflow. Produces Windows, Linux, macOS arm64, and macOS x86_64 zips as workflow artifacts only (not GitHub Releases).
+6. **Update test channel (private upgrade rehearsal)**: `python scripts/apply_release_config.py test` before packaging. Test builds only see GitHub **pre-releases** whose tag ends with `-upgrade-test`. Production `stable` builds ignore all pre-releases. See [Update test channel](#update-test-channel) below.
+7. **Without scripts**: `pyinstaller build/vintage_radio.spec --noconfirm` on any OS; output is in `dist/Vintage Radio/` (run the executable inside).
+
+## Update test channel
+
+Use this to run the full **Help → Check for updates** flow without exposing builds to stable users.
+
+| Channel | `release_config` | GitHub releases visible |
+|---------|------------------|-------------------------|
+| **stable** | `release_config.example.json` | Full releases only (`Pre-release` unchecked) |
+| **test** | `release_config.test.json` | Pre-releases only, tag must end with `-upgrade-test` |
+| **dev** | `release_config.dev.json` | Updates disabled |
+
+**On GitHub (same repo):**
+
+1. Create a tag such as `v1.1.0-upgrade-test` (must end with `-upgrade-test`).
+2. **Releases → Draft a new release** → select that tag.
+3. Check **Set as a pre-release** (required for the test channel).
+4. Upload installer assets (`Vintage-Radio-Windows.zip`, `Vintage-Radio-macOS-arm64.zip`, `Vintage-Radio-macOS-x86_64.zip`, optional universal `Vintage.Radio.dmg`).
+5. Publish the pre-release.
+
+**Build a test “old” app locally:**
+
+```powershell
+python scripts/set_app_version.py v1.0.0-upgrade-test
+python scripts/apply_release_config.py test
+build\build_windows.bat
+```
+
+Install/run that build → **Check for updates** → should offer `v1.1.0-upgrade-test` (or whatever newer `-upgrade-test` pre-release you published). Stable users on `v1.0.x` never see it.
+
+Optional: point test builds at a separate repo via `"repo": "youruser/Vintage_radio-upgrade-test"` in `release_config.test.json`. That repo must be **public** — GitHub returns HTTP 404 to unauthenticated API calls for private repos, and the shipped app has no GitHub token. Stable users are still safe: they use the main repo and ignore all pre-releases.
 
 ## Table of Contents
 

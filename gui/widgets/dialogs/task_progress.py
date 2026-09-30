@@ -75,7 +75,7 @@ class _BackgroundWorker(QtCore.QObject):
             self.finished.emit(result)
         except Exception as exc:
             msg = str(exc)
-            if "cancelled by user" in msg.lower() or msg.strip().lower() == "cancelled":
+            if "cancelled by user" in msg.lower() or "stopped by user" in msg.lower() or msg.strip().lower() == "cancelled":
                 self.error.emit(msg)
             else:
                 self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
@@ -96,6 +96,8 @@ class TaskProgressDialog(QtWidgets.QDialog):
         show_byte_detail: bool = False,
         initial_message: str = "Starting...",
         on_before_start: Optional[Callable[[], None]] = None,
+        on_reject: Optional[Callable[[], None]] = None,
+        cancel_warning: Optional[str] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -172,6 +174,8 @@ class TaskProgressDialog(QtWidgets.QDialog):
         self.on_success: Optional[Callable[[Any], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
         self._on_before_start = on_before_start
+        self._on_reject = on_reject
+        self._cancel_warning = cancel_warning
         self._cancel_event = threading.Event()
         # Set to True once the worker signals it has entered a non-cancellable
         # cleanup phase (current == total > 0).  Cancel is disabled at that point.
@@ -531,22 +535,39 @@ class TaskProgressDialog(QtWidgets.QDialog):
             return
 
         if self._thread.isRunning():
-            if self._cancel_btn is not None:
+            if self._cancel_btn is not None or self._cancel_warning is not None:
                 _mb = VintageMessageBox(self)
                 _mb.setWindowTitle("Cancel?")
-                _mb.setText(
-                    "Cancelling now will stop the write mid-way and may leave the "
-                    "SD card in an incomplete state, requiring a reformat.\n\n"
-                    "Cancel the write anyway?"
-                )
+                if self._cancel_warning:
+                    _mb.setText(self._cancel_warning)
+                    _yes_label = "Stop"
+                else:
+                    _mb.setText(
+                        "Cancelling now will stop the write mid-way and may leave the "
+                        "SD card in an incomplete state, requiring a reformat.\n\n"
+                        "Cancel the write anyway?"
+                    )
+                    _yes_label = "Cancel write"
                 _mb.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-                _yes = _mb.addButton("Cancel write", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
-                _mb.addButton("Keep writing", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+                _yes = _mb.addButton(_yes_label, QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+                _mb.addButton("Keep going", QtWidgets.QMessageBox.ButtonRole.RejectRole)
                 _mb.exec()
                 if _mb.clickedButton() is not _yes:
                     return
             self._cancel_event.set()
-            self._detach_thread()
+            if self._on_reject is not None:
+                try:
+                    self._on_reject()
+                except Exception:
+                    pass
+            deadline = time.monotonic() + 5.0
+            while self._thread.isRunning() and time.monotonic() < deadline:
+                QtWidgets.QApplication.processEvents()
+                time.sleep(0.05)
+            if self._thread.isRunning():
+                self._detach_thread()
+            else:
+                self._cleanup_thread()
         super().reject()
 
 

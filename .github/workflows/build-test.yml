@@ -1,28 +1,33 @@
-# Build standalone Vintage Radio executable for testing (any branch)
-# Artifacts are uploaded for download but NO release is created.
-# Trigger: push to any branch, or manual "Run workflow" on any branch.
+# Manual test builds only — artifacts are uploaded for download from the Actions run.
+# They are NOT attached to GitHub Releases, so shipped apps' updaters never see them.
+#
+# Trigger: Actions → "Build test artifacts" → Run workflow.
+#
+# Local equivalent (dev channel disables in-app update checks):
+#   bash build/build_macos.sh --no-dmg --arch arm64 --channel dev
+#   bash build/build_macos.sh --no-dmg --arch x86_64 --channel dev
+#   bash build/build_linux.sh --channel dev
+#   build\build_windows.bat  (+ copy release_config.dev.json → release_config.json before PyInstaller)
 
 name: Build test artifacts
 
 on:
-  push:
-    branches-ignore: [release]
-    tags-ignore: ["v*"]
-  pull_request:
   workflow_dispatch:
+  push:
+    branches: [main, master, release]
+  pull_request:
 
 jobs:
-  build:
+  pytest:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            artifact: Vintage-Radio-Windows-test
-          - os: macos-15
-            artifact: Vintage-Radio-macOS-test
+        os: [ubuntu-latest, windows-latest, macos-15]
 
     runs-on: ${{ matrix.os }}
+
+    env:
+      QT_QPA_PLATFORM: offscreen
 
     steps:
       - uses: actions/checkout@v4
@@ -32,42 +37,176 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install macOS build dependencies (macOS only)
+      - name: Install macOS test dependencies
         if: runner.os == 'macOS'
         run: brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
 
-      - name: Install dependencies
+      - name: Install Linux test dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpython3-dev libgl1-mesa-dev libxkbcommon-x11-0
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest (network tests excluded via pytest.ini)
+        run: python -m pytest -q
+
+  build:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows
+            os: windows-latest
+            artifact: Vintage-Radio-Windows-test
+          - id: linux
+            os: ubuntu-latest
+            artifact: Vintage-Radio-Linux-test
+          - id: macos-arm64
+            os: macos-15
+            artifact: Vintage-Radio-macOS-arm64-test
+            mac_arch: arm64
+          - id: macos-x86_64
+            os: macos-15
+            artifact: Vintage-Radio-macOS-x86_64-test
+            mac_arch: x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (Windows / Linux / macOS arm64)
+        if: matrix.id != 'macos-x86_64'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Rosetta (macOS Intel build on Apple Silicon runner)
+        if: matrix.id == 'macos-x86_64'
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Install x86_64 Python for Intel macOS build
+        if: matrix.id == 'macos-x86_64'
+        run: |
+          curl -fsSL -o python.pkg "https://www.python.org/ftp/python/3.13.2/python-3.13.2-macos11.pkg"
+          sudo installer -pkg python.pkg -target /
+          arch -x86_64 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 --version
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpython3-dev libgl1-mesa-dev libxkbcommon-x11-0
+
+      - name: Install Python dependencies (Windows / Linux / macOS arm64)
+        if: matrix.id != 'macos-x86_64'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Create Windows .ico from PNG (Windows only)
-        if: runner.os == 'Windows'
+      - name: Install Python dependencies (macOS x86_64 under Rosetta)
+        if: matrix.id == 'macos-x86_64'
+        run: |
+          PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+          arch -x86_64 "$PY" -m pip install --upgrade pip
+          arch -x86_64 "$PY" -m pip install -r requirements.txt pyinstaller
+
+      - name: Apply dev release config (disable updater in test builds)
+        shell: bash
+        run: python scripts/apply_release_config.py dev
+
+      - name: Create Windows .ico from PNG
+        if: matrix.id == 'windows'
         run: |
           pip install Pillow
           python -c "from PIL import Image; Image.open('gui/resources/vintage_radio.png').save('gui/resources/vintage_radio.ico', format='ICO', sizes=[(256,256),(48,48),(32,32),(16,16)])"
 
-      - name: Build Windows with PyInstaller
-        if: runner.os == 'Windows'
+      - name: Build Windows
+        if: matrix.id == 'windows'
         run: pyinstaller build/vintage_radio.spec --noconfirm
 
-      - name: "Build macOS app (same as local - build_macos.sh)"
-        if: runner.os == 'macOS'
-        run: bash build/build_macos.sh --no-dmg
+      - name: Build Linux
+        if: matrix.id == 'linux'
+        run: bash build/build_linux.sh --channel dev
 
-      - name: Upload artifact (Windows)
-        if: runner.os == 'Windows'
+      - name: Build macOS (arm64)
+        if: matrix.id == 'macos-arm64'
+        run: bash build/build_macos.sh --no-dmg --arch arm64 --channel dev
+
+      - name: Build macOS (x86_64)
+        if: matrix.id == 'macos-x86_64'
+        run: |
+          export PATH="/Library/Frameworks/Python.framework/Versions/3.13/bin:$PATH"
+          arch -x86_64 bash build/build_macos.sh --no-dmg --arch x86_64 --channel dev
+
+      - name: Zip Windows artifact
+        if: matrix.id == 'windows'
+        shell: bash
+        run: |
+          cd "dist/Vintage Radio"
+          zip -r "../../Vintage-Radio-Windows-test.zip" .
+          cd ../..
+
+      - name: Zip Linux artifact
+        if: matrix.id == 'linux'
+        run: |
+          cd "dist/Vintage Radio"
+          zip -r "../../Vintage-Radio-Linux-test.zip" .
+          cd ../..
+
+      - name: Zip macOS arm64 artifact
+        if: matrix.id == 'macos-arm64'
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/Vintage Radio-arm64.app" \
+            "Vintage-Radio-macOS-arm64-test.zip"
+
+      - name: Zip macOS x86_64 artifact
+        if: matrix.id == 'macos-x86_64'
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/Vintage Radio-x86_64.app" \
+            "Vintage-Radio-macOS-x86_64-test.zip"
+
+      - name: Upload Windows artifact
+        if: matrix.id == 'windows'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/Vintage Radio/
-          retention-days: 7
+          path: Vintage-Radio-Windows-test.zip
+          retention-days: 14
 
-      - name: Upload artifact (macOS)
-        if: runner.os == 'macOS'
+      - name: Upload Linux artifact
+        if: matrix.id == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/Vintage Radio.app
-          retention-days: 7
+          path: Vintage-Radio-Linux-test.zip
+          retention-days: 14
+
+      - name: Upload macOS arm64 artifact
+        if: matrix.id == 'macos-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: Vintage-Radio-macOS-arm64-test.zip
+          retention-days: 14
+
+      - name: Upload macOS x86_64 artifact
+        if: matrix.id == 'macos-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: Vintage-Radio-macOS-x86_64-test.zip
+          retention-days: 14
