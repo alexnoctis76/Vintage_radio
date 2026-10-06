@@ -358,6 +358,13 @@ class ModalFooter(QtWidgets.QWidget):
     def add_button(self, button: QtWidgets.QPushButton) -> None:
         self._row.addWidget(button)
 
+    def center_action_buttons(self) -> None:
+        """Balance the leading stretch so footer actions sit centered in the modal."""
+        if getattr(self, "_center_trailing_stretch", False):
+            return
+        self._row.addStretch(1)
+        self._center_trailing_stretch = True
+
 
 class SyncBadge(QtWidgets.QLabel):
     """Pill badge ('Update', 'Full refresh') on sync option cards."""

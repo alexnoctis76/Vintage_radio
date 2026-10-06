@@ -980,6 +980,8 @@ class DatabaseManager:
         if existing is None:
             existing = self.get_song_by_path(file_path)
         if existing is not None:
+            song_id = int(existing["id"])
+            updates: Dict[str, Any] = {}
             # Update file_path if the caller provides a different (valid) one.
             # This fixes re-import on a different machine where hash matches
             # but the old path is from another computer.
@@ -987,8 +989,28 @@ class DatabaseManager:
             if file_path and file_path != old_path:
                 from pathlib import Path as _P
                 if _P(file_path).exists() and not _P(old_path).exists():
-                    self.update_song(int(existing["id"]), {"file_path": file_path})
-            return int(existing["id"])
+                    updates["file_path"] = file_path
+            # Same path on disk but content changed (re-tag, strip ID3, re-encode).
+            if file_hash and file_size is not None:
+                stored_hash = str(existing["file_hash"] or "").strip()
+                stored_size = existing["file_size"]
+                if stored_hash != str(file_hash).strip() or stored_size != file_size:
+                    updates.update(
+                        {
+                            "file_hash": file_hash,
+                            "file_size": file_size,
+                            "original_filename": original_filename,
+                            "title": title,
+                            "artist": artist,
+                            "duration": duration,
+                            "format": format,
+                            "sd_path": "",
+                        }
+                    )
+            if updates:
+                self.update_song(song_id, updates)
+                self.clear_song_sync_error(song_id)
+            return song_id
 
         self.conn.execute(
             """

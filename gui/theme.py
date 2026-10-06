@@ -602,6 +602,7 @@ IF_DETAIL_MIDDLE_MIN     = 120  # px — notes row grows to fill card height
 
 SYNC_MDL_CHOICE_W       = 720   # px — sync choice dialog width (HTML: 890px)
 SYNC_MDL_CONFIRM_W      = 520   # px — replace confirm dialog width (HTML: 650px)
+SYNC_MDL_SYNC_FAILURE_W = 560   # px — hash-mismatch sync prompt (three centered buttons)
 SYNC_MDL_PROGRESS_W     = 520   # px — task progress dialog width
 SYNC_MDL_PROGRESS_H     = 20    # px — progress bar height inside sync modals
 SYNC_MDL_PROGRESS_TEXT_SIZE = 11  # pt — overlay text on progress bar

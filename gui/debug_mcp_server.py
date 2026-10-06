@@ -254,6 +254,11 @@ class DebugMcpServerManager:
             return {"ok": bool(suite.get("ok")), "suite": suite}
         if method == "device_connect":
             return self._invoke_action("connect_device", params)
+        if method == "run_fingerprint_sync_test":
+            return self._invoke_action(
+                "run_fingerprint_sync_test",
+                params if isinstance(params, dict) else {},
+            )
         if method == "run_commercials_acceptance":
             from .mcp_commercials_acceptance import SUITES, run_commercials_acceptance
 

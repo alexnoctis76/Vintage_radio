@@ -34,6 +34,7 @@ from .audio_metadata import (
     mp3_matches_conversion_profile,
 )
 from .database import DatabaseManager
+from .sync_failure_prompt import SyncFailureAction
 from .resource_paths import (
     resource_path,
     resolve_ffmpeg_executable,
@@ -48,7 +49,6 @@ SYNC_TARGET_VOLUME_LABEL = "VINTAGERADIO"
 # content mismatches even when two different libraries share folder structure.
 _SYNC_MANIFEST_NAME = ".sync_manifest.json"
 
-SyncFailureAction = Literal["stop", "skip", "skip_all"]
 OnSyncFailureCallback = Callable[[Dict[str, str]], SyncFailureAction]
 
 # A wedged removable volume (stale SMB share, hung FAT driver, USB passthrough glitch)
@@ -113,6 +113,7 @@ class _SyncFailurePolicy:
     """Mutable policy state for interactive sync failure handling."""
 
     skip_all: bool = False
+    accept_all: bool = False
 
 
 def _decide_sync_failure(
@@ -120,13 +121,20 @@ def _decide_sync_failure(
     policy: _SyncFailurePolicy,
     info: Dict[str, str],
 ) -> SyncFailureAction:
-    if policy.skip_all:
+    kind = str(info.get("kind") or "")
+    if policy.skip_all and kind == "hash_mismatch":
         return "skip"
+    if policy.accept_all and kind == "hash_mismatch":
+        return "accept_file"
     if callback is None:
         return "skip"
     action = callback(info)
     if action == "skip_all":
         policy.skip_all = True
+        return "skip"
+    if action == "accept_all":
+        policy.accept_all = True
+        return "accept_file"
     return action
 
 
@@ -284,10 +292,17 @@ class SDManager:
         """
         root = Path(sd_root)
         fmt_label = _sanitize_fat_volume_label(volume_label)
+        if not fmt_label:
+            fmt_label = _sanitize_fat_volume_label(_get_volume_label(root))
 
         # ── Attempt quick format ──
         system = platform.system()
         if system == "Windows":
+            if not fmt_label:
+                print(
+                    "Clean install: no FAT volume label captured; "
+                    "Windows quick-format may show the drive as 'USB Drive'."
+                )
             try:
                 return self._quick_format_windows(
                     root,
@@ -484,8 +499,19 @@ class SDManager:
         final.parent.mkdir(parents=True, exist_ok=True)
         os.replace(part, final)
 
+    def remember_live_volume_label(self, sd_root: Path) -> str:
+        """Read the OS FAT label and store it for clean-sync format / post-sync restore."""
+        live = _sanitize_fat_volume_label(_get_volume_label(Path(sd_root)))
+        if live:
+            self.db.set_setting("sd_label", live)
+            self.db.set_setting("sd_volume_label", live)
+        return live
+
     def capture_volume_label_before_sync(self, sd_root: Path) -> str:
         """Remember the current FAT volume name before format/sync (for restore after)."""
+        live = _sanitize_fat_volume_label(_get_volume_label(Path(sd_root)))
+        if live:
+            return live
         hint = (
             (self.db.get_setting("sd_volume_label") or "").strip()
             or (self.db.get_setting("sd_label") or "").strip()
@@ -1204,6 +1230,83 @@ class SDManager:
             descriptor, sd_path=sd_path
         )
 
+    def _refresh_song_from_source_file(
+        self, song_id: int, file_path: Path
+    ) -> Optional[Any]:
+        """Re-read metadata and fingerprint from disk into the library row."""
+        try:
+            metadata = extract_metadata(file_path)
+            file_hash = compute_file_hash(file_path)
+        except OSError:
+            return None
+        self.db.update_song(
+            song_id,
+            {
+                "file_path": metadata["file_path"],
+                "original_filename": metadata["original_filename"],
+                "title": metadata["title"],
+                "artist": metadata["artist"],
+                "duration": metadata["duration"],
+                "file_hash": file_hash,
+                "file_size": metadata["file_size"],
+                "format": metadata["format"],
+                "sd_path": "",
+            },
+        )
+        self.db.clear_song_sync_error(song_id)
+        return self.db.get_song_by_id(song_id)
+
+    def refresh_library_fingerprints_from_disk(self) -> int:
+        """Re-read hash/size (and tags) from disk for every library track that still exists."""
+        updated = 0
+        for song in self.db.list_songs():
+            song_id = _record_get(song, "id")
+            if not song_id:
+                continue
+            fp = Path(str(_record_get(song, "file_path") or ""))
+            if not fp.is_file():
+                continue
+            stored_hash = str(_record_get(song, "file_hash") or "").strip()
+            stored_size = _record_get(song, "file_size")
+            try:
+                if stored_hash and file_matches_metadata(fp, stored_size, stored_hash):
+                    continue
+            except OSError:
+                pass
+            if self._refresh_song_from_source_file(int(song_id), fp) is not None:
+                updated += 1
+        return updated
+
+    def _persist_track_sync_failure(
+        self,
+        song: Any,
+        error: str,
+        *,
+        station: str,
+        conversion_failures: List[Dict[str, str]],
+        sd_target: Optional[Path] = None,
+    ) -> None:
+        msg = (error or "sync failed").strip()[:500]
+        song_id = _record_get(song, "id")
+        title = str(
+            _record_get(song, "title") or _record_get(song, "original_filename") or ""
+        ).strip()
+        file_path = str(_record_get(song, "file_path") or "").strip()
+        if song_id:
+            self.db.set_song_sync_error(int(song_id), msg)
+        if sd_target is not None:
+            _unlink_sd_slot(sd_target)
+        conversion_failures.append(
+            {
+                "path": file_path,
+                "name": Path(file_path).name if file_path else "?",
+                "title": title,
+                "station": station,
+                "error": msg,
+                "song_id": str(song_id) if song_id else "",
+            }
+        )
+
     def _note_track_sync_failure(
         self,
         song: Any,
@@ -1217,15 +1320,10 @@ class SDManager:
         sd_target: Optional[Path] = None,
     ) -> SyncFailureAction:
         msg = (error or "sync failed").strip()[:500]
-        song_id = _record_get(song, "id")
         title = str(
             _record_get(song, "title") or _record_get(song, "original_filename") or ""
         ).strip()
         file_path = str(_record_get(song, "file_path") or "").strip()
-        if song_id:
-            self.db.set_song_sync_error(int(song_id), msg)
-        if sd_target is not None:
-            _unlink_sd_slot(sd_target)
         failure_info = {
             "kind": kind,
             "path": file_path,
@@ -1235,15 +1333,12 @@ class SDManager:
             "error": msg,
         }
         action = _decide_sync_failure(on_sync_failure, failure_policy, failure_info)
-        conversion_failures.append(
-            {
-                "path": file_path,
-                "name": Path(file_path).name if file_path else "?",
-                "title": title,
-                "station": station,
-                "error": msg,
-                "song_id": str(song_id) if song_id else "",
-            }
+        self._persist_track_sync_failure(
+            song,
+            msg,
+            station=station,
+            conversion_failures=conversion_failures,
+            sd_target=sd_target,
         )
         return action
 
@@ -2232,23 +2327,48 @@ class SDManager:
                             "File content no longer matches the library record "
                             "(changed or corrupted)."
                         )
-                        action = self._note_track_sync_failure(
-                            song,
-                            hash_msg,
-                            station=station_name,
-                            kind="hash_mismatch",
-                            conversion_failures=conversion_failures,
-                            on_sync_failure=on_sync_failure,
-                            failure_policy=failure_policy,
-                            sd_target=target_path,
+                        failure_info = {
+                            "kind": "hash_mismatch",
+                            "path": str(file_path),
+                            "name": file_path.name,
+                            "title": title_for_log,
+                            "station": station_name,
+                            "error": hash_msg,
+                        }
+                        action = _decide_sync_failure(
+                            on_sync_failure, failure_policy, failure_info
                         )
-                        if action == "stop":
+                        if action == "accept_file":
+                            song_id = _record_get(song, "id")
+                            if song_id:
+                                updated = self._refresh_song_from_source_file(
+                                    int(song_id), file_path
+                                )
+                                if updated is not None:
+                                    song = updated
+                            _unlink_sd_slot(target_path)
+                        elif action == "stop":
+                            self._persist_track_sync_failure(
+                                song,
+                                hash_msg,
+                                station=station_name,
+                                conversion_failures=conversion_failures,
+                                sd_target=target_path,
+                            )
                             self._terminate_active_ffmpeg_processes()
                             _raise_sync_stopped()
-                        skipped += 1
-                        station_skipped += 1
-                        processed_tracks += 1
-                        continue
+                        else:
+                            self._persist_track_sync_failure(
+                                song,
+                                hash_msg,
+                                station=station_name,
+                                conversion_failures=conversion_failures,
+                                sd_target=target_path,
+                            )
+                            skipped += 1
+                            station_skipped += 1
+                            processed_tracks += 1
+                            continue
 
                 try:
                     mp3_ok = True
@@ -2809,13 +2929,19 @@ class SDManager:
 
     @staticmethod
     def _resolve_source_hash_static(source_path: Path, descriptor: Dict[str, Any]) -> str:
-        h = str(descriptor.get("source_hash") or "").strip()
-        if h:
-            return h
+        """Hash for manifest compare — re-read disk when library metadata is stale."""
+        db_hash = str(descriptor.get("source_hash") or "").strip()
+        db_size = descriptor.get("source_size")
+        try:
+            if source_path.is_file() and db_hash:
+                if file_matches_metadata(source_path, db_size, db_hash):
+                    return db_hash
+        except OSError:
+            pass
         try:
             return compute_file_hash(source_path)
         except OSError:
-            return ""
+            return db_hash
 
     def _basic_track_can_skip(
         self,
@@ -2848,9 +2974,27 @@ class SDManager:
         if target_size <= 0:
             return False
 
+        # Library DB metadata must match the file on disk before manifest skip.
+        # Otherwise stale hashes in the DB still match an old .sync_manifest.json
+        # even though the source file was edited (e.g. ID3 strip).
+        try:
+            disk_size = int(source_path.stat().st_size)
+            lib_size = int(descriptor.get("source_size") or 0)
+            if lib_size and disk_size != lib_size:
+                return False
+        except OSError:
+            return False
+        db_hash = str(descriptor.get("source_hash") or "").strip()
+        if db_hash:
+            try:
+                if not file_matches_metadata(source_path, lib_size or disk_size, db_hash):
+                    return False
+            except OSError:
+                return False
+
         # ── Fast path: manifest slot matches library (metadata-only) ──
         if manifest_trusted and old_entry:
-            source_hash = str(descriptor.get("source_hash") or "").strip()
+            source_hash = db_hash or str(descriptor.get("source_hash") or "").strip()
             if not source_hash:
                 source_hash = self._resolve_source_hash(source_path, descriptor)
             if self._manifest_entry_matches_library(
