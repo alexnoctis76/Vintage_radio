@@ -472,8 +472,8 @@ class SettingsPage(QtWidgets.QWidget):
         self._clear_cache_btn.clicked.connect(self.clear_conversion_cache_clicked.emit)
         card.add_row(
             _action_row(self._clear_cache_btn, indent=t.SETTINGS_ACTION_INDENT),
-            "Clearing the cache removes stored conversions for this library. "
-            "The next sync will re-encode tracks from your source files.",
+            "Clears stored conversions and re-reads each track’s on-disk fingerprint "
+            "for this library. The next sync will re-encode where needed.",
         )
 
         card.add_divider()

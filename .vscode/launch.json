@@ -1,0 +1,48 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Vintage Radio (dev)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_vintage_radio.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Seed fingerprint test (packaged)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/seed_fingerprint_mismatch_test_library.py",
+      "args": ["--packaged"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Seed fingerprint test (packaged + mismatch)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/seed_fingerprint_mismatch_test_library.py",
+      "args": ["--packaged", "--apply-mismatch"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Seed sync failure paths (packaged)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/seed_sync_failure_paths_test_library.py",
+      "args": ["--packaged", "--prepare-mixed"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Seed commercials test libraries (packaged)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/seed_packaged_commercials_library.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

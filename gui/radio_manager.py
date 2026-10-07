@@ -85,6 +85,7 @@ from .widgets.library_bar.library_bar   import LibraryBar     as _LibraryBar
 from .widgets.sidebar.sidebar           import Sidebar        as _Sidebar, _NAV_ITEMS as _SIDEBAR_NAV_ITEMS
 from .test_mode import TestModeWidget
 from .debug_mcp_server import DebugMcpServerManager
+from .widgets.dialogs.modal_body_text import ModalBodyText
 from .widgets.dialogs.vintage_message import VintageMessageBox
 from .widgets.dialogs.vintage_input import get_item, get_multiline_text, get_text
 from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
@@ -5210,6 +5211,49 @@ class MainWindow(QtWidgets.QMainWindow):
                     }
 
             return self._mcp_run_on_gui_sync(_install_fn, wait_s=600.0)
+        if action == "run_fingerprint_sync_test":
+            scenario = str(payload.get("scenario", "")).strip().lower()
+            explicit_policy = "on_mismatch" in payload
+            # Bare invocation runs every dialog choice. An explicit on_mismatch
+            # still selects that one legacy policy.
+            if scenario in ("", "sync") and not explicit_policy:
+                scenario = "all"
+
+            def _fp_test_fn() -> Dict[str, Any]:
+                from gui.mcp_fingerprint_sync_test import (
+                    LIBRARY_SLUG,
+                    run_fingerprint_reimport_check,
+                    run_fingerprint_sync_test,
+                )
+
+                if scenario == "reimport":
+                    rep = run_fingerprint_reimport_check(log=self._mcp_log)
+                    return {"ok": bool(rep.get("ok")), "report": rep}
+                do_switch = bool(payload.get("switch_library", True))
+
+                def _switch(slug: str) -> None:
+                    # The fixture creates the library; reload so the switch sees it.
+                    self._lib_registry.reload()
+                    if slug != self._lib_registry.active_library():
+                        self._switch_library(slug)
+
+                rep = run_fingerprint_sync_test(
+                    setup=bool(payload.get("setup", True)),
+                    apply_mismatch=bool(payload.get("apply_mismatch", True)),
+                    on_mismatch=str(payload.get("on_mismatch", "accept_file")),
+                    scenario=scenario,
+                    switch_library=do_switch,
+                    switch_library_fn=_switch if do_switch else None,
+                    log=self._mcp_log,
+                )
+                return {
+                    "ok": bool(rep.get("ok")),
+                    "library_slug": rep.get("library_slug", LIBRARY_SLUG),
+                    "report": rep,
+                }
+
+            wait_s = 900.0 if scenario == "all" else 300.0
+            return self._mcp_run_on_gui_sync(_fp_test_fn, wait_s=wait_s)
         return {"ok": False, "error": "unknown_action", "action": action}
 
     def _mcp_emulator_gesture(self, gesture: str) -> Dict[str, Any]:
@@ -5545,12 +5589,11 @@ class MainWindow(QtWidgets.QMainWindow):
             subtitle="Choose what to copy to the connected Pico.",
             min_width=520,
         )
-        intro = QtWidgets.QLabel(
+        intro = ModalBodyText(
             "The MCP debug server runs on this computer. For serial automation (VRTEST), "
             "the Pico needs components/vintage_radio_ipc.py on its flash. "
-            "Flashing a UF2 image alone often does not add new components/*.py files."
+            "Flashing a UF2 image alone often does not add new components/*.py files.",
         )
-        intro.setWordWrap(True)
         intro.setStyleSheet("background: transparent;")
         choice_lay.addWidget(intro)
         combo = VintageComboBox(
@@ -5567,11 +5610,10 @@ class MainWindow(QtWidgets.QMainWindow):
             True,
         )
         choice_lay.addWidget(combo)
-        foot = QtWidgets.QLabel(
+        foot = ModalBodyText(
             "Pico must be connected via USB (mpremote connect auto). "
-            "The device will soft-reset after copy."
+            "The device will soft-reset after copy.",
         )
-        foot.setWordWrap(True)
         foot.setStyleSheet("background: transparent;")
         choice_lay.addWidget(foot)
         cancel_btn = ModalButton("Cancel", variant="secondary")
@@ -10475,9 +10517,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "Delete all locally cached converted MP3s for this library?"
         )
         mb.setInformativeText(
-            "This only affects files stored on your PC to speed up sync. "
-            "Your music library and SD card are not changed.\n\n"
-            "The next sync will re-encode tracks from source files (slower)."
+            "Removes locally cached converted MP3s for this library and re-reads each "
+            "track’s fingerprint from the files on disk (hash and size). "
+            "Your SD card is not changed.\n\n"
+            "The next sync will re-encode from source files where needed (slower)."
         )
         btn_clear = mb.addButton(
             "Clear cache",
@@ -10490,7 +10533,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         ok, err = self.sd_manager.clear_basic_sync_mp3_cache_for_library()
         if ok:
-            self.statusBar().showMessage("Conversion cache cleared.", 5000)
+            refreshed = self.sd_manager.refresh_library_fingerprints_from_disk()
+            self._refresh_library_source_health_ui()
+            msg = "Conversion cache cleared."
+            if refreshed:
+                msg += f" Refreshed {refreshed} track fingerprint(s) from disk."
+            self.statusBar().showMessage(msg, 6000)
         else:
             VintageMessageBox.warning(
                 self,
@@ -11698,6 +11746,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if reply != VintageMessageBox.StandardButton.Yes:
                 return
+        self._persist_live_sd_volume_label_before_sync(sd_root)
         dlg = TaskProgressDialog(
             parent=self,
             title="Sync Stations to SD" + (" (clean)" if force_clean else ""),
@@ -11714,6 +11763,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cancelable=True,
             cancel_callback_kwarg="should_cancel",
         )
+        failure_prompter.set_should_cancel(dlg._cancel_event.is_set)
 
         def on_success(result):
             conversion_failures: List[Dict[str, Any]] = []
@@ -11821,7 +11871,14 @@ class MainWindow(QtWidgets.QMainWindow):
                         preserved = str(
                             result.get("preserved_volume_label") or ""
                         ).strip()
-                    if not preserved and self.sd_root:
+                    if not preserved:
+                        for _key in ("sd_volume_label", "sd_label"):
+                            preserved = sd_manager_module._sanitize_fat_volume_label(
+                                str(self.db.get_setting(_key) or "")
+                            )
+                            if preserved:
+                                break
+                    if not preserved:
                         preserved = self.sd_manager.capture_volume_label_before_sync(
                             Path(self.sd_root)
                         )
@@ -11852,7 +11909,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(1500, lambda: self.safely_remove_sd(auto=True, attempt=1))
 
         def on_error(msg):
-            if "Sync cancelled by user" in str(msg):
+            low = str(msg).lower()
+            if "sync cancelled by user" in low or "stopped by user" in low:
                 self.statusBar().showMessage("Basic sync cancelled.", 4000)
                 return
             VintageMessageBox.critical(
@@ -13835,6 +13893,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self.sd_manager, "volume_label"):
             return self.sd_manager.volume_label(path)
         return sd_manager_module._get_volume_label(path)
+
+    def _persist_live_sd_volume_label_before_sync(self, sd_root: Path) -> None:
+        """Capture Explorer/FAT renames immediately before sync (esp. clean install)."""
+        remember = getattr(self.sd_manager, "remember_live_volume_label", None)
+        if remember is not None:
+            lab = remember(sd_root)
+        else:
+            lab = sd_manager_module._sanitize_fat_volume_label(
+                self._get_volume_label(sd_root)
+            )
+            if lab:
+                self.db.set_setting("sd_label", lab)
+                self.db.set_setting("sd_volume_label", lab)
+        if lab:
+            self.sd_label = lab
 
     def _refresh_sd_combos(self) -> None:
         self.sd_album_combo.blockSignals(True)

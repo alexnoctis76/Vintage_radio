@@ -480,6 +480,36 @@ def test_resolve_mount_volume_name_uses_mount_folder_name():
         assert _resolve_mount_volume_name(p, "") == "MyRadioCard"
 
 
+def test_capture_volume_label_prefers_live_os_label(sd_db, tmp_path):
+    sd_db.set_setting("sd_volume_label", "STALEDB")
+    sd_db.set_setting("sd_label", "STALEDB")
+    mgr = SDManager(sd_db)
+    root = tmp_path / "card"
+    root.mkdir()
+    with mock.patch("gui.sd_manager._get_volume_label", return_value="My Radio"):
+        assert mgr.capture_volume_label_before_sync(root) == "MY RADIO"
+
+
+def test_remember_live_volume_label_persists_to_db(sd_db, tmp_path):
+    mgr = SDManager(sd_db)
+    root = tmp_path / "card"
+    root.mkdir()
+    with mock.patch("gui.sd_manager._get_volume_label", return_value="BravoSD"):
+        assert mgr.remember_live_volume_label(root) == "BRAVOSD"
+    assert sd_db.get_setting("sd_volume_label") == "BRAVOSD"
+    assert sd_db.get_setting("sd_label") == "BRAVOSD"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows drive-root fallback")
+def test_capture_volume_label_falls_back_to_db_hint_when_os_empty(sd_db):
+    sd_db.set_setting("sd_volume_label", "FROMDB")
+    sd_db.set_setting("sd_label", "")
+    mgr = SDManager(sd_db)
+    with mock.patch("gui.sd_manager.os.name", "nt"):
+        with mock.patch("gui.sd_manager._get_volume_label", return_value=""):
+            assert mgr.capture_volume_label_before_sync(Path("E:/")) == "FROMDB"
+
+
 class TestBasicConvertWorkersAuto:
     """_basic_convert_workers_auto tiers: RAM + logical CPU count (see sd_manager)."""
 
@@ -541,6 +571,28 @@ def test_clear_basic_sync_mp3_cache_for_library_removes_tree(sd_mgr, tmp_path):
     assert ok
     assert err == ""
     assert not root.exists()
+
+
+def test_refresh_library_fingerprints_from_disk_updates_stale_hash(sd_db, tmp_path):
+    fp = tmp_path / "track.mp3"
+    fp.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 500)
+    from gui.audio_metadata import compute_file_hash
+
+    sid = sd_db.add_song(
+        original_filename="track.mp3",
+        file_path=str(fp),
+        title="T",
+        file_hash="stale",
+        file_size=fp.stat().st_size,
+        format="mp3",
+    )
+    fp.write_bytes(fp.read_bytes() + b"edited")
+    mgr = SDManager(sd_db)
+    n = mgr.refresh_library_fingerprints_from_disk()
+    assert n == 1
+    row = sd_db.get_song_by_id(sid)
+    assert row["file_hash"] == compute_file_hash(fp)
+    assert row["file_size"] == fp.stat().st_size
 
 
 def test_clear_basic_sync_mp3_cache_for_library_noop_when_missing(sd_mgr, tmp_path):
@@ -699,14 +751,42 @@ class TestBasicSyncChanges:
             mgr.sync_library_basic(sd_root)
             manifest = json.loads((sd_root / ".sync_manifest.json").read_text(encoding="utf-8"))
             assert manifest["stations"]["01"]["tracks"]["001"].get("sd_size", 0) > 0
-            with mock.patch(
-                "gui.sd_manager.compute_file_hash",
-                side_effect=AssertionError("hash should not run on manifest fast path"),
-            ) as hash_mock:
-                r2 = mgr.sync_library_basic(sd_root)
-            hash_mock.assert_not_called()
+            r2 = mgr.sync_library_basic(sd_root)
         assert int(r2["copied"]) == 0
         assert int(r2["skipped"]) >= 2
+
+    def test_validate_basic_sd_detects_disk_change_with_stale_db_hash(
+        self, basic_station_setup, tmp_path
+    ):
+        """SD Sync Status preview must not claim in-sync when the file on disk changed."""
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_validate_stale"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root)
+        a.write_bytes(a.read_bytes() + b"edit")
+        result = mgr.validate_basic_sd(sd_root)
+        assert any("source differs from last sync" in d for d in result.differences)
+
+    def test_stale_library_metadata_bypasses_manifest_skip(
+        self, basic_station_setup, tmp_path
+    ):
+        """Edited source files must reach hash mismatch handling, not silent manifest skip."""
+        mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+        sd_root = tmp_path / "sd_stale_manifest"
+        sd_root.mkdir()
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root)
+        a.write_bytes(a.read_bytes() + b"edit")
+        prompts: list = []
+
+        def _on_failure(info: dict) -> str:
+            prompts.append(dict(info))
+            return "skip"
+
+        with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+            mgr.sync_library_basic(sd_root, on_sync_failure=_on_failure)
+        assert any(p.get("kind") == "hash_mismatch" for p in prompts)
 
     def test_corrupt_sd_file_triggers_recopy_despite_manifest(
         self, basic_station_setup, tmp_path
@@ -871,3 +951,104 @@ def test_hash_mismatch_skip_continues_sync(basic_station_setup, tmp_path):
     assert int(result["copied"]) == 1
     assert not (sd_root / "01" / "001.mp3").exists()
     assert (sd_root / "01" / "002.mp3").exists()
+
+
+def test_hash_mismatch_accept_all_updates_both_tracks(
+    basic_station_setup, tmp_path
+):
+    mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+    sd_root = tmp_path / "sd_hash_accept_all"
+    sd_root.mkdir()
+    _write_minimal_mp3(a, repeat=15)
+    _write_minimal_mp3(b, repeat=20)
+    for sid, path in ((sid_a, a), (sid_b, b)):
+        db.conn.execute(
+            "UPDATE songs SET file_hash = ? WHERE id = ?;",
+            ("deadbeef" * 8, sid),
+        )
+    db.conn.commit()
+    calls = {"n": 0}
+
+    def _on_failure(_info: dict) -> str:
+        calls["n"] += 1
+        return "accept_all" if calls["n"] == 1 else "accept_file"
+
+    with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+        result = mgr.sync_library_basic(
+            sd_root,
+            on_sync_failure=_on_failure,
+        )
+    assert calls["n"] == 1
+    assert int(result["copied"]) == 2
+    assert compute_file_hash(a) == db.get_song_by_id(sid_a)["file_hash"]
+    assert compute_file_hash(b) == db.get_song_by_id(sid_b)["file_hash"]
+
+
+def test_hash_mismatch_accept_file_syncs_and_updates_library(
+    basic_station_setup, tmp_path
+):
+    mgr, db, st_id, sid_a, sid_b, a, b = basic_station_setup
+    sd_root = tmp_path / "sd_hash_accept"
+    sd_root.mkdir()
+    _write_minimal_mp3(a, repeat=15)
+    stale_hash = "deadbeef" * 8
+    db.conn.execute(
+        "UPDATE songs SET file_hash = ? WHERE id = ?;",
+        (stale_hash, sid_a),
+    )
+    db.conn.commit()
+    expected_hash = compute_file_hash(a)
+    with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+        result = mgr.sync_library_basic(
+            sd_root,
+            on_sync_failure=lambda _info: "accept_file",
+        )
+    assert int(result["copied"]) == 2
+    assert (sd_root / "01" / "001.mp3").exists()
+    row = db.get_song_by_id(sid_a)
+    assert row["file_hash"] == expected_hash
+    assert row["file_hash"] != stale_hash
+
+
+def test_accept_all_hash_does_not_auto_skip_conversion_failure(tmp_path, monkeypatch):
+    """Apply-to-all on hash mismatch must not suppress conversion failure prompts."""
+    monkeypatch.setattr(
+        "gui.sync_failure_paths_test_fixture.app_data_dir",
+        lambda: tmp_path,
+    )
+    from gui.sync_failure_paths_test_fixture import (
+        STATION_FOLDER,
+        prepare_mixed_failure_state,
+        upsert_station,
+    )
+
+    db_path, slug, _st_id, _specs = upsert_station(new_library=True, set_active=False)
+    prepare_mixed_failure_state(library_slug=slug)
+    db = DatabaseManager(db_path=db_path, backups_dir=tmp_path / "backups")
+    mgr = SDManager(db)
+    sd_root = tmp_path / "sd_mixed_failures"
+    sd_root.mkdir()
+    prompts: list = []
+
+    def _on_failure(info: dict) -> str:
+        prompts.append(dict(info))
+        if str(info.get("kind") or "") == "hash_mismatch":
+            return "accept_all"
+        return "skip"
+
+    with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+        result = mgr.sync_library_basic(
+            sd_root,
+            force_clean=True,
+            on_sync_failure=_on_failure,
+        )
+
+    kinds = [p.get("kind") for p in prompts]
+    assert kinds.count("hash_mismatch") == 1
+    assert "conversion_failure" in kinds
+    folder = f"{STATION_FOLDER:02d}"
+    assert (sd_root / folder / "001.mp3").is_file()
+    assert (sd_root / folder / "003.mp3").is_file()
+    assert not (sd_root / folder / "002.mp3").exists()
+    assert int(result["copied"]) >= 2
+    db.close()

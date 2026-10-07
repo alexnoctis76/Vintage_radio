@@ -12,6 +12,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 import gui.theme as t
 from gui import ui_scale as u
 from gui.widgets.common.styled_combo import VintageComboBox
+from gui.widgets.dialogs.modal_body_text import ModalBodyText
 from gui.widgets.dialogs.sync.primitives import (
     ModalButton,
     ModalFooter,
@@ -82,16 +83,14 @@ class SdDiskImageFlashWizardDialog(QtWidgets.QDialog):
         )
         body_lay.setSpacing(10)
 
-        intro = QtWidgets.QLabel(
+        intro = ModalBodyText(
             "Your music is prepared on this computer, then written to the SD card "
-            "you choose below. Everything already on that card will be erased."
+            "you choose below. Everything already on that card will be erased.",
         )
-        intro.setWordWrap(True)
         intro.setStyleSheet(_field_label_style())
         body_lay.addWidget(intro)
 
-        self._admin_label = QtWidgets.QLabel()
-        self._admin_label.setWordWrap(True)
+        self._admin_label = ModalBodyText()
         self._admin_label.setStyleSheet(
             f"color: {t.SYNC_MDL_CARD_HELPER_CLR}; font-size: {u.px(t.SYNC_MDL_CARD_HELPER_SIZE)}px;"
             f"background: transparent;"

@@ -70,6 +70,64 @@ class TestSongsCRUD:
         row = tmp_db.get_song_by_hash_size("h1", 100)
         assert row is not None
 
+    def test_add_song_same_path_refreshes_fingerprint(self, tmp_db, tmp_path):
+        fp = tmp_path / "track.mp3"
+        fp.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 500)
+        size1 = fp.stat().st_size
+        sid = tmp_db.add_song(
+            original_filename="track.mp3",
+            file_path=str(fp),
+            title="Old title",
+            file_hash="stale_hash",
+            file_size=size1,
+            format="mp3",
+        )
+        fp.write_bytes(fp.read_bytes() + b"extra")
+        size2 = fp.stat().st_size
+        sid2 = tmp_db.add_song(
+            original_filename="track.mp3",
+            file_path=str(fp),
+            title="New title",
+            file_hash="fresh_hash",
+            file_size=size2,
+            format="mp3",
+        )
+        assert sid2 == sid
+        row = tmp_db.get_song_by_id(sid)
+        assert row["file_hash"] == "fresh_hash"
+        assert row["file_size"] == size2
+        assert row["title"] == "New title"
+
+    def test_add_song_same_path_noop_leaves_sync_error(self, tmp_db, tmp_path):
+        from gui.audio_metadata import compute_file_hash
+
+        fp = tmp_path / "track.mp3"
+        fp.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 400)
+        file_hash = compute_file_hash(fp)
+        file_size = fp.stat().st_size
+        sid = tmp_db.add_song(
+            original_filename="track.mp3",
+            file_path=str(fp),
+            title="Same",
+            file_hash=file_hash,
+            file_size=file_size,
+            format="mp3",
+        )
+        tmp_db.set_song_sync_error(sid, "previous sync failure")
+        sid2 = tmp_db.add_song(
+            original_filename="track.mp3",
+            file_path=str(fp),
+            title="Same",
+            file_hash=file_hash,
+            file_size=file_size,
+            format="mp3",
+        )
+        assert sid2 == sid
+        row = tmp_db.get_song_by_id(sid)
+        assert str(row["sync_error"] or "").strip() == "previous sync failure"
+        assert row["file_hash"] == file_hash
+        assert row["file_size"] == file_size
+
     def test_update_song(self, tmp_db):
         sid = tmp_db.add_song(original_filename="c.mp3", file_path="/x/c.mp3", title="C")
         tmp_db.update_song(sid, {"title": "C Updated"})

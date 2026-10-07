@@ -4,6 +4,24 @@ Desktop application for managing your music library and syncing it to a vintage-
 
 ---
 
+# Release summary — **v1.1.1**
+
+## Sync and library reliability
+
+- **Hash mismatch on SD sync** — When a track file on disk no longer matches the library fingerprint (retag, re-export, ID3 edits), sync prompts **Update Track** / **Skip Track** with optional **Apply to all remaining mismatches**; **Abort** stops sync cleanly instead of hanging at 0/N.
+- **Same-path re-import** — Re-adding or refreshing a track at the same file path updates stored hash/size when the file changed.
+- **SD Sync Status** — Preview no longer reports “in sync” when only the DB is stale; manifest checks re-read disk like the sync path.
+- **Apply-all / skip-all** — Bulk choices apply only to **hash mismatches**, not unrelated conversion failures.
+- **Clear conversion cache** — Optionally refreshes library fingerprints from disk after wiping cached MP3s.
+- **SD volume name** — Clean sync better preserves a custom FAT label (Explorer rename or saved library name) on Windows and macOS.
+
+## Also in v1.1.1
+
+- MCP/debug: tracked **fingerprint mismatch test fixture** (no dependency on local `agent_workshop/`).
+- Regression tests for sync failure policy, volume-label capture, and database fingerprint updates.
+
+---
+
 # Release summary — **v1.1.0**
 
 ## Personalize your radio with custom commercials
