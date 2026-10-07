@@ -13,6 +13,7 @@ import gui.theme as t
 from gui import ui_scale as u
 from gui.sd_disk_image_flash import parse_disk_write_progress_message
 from gui.widgets.common.vintage_progress import VintageProgressBar
+from gui.widgets.dialogs.modal_body_text import ModalBodyText
 from gui.widgets.dialogs.vintage_message import VintageMessageBox
 from gui.widgets.dialogs.sync.primitives import (
     ModalButton,
@@ -127,13 +128,11 @@ class TaskProgressDialog(QtWidgets.QDialog):
         )
         body_lay.setSpacing(10)
 
-        self._image_scan_label = QtWidgets.QLabel("")
-        self._image_scan_label.setWordWrap(True)
+        self._image_scan_label = ModalBodyText("")
         self._image_scan_label.hide()
         body_lay.addWidget(self._image_scan_label)
 
-        self._status_label = QtWidgets.QLabel(initial_message)
-        self._status_label.setWordWrap(True)
+        self._status_label = ModalBodyText(initial_message)
         self._status_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred,
             QtWidgets.QSizePolicy.Policy.MinimumExpanding,
@@ -144,8 +143,7 @@ class TaskProgressDialog(QtWidgets.QDialog):
         self._progress_bar.setRange(0, 0)
         body_lay.addWidget(self._progress_bar)
 
-        self._eta_label = QtWidgets.QLabel("")
-        self._eta_label.setWordWrap(True)
+        self._eta_label = ModalBodyText("")
         body_lay.addWidget(self._eta_label)
 
         shell.add_widget(body)
@@ -436,12 +434,12 @@ class TaskProgressDialog(QtWidgets.QDialog):
             self._progress_monotonic_start = None
         self._status_label.setText(message)
         self._resize_status_label(message)
-        self.adjustSize()
         if phase == "disk_write" and image_scan_message:
             self._image_scan_label.setText(image_scan_message)
             self._image_scan_label.show()
         elif phase != "disk_write":
             self._image_scan_label.hide()
+        self.adjustSize()
 
     @QtCore.pyqtSlot(object)
     def _on_finished(self, result):
@@ -601,8 +599,7 @@ class IndeterminateProgressDialog(QtWidgets.QDialog):
         )
         body_lay.setSpacing(10)
 
-        self._status_label = QtWidgets.QLabel(message)
-        self._status_label.setWordWrap(True)
+        self._status_label = ModalBodyText(message)
         self._status_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred,
             QtWidgets.QSizePolicy.Policy.MinimumExpanding,

@@ -15,6 +15,7 @@ from PyQt6 import QtCore, QtWidgets
 from .database import DatabaseManager
 from .board_profiles import BOARD_PROFILES_BY_ID, get_board_profile
 from .widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from .widgets.dialogs.modal_body_text import ModalBodyText
 from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
 from .widgets.dialogs.vintage_input import get_text
 from .widgets.dialogs.vintage_message import VintageMessageBox
@@ -187,13 +188,11 @@ class ProfileManagerDialog(QtWidgets.QDialog):
         self._board_label = QtWidgets.QLabel()
         details_layout.addRow("Board:", self._board_label)
 
-        self._pin_summary = QtWidgets.QLabel()
-        self._pin_summary.setWordWrap(True)
+        self._pin_summary = ModalBodyText()
         self._pin_summary.setStyleSheet("font-size: 11px; color: #555;")
         details_layout.addRow("Pins:", self._pin_summary)
 
-        self._driver_label = QtWidgets.QLabel()
-        self._driver_label.setWordWrap(True)
+        self._driver_label = ModalBodyText()
         details_layout.addRow("Custom Driver:", self._driver_label)
 
         self._created_label = QtWidgets.QLabel()

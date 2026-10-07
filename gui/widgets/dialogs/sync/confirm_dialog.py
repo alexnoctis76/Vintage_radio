@@ -12,6 +12,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
 from gui import ui_scale as u
+from gui.widgets.dialogs.modal_body_text import ModalBodyText
 from .primitives import (
     ModalFooter,
     ModalHeader,
@@ -66,13 +67,12 @@ class ReplaceConfirmDialog(QtWidgets.QDialog):
 
         sd_html = _html_escape(sd_display)
         lib_html = _html_escape(library_name)
-        main_text = QtWidgets.QLabel(
+        main_text = ModalBodyText(
             f"This will remove the music currently on <b>{sd_html}</b> and copy "
-            f"<b>{lib_html}</b> to the SD card from the beginning."
+            f"<b>{lib_html}</b> to the SD card from the beginning.",
+            rich=True,
         )
         self._main_text = main_text
-        main_text.setWordWrap(True)
-        main_text.setTextFormat(QtCore.Qt.TextFormat.RichText)
         main_text.setStyleSheet(
             f"color: {t.SYNC_MDL_CONFIRM_TEXT_CLR};"
             f"font-size: {u.px(t.SYNC_MDL_CONFIRM_TEXT_SIZE)}px;"

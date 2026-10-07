@@ -30,6 +30,10 @@ class LibraryRegistry:
         self._registry_path = self._lib_dir / _REGISTRY_FILE
         self._data = self._load()
 
+    def reload(self) -> None:
+        """Re-read ``libraries.json`` (e.g. after MCP test fixture created a library)."""
+        self._data = self._load()
+
     def _load(self) -> dict:
         if self._registry_path.exists():
             try:

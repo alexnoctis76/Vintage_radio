@@ -10,6 +10,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 import gui.theme as t
 from gui import ui_scale as u
 from gui.widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from gui.widgets.dialogs.modal_body_text import ModalBodyText
 from .primitives import (
     ModalButton,
     ModalFooter,
@@ -64,8 +65,7 @@ class ScrollableListConfirmDialog(QtWidgets.QDialog):
         )
         body_lay.setSpacing(10)
 
-        intro_lbl = QtWidgets.QLabel(explanation)
-        intro_lbl.setWordWrap(True)
+        intro_lbl = ModalBodyText(explanation)
         intro_lbl.setStyleSheet(
             f"color: {t.SYNC_MDL_CONFIRM_TEXT_CLR};"
             f"font-size: {u.px(t.SYNC_MDL_CONFIRM_TEXT_SIZE)}px;"

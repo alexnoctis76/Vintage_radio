@@ -9,6 +9,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 import gui.theme as t
 from gui import ui_scale as u
 from gui.widgets.common.mockup_scrollbar import wrap_with_mockup_scrollbar
+from gui.widgets.dialogs.modal_body_text import ModalBodyText
 from gui.widgets.dialogs.sync.primitives import (
     ModalButton,
     ModalFooter,
@@ -123,13 +124,10 @@ class VintageMessageBox(QtWidgets.QDialog):
         summary_lay = QtWidgets.QVBoxLayout(self._summary_page)
         summary_lay.setContentsMargins(0, 0, 0, 0)
         summary_lay.setSpacing(8)
-        self._text_lbl = QtWidgets.QLabel()
-        self._text_lbl.setWordWrap(True)
+        self._text_lbl = ModalBodyText()
         self._text_lbl.setStyleSheet(self._main_text_style())
         summary_lay.addWidget(self._text_lbl)
-        self._info_lbl = QtWidgets.QLabel()
-        self._info_lbl.setWordWrap(True)
-        self._info_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self._info_lbl = ModalBodyText(rich=True)
         self._info_lbl.setStyleSheet(self._info_text_style())
         self._info_lbl.hide()
         summary_lay.addWidget(self._info_lbl)

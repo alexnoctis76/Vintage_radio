@@ -14,6 +14,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import gui.theme as t
 from gui import ui_scale as u
+from gui.widgets.dialogs.modal_body_text import ModalBodyText
 
 ButtonVariant = Literal["primary", "secondary", "danger", "update", "full_refresh"]
 
@@ -454,12 +455,10 @@ class SyncOptionCard(QtWidgets.QFrame):
         lay.addLayout(topline)
         lay.addSpacing(12)
 
-        self._desc_lbl = QtWidgets.QLabel(description)
-        self._desc_lbl.setWordWrap(True)
+        self._desc_lbl = ModalBodyText(description)
         lay.addWidget(self._desc_lbl)
 
-        self._helper_lbl = QtWidgets.QLabel(helper)
-        self._helper_lbl.setWordWrap(True)
+        self._helper_lbl = ModalBodyText(helper)
         lay.addStretch(1)
         lay.addWidget(self._helper_lbl)
         lay.addSpacing(12)
@@ -529,8 +528,7 @@ class SafetyNote(QtWidgets.QFrame):
         self._icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         row.addWidget(self._icon, 0, QtCore.Qt.AlignmentFlag.AlignTop)
 
-        self._msg = QtWidgets.QLabel(text)
-        self._msg.setWordWrap(True)
+        self._msg = ModalBodyText(text)
         row.addWidget(self._msg, 1)
 
         self._row = row

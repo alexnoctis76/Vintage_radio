@@ -23,6 +23,30 @@ def qapp():
     return app
 
 
+def test_sync_failure_summary_reserves_wrapped_height(qapp):
+    """The post-sync failure summary must keep the last detail line visible on macOS."""
+    body = (
+        "These library files could not be converted or copied to the SD card. "
+        "Fix or remove the bad files and sync again.\n\n"
+        "Track B (Mismatch test)\n"
+        "File content no longer matches the library record (changed or corrupted)."
+    )
+    dlg = VintageMessageBox(None)
+    dlg.setFixedWidth(520)
+    dlg.setText(body)
+    dlg._apply_content()
+    try:
+        dlg.show()
+        qapp.processEvents()
+        label = dlg._text_lbl
+        assert "corrupted" in label.text()
+        if not label.uses_label():
+            assert label.height() > label.fontMetrics().lineSpacing() * 4
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+
+
 def test_no_detail_button_when_no_detailed_text(qapp):
     dlg = VintageMessageBox(None)
     dlg.setText("Short summary")

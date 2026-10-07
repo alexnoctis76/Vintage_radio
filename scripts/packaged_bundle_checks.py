@@ -98,17 +98,25 @@ def check_main_executable(app: Path) -> CheckResult:
 
 
 def check_python_shared_library(app: Path) -> CheckResult:
-    """The PyInstaller bootloader dlopens ``Contents/Frameworks/Python`` (a symlink)."""
-    lib = app / "Contents" / "Frameworks" / "Python"
-    if not lib.exists():
-        return _result("python_shared_library_valid", False, f"{lib} missing or dangling symlink")
-    if not is_macho_file(lib):
-        return _result(
-            "python_shared_library_valid",
-            False,
-            f"{lib} is not a Mach-O file (symlink flattened to text by a bad extract?)",
-        )
-    return _result("python_shared_library_valid", True, str(lib.resolve()))
+    """PyInstaller macOS bundles expose ``Frameworks/Python`` (symlink) or ``libpython3.*.dylib``."""
+    fw = app / "Contents" / "Frameworks"
+    lib = fw / "Python"
+    if lib.exists():
+        if not is_macho_file(lib):
+            return _result(
+                "python_shared_library_valid",
+                False,
+                f"{lib} is not a Mach-O file (symlink flattened to text by a bad extract?)",
+            )
+        return _result("python_shared_library_valid", True, str(lib.resolve()))
+    for candidate in sorted(fw.glob("libpython3.*.dylib")):
+        if is_macho_file(candidate):
+            return _result("python_shared_library_valid", True, str(candidate))
+    return _result(
+        "python_shared_library_valid",
+        False,
+        f"{fw / 'Python'} missing and no libpython3.*.dylib under Frameworks",
+    )
 
 
 def collect_symlinks(root: Path) -> Dict[str, str]:

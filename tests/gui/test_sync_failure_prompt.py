@@ -74,6 +74,32 @@ def test_map_sync_failure_choice(spec, expected):
     assert map_sync_failure_choice(spec) == expected
 
 
+def test_accept_all_policy_only_auto_accepts_hash_mismatch():
+    policy = _SyncFailurePolicy()
+    policy.accept_all = True
+    assert (
+        _decide_sync_failure(None, policy, {"kind": "hash_mismatch"})
+        == "accept_file"
+    )
+    calls: list = []
+
+    def _cb(info: dict) -> str:
+        calls.append(info)
+        return "skip"
+
+    assert (
+        _decide_sync_failure(_cb, policy, {"kind": "conversion_failure"})
+        == "skip"
+    )
+    assert (
+        _decide_sync_failure(_cb, policy, {"kind": "copy_failure"}) == "skip"
+    )
+    assert calls == [
+        {"kind": "conversion_failure"},
+        {"kind": "copy_failure"},
+    ]
+
+
 def test_skip_all_policy_only_auto_skips_hash_mismatch():
     policy = _SyncFailurePolicy()
     policy.skip_all = True
@@ -162,3 +188,95 @@ def test_hash_mismatch_dialog_skip_with_apply_all(qapp, monkeypatch):
 
 def test_apply_all_checkbox_label():
     assert "remaining mismatches" in _APPLY_ALL_CHECKBOX.lower()
+
+
+def test_hash_mismatch_dialog_windows_keeps_label(qapp, monkeypatch):
+    from gui.sync_failure_prompt import _HashMismatchSyncDialog
+
+    monkeypatch.setattr("gui.widgets.dialogs.modal_body_text.sys.platform", "win32")
+    dlg = _HashMismatchSyncDialog(None, "Track body")
+    try:
+        assert dlg._body_text_lbl.uses_label()
+    finally:
+        dlg.deleteLater()
+
+
+def test_hash_mismatch_dialog_darwin_body_label_height(qapp, monkeypatch):
+    from gui.sync_failure_prompt import _HashMismatchSyncDialog
+
+    monkeypatch.setattr("gui.widgets.dialogs.modal_body_text.sys.platform", "darwin")
+    body = (
+        "Headline line one.\n\nTrack: track_a.mp3\nStation: Mismatch test\n"
+        "Detail paragraph that wraps across several lines on a fixed-width modal.\n\n"
+        "Choose Update Track to save the file as it is now and copy it to the SD card."
+    )
+    dlg = _HashMismatchSyncDialog(None, body)
+    try:
+        dlg.show()
+        qapp.processEvents()
+        edit = dlg._body_text_lbl
+        assert not edit.uses_label()
+        fm = edit.fontMetrics()
+        assert "copy it to the SD card" in edit.text()
+        assert edit.height() > fm.lineSpacing() * 4
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+
+
+def test_darwin_late_rich_text_returns_source_html(qapp, monkeypatch):
+    monkeypatch.setattr("gui.widgets.dialogs.modal_body_text.sys.platform", "darwin")
+    from PyQt6 import QtCore
+
+    from gui.widgets.dialogs.modal_body_text import ModalBodyText
+
+    html = "<b>Hello</b> world"
+    widget = ModalBodyText("plain")
+    try:
+        widget.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        widget.setText(html)
+        assert widget.text() == html
+    finally:
+        widget.deleteLater()
+
+
+def test_darwin_set_text_does_not_resize_flexible_dialog(qapp, monkeypatch):
+    monkeypatch.setattr("gui.widgets.dialogs.modal_body_text.sys.platform", "darwin")
+    from gui.widgets.dialogs.modal_body_text import ModalBodyText
+
+    dlg = QtWidgets.QDialog()
+    dlg.setMinimumWidth(700)
+    dlg.resize(700, 450)
+    body = ModalBodyText("short", parent=dlg)
+    layout = QtWidgets.QVBoxLayout(dlg)
+    layout.addWidget(body)
+    dlg.show()
+    qapp.processEvents()
+    dlg.resize(700, 450)
+    qapp.processEvents()
+    before = dlg.size()
+    body.setText("A much longer paragraph that should wrap. " * 30)
+    qapp.processEvents()
+    try:
+        assert dlg.size() == before
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+
+
+def test_darwin_resize_reflows_wrapped_height(qapp, monkeypatch):
+    monkeypatch.setattr("gui.widgets.dialogs.modal_body_text.sys.platform", "darwin")
+    from gui.widgets.dialogs.modal_body_text import ModalBodyText
+
+    body = ModalBodyText("word " * 80)
+    try:
+        body.show()
+        body.resize(420, 40)
+        qapp.processEvents()
+        wide = body._edit.height()
+        body.resize(120, 40)
+        qapp.processEvents()
+        assert body._edit.height() > wide
+    finally:
+        body.close()
+        body.deleteLater()

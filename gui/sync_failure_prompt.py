@@ -12,6 +12,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 import gui.theme as t
 from gui import ui_scale as u
 from gui.widgets.common.styled_checkbox import VintageCheckBox
+from gui.widgets.dialogs.modal_body_text import ModalBodyText
 from gui.widgets.dialogs.sync.primitives import (
     ModalButton,
     ModalFooter,
@@ -81,13 +82,13 @@ class _HashMismatchSyncDialog(QtWidgets.QDialog):
         )
         body_lay.setSpacing(12)
 
-        text_lbl = QtWidgets.QLabel(body)
-        text_lbl.setWordWrap(True)
+        text_lbl = ModalBodyText(body)
         text_lbl.setStyleSheet(
             f"color: {t.SYNC_MDL_CONFIRM_TEXT_CLR};"
             f"font-size: {u.px(t.SYNC_MDL_CARD_BODY_SIZE)}px;"
             f"background: transparent;"
         )
+        self._body_text_lbl = text_lbl
         body_lay.addWidget(text_lbl)
 
         self._apply_all_cb = VintageCheckBox(_APPLY_ALL_CHECKBOX)

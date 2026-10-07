@@ -1008,3 +1008,47 @@ def test_hash_mismatch_accept_file_syncs_and_updates_library(
     row = db.get_song_by_id(sid_a)
     assert row["file_hash"] == expected_hash
     assert row["file_hash"] != stale_hash
+
+
+def test_accept_all_hash_does_not_auto_skip_conversion_failure(tmp_path, monkeypatch):
+    """Apply-to-all on hash mismatch must not suppress conversion failure prompts."""
+    monkeypatch.setattr(
+        "gui.sync_failure_paths_test_fixture.app_data_dir",
+        lambda: tmp_path,
+    )
+    from gui.sync_failure_paths_test_fixture import (
+        STATION_FOLDER,
+        prepare_mixed_failure_state,
+        upsert_station,
+    )
+
+    db_path, slug, _st_id, _specs = upsert_station(new_library=True, set_active=False)
+    prepare_mixed_failure_state(library_slug=slug)
+    db = DatabaseManager(db_path=db_path, backups_dir=tmp_path / "backups")
+    mgr = SDManager(db)
+    sd_root = tmp_path / "sd_mixed_failures"
+    sd_root.mkdir()
+    prompts: list = []
+
+    def _on_failure(info: dict) -> str:
+        prompts.append(dict(info))
+        if str(info.get("kind") or "") == "hash_mismatch":
+            return "accept_all"
+        return "skip"
+
+    with mock.patch.object(mgr, "_copy_am_wav_to_dfplayer_sd", return_value=False):
+        result = mgr.sync_library_basic(
+            sd_root,
+            force_clean=True,
+            on_sync_failure=_on_failure,
+        )
+
+    kinds = [p.get("kind") for p in prompts]
+    assert kinds.count("hash_mismatch") == 1
+    assert "conversion_failure" in kinds
+    folder = f"{STATION_FOLDER:02d}"
+    assert (sd_root / folder / "001.mp3").is_file()
+    assert (sd_root / folder / "003.mp3").is_file()
+    assert not (sd_root / folder / "002.mp3").exists()
+    assert int(result["copied"]) >= 2
+    db.close()

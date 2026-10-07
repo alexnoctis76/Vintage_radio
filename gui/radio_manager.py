@@ -85,6 +85,7 @@ from .widgets.library_bar.library_bar   import LibraryBar     as _LibraryBar
 from .widgets.sidebar.sidebar           import Sidebar        as _Sidebar, _NAV_ITEMS as _SIDEBAR_NAV_ITEMS
 from .test_mode import TestModeWidget
 from .debug_mcp_server import DebugMcpServerManager
+from .widgets.dialogs.modal_body_text import ModalBodyText
 from .widgets.dialogs.vintage_message import VintageMessageBox
 from .widgets.dialogs.vintage_input import get_item, get_multiline_text, get_text
 from .widgets.dialogs.sync.primitives import ModalButton, begin_sync_modal_dialog
@@ -5211,7 +5212,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
             return self._mcp_run_on_gui_sync(_install_fn, wait_s=600.0)
         if action == "run_fingerprint_sync_test":
-            scenario = str(payload.get("scenario", "sync")).strip().lower()
+            scenario = str(payload.get("scenario", "")).strip().lower()
+            explicit_policy = "on_mismatch" in payload
+            # Bare invocation runs every dialog choice. An explicit on_mismatch
+            # still selects that one legacy policy.
+            if scenario in ("", "sync") and not explicit_policy:
+                scenario = "all"
 
             def _fp_test_fn() -> Dict[str, Any]:
                 from gui.mcp_fingerprint_sync_test import (
@@ -5226,25 +5232,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 do_switch = bool(payload.get("switch_library", True))
 
                 def _switch(slug: str) -> None:
+                    # The fixture creates the library; reload so the switch sees it.
+                    self._lib_registry.reload()
                     if slug != self._lib_registry.active_library():
                         self._switch_library(slug)
 
                 rep = run_fingerprint_sync_test(
                     setup=bool(payload.get("setup", True)),
                     apply_mismatch=bool(payload.get("apply_mismatch", True)),
-                    stale_db_only=bool(payload.get("stale_db_only", False)),
                     on_mismatch=str(payload.get("on_mismatch", "accept_file")),
+                    scenario=scenario,
                     switch_library=do_switch,
                     switch_library_fn=_switch if do_switch else None,
                     log=self._mcp_log,
                 )
                 return {
                     "ok": bool(rep.get("ok")),
-                    "library_slug": LIBRARY_SLUG,
+                    "library_slug": rep.get("library_slug", LIBRARY_SLUG),
                     "report": rep,
                 }
 
-            return self._mcp_run_on_gui_sync(_fp_test_fn, wait_s=300.0)
+            wait_s = 900.0 if scenario == "all" else 300.0
+            return self._mcp_run_on_gui_sync(_fp_test_fn, wait_s=wait_s)
         return {"ok": False, "error": "unknown_action", "action": action}
 
     def _mcp_emulator_gesture(self, gesture: str) -> Dict[str, Any]:
@@ -5580,12 +5589,11 @@ class MainWindow(QtWidgets.QMainWindow):
             subtitle="Choose what to copy to the connected Pico.",
             min_width=520,
         )
-        intro = QtWidgets.QLabel(
+        intro = ModalBodyText(
             "The MCP debug server runs on this computer. For serial automation (VRTEST), "
             "the Pico needs components/vintage_radio_ipc.py on its flash. "
-            "Flashing a UF2 image alone often does not add new components/*.py files."
+            "Flashing a UF2 image alone often does not add new components/*.py files.",
         )
-        intro.setWordWrap(True)
         intro.setStyleSheet("background: transparent;")
         choice_lay.addWidget(intro)
         combo = VintageComboBox(
@@ -5602,11 +5610,10 @@ class MainWindow(QtWidgets.QMainWindow):
             True,
         )
         choice_lay.addWidget(combo)
-        foot = QtWidgets.QLabel(
+        foot = ModalBodyText(
             "Pico must be connected via USB (mpremote connect auto). "
-            "The device will soft-reset after copy."
+            "The device will soft-reset after copy.",
         )
-        foot.setWordWrap(True)
         foot.setStyleSheet("background: transparent;")
         choice_lay.addWidget(foot)
         cancel_btn = ModalButton("Cancel", variant="secondary")

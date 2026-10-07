@@ -283,10 +283,24 @@ if [ "$SIGN" = false ]; then
     done < <(find "$APP_BUNDLE" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
     rm -rf "$APP_BUNDLE/Contents/_CodeSignature" 2>/dev/null || true
     [ "$_strip_count" -gt 0 ] && echo "  Removed signature from $_strip_count binary(ies)"
-    # codesign --remove clears the execute bit on some Mach-O; restore for launch/update.
+    # codesign --remove clears the execute bit, so this must not filter on -perm +111
+    # (those files no longer match). Contents/MacOS includes the main executable.
+    # mpy-cross lives under Frameworks/Resources, outside MacOS.
     while IFS= read -r -d '' f; do
         chmod u+x "$f" 2>/dev/null || true
     done < <(find "$APP_BUNDLE/Contents/MacOS" -type f -print0 2>/dev/null)
+    while IFS= read -r -d '' f; do
+        chmod u+x "$f" 2>/dev/null || true
+    done < <(find "$APP_BUNDLE" -type f -name "mpy-cross" -print0 2>/dev/null)
+    # Apple Silicon kills an unsigned Mach-O at exec (exit 137 / SIGKILL). The
+    # strip above is still required: PyInstaller signs the bundle before
+    # mpremote_helper is copied in, and that stale signature is what Gatekeeper
+    # reports as "damaged". Sign the finished bundle once, after every file is
+    # in place, so the nested tools and the app itself can run.
+    echo "Ad-hoc signing finished bundle (required for Apple Silicon)..."
+    if ! codesign --force --deep --sign - "$APP_BUNDLE"; then
+        echo "Warning: ad-hoc signing failed. The app and mpy-cross will be killed on launch."
+    fi
 fi
 
 # Code sign only with Developer ID. Ad-hoc signing (-) causes "damaged" when the app
